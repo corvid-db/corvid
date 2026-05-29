@@ -52,6 +52,8 @@ format and API may change without backward-compatibility guarantees.
 - More predicates: `is_in` (set membership), `between` (inclusive range),
   `starts_with`/`contains` (text); between/in/starts_with route through the
   scalar index (text prefix scan), the rest verify on scan.
+- Delete-by-query (`delete_where`, index-accelerated) and `delete_batch`,
+  cascading through every index; exposed over MCP (delete_where).
 - Partial writes: `patch` (merge fields), `update` (read-modify-write), and
   `compare_and_set` (atomic conditional write/delete/insert-if-absent). All keep
   indexes consistent; exposed over MCP.

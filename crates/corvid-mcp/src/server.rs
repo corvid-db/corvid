@@ -62,6 +62,7 @@ impl Server {
             "create_scalar_index" => self.create_scalar_index(params),
             "patch" => self.patch(params),
             "compare_and_set" => self.compare_and_set(params),
+            "delete_where" => self.delete_where(params),
             "create_geo_index" => self.create_geo_index(params),
             "create_compound_index" => self.create_compound_index(params),
             "backup" => self.backup(params),
@@ -114,6 +115,18 @@ impl Server {
             new,
         )?;
         Ok(json!({ "applied": applied }))
+    }
+
+    fn delete_where(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let filter = p
+            .get("filter")
+            .ok_or_else(|| ToolError::BadParams("missing 'filter'".into()))?;
+        let removed = self
+            .db
+            .collection(collection)
+            .delete_where(parse_predicate(filter)?)?;
+        Ok(json!({ "removed": removed }))
     }
 
     fn get(&self, p: &Json) -> Result<Json, ToolError> {

@@ -157,6 +157,18 @@ fn tools_list() -> Json {
                 }
             },
             {
+                "name": "delete_where",
+                "description": "Delete every document matching a filter predicate. Returns {removed}.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "filter": { "type": "object" }
+                    },
+                    "required": ["collection", "filter"]
+                }
+            },
+            {
                 "name": "search",
                 "description": "Hybrid search: filter + vector + text, fused, optionally MMR-reranked.",
                 "inputSchema": {
@@ -458,6 +470,7 @@ mod tests {
             "delete",
             "patch",
             "compare_and_set",
+            "delete_where",
             "search",
             "create_index",
             "link",

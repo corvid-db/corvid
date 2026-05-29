@@ -379,6 +379,40 @@ impl Collection<'_> {
         Ok(removed)
     }
 
+    /// Delete every document matching `predicate`; returns the number removed.
+    /// Matching uses the query builder (so it is index-accelerated where
+    /// possible); each match is removed through the normal delete path, keeping
+    /// all indexes consistent.
+    pub fn delete_where(&self, predicate: crate::filter::Predicate) -> Result<usize> {
+        self.ensure_writable()?;
+        let keys: Vec<Vec<u8>> = self
+            .query()
+            .filter(predicate)
+            .run()?
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        let mut removed = 0;
+        for key in keys {
+            if self.delete(&key)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Delete each of `keys`; returns how many existed and were removed.
+    pub fn delete_batch(&self, keys: &[&[u8]]) -> Result<usize> {
+        self.ensure_writable()?;
+        let mut removed = 0;
+        for key in keys {
+            if self.delete(key)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Return every `(key, document)` pair, in key order.
     pub fn scan(&self) -> Result<Vec<(Vec<u8>, Value)>> {
         let mut out = Vec::new();
@@ -399,6 +433,33 @@ mod tests {
         m.insert("name".to_owned(), Value::Text(name.to_owned()));
         m.insert("n".to_owned(), Value::Int(n));
         Value::Map(m)
+    }
+
+    #[test]
+    fn delete_where_and_batch() {
+        use crate::field;
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.create_scalar_index("n").unwrap();
+        for i in 0..20i64 {
+            c.insert(&[i as u8], &doc("x", i)).unwrap();
+        }
+        // delete-by-query (index-accelerated): remove n >= 15 → 5 docs.
+        let removed = c.delete_where(field("n").ge(Value::Int(15))).unwrap();
+        assert_eq!(removed, 5);
+        assert_eq!(c.len().unwrap(), 15);
+        // The scalar index reflects the deletions.
+        assert!(
+            c.query()
+                .filter(field("n").ge(Value::Int(15)))
+                .run()
+                .unwrap()
+                .is_empty()
+        );
+        // batch delete (some keys absent).
+        let n = c.delete_batch(&[&[0u8], &[1u8], &[99u8]]).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(c.len().unwrap(), 13);
     }
 
     #[test]
