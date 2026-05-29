@@ -15,6 +15,7 @@
 //! graph is never left half-updated.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::distance::Metric;
@@ -295,7 +296,9 @@ impl Ord for Cand {
 /// Loads nodes from a reader on demand and caches them for the operation,
 /// tracking which are dirtied so they can be flushed in one pass.
 struct Cache {
-    nodes: HashMap<u64, Node>,
+    /// Cached nodes behind `Rc` so loading one into the search frontier is a
+    /// refcount bump, not a deep copy of its vector + neighbour lists.
+    nodes: HashMap<u64, Rc<Node>>,
     dirty: std::collections::HashSet<u64>,
 }
 
@@ -322,6 +325,7 @@ pub(crate) fn insert(
         let mut meta = read_meta(tx, ns)?;
         let mut cache = Cache::new();
         insert_in_txn(tx, ns, p, &mut cache, &mut meta, doc_key, vector)?;
+        flush_dirty(tx, ns, &mut cache)?;
         tx.put(ns, &[TAG_META], &encode_meta(meta))?;
         Ok(())
     })
@@ -349,9 +353,13 @@ pub(crate) fn insert_many(
         for (doc_key, vector) in items {
             insert_in_txn(tx, ns, p, &mut cache, &mut meta, doc_key, vector)?;
             if cache.nodes.len() > BULK_CACHE_CAP {
-                cache.nodes.clear(); // dirty already flushed; reloads on demand
+                // Persist dirty nodes before evicting, then drop the resident
+                // set (it reloads on demand).
+                flush_dirty(tx, ns, &mut cache)?;
+                cache.nodes.clear();
             }
         }
+        flush_dirty(tx, ns, &mut cache)?;
         tx.put(ns, &[TAG_META], &encode_meta(meta))?;
         Ok(())
     })
@@ -383,10 +391,10 @@ fn insert_in_txn(
         // Overwrite: tombstone the previous node for this key.
         if let Some(old_bytes) = tx.get(ns, &keymap_key(doc_key))? {
             let old_id = u64::from_be_bytes(old_bytes.as_slice().try_into().unwrap_or([0; 8]));
-            if let Some(node) = load(tx, ns, cache, p, old_id)? {
-                let mut node = node;
-                node.deleted = true;
-                cache.nodes.insert(old_id, node);
+            if load(tx, ns, cache, p, old_id)?.is_some()
+                && let Some(node) = cache.nodes.get_mut(&old_id)
+            {
+                Rc::make_mut(node).deleted = true;
                 cache.dirty.insert(old_id);
             }
         }
@@ -396,12 +404,12 @@ fn insert_in_txn(
         let level = level_for(id, p.ml);
         cache.nodes.insert(
             id,
-            Node {
+            Rc::new(Node {
                 deleted: false,
                 doc_key: doc_key.to_vec(),
                 vector: p.encode(vector),
                 layers: vec![Vec::new(); level + 1],
-            },
+            }),
         );
         cache.dirty.insert(id);
         tx.put(ns, &keymap_key(doc_key), &id.to_be_bytes())?;
@@ -428,10 +436,11 @@ fn insert_in_txn(
                 let neighbors: Vec<u64> = w.iter().take(m_layer).map(|c| c.id).collect();
 
                 if let Some(node) = cache.nodes.get_mut(&id) {
-                    node.layers[layer] = neighbors.clone();
+                    Rc::make_mut(node).layers[layer] = neighbors.clone();
                 }
                 for &nb in &neighbors {
                     if let Some(node) = cache.nodes.get_mut(&nb) {
+                        let node = Rc::make_mut(node);
                         node.layers[layer].push(id);
                         let overflow = node.layers[layer].len() > m_layer;
                         cache.dirty.insert(nb);
@@ -452,14 +461,22 @@ fn insert_in_txn(
             meta.entry = Some(id);
         }
 
-        // Flush this insert's touched nodes (so a later insert in the same
-        // transaction sees them via read-your-writes). Drain dirty but keep the
-        // nodes cached for reuse by the next insert in a bulk batch.
-        let dirty: Vec<u64> = cache.dirty.drain().collect();
-        for nid in dirty {
-            if let Some(node) = cache.nodes.get(&nid) {
-                tx.put(ns, &node_key(nid), &encode_node(node))?;
-            }
+        // Touched nodes stay dirty in the cache; the cache provides read-your-
+        // writes for the rest of this transaction. They are flushed to the store
+        // once at the end of the batch (or before the cache is evicted over its
+        // cap) — so a hub node touched by many inserts is written once, not once
+        // per insert.
+    }
+    Ok(())
+}
+
+/// Write every dirty node to the store and clear the dirty set (nodes stay
+/// cached). Call before evicting the cache and at the end of a batch.
+fn flush_dirty(tx: &mut crate::store::WriteBatch<'_>, ns: &str, cache: &mut Cache) -> Result<()> {
+    let dirty: Vec<u64> = cache.dirty.drain().collect();
+    for nid in dirty {
+        if let Some(node) = cache.nodes.get(&nid) {
+            tx.put(ns, &node_key(nid), &encode_node(node))?;
         }
     }
     Ok(())
@@ -560,18 +577,19 @@ fn load(
     cache: &mut Cache,
     p: &DiskParams,
     id: u64,
-) -> Result<Option<Node>> {
+) -> Result<Option<Rc<Node>>> {
     if let Some(n) = cache.nodes.get(&id) {
         return Ok(Some(n.clone()));
     }
     match tx.get(ns, &node_key(id))? {
-        Some(b) => {
-            let node = decode_node(&b, p);
-            if let Some(n) = &node {
-                cache.nodes.insert(id, n.clone());
+        Some(b) => match decode_node(&b, p) {
+            Some(node) => {
+                let rc = Rc::new(node);
+                cache.nodes.insert(id, rc.clone());
+                Ok(Some(rc))
             }
-            Ok(node)
-        }
+            None => Ok(None),
+        },
         None => Ok(None),
     }
 }
@@ -582,18 +600,19 @@ fn load_r(
     cache: &mut Cache,
     p: &DiskParams,
     id: u64,
-) -> Result<Option<Node>> {
+) -> Result<Option<Rc<Node>>> {
     if let Some(n) = cache.nodes.get(&id) {
         return Ok(Some(n.clone()));
     }
     match r.get(ns, &node_key(id))? {
-        Some(b) => {
-            let node = decode_node(&b, p);
-            if let Some(n) = &node {
-                cache.nodes.insert(id, n.clone());
+        Some(b) => match decode_node(&b, p) {
+            Some(node) => {
+                let rc = Rc::new(node);
+                cache.nodes.insert(id, rc.clone());
+                Ok(Some(rc))
             }
-            Ok(node)
-        }
+            None => Ok(None),
+        },
         None => Ok(None),
     }
 }
@@ -693,7 +712,7 @@ fn prune(
     scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     scored.truncate(m);
     if let Some(n) = cache.nodes.get_mut(&node) {
-        n.layers[layer] = scored.into_iter().map(|(_, id)| id).collect();
+        Rc::make_mut(n).layers[layer] = scored.into_iter().map(|(_, id)| id).collect();
     }
     Ok(())
 }
