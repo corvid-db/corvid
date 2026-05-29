@@ -40,4 +40,14 @@ pub enum Error {
     /// A collection name used the engine-reserved `__` prefix.
     #[error("reserved collection name: {0}")]
     ReservedCollection(String),
+
+    /// The on-disk file was written by an incompatible format version. Per
+    /// project policy there is no migration: the old file must be reimported.
+    #[error("incompatible format: file is v{found}, engine expects v{expected}")]
+    IncompatibleFormat {
+        /// The version found in the file.
+        found: u64,
+        /// The version this engine writes.
+        expected: u64,
+    },
 }

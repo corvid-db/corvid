@@ -31,6 +31,10 @@ const CATALOG: TableDefinition<&str, u64> = TableDefinition::new("catalog");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 /// Key in [`META`] holding the next collection id to assign.
 const NEXT_ID: &str = "next_collection_id";
+/// Key in [`META`] holding the on-disk format version.
+const FORMAT_VERSION_KEY: &str = "format_version";
+/// The format version this engine writes. Bump on any breaking on-disk change.
+const FORMAT_VERSION: u64 = 1;
 
 /// An embedded transactional key/value store.
 pub struct Store {
@@ -40,16 +44,80 @@ pub struct Store {
 impl Store {
     /// Open (creating if absent) a store backed by a file at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Ok(Self {
+        let store = Self {
             db: Database::create(path)?,
-        })
+        };
+        store.check_format_version()?;
+        Ok(store)
     }
 
     /// Open a purely in-memory store. Nothing is persisted.
     pub fn open_in_memory() -> Result<Self> {
-        Ok(Self {
+        let store = Self {
             db: Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?,
-        })
+        };
+        store.check_format_version()?;
+        Ok(store)
+    }
+
+    /// Verify (or stamp) the on-disk format version. A file from an
+    /// incompatible version is refused rather than silently mis-decoded.
+    fn check_format_version(&self) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        let found = {
+            let meta = txn.open_table(META)?;
+            meta.get(FORMAT_VERSION_KEY)?.map(|g| g.value())
+        };
+        match found {
+            Some(v) if v != FORMAT_VERSION => {
+                txn.abort()?;
+                Err(crate::Error::IncompatibleFormat {
+                    found: v,
+                    expected: FORMAT_VERSION,
+                })
+            }
+            Some(_) => {
+                txn.abort()?;
+                Ok(())
+            }
+            None => {
+                {
+                    let mut meta = txn.open_table(META)?;
+                    meta.insert(FORMAT_VERSION_KEY, FORMAT_VERSION)?;
+                }
+                txn.commit()?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Overwrite the stored format version (test-only, to simulate a file
+    /// written by a different engine version).
+    #[cfg(test)]
+    pub(crate) fn set_format_version_for_test(&self, version: u64) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut meta = txn.open_table(META)?;
+            meta.insert(FORMAT_VERSION_KEY, version)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Atomically reserve the next monotonic auto-key id for `collection`.
+    /// Big-endian encoding of the returned id keeps auto-keyed records in
+    /// insertion order.
+    pub fn next_auto_id(&self, collection: &str) -> Result<u64> {
+        let txn = self.db.begin_write()?;
+        let id = {
+            let mut meta = txn.open_table(META)?;
+            let key = format!("auto:{collection}");
+            let id = meta.get(key.as_str())?.map(|g| g.value()).unwrap_or(0);
+            meta.insert(key.as_str(), id + 1)?;
+            id
+        };
+        txn.commit()?;
+        Ok(id)
     }
 
     /// Run `f` inside a single write transaction and commit once.

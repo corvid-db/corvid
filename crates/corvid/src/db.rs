@@ -126,6 +126,16 @@ impl Collection<'_> {
         Ok(())
     }
 
+    /// Insert `doc` under a freshly generated, monotonically increasing key
+    /// (big-endian, so keys sort in insertion order). Returns the new key.
+    pub fn insert_auto(&self, doc: &Value) -> Result<Vec<u8>> {
+        self.ensure_writable()?;
+        let id = self.db.store().next_auto_id(self.name)?;
+        let key = id.to_be_bytes().to_vec();
+        self.insert(&key, doc)?;
+        Ok(key)
+    }
+
     /// Fetch and decode the document at `key`, if present.
     pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         match self.db.store().get(self.name, key)? {
@@ -238,6 +248,37 @@ mod tests {
             c.get(b"v").unwrap(),
             Some(Value::Vector(vec![1.0, 2.0, 3.0]))
         );
+    }
+
+    #[test]
+    fn insert_auto_generates_ordered_keys() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("events");
+        let k0 = c.insert_auto(&Value::Int(10)).unwrap();
+        let k1 = c.insert_auto(&Value::Int(20)).unwrap();
+        assert_ne!(k0, k1);
+        // Keys sort in insertion order; scan reflects it.
+        let scanned = c.scan().unwrap();
+        assert_eq!(scanned[0].0, k0);
+        assert_eq!(scanned[1].0, k1);
+        assert_eq!(c.get(&k0).unwrap(), Some(Value::Int(10)));
+    }
+
+    #[test]
+    fn incompatible_format_version_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvid.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.collection("docs").insert(b"k", &Value::Int(1)).unwrap();
+        }
+        // Corrupt the stored format version directly via the store.
+        {
+            let store = crate::store::Store::open(&path).unwrap();
+            store.set_format_version_for_test(999).unwrap();
+        }
+        let err = Db::open(&path);
+        assert!(matches!(err, Err(crate::Error::IncompatibleFormat { .. })));
     }
 
     #[test]
