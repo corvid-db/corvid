@@ -59,6 +59,7 @@ impl Server {
             "traverse" => self.traverse(params),
             "create_index" => self.create_index(params),
             "geo" => self.geo(params),
+            "join" => self.join(params),
             other => Err(ToolError::UnknownTool(other.to_owned())),
         }
     }
@@ -237,6 +238,24 @@ impl Server {
             })
             .collect();
         Ok(json!({ "results": results }))
+    }
+
+    fn join(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let other = str_param(p, "other")?;
+        let fk = str_param(p, "foreign_key_field")?;
+        let rows = self.db.collection(collection).join(other, fk)?;
+        let out: Vec<Json> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "key": String::from_utf8_lossy(&r.key),
+                    "left": value_to_json(&r.left),
+                    "right": r.right.as_ref().map(value_to_json).unwrap_or(Json::Null),
+                })
+            })
+            .collect();
+        Ok(json!({ "rows": out }))
     }
 }
 
@@ -752,6 +771,30 @@ mod tests {
         let results = out["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["key"], "near");
+    }
+
+    #[test]
+    fn join_tool_resolves_references() {
+        let s = server();
+        s.handle(
+            "store",
+            &json!({"collection": "authors", "key": "rocky", "document": {"name": "Rocky"}}),
+        )
+        .unwrap();
+        s.handle(
+            "store",
+            &json!({"collection": "posts", "key": "p1", "document": {"title": "Hi", "author_id": "rocky"}}),
+        )
+        .unwrap();
+        let out = s
+            .handle(
+                "join",
+                &json!({"collection": "posts", "other": "authors", "foreign_key_field": "author_id"}),
+            )
+            .unwrap();
+        let rows = out["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["right"], json!({"name": "Rocky"}));
     }
 
     #[test]

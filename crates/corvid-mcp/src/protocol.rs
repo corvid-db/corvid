@@ -229,6 +229,19 @@ fn tools_list() -> Json {
                     },
                     "required": ["collection", "field", "lat", "lon", "radius_km"]
                 }
+            },
+            {
+                "name": "join",
+                "description": "Left-outer join a collection to another by a foreign-key field.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "other": { "type": "string" },
+                        "foreign_key_field": { "type": "string" }
+                    },
+                    "required": ["collection", "other", "foreign_key_field"]
+                }
             }
         ]
     })
@@ -311,6 +324,7 @@ mod tests {
             "neighbors",
             "traverse",
             "geo",
+            "join",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
