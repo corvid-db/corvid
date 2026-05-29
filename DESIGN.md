@@ -227,7 +227,7 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 - **Browser support (OPFS StorageBackend + wasm-bindgen)** — *deferred by decision (2026-05-29)*. The engine is wasm-ready and size-validated (≈0.2 MB gzipped, CI-enforced) and runs in-memory on wasm; the browser-persistence layer (OPFS-SAHPool VFS, Worker RPC, JS bindings) is explicitly out of scope for now. Desktop + server is the focus.
 - **Streaming result iterators** (#15): results are materialized; a streaming/cursor API is a larger refactor.
 - **Declared schema/constraints** (#9): schema-on-read today; a strict-schema layer is a future addition.
-- **Richer text analysis** (#23): single English-ish analyzer; stemming/stopwords/phrase/CJK are future.
+- **Phrase / positional text queries** (#23 remainder): the analyzer now does stop-word removal + S-stemming (shared by index and query); phrase/positional matching needs positions in the postings and is a larger format change. CJK segmentation also future.
 - **Plan-cache AST** (#26): `.explain()` exists; an identity-hashable cached plan is future.
 
 ---

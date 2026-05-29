@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 use crate::store::Store;
-use crate::text::{Bm25Params, idf, term_score, tokenize};
+use crate::text::{Bm25Params, analyze, idf, term_score};
 
 const TAG_POST: u8 = b'P';
 const TAG_FWD: u8 = b'F';
@@ -188,7 +188,7 @@ fn index_in_txn(
 
     let mut tf: HashMap<String, u32> = HashMap::new();
     let mut len = 0u32;
-    for token in tokenize(text) {
+    for token in analyze(text) {
         *tf.entry(token).or_insert(0) += 1;
         len += 1;
     }
@@ -228,7 +228,7 @@ pub(crate) fn search(store: &Store, ns: &str, query: &str, k: usize) -> Result<R
     };
     let params = Bm25Params::default();
 
-    let mut query_terms = tokenize(query);
+    let mut query_terms = analyze(query);
     query_terms.sort();
     query_terms.dedup();
 

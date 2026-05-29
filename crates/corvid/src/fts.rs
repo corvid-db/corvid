@@ -17,7 +17,7 @@ use crate::db::{Collection, Db};
 use crate::disk_fts;
 use crate::error::Result;
 use crate::store::Store;
-use crate::text::{Bm25Params, idf, term_score, tokenize};
+use crate::text::{Bm25Params, analyze, idf, term_score};
 use crate::value::Value;
 
 /// Reserved collection holding persisted text-index definitions.
@@ -76,7 +76,7 @@ impl Inverted {
         self.remove(key);
         let mut tf: HashMap<String, u32> = HashMap::new();
         let mut len = 0usize;
-        for token in tokenize(text) {
+        for token in analyze(text) {
             *tf.entry(token).or_insert(0) += 1;
             len += 1;
         }
@@ -121,7 +121,7 @@ impl Inverted {
             v => v,
         };
 
-        let mut query_terms = tokenize(query);
+        let mut query_terms = analyze(query);
         query_terms.sort();
         query_terms.dedup();
 
@@ -496,6 +496,19 @@ mod tests {
                 .iter()
                 .any(|h| h.key == b"b".to_vec())
         );
+    }
+
+    #[test]
+    fn stemming_matches_singular_and_plural() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &doc("the running dogs")).unwrap();
+        c.create_text_index("body").unwrap();
+        // Query the singular; the plural in the doc was stemmed to match.
+        let hits = c.text_search("body", "dog", 10).unwrap();
+        assert!(hits.iter().any(|h| h.key == b"a".to_vec()));
+        // A stop word matches nothing (it was never indexed).
+        assert!(c.text_search("body", "the", 10).unwrap().is_empty());
     }
 
     #[test]

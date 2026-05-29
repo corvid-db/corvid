@@ -15,6 +15,9 @@ format and API may change without backward-compatibility guarantees.
   incremental, persistent HNSW index (`create_vector_index`) used transparently
   by `vector_search` and the builder (with an `.approx()` filtered-ANN path).
 - Full-text search: BM25 with an incremental inverted index (`create_text_index`).
+- Text analyzer: stop-word removal + Harman S-stemmer (plural normalization),
+  shared by index and query so singular/plural match (`dog`↔`dogs`). Configurable
+  via `Analyzer`; raw `tokenize` still available.
 - On-disk indexes (bounded memory, persist across reopen, no rebuild): on-disk
   HNSW vector index (`create_vector_index_ondisk`, with a quantized variant
   `create_vector_index_ondisk_quantized` for binary/scalar on-disk footprint),

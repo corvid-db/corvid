@@ -12,7 +12,7 @@ use std::collections::{BinaryHeap, HashMap};
 use crate::db::Collection;
 use crate::distance::Metric;
 use crate::error::Result;
-use crate::text::{Bm25Params, idf, term_score, tokenize};
+use crate::text::{Bm25Params, analyze, idf, term_score};
 use crate::value::Value;
 
 /// One result of a vector search: the document, its key, and its distance to
@@ -203,7 +203,7 @@ pub(crate) fn ranked_bm25(
 ) -> Vec<(Vec<u8>, f32)> {
     let params = Bm25Params::default();
 
-    let mut query_terms = tokenize(query);
+    let mut query_terms = analyze(query);
     query_terms.sort();
     query_terms.dedup();
     if query_terms.is_empty() {
@@ -225,7 +225,7 @@ pub(crate) fn ranked_bm25(
         };
         let mut term_freq: HashMap<String, u32> = HashMap::new();
         let mut len = 0usize;
-        for token in tokenize(text) {
+        for token in analyze(text) {
             *term_freq.entry(token).or_insert(0) += 1;
             len += 1;
         }
@@ -459,7 +459,8 @@ mod tests {
     #[test]
     fn text_search_respects_k() {
         let db = seed_text();
-        let hits = db.collection("docs").text_search("body", "the", 1).unwrap();
+        // "fox" is in docs a and c; k caps the result to 1.
+        let hits = db.collection("docs").text_search("body", "fox", 1).unwrap();
         assert_eq!(hits.len(), 1);
     }
 
