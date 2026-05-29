@@ -5,9 +5,21 @@ API instead of SQL. One in-process dependency that does vector search,
 full-text search, metadata filtering, and rank fusion — composed into a single
 call.
 
-> Status: **v0.1-alpha**, under active development. The API will change freely
-> until 1.0 (no backward-compatibility guarantees yet). Built for the author's
-> own use first; shared in the open.
+> **What this is.** A personal experiment, and an honest one: corvid was
+> *entirely vibe coded* — built by directing an AI coding agent, not hand-written
+> line by line. It is not a product, has no roadmap, and comes with no support
+> promises.
+>
+> **What it isn't.** A toy. The code is solid and genuinely usable: ~390 tests,
+> >90% line coverage, zero-warning clippy, criterion benchmarks on the hot
+> paths, and a correctness-first design (filters are true predicates, indexes
+> are never stale, writes are transactional). If a corner is rough, it's a
+> missing feature, not a broken one.
+>
+> Status: **v0.1**, pre-1.0. The API changes freely until 1.0 — no
+> backward-compatibility guarantees yet; a format change is migrated with
+> `dump`/`load`, never silently. Built for the author's own use first; shared in
+> the open under MIT. Use it, fork it, learn from it.
 
 ## Why
 

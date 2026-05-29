@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 authors = ["Rocky <smrockypk@gmail.com>"]
-repository = "https://github.com/rocky/corvid"
+repository = "https://github.com/i-rocky/corvid"
 keywords = ["database", "embedded", "vector", "search", "ai"]
 categories = ["database-implementations"]
 
