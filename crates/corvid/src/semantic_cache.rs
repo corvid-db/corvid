@@ -167,7 +167,7 @@ mod tests {
     fn works_with_an_ann_index() {
         let db = cache_db();
         let c = db.collection("cache");
-        c.create_vector_index("q", Metric::Cosine);
+        c.create_vector_index("q", Metric::Cosine).unwrap();
         let cache = c.semantic_cache("q", "response", Metric::Cosine, 0.05);
         cache.put(b"k", vec![1.0, 0.0], Value::Int(42)).unwrap();
         assert_eq!(cache.get(&[1.0, 0.0]).unwrap(), Some(Value::Int(42)));

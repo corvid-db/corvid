@@ -29,20 +29,24 @@ pub struct Db {
 impl Db {
     /// Open (creating if absent) a database backed by a file at `path`.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Ok(Self {
+        let db = Self {
             store: Store::open(path)?,
             indexes: Mutex::new(IndexState::default()),
             subscribers: Mutex::new(Subscribers::default()),
-        })
+        };
+        db.load_index_defs()?;
+        Ok(db)
     }
 
     /// Open a purely in-memory database.
     pub fn open_in_memory() -> Result<Self> {
-        Ok(Self {
+        let db = Self {
             store: Store::open_in_memory()?,
             indexes: Mutex::new(IndexState::default()),
             subscribers: Mutex::new(Subscribers::default()),
-        })
+        };
+        db.load_index_defs()?;
+        Ok(db)
     }
 
     /// Get a handle to a named collection. The collection is created lazily on
@@ -65,11 +69,6 @@ impl Db {
     /// The change-feed subscriber registry.
     pub(crate) fn subscribers(&self) -> &Mutex<Subscribers> {
         &self.subscribers
-    }
-
-    /// Record a write to `collection`, invalidating its derived indexes.
-    pub(crate) fn bump_gen(&self, collection: &str) {
-        self.indexes.lock().expect("index lock").bump(collection);
     }
 }
 
@@ -107,7 +106,7 @@ impl Collection<'_> {
     pub fn insert(&self, key: &[u8], doc: &Value) -> Result<()> {
         self.ensure_writable()?;
         self.db.store().put(self.name, key, &doc.encode())?;
-        self.db.bump_gen(self.name);
+        self.db.index_on_insert(self.name, key, doc);
         self.db.notify(ChangeEvent {
             collection: self.name.to_owned(),
             key: key.to_vec(),
@@ -128,7 +127,7 @@ impl Collection<'_> {
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
         let removed = self.db.store().delete(self.name, key)?;
         if removed {
-            self.db.bump_gen(self.name);
+            self.db.index_on_delete(self.name, key);
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
                 key: key.to_vec(),

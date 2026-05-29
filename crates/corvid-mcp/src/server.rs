@@ -213,7 +213,7 @@ impl Server {
         let metric = parse_metric(p.get("metric"))?;
         self.db
             .collection(collection)
-            .create_vector_index(field, metric);
+            .create_vector_index(field, metric)?;
         Ok(json!({ "ok": true }))
     }
 
