@@ -24,9 +24,12 @@
 //!
 //! ## Execution model
 //!
-//! 1. Scan the collection once and apply every `filter` predicate. Filtering
-//!    happens *before* ranking, so `filter` is a true predicate over the
-//!    corpus — top-k is computed among matching documents, never post-hoc.
+//! 1. Build the candidate set with the most bounded source available: an ANN
+//!    or text index for a single indexed source, a scalar/geo index when a
+//!    filter drives it, a streaming bounded top-k for an unindexed single
+//!    vector source, or a full scan as the fallback. Filtering happens *before*
+//!    ranking, so `filter` is a true predicate over the corpus — top-k is
+//!    computed among matching documents, never post-hoc.
 //! 2. Rank the filtered set independently for each retrieval source (each
 //!    capped at its own `k`).
 //! 3. Fuse the per-source rankings with Reciprocal Rank Fusion (a single
@@ -286,6 +289,85 @@ impl QueryBuilder<'_> {
         Ok(Some(out))
     }
 
+    /// Single text source backed by a text index: fetch the top `k` by BM25
+    /// straight from the index (bounded memory, no corpus rescan), then verify
+    /// filters. `None` to fall back. Filtered queries take this only under
+    /// [`Self::approx`] (the index ranks before filtering, so a selective
+    /// filter may leave fewer than `k`).
+    fn text_candidates(&self) -> Result<Option<Candidates>> {
+        if self.sources.len() != 1 {
+            return Ok(None);
+        }
+        let Source::Text { field, query, k } = &self.sources[0] else {
+            return Ok(None);
+        };
+        if !self.filters.is_empty() && !self.approx {
+            return Ok(None);
+        }
+        let Some(ranked) =
+            self.collection
+                .db()
+                .fts_search(self.collection.name(), field, query, *k)?
+        else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        for (key, _score) in ranked {
+            if let Some(doc) = self.collection.get(&key)?
+                && self.filters.iter().all(|p| p.eval(&doc))
+            {
+                out.push((key, doc));
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Single vector source with no usable ANN index (or an exact filtered
+    /// query): compute the top `k` by distance while *streaming* the collection,
+    /// holding only a bounded working set (~`4k`) instead of materializing every
+    /// matching document. Distance needs no corpus statistics, so this is exact.
+    fn streaming_vector_candidates(&self) -> Result<Option<Candidates>> {
+        if self.sources.len() != 1 {
+            return Ok(None);
+        }
+        let Source::Vector {
+            field,
+            query,
+            k,
+            metric,
+        } = &self.sources[0]
+        else {
+            return Ok(None);
+        };
+        let k = *k;
+        if k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let prune_at = k.saturating_mul(4).max(1024);
+        let sort_trunc = |buf: &mut Vec<(f32, Vec<u8>, Value)>| {
+            buf.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            buf.truncate(k);
+        };
+        let mut buf: Vec<(f32, Vec<u8>, Value)> = Vec::new();
+        self.collection.for_each_doc(|key, doc| {
+            if self.filters.iter().all(|p| p.eval(&doc))
+                && let Some(v) = doc.get(field).and_then(Value::as_vector)
+                && v.len() == query.len()
+            {
+                let dist = metric.distance(query, v);
+                buf.push((dist, key.to_vec(), doc));
+                if buf.len() >= prune_at {
+                    sort_trunc(&mut buf);
+                }
+            }
+            Ok(true)
+        })?;
+        sort_trunc(&mut buf);
+        Ok(Some(
+            buf.into_iter().map(|(_, key, doc)| (key, doc)).collect(),
+        ))
+    }
+
     /// Try the scalar-index fast path: if a top-level AND filter is an
     /// equality or range comparison on a field with a scalar index, fetch only
     /// the candidate documents (a superset) and verify every filter against
@@ -438,19 +520,26 @@ impl QueryBuilder<'_> {
             return self.run_scan_only();
         }
 
-        // Pick the narrowest available source for the filtered set: the ANN
-        // index (vector queries), else a scalar index, else a full scan.
-        let filtered: Vec<(Vec<u8>, Value)> = match self.ann_candidates()? {
-            Some(candidates) => candidates,
-            None => match self.indexed_candidates()? {
-                Some(candidates) => candidates,
-                None => self
-                    .collection
-                    .scan()?
-                    .into_iter()
-                    .filter(|(_, doc)| self.filters.iter().all(|p| p.eval(doc)))
-                    .collect(),
-            },
+        // Pick the narrowest / most-bounded source for the candidate set:
+        //   1. ANN index (single indexed vector source),
+        //   2. text index (single indexed text source),
+        //   3. scalar/geo index (a filter drives a sub-linear candidate scan),
+        //   4. streaming bounded top-k (single vector source, no index),
+        //   5. full scan + filter (multi-source / unindexed text).
+        let filtered: Vec<(Vec<u8>, Value)> = if let Some(c) = self.ann_candidates()? {
+            c
+        } else if let Some(c) = self.text_candidates()? {
+            c
+        } else if let Some(c) = self.indexed_candidates()? {
+            c
+        } else if let Some(c) = self.streaming_vector_candidates()? {
+            c
+        } else {
+            self.collection
+                .scan()?
+                .into_iter()
+                .filter(|(_, doc)| self.filters.iter().all(|p| p.eval(doc)))
+                .collect()
         };
 
         // 2. Rank the filtered set per source.
@@ -1056,6 +1145,46 @@ mod tests {
             .unwrap();
         assert_eq!(rows[0].key, b"a".to_vec());
         assert!(!rows.iter().any(|r| r.key == b"c".to_vec()));
+    }
+
+    #[test]
+    fn streaming_vector_topk_matches_exact_over_prune_threshold() {
+        // More than the 1024 prune threshold, no vector index → the builder
+        // uses the streaming bounded top-k path; it must equal exact KNN.
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for i in 0..1500u32 {
+            let mut m = BTreeMap::new();
+            // A spread of 2-D vectors.
+            let a = (i % 50) as f32;
+            let b = (i / 50) as f32;
+            m.insert("embedding".to_owned(), Value::Vector(vec![a, b]));
+            c.insert(&i.to_le_bytes(), &Value::Map(m)).unwrap();
+        }
+        let q = vec![3.0, 7.0];
+        let exact = c.vector_search("embedding", &q, 10, Metric::L2).unwrap();
+        let rows = c
+            .query()
+            .vector("embedding", q.clone(), 10, Metric::L2)
+            .limit(10)
+            .run()
+            .unwrap();
+        let got: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+        let want: Vec<_> = exact.iter().map(|h| h.key.clone()).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn single_text_source_uses_index_and_ranks() {
+        let db = seed();
+        let c = db.collection("docs");
+        c.create_text_index("body").unwrap();
+        // "rust" appears in a (blog) and c (news); indexed text path ranks them.
+        let rows = c.query().text("body", "rust", 10).run().unwrap();
+        let keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+        assert!(keys.contains(&b"a".to_vec()));
+        assert!(keys.contains(&b"c".to_vec()));
+        assert!(!keys.contains(&b"b".to_vec())); // "python web framework"
     }
 
     #[test]

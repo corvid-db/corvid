@@ -34,6 +34,10 @@ format and API may change without backward-compatibility guarantees.
 - WASM: the engine compiles to `wasm32-unknown-unknown`; a `corvid-wasm` cdylib
   harness links it into a ≈0.2 MB gzipped bundle, CI-enforced under 2 MB. The
   engine also cross-compiles for aarch64 iOS/Android.
+- Bounded ranked execution: the builder uses the text index for a single text
+  source (no corpus rescan) and a streaming bounded top-k for an unindexed
+  single vector source, so single-source ranked queries don't materialize the
+  whole collection.
 - Fluent multi-modal query builder: filter + vector + text + RRF fusion + MMR
   rerank + projection + `order_by`/`offset` pagination + `count`/`group_count`.
 - Filter predicates (`field().gt()`, and/or/not, dotted paths, `within_km` geo).
