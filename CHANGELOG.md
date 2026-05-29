@@ -15,6 +15,11 @@ format and API may change without backward-compatibility guarantees.
   incremental, persistent HNSW index (`create_vector_index`) used transparently
   by `vector_search` and the builder (with an `.approx()` filtered-ANN path).
 - Full-text search: BM25 with an incremental inverted index (`create_text_index`).
+- On-disk indexes (bounded memory, persist across reopen, no rebuild): on-disk
+  HNSW vector index (`create_vector_index_ondisk`), on-disk inverted text index
+  (`create_text_index_ondisk`), and a scalar secondary index
+  (`create_scalar_index`) making equality/range filters and counts sub-linear
+  instead of full scans.
 - Fluent multi-modal query builder: filter + vector + text + RRF fusion + MMR
   rerank + projection + `order_by`/`offset` pagination + `count`/`group_count`.
 - Filter predicates (`field().gt()`, and/or/not, dotted paths, `within_km` geo).

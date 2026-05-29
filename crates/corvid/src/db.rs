@@ -24,6 +24,7 @@ pub struct Db {
     store: Store,
     indexes: Mutex<IndexState>,
     fts: Mutex<crate::fts::FtsState>,
+    scalar: Mutex<crate::scalar::ScalarState>,
     subscribers: Mutex<Subscribers>,
 }
 
@@ -34,10 +35,12 @@ impl Db {
             store: Store::open(path)?,
             indexes: Mutex::new(IndexState::default()),
             fts: crate::fts::new_state(),
+            scalar: crate::scalar::new_state(),
             subscribers: Mutex::new(Subscribers::default()),
         };
         db.load_index_defs()?;
         db.load_text_defs()?;
+        db.load_scalar_defs()?;
         Ok(db)
     }
 
@@ -47,10 +50,12 @@ impl Db {
             store: Store::open_in_memory()?,
             indexes: Mutex::new(IndexState::default()),
             fts: crate::fts::new_state(),
+            scalar: crate::scalar::new_state(),
             subscribers: Mutex::new(Subscribers::default()),
         };
         db.load_index_defs()?;
         db.load_text_defs()?;
+        db.load_scalar_defs()?;
         Ok(db)
     }
 
@@ -85,6 +90,11 @@ impl Db {
     /// The full-text index state.
     pub(crate) fn fts(&self) -> &Mutex<crate::fts::FtsState> {
         &self.fts
+    }
+
+    /// The scalar secondary-index state.
+    pub(crate) fn scalar(&self) -> &Mutex<crate::scalar::ScalarState> {
+        &self.scalar
     }
 
     /// The change-feed subscriber registry.
@@ -129,6 +139,7 @@ impl Collection<'_> {
         self.db.store().put(self.name, key, &doc.encode())?;
         self.db.index_on_insert(self.name, key, doc)?;
         self.db.fts_on_insert(self.name, key, doc)?;
+        self.db.scalar_on_insert(self.name, key, doc)?;
         self.db.notify(ChangeEvent {
             collection: self.name.to_owned(),
             key: key.to_vec(),
@@ -174,6 +185,7 @@ impl Collection<'_> {
         for (key, doc) in items {
             self.db.index_on_insert(self.name, key, doc)?;
             self.db.fts_on_insert(self.name, key, doc)?;
+            self.db.scalar_on_insert(self.name, key, doc)?;
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
                 key: key.to_vec(),
@@ -209,6 +221,7 @@ impl Collection<'_> {
         if removed {
             self.db.index_on_delete(self.name, key)?;
             self.db.fts_on_delete(self.name, key)?;
+            self.db.scalar_on_delete(self.name, key)?;
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
                 key: key.to_vec(),

@@ -95,6 +95,38 @@ fn main() {
             .unwrap()
     });
 
+    // Scalar index on the high-cardinality `n`. The win is for *selective*
+    // predicates: a selective equality or narrow range touches only the matching
+    // key range plus a few point-gets, instead of scanning the whole collection.
+    // (A low-selectivity filter that matches half the corpus is still better
+    // served by a sequential scan — the index returns a verified superset, so
+    // either path is correct.)
+    // (Compare the timings below against "filtered count (stream)" above: that
+    // is the cost of a full scan. The selective indexed ops should be far
+    // cheaper because they touch only the matching key range.)
+    time("build scalar index (n)", || {
+        docs.create_scalar_index("n").unwrap()
+    });
+    if n > 0 {
+        let mid = (n / 2) as i64;
+        let eq = time("selective eq count (scalar index)", || {
+            docs.query()
+                .filter(field("n").eq(Value::Int(mid)))
+                .count()
+                .unwrap()
+        });
+        assert_eq!(eq, 1);
+
+        let narrow = time("narrow range fetch (scalar index)", || {
+            docs.query()
+                .filter(field("n").ge(Value::Int(mid)))
+                .filter(field("n").lt(Value::Int(mid + 100)))
+                .run()
+                .unwrap()
+        });
+        assert_eq!(narrow.len(), 100);
+    }
+
     time("group_count (stream)", || {
         docs.query().group_count("category").unwrap()
     });

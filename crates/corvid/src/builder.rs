@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::db::Collection;
 use crate::distance::Metric;
 use crate::error::Result;
-use crate::filter::Predicate;
+use crate::filter::{CmpOp, Predicate};
 use crate::fusion::{DEFAULT_RRF_K, mmr, reciprocal_rank_fusion};
 use crate::query::{doc_map, ranked_bm25, ranked_vector};
 use crate::value::Value;
@@ -215,6 +215,10 @@ impl QueryBuilder<'_> {
         if self.filters.is_empty() {
             return self.collection.len();
         }
+        // Scalar-index fast path: count verified candidates without a full scan.
+        if let Some(matched) = self.indexed_candidates()? {
+            return Ok(matched.len());
+        }
         let mut n = 0usize;
         self.collection.for_each_doc(|_, doc| {
             if self.filters.iter().all(|p| p.eval(&doc)) {
@@ -282,6 +286,75 @@ impl QueryBuilder<'_> {
         Ok(Some(out))
     }
 
+    /// Try the scalar-index fast path: if a top-level AND filter is an
+    /// equality or range comparison on a field with a scalar index, fetch only
+    /// the candidate documents (a superset) and verify every filter against
+    /// each. Returns the filtered set, or `None` to fall back to a full scan.
+    ///
+    /// An equality predicate is preferred (most selective); otherwise the first
+    /// range predicate is used.
+    fn indexed_candidates(&self) -> Result<Option<Candidates>> {
+        if self.filters.is_empty() {
+            return Ok(None);
+        }
+        let db = self.collection.db();
+        let coll = self.collection.name();
+
+        // Choose the indexed field to drive the scan: prefer one carrying an
+        // equality (tightest), else one carrying a range. All top-level AND
+        // comparisons on that field are combined into a single bounded window.
+        let mut target: Option<&str> = None;
+        let mut best_eq = false;
+        for pred in &self.filters {
+            let Predicate::Compare { path, op, .. } = pred else {
+                continue;
+            };
+            if !matches!(
+                op,
+                CmpOp::Eq | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge
+            ) || !db.has_scalar_index(coll, path)
+            {
+                continue;
+            }
+            let is_eq = *op == CmpOp::Eq;
+            if target.is_none() || (is_eq && !best_eq) {
+                target = Some(path);
+                best_eq = is_eq;
+            }
+        }
+        let Some(field) = target else {
+            return Ok(None);
+        };
+
+        let constraints: Vec<crate::scalar::Constraint<'_>> = self
+            .filters
+            .iter()
+            .filter_map(|p| match p {
+                Predicate::Compare { path, op, value } if path == field => {
+                    Some(crate::scalar::Constraint { op: *op, value })
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Cap candidates so a low-selectivity filter falls back to a bounded
+        // scan instead of materialising a huge set in memory.
+        const CANDIDATE_CAP: usize = 100_000;
+        let Some(keys) = db.scalar_candidates(coll, field, &constraints, CANDIDATE_CAP)? else {
+            return Ok(None);
+        };
+
+        let mut out = Vec::new();
+        for key in keys {
+            if let Some(doc) = self.collection.get(&key)?
+                && self.filters.iter().all(|p| p.eval(&doc))
+            {
+                out.push((key, doc));
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Describe the query plan as a human-readable string (for debugging). Does
     /// not execute the query, so it may be called before [`Self::run`].
     pub fn explain(&self) -> String {
@@ -330,15 +403,19 @@ impl QueryBuilder<'_> {
             return self.run_scan_only();
         }
 
-        // Use the ANN index when applicable; otherwise scan and filter exactly.
+        // Pick the narrowest available source for the filtered set: the ANN
+        // index (vector queries), else a scalar index, else a full scan.
         let filtered: Vec<(Vec<u8>, Value)> = match self.ann_candidates()? {
             Some(candidates) => candidates,
-            None => self
-                .collection
-                .scan()?
-                .into_iter()
-                .filter(|(_, doc)| self.filters.iter().all(|p| p.eval(doc)))
-                .collect(),
+            None => match self.indexed_candidates()? {
+                Some(candidates) => candidates,
+                None => self
+                    .collection
+                    .scan()?
+                    .into_iter()
+                    .filter(|(_, doc)| self.filters.iter().all(|p| p.eval(doc)))
+                    .collect(),
+            },
         };
 
         // 2. Rank the filtered set per source.
@@ -414,6 +491,36 @@ impl QueryBuilder<'_> {
     /// under `order_by`). Without `limit` and with `order_by`, all matching
     /// rows are held (an unbounded sort, as any DB without a sort index does).
     fn run_scan_only(self) -> Result<Vec<ResultRow>> {
+        // Scalar-index fast path: fetch only candidate documents instead of
+        // scanning the whole collection, then order/paginate in memory (the set
+        // is bounded by the number of matches).
+        if let Some(mut matched) = self.indexed_candidates()? {
+            if let Some((field, descending)) = &self.order_by {
+                sort_by_field(&mut matched, field, *descending);
+            } else {
+                matched.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
+            }
+            let start = self.offset.min(matched.len());
+            let mut window = matched.split_off(start);
+            if let Some(limit) = self.limit {
+                window.truncate(limit);
+            }
+            return Ok(window
+                .into_iter()
+                .map(|(key, document)| {
+                    let document = match &self.projection {
+                        Some(fields) => project(document, fields),
+                        None => document,
+                    };
+                    ResultRow {
+                        key,
+                        score: 0.0,
+                        document,
+                    }
+                })
+                .collect());
+        }
+
         let cap = self.limit.map(|l| self.offset.saturating_add(l));
         let mut buf: Vec<(Vec<u8>, Value)> = Vec::new();
 
@@ -914,6 +1021,48 @@ mod tests {
             .unwrap();
         assert_eq!(rows[0].key, b"a".to_vec());
         assert!(!rows.iter().any(|r| r.key == b"c".to_vec()));
+    }
+
+    #[test]
+    fn scalar_index_path_matches_unindexed_for_range_order_paginate() {
+        // Two identical collections; index one field on only one of them. A
+        // range + order + paginate query must return byte-identical rows.
+        fn fill(c: &crate::Collection) {
+            for i in 0..50i64 {
+                let mut m = BTreeMap::new();
+                m.insert("n".to_owned(), Value::Int(i % 7));
+                m.insert("tag".to_owned(), Value::Text(format!("t{}", i % 3)));
+                c.insert(&[i as u8], &Value::Map(m)).unwrap();
+            }
+        }
+        let plain = Db::open_in_memory().unwrap();
+        fill(&plain.collection("docs"));
+        let indexed = Db::open_in_memory().unwrap();
+        let ic = indexed.collection("docs");
+        fill(&ic);
+        ic.create_scalar_index("n").unwrap();
+
+        let run = |db: &Db| {
+            db.collection("docs")
+                .query()
+                .filter(field("n").ge(Value::Int(2)))
+                .filter(field("tag").eq(Value::Text("t1".into())))
+                .order_by("n", true)
+                .offset(1)
+                .limit(5)
+                .run()
+                .unwrap()
+        };
+        assert_eq!(run(&plain), run(&indexed));
+        // And counts match.
+        let count = |db: &Db| {
+            db.collection("docs")
+                .query()
+                .filter(field("n").ge(Value::Int(2)))
+                .count()
+                .unwrap()
+        };
+        assert_eq!(count(&plain), count(&indexed));
     }
 
     #[test]

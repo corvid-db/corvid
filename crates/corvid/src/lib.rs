@@ -25,6 +25,7 @@ pub mod index;
 pub mod join;
 pub mod query;
 pub mod reactive;
+pub mod scalar;
 pub mod semantic_cache;
 pub mod sketch;
 pub mod store;
