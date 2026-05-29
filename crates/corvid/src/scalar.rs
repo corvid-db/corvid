@@ -539,6 +539,116 @@ mod tests {
     }
 
     #[test]
+    fn cap_exceeded_falls_back_to_none() {
+        let db = db_with_index(); // four docs, n in {1,2,3}
+        // A range covering everything, with a cap below the match count, must
+        // signal fall-back (None) rather than materialise the set.
+        let got = db
+            .scalar_candidates("docs", "n", &one(CmpOp::Ge, &Value::Int(0)), 2)
+            .unwrap();
+        assert!(got.is_none(), "over-cap range must fall back");
+    }
+
+    #[test]
+    fn mixed_type_constraints_are_not_serviceable() {
+        let db = db_with_index();
+        let (lo, hi) = (Value::Int(1), Value::Text("z".into()));
+        let constraints = vec![
+            Constraint {
+                op: CmpOp::Ge,
+                value: &lo,
+            },
+            Constraint {
+                op: CmpOp::Le,
+                value: &hi,
+            },
+        ];
+        assert!(
+            db.scalar_candidates("docs", "n", &constraints, 1000)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn float_and_int_share_a_numeric_window() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        let mut m = BTreeMap::new();
+        m.insert("x".to_owned(), Value::Float(2.5));
+        c.insert(b"f", &Value::Map(m)).unwrap();
+        c.insert(b"i", &rec_field("x", Value::Int(2))).unwrap();
+        c.create_scalar_index("x").unwrap();
+        // Range [2.0, 3.0] over the shared numeric lane finds both.
+        let (lo, hi) = (Value::Float(2.0), Value::Float(3.0));
+        let constraints = vec![
+            Constraint {
+                op: CmpOp::Ge,
+                value: &lo,
+            },
+            Constraint {
+                op: CmpOp::Le,
+                value: &hi,
+            },
+        ];
+        let mut got = db
+            .scalar_candidates("docs", "x", &constraints, 1000)
+            .unwrap()
+            .unwrap();
+        got.sort();
+        assert_eq!(got, vec![b"f".to_vec(), b"i".to_vec()]);
+    }
+
+    #[test]
+    fn text_and_bool_eq_lookups() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"t", &rec_field("s", Value::Text("hello".into())))
+            .unwrap();
+        c.insert(b"b", &rec_field("flag", Value::Bool(true)))
+            .unwrap();
+        c.create_scalar_index("s").unwrap();
+        c.create_scalar_index("flag").unwrap();
+        let s = db
+            .scalar_candidates(
+                "docs",
+                "s",
+                &one(CmpOp::Eq, &Value::Text("hello".into())),
+                100,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, vec![b"t".to_vec()]);
+        let f = db
+            .scalar_candidates("docs", "flag", &one(CmpOp::Eq, &Value::Bool(true)), 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f, vec![b"b".to_vec()]);
+    }
+
+    fn rec_field(field: &str, value: Value) -> Value {
+        let mut m = BTreeMap::new();
+        m.insert(field.to_owned(), value);
+        Value::Map(m)
+    }
+
+    #[test]
+    fn non_indexable_value_is_skipped() {
+        // A container value can't be indexed: the field is simply absent from
+        // the index, and a query on it returns no candidates (empty, not error).
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"v", &rec_field("arr", Value::Array(vec![Value::Int(1)])))
+            .unwrap();
+        c.create_scalar_index("arr").unwrap();
+        let got = db
+            .scalar_candidates("docs", "arr", &one(CmpOp::Eq, &Value::Int(1)), 100)
+            .unwrap();
+        // Int query value pins a numeric lane with no entries → empty superset.
+        assert_eq!(got, Some(vec![]));
+    }
+
+    #[test]
     fn unindexed_field_returns_none() {
         let db = db_with_index();
         assert!(

@@ -59,6 +59,7 @@ impl Server {
             "traverse" => self.traverse(params),
             "create_index" => self.create_index(params),
             "create_text_index" => self.create_text_index(params),
+            "create_scalar_index" => self.create_scalar_index(params),
             "geo" => self.geo(params),
             "join" => self.join(params),
             "in_neighbors" => self.in_neighbors(params),
@@ -243,7 +244,20 @@ impl Server {
     fn create_text_index(&self, p: &Json) -> Result<Json, ToolError> {
         let collection = str_param(p, "collection")?;
         let field = str_param(p, "field")?;
-        self.db.collection(collection).create_text_index(field)?;
+        let on_disk = p.get("on_disk").and_then(Json::as_bool).unwrap_or(false);
+        let c = self.db.collection(collection);
+        if on_disk {
+            c.create_text_index_ondisk(field)?;
+        } else {
+            c.create_text_index(field)?;
+        }
+        Ok(json!({ "ok": true }))
+    }
+
+    fn create_scalar_index(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let field = str_param(p, "field")?;
+        self.db.collection(collection).create_scalar_index(field)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -933,6 +947,45 @@ mod tests {
         s.handle(
             "create_text_index",
             &json!({"collection": "docs", "field": "body"}),
+        )
+        .unwrap();
+        let out = s
+            .handle(
+                "search",
+                &json!({"collection": "docs", "text": {"field": "body", "query": "rust", "k": 5}}),
+            )
+            .unwrap();
+        assert_eq!(out["results"][0]["key"], "a");
+    }
+
+    #[test]
+    fn create_scalar_index_then_filtered_count() {
+        let s = server();
+        store(&s, "a", json!({"n": 1}));
+        store(&s, "b", json!({"n": 2}));
+        store(&s, "c", json!({"n": 2}));
+        s.handle(
+            "create_scalar_index",
+            &json!({"collection": "docs", "field": "n"}),
+        )
+        .unwrap();
+        let out = s
+            .handle(
+                "count",
+                &json!({"collection": "docs", "filter": {"field": "n", "op": "eq", "value": 2}}),
+            )
+            .unwrap();
+        assert_eq!(out["count"], json!(2));
+    }
+
+    #[test]
+    fn create_text_index_ondisk_then_search() {
+        let s = server();
+        store(&s, "a", json!({"body": "rust embedded database"}));
+        store(&s, "b", json!({"body": "python web"}));
+        s.handle(
+            "create_text_index",
+            &json!({"collection": "docs", "field": "body", "on_disk": true}),
         )
         .unwrap();
         let out = s

@@ -260,7 +260,20 @@ fn tools_list() -> Json {
             },
             {
                 "name": "create_text_index",
-                "description": "Create an inverted full-text index on a field to accelerate text search.",
+                "description": "Create an inverted full-text index on a field to accelerate text search. Set on_disk for bounded memory on large corpora (persists, no rebuild).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "field": { "type": "string" },
+                        "on_disk": { "type": "boolean" }
+                    },
+                    "required": ["collection", "field"]
+                }
+            },
+            {
+                "name": "create_scalar_index",
+                "description": "Create a scalar index on a field so equality and range filters (and counts) on it are sub-linear instead of full scans.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -383,6 +396,7 @@ mod tests {
             "join",
             "in_neighbors",
             "create_text_index",
+            "create_scalar_index",
             "list_collections",
             "count",
             "insert_auto",
