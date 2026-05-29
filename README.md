@@ -66,9 +66,17 @@ computed among matching documents, never a post-hoc trim.
 | Fluent multi-modal query builder + projection + aggregation | ✅ |
 | HNSW approximate index (`create_vector_index`) | ✅ in-memory, derived |
 | Directed property graph (`link`/`neighbors`/`traverse`) | ✅ |
+| Geospatial: radius / bounding-box / `within_km` filter | ✅ |
+| Cross-collection lookup joins | ✅ |
 | Semantic (vector-keyed) cache | ✅ |
+| Probabilistic sketches (HyperLogLog, Bloom) | ✅ |
+| Reactive change feeds | ✅ |
 | MCP sidecar over stdio | ✅ |
 | Persisted ANN graph, WASM/browser, mobile | ⏳ planned |
+
+Image search is vector search over image embeddings: embed in your app (CLIP
+etc.), store the `$vector`, query — same engine as text vectors. corvid does
+not run the embedding model itself (by design).
 
 Vector and text search are **exact** (brute-force over a scan) by default — the
 correctness baseline. Calling `create_vector_index` registers an HNSW index
