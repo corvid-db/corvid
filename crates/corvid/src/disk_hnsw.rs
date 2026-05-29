@@ -72,10 +72,20 @@ impl DiskParams {
         if layer == 0 { self.m0 } else { self.m }
     }
 
+    /// Build the PQ probe for a query: under L2, precompute the asymmetric-
+    /// distance table once (so each node is O(m) table lookups instead of an
+    /// O(dim) reconstruct + distance); other metrics keep the query vector.
+    fn pq_probe(pq: &Pq, metric: Metric, query: Vec<f32>) -> DProbe {
+        match metric {
+            Metric::L2 => DProbe::PqAdc(pq.l2_table(&query)),
+            _ => DProbe::Pq(query),
+        }
+    }
+
     /// Encode a query vector into the form distances are computed against.
     fn make_probe(&self, query: &[f32]) -> DProbe {
         match &self.pq {
-            Some(_) => DProbe::Pq(query.to_vec()),
+            Some(pq) => Self::pq_probe(pq, self.metric, query.to_vec()),
             None => DProbe::Q(self.quant.probe(query)),
         }
     }
@@ -83,7 +93,7 @@ impl DiskParams {
     /// Build a probe from an already-stored vector (for neighbour pruning).
     fn probe_of(&self, stored: &StoredVec) -> DProbe {
         match (&self.pq, stored) {
-            (Some(pq), StoredVec::Packed(code)) => DProbe::Pq(pq.decode(code)),
+            (Some(pq), StoredVec::Packed(code)) => Self::pq_probe(pq, self.metric, pq.decode(code)),
             (Some(_), StoredVec::Full(_)) => DProbe::Pq(Vec::new()),
             (None, _) => DProbe::Q(self.quant.probe_of(stored)),
         }
@@ -92,6 +102,7 @@ impl DiskParams {
     /// Distance from a probe to a stored vector.
     fn dist(&self, probe: &DProbe, stored: &StoredVec) -> f32 {
         match (probe, &self.pq, stored) {
+            (DProbe::PqAdc(table), Some(pq), StoredVec::Packed(code)) => pq.adc_l2(table, code),
             (DProbe::Pq(q), Some(pq), StoredVec::Packed(code)) => pq.distance(self.metric, q, code),
             (DProbe::Q(p), None, _) => self.quant.dist(self.metric, p, stored),
             _ => f32::INFINITY,
@@ -115,11 +126,13 @@ impl DiskParams {
     }
 }
 
-/// A query in the representation used for distance: a quantization probe, or a
-/// full vector for the PQ reconstruction path.
+/// A query in the representation used for distance: a quantization probe, a
+/// full vector for the PQ reconstruction path, or a precomputed PQ L2
+/// asymmetric-distance table for the fast path.
 enum DProbe {
     Q(Probe),
     Pq(Vec<f32>),
+    PqAdc(Vec<f32>),
 }
 
 /// A graph node as stored on disk.
