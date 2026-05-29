@@ -491,65 +491,66 @@ impl QueryBuilder<'_> {
         }
         let db = self.collection.db();
         let coll = self.collection.name();
+        // Cap candidates so an unselective predicate blows the cap (returns
+        // None) and is skipped, instead of materialising a huge set.
+        const CAP: usize = 100_000;
 
-        // Choose the indexed field to drive the scan: prefer one carrying an
-        // equality (tightest), else one carrying a range. All top-level AND
-        // comparisons on that field are combined into a single bounded window.
-        let mut target: Option<&str> = None;
-        let mut best_eq = false;
+        // Probe every index-serviceable source (each bounded by the cap) and
+        // keep the *smallest* candidate set — i.e. let the most selective index
+        // drive, minimising the documents fetched and verified. This is
+        // selectivity-driven planning without persisted statistics: an
+        // unselective index over-runs the cap and drops out on its own.
+        let mut best: Option<Vec<Vec<u8>>> = None;
+
+        // 1. Each indexed scalar field carrying comparisons: combine all of its
+        //    AND comparisons into one window (e.g. n>=5 AND n<=10).
+        let mut seen_fields: Vec<&str> = Vec::new();
         for pred in &self.filters {
-            let Predicate::Compare { path, op, .. } = pred else {
-                continue;
-            };
-            if !matches!(
-                op,
-                CmpOp::Eq | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge
-            ) || !db.has_scalar_index(coll, path)
+            if let Predicate::Compare { path, op, .. } = pred
+                && matches!(
+                    op,
+                    CmpOp::Eq | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge
+                )
+                && db.has_scalar_index(coll, path)
+                && !seen_fields.contains(&path.as_str())
             {
-                continue;
-            }
-            let is_eq = *op == CmpOp::Eq;
-            if target.is_none() || (is_eq && !best_eq) {
-                target = Some(path);
-                best_eq = is_eq;
+                seen_fields.push(path);
+                let constraints: Vec<crate::scalar::Constraint<'_>> = self
+                    .filters
+                    .iter()
+                    .filter_map(|p| match p {
+                        Predicate::Compare {
+                            path: p2,
+                            op,
+                            value,
+                        } if p2 == path => Some(crate::scalar::Constraint { op: *op, value }),
+                        _ => None,
+                    })
+                    .collect();
+                keep_smaller(
+                    &mut best,
+                    db.scalar_candidates(coll, path, &constraints, CAP)?,
+                );
             }
         }
-        // Scalar index drives the scan when a comparison field is indexed;
-        // otherwise try a spatial index for a GeoWithin filter.
-        let scalar_keys = if let Some(field) = target {
-            let constraints: Vec<crate::scalar::Constraint<'_>> = self
-                .filters
-                .iter()
-                .filter_map(|p| match p {
-                    Predicate::Compare { path, op, value } if path == field => {
-                        Some(crate::scalar::Constraint { op: *op, value })
-                    }
-                    _ => None,
-                })
-                .collect();
-            // Cap candidates so a low-selectivity filter falls back to a bounded
-            // scan instead of materialising a huge set in memory.
-            const CANDIDATE_CAP: usize = 100_000;
-            db.scalar_candidates(coll, field, &constraints, CANDIDATE_CAP)?
-        } else {
-            None
-        };
+        // 2. Each Between / In / StartsWith predicate on an indexed field.
+        for pred in &self.filters {
+            if matches!(
+                pred,
+                Predicate::Between { .. } | Predicate::In { .. } | Predicate::StartsWith { .. }
+            ) {
+                keep_smaller(&mut best, self.predicate_candidates(pred)?);
+            }
+        }
+        // 3. Whole-query alternative drivers: compound prefix, geo, OR union.
+        keep_smaller(&mut best, self.compound_candidate_keys()?);
+        keep_smaller(&mut best, self.geo_candidate_keys()?);
+        keep_smaller(&mut best, self.or_candidate_keys()?);
 
-        let keys = if let Some(k) = scalar_keys {
-            k
-        } else if let Some(k) = self.range_set_prefix_candidate_keys()? {
-            k
-        } else if let Some(k) = self.compound_candidate_keys()? {
-            k
-        } else if let Some(k) = self.geo_candidate_keys()? {
-            k
-        } else if let Some(k) = self.or_candidate_keys()? {
-            k
-        } else {
-            return Ok(None);
-        };
-
-        self.verify_candidates(keys)
+        match best {
+            Some(keys) => self.verify_candidates(keys),
+            None => Ok(None),
+        }
     }
 
     /// Index-serviceable candidate keys for a *single* predicate (eq/range/in/
@@ -650,61 +651,6 @@ impl QueryBuilder<'_> {
                     }
                 }
                 return Ok(Some(out));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Candidate keys for the first index-serviceable `Between` / `In` /
-    /// `StartsWith` filter on an indexed field (a verified superset), else
-    /// `None`.
-    fn range_set_prefix_candidate_keys(&self) -> Result<Option<Vec<Vec<u8>>>> {
-        const CAP: usize = 100_000;
-        let db = self.collection.db();
-        let coll = self.collection.name();
-        for pred in &self.filters {
-            match pred {
-                Predicate::Between { path, low, high } if db.has_scalar_index(coll, path) => {
-                    let cons = [
-                        crate::scalar::Constraint {
-                            op: CmpOp::Ge,
-                            value: low,
-                        },
-                        crate::scalar::Constraint {
-                            op: CmpOp::Le,
-                            value: high,
-                        },
-                    ];
-                    return db.scalar_candidates(coll, path, &cons, CAP);
-                }
-                Predicate::In { path, values } if db.has_scalar_index(coll, path) => {
-                    let mut seen = std::collections::HashSet::new();
-                    let mut out = Vec::new();
-                    for v in values {
-                        let cons = [crate::scalar::Constraint {
-                            op: CmpOp::Eq,
-                            value: v,
-                        }];
-                        match db.scalar_candidates(coll, path, &cons, CAP)? {
-                            Some(ks) => {
-                                for k in ks {
-                                    if seen.insert(k.clone()) {
-                                        out.push(k);
-                                    }
-                                }
-                                if out.len() > CAP {
-                                    return Ok(None);
-                                }
-                            }
-                            None => return Ok(None),
-                        }
-                    }
-                    return Ok(Some(out));
-                }
-                Predicate::StartsWith { path, prefix } if db.has_scalar_index(coll, path) => {
-                    return db.scalar_prefix_candidates(coll, path, prefix, CAP);
-                }
-                _ => {}
             }
         }
         Ok(None)
@@ -1092,6 +1038,16 @@ fn group_key(v: &Value) -> Option<String> {
         Value::Float(f) => Some(f.to_string()),
         Value::Bool(b) => Some(b.to_string()),
         _ => None,
+    }
+}
+
+/// Keep whichever candidate set is smaller (the more selective). `None`
+/// candidates (no index / over the cap) are ignored.
+fn keep_smaller(best: &mut Option<Vec<Vec<u8>>>, candidate: Option<Vec<Vec<u8>>>) {
+    if let Some(k) = candidate
+        && best.as_ref().is_none_or(|b| k.len() < b.len())
+    {
+        *best = Some(k);
     }
 }
 
@@ -1579,6 +1535,42 @@ mod tests {
         assert!(keys.contains(&b"a".to_vec()));
         assert!(keys.contains(&b"c".to_vec()));
         assert!(!keys.contains(&b"b".to_vec())); // "python web framework"
+    }
+
+    #[test]
+    fn selectivity_picks_smallest_index_and_is_correct() {
+        // Two indexed fields: `tag` (very common) and `uid` (unique). A query
+        // pinning both must still return the exact rows; the planner drives on
+        // the selective field. Parity with an unindexed collection proves it.
+        fn fill(c: &crate::Collection) {
+            for i in 0..200i64 {
+                let mut m = BTreeMap::new();
+                m.insert("tag".to_owned(), Value::Text("common".into())); // all share it
+                m.insert("uid".to_owned(), Value::Int(i)); // unique
+                c.insert(&[i as u8], &Value::Map(m)).unwrap();
+            }
+        }
+        let plain = Db::open_in_memory().unwrap();
+        fill(&plain.collection("docs"));
+        let indexed = Db::open_in_memory().unwrap();
+        let ic = indexed.collection("docs");
+        fill(&ic);
+        ic.create_scalar_index("tag").unwrap();
+        ic.create_scalar_index("uid").unwrap();
+
+        let run = |db: &Db| {
+            db.collection("docs")
+                .query()
+                .filter(field("tag").eq(Value::Text("common".into())))
+                .filter(field("uid").eq(Value::Int(42)))
+                .run()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(&plain), run(&indexed));
+        assert_eq!(run(&indexed), vec![vec![42u8]]);
     }
 
     #[test]

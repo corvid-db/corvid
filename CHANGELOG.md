@@ -49,6 +49,10 @@ format and API may change without backward-compatibility guarantees.
 - Keyset (cursor) pagination: `page`/`page_where(after, limit)` return a page
   of rows plus a `next` cursor, resuming by key without offset rescans;
   streamed and bounded. MCP `page`.
+- Selectivity-driven index choice: the builder probes every serviceable index
+  (each capped) and drives on the smallest candidate set, so the most
+  selective index wins and unselective ones drop out at the cap — no persisted
+  statistics needed.
 - Identity-hashable query plans: `QueryBuilder::plan()` returns a canonical
   `QueryPlan` (equal iff the query shape is equal); `PlanCache` keys prepared
   work by shape (caches shape, not results, so never stale).
