@@ -9,6 +9,7 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Embedded multi-modal data store with a fluent builder API"
+readme = "../../README.md"
 
 [dependencies]
 redb.workspace = true

@@ -50,10 +50,14 @@ computed among matching documents, never a post-hoc trim.
   no networking).
 - **`corvid-mcp`** — a sidecar that exposes a corvid store to agentic coding
   tools over MCP (JSON-RPC on stdio). Run `corvid-mcp [PATH]` and point an MCP
-  client at it; tools: `store`, `get`, `delete`, `search`, `create_index`,
-  `create_text_index`, `create_scalar_index`, `count`, `geo`, `join`, `link`,
-  `unlink`, `neighbors`, `in_neighbors`, `traverse`, `list_collections`,
+  client at it; tools: `store`, `patch`, `compare_and_set`, `get`, `delete`,
+  `delete_where`, `page`, `search`, `phrase_search`, `count`, `geo`, `join`,
+  `link`, `unlink`, `neighbors`, `in_neighbors`, `traverse`, `create_index`,
+  `create_text_index`, `create_scalar_index`, `create_compound_index`,
+  `create_geo_index`, `backup`, `dump`, `load`, `list_collections`,
   `insert_auto`.
+
+A task-oriented walkthrough of every feature is in the **[user guide](docs/GUIDE.md)**.
 
 ## Capabilities (v0.1)
 
