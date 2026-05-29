@@ -155,7 +155,8 @@ fn tools_list() -> Json {
                     "properties": {
                         "collection": { "type": "string" },
                         "field": { "type": "string" },
-                        "metric": { "type": "string", "enum": ["cosine", "dot", "l2"] }
+                        "metric": { "type": "string", "enum": ["cosine", "dot", "l2"] },
+                        "quant": { "type": "string", "enum": ["none", "binary", "scalar"] }
                     },
                     "required": ["collection", "field"]
                 }

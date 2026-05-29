@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use crate::db::{Collection, Db};
 use crate::distance::Metric;
 use crate::error::Result;
-use crate::hnsw::Hnsw;
+use crate::hnsw::{DEFAULT_EF_CONSTRUCTION, DEFAULT_M, Hnsw, Quantization};
 use crate::store::Store;
 use crate::value::Value;
 
@@ -28,11 +28,18 @@ const INDEX_DEFS: &str = "__indexes__";
 /// Ranked `(key, distance)` results, nearest first.
 type RankedKeys = Vec<(Vec<u8>, f32)>;
 
+/// A registered vector index definition.
+#[derive(Clone, Copy)]
+struct VectorDef {
+    metric: Metric,
+    quant: Quantization,
+}
+
 /// Per-database derived-index state, guarded by a mutex on the [`Db`].
 #[derive(Default)]
 pub(crate) struct IndexState {
-    /// Registered index definitions (`(collection, field) -> metric`).
-    defs: HashMap<(String, String), Metric>,
+    /// Registered index definitions (`(collection, field) -> def`).
+    defs: HashMap<(String, String), VectorDef>,
     /// Built in-memory indexes, populated lazily.
     built: HashMap<(String, String), BuiltIndex>,
 }
@@ -47,9 +54,9 @@ struct BuiltIndex {
 }
 
 impl BuiltIndex {
-    fn new(metric: Metric) -> Self {
+    fn new(def: VectorDef) -> Self {
         Self {
-            hnsw: Hnsw::new(metric),
+            hnsw: Hnsw::with_quant(def.metric, def.quant, DEFAULT_M, DEFAULT_EF_CONSTRUCTION),
             node_to_key: Vec::new(),
             key_to_node: HashMap::new(),
         }
@@ -102,29 +109,38 @@ impl Db {
                 split_def_key(&key),
                 value.first().and_then(metric_from_byte),
             ) {
-                state.defs.insert((coll, field), metric);
+                // Quantization byte is optional (older defs are metric-only).
+                let quant = value
+                    .get(1)
+                    .and_then(quant_from_byte)
+                    .unwrap_or(Quantization::None);
+                state
+                    .defs
+                    .insert((coll, field), VectorDef { metric, quant });
             }
         }
         Ok(())
     }
 
-    /// Register (or replace) an HNSW index on `field` for `collection`. The
-    /// definition is persisted; the graph builds lazily on first use.
+    /// Register (or replace) an HNSW index on `field` for `collection`, with a
+    /// storage quantization mode. The definition is persisted; the graph builds
+    /// lazily on first use.
     pub(crate) fn register_vector_index(
         &self,
         collection: &str,
         field: &str,
         metric: Metric,
+        quant: Quantization,
     ) -> Result<()> {
         self.store().put(
             INDEX_DEFS,
             &def_key(collection, field),
-            &[metric_byte(metric)],
+            &[metric_byte(metric), quant_byte(quant)],
         )?;
         let mut state = self.indexes().lock().expect("index lock");
         let key = (collection.to_owned(), field.to_owned());
-        state.defs.insert(key.clone(), metric);
-        // Drop any built graph so it rebuilds with the (possibly new) metric.
+        state.defs.insert(key.clone(), VectorDef { metric, quant });
+        // Drop any built graph so it rebuilds with the (possibly new) def.
         state.built.remove(&key);
         Ok(())
     }
@@ -180,16 +196,22 @@ impl Db {
         let map_key = (collection.to_owned(), field.to_owned());
 
         // Decide what work to do under a short lock; build/scan unlocked.
-        let needs_build = {
+        let def = {
             let state = self.indexes().lock().expect("index lock");
             match state.defs.get(&map_key) {
-                Some(m) if *m == metric => !state.built.contains_key(&map_key),
+                Some(d) if d.metric == metric => *d,
                 _ => return Ok(None), // no index, or metric mismatch → exact
             }
         };
+        let needs_build = !self
+            .indexes()
+            .lock()
+            .expect("index lock")
+            .built
+            .contains_key(&map_key);
 
         if needs_build {
-            let built = build_index(self.store(), collection, field, metric)?;
+            let built = build_index(self.store(), collection, field, def)?;
             let mut state = self.indexes().lock().expect("index lock");
             state.built.entry(map_key.clone()).or_insert(built);
         }
@@ -203,7 +225,7 @@ impl Db {
                 .is_some_and(|b| !b.node_to_key.is_empty() && b.dead() * 2 > b.node_to_key.len())
         };
         if needs_compact {
-            let built = build_index(self.store(), collection, field, metric)?;
+            let built = build_index(self.store(), collection, field, def)?;
             let mut state = self.indexes().lock().expect("index lock");
             state.built.insert(map_key.clone(), built);
         }
@@ -214,8 +236,8 @@ impl Db {
 }
 
 /// Build a fresh index for `field` by scanning `collection`.
-fn build_index(store: &Store, collection: &str, field: &str, metric: Metric) -> Result<BuiltIndex> {
-    let mut built = BuiltIndex::new(metric);
+fn build_index(store: &Store, collection: &str, field: &str, def: VectorDef) -> Result<BuiltIndex> {
+    let mut built = BuiltIndex::new(def);
     for (key, bytes) in store.scan(collection)? {
         let doc = Value::decode(&bytes)?;
         if let Some(v) = doc.get(field).and_then(Value::as_vector) {
@@ -257,14 +279,45 @@ fn metric_from_byte(b: &u8) -> Option<Metric> {
     }
 }
 
+fn quant_byte(q: Quantization) -> u8 {
+    match q {
+        Quantization::None => 0,
+        Quantization::Binary => 1,
+        Quantization::Scalar => 2,
+    }
+}
+
+fn quant_from_byte(b: &u8) -> Option<Quantization> {
+    match b {
+        0 => Some(Quantization::None),
+        1 => Some(Quantization::Binary),
+        2 => Some(Quantization::Scalar),
+        _ => None,
+    }
+}
+
 impl Collection<'_> {
-    /// Create (or replace) an in-memory HNSW index on `field` under `metric`.
+    /// Create (or replace) a full-precision in-memory HNSW index on `field`.
     ///
     /// The definition persists across reopen; the graph builds lazily and is
     /// then maintained incrementally. [`Collection::vector_search`] on the same
     /// `field`/`metric` uses it; other fields/metrics stay exact.
     pub fn create_vector_index(&self, field: &str, metric: Metric) -> Result<()> {
-        self.db().register_vector_index(self.name(), field, metric)
+        self.db()
+            .register_vector_index(self.name(), field, metric, Quantization::None)
+    }
+
+    /// Like [`Collection::create_vector_index`] but storing vectors with a
+    /// [`Quantization`] mode to cut index memory (binary ≈ 32×, scalar ≈ 4×) at
+    /// some recall cost.
+    pub fn create_vector_index_quantized(
+        &self,
+        field: &str,
+        metric: Metric,
+        quant: Quantization,
+    ) -> Result<()> {
+        self.db()
+            .register_vector_index(self.name(), field, metric, quant)
     }
 }
 
@@ -393,6 +446,45 @@ mod tests {
             .vector_search("embedding", &[1.0, 0.0], 1, Metric::Cosine)
             .unwrap();
         assert_eq!(hits[0].key, b"a".to_vec());
+    }
+
+    #[test]
+    fn quantized_index_is_used_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvid.db");
+        {
+            let db = Db::open(&path).unwrap();
+            let c = db.collection("docs");
+            c.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
+            c.insert(b"b", &doc(vec![0.0, 1.0])).unwrap();
+            c.create_vector_index_quantized("embedding", Metric::Cosine, Quantization::Scalar)
+                .unwrap();
+            let hits = c
+                .vector_search("embedding", &[1.0, 0.0], 1, Metric::Cosine)
+                .unwrap();
+            assert_eq!(hits[0].key, b"a".to_vec());
+        }
+        // The quantized definition reloads on reopen and is still used.
+        let db = Db::open(&path).unwrap();
+        let hits = db
+            .collection("docs")
+            .vector_search("embedding", &[1.0, 0.0], 1, Metric::Cosine)
+            .unwrap();
+        assert_eq!(hits[0].key, b"a".to_vec());
+    }
+
+    #[test]
+    fn binary_quantized_index_via_collection() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"pos", &doc(vec![1.0, 1.0])).unwrap();
+        c.insert(b"neg", &doc(vec![-1.0, -1.0])).unwrap();
+        c.create_vector_index_quantized("embedding", Metric::Cosine, Quantization::Binary)
+            .unwrap();
+        let hits = c
+            .vector_search("embedding", &[1.0, 1.0], 1, Metric::Cosine)
+            .unwrap();
+        assert_eq!(hits[0].key, b"pos".to_vec());
     }
 
     #[test]

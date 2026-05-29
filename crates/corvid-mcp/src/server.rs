@@ -19,7 +19,7 @@
 //! `{op: "exists", field}`, `{op: "and"|"or", clauses: [...]}`,
 //! `{op: "not", clause: {...}}`.
 
-use corvid::{Db, Metric, Predicate, field};
+use corvid::{Db, Metric, Predicate, Quantization, field};
 use serde_json::{Value as Json, json};
 
 use crate::convert::{json_to_value, value_to_json};
@@ -230,9 +230,10 @@ impl Server {
         let collection = str_param(p, "collection")?;
         let field = str_param(p, "field")?;
         let metric = parse_metric(p.get("metric"))?;
+        let quant = parse_quant(p.get("quant"))?;
         self.db
             .collection(collection)
-            .create_vector_index(field, metric)?;
+            .create_vector_index_quantized(field, metric, quant)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -434,6 +435,17 @@ fn f32_array(value: Option<&Json>) -> Result<Vec<f32>, ToolError> {
                 .ok_or_else(|| ToolError::BadParams("'query' entries must be numbers".into()))
         })
         .collect()
+}
+
+fn parse_quant(value: Option<&Json>) -> Result<Quantization, ToolError> {
+    match value.and_then(Json::as_str) {
+        None | Some("none") => Ok(Quantization::None),
+        Some("binary") => Ok(Quantization::Binary),
+        Some("scalar") => Ok(Quantization::Scalar),
+        _ => Err(ToolError::BadParams(
+            "'quant' must be one of: none, binary, scalar".into(),
+        )),
+    }
 }
 
 fn parse_metric(value: Option<&Json>) -> Result<Metric, ToolError> {

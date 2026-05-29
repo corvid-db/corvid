@@ -20,9 +20,132 @@ pub const DEFAULT_M: usize = 16;
 /// Default candidate-list size during construction.
 pub const DEFAULT_EF_CONSTRUCTION: usize = 128;
 
-/// A node: its vector and its neighbour lists, one per layer it lives on.
+/// How vectors are stored in the index — trading accuracy for memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quantization {
+    /// Full `f32` precision (no quantization): `dim * 4` bytes/vector.
+    None,
+    /// One bit per dimension (sign), compared by Hamming distance: ~32x
+    /// smaller. Best with cosine / normalized vectors.
+    Binary,
+    /// 8-bit scalar quantization (per-vector min + scale): ~4x smaller.
+    /// Distance reconstructs to `f32` and uses the configured metric.
+    Scalar,
+}
+
+/// A vector as stored in a node.
+enum StoredVec {
+    Full(Vec<f32>),
+    Packed(Vec<u8>),
+}
+
+/// A query in the representation used for distance against stored vectors.
+enum Probe {
+    Full(Vec<f32>),
+    Bits(Vec<u8>),
+}
+
+impl Quantization {
+    fn encode(self, v: &[f32]) -> StoredVec {
+        match self {
+            Quantization::None => StoredVec::Full(v.to_vec()),
+            Quantization::Binary => StoredVec::Packed(binary_encode(v)),
+            Quantization::Scalar => StoredVec::Packed(scalar_encode(v)),
+        }
+    }
+
+    fn probe(self, v: &[f32]) -> Probe {
+        match self {
+            Quantization::Binary => Probe::Bits(binary_encode(v)),
+            // None and Scalar keep the query in full precision.
+            _ => Probe::Full(v.to_vec()),
+        }
+    }
+
+    /// Build a query probe from an already-stored vector (for neighbour pruning).
+    fn probe_of(self, stored: &StoredVec) -> Probe {
+        match (self, stored) {
+            (Quantization::Binary, StoredVec::Packed(b)) => Probe::Bits(b.clone()),
+            (Quantization::Scalar, StoredVec::Packed(b)) => Probe::Full(scalar_decode(b)),
+            (_, StoredVec::Full(v)) => Probe::Full(v.clone()),
+            (_, StoredVec::Packed(b)) => Probe::Full(scalar_decode(b)),
+        }
+    }
+
+    fn dist(self, metric: Metric, probe: &Probe, stored: &StoredVec) -> f32 {
+        match (self, probe, stored) {
+            (Quantization::None, Probe::Full(q), StoredVec::Full(v)) => metric.distance(q, v),
+            (Quantization::Binary, Probe::Bits(q), StoredVec::Packed(v)) => {
+                if q.len() != v.len() {
+                    return f32::INFINITY;
+                }
+                hamming(q, v) as f32
+            }
+            (Quantization::Scalar, Probe::Full(q), StoredVec::Packed(v)) => {
+                let recon = scalar_decode(v);
+                if recon.len() != q.len() {
+                    return f32::INFINITY;
+                }
+                metric.distance(q, &recon)
+            }
+            _ => f32::INFINITY,
+        }
+    }
+}
+
+/// Pack the sign of each dimension into one bit (1 if `>= 0`).
+fn binary_encode(v: &[f32]) -> Vec<u8> {
+    let mut bits = vec![0u8; v.len().div_ceil(8)];
+    for (i, &x) in v.iter().enumerate() {
+        if x >= 0.0 {
+            bits[i / 8] |= 1 << (i % 8);
+        }
+    }
+    bits
+}
+
+/// Hamming distance between two equal-length bit-packed vectors.
+fn hamming(a: &[u8], b: &[u8]) -> u32 {
+    a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+}
+
+/// Scalar-quantize to `min(4) ‖ scale(4) ‖ u8/dim`.
+fn scalar_encode(v: &[f32]) -> Vec<u8> {
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for &x in v {
+        min = min.min(x);
+        max = max.max(x);
+    }
+    if !min.is_finite() {
+        min = 0.0;
+    }
+    if !max.is_finite() {
+        max = 0.0;
+    }
+    let scale = if max > min { (max - min) / 255.0 } else { 1.0 };
+    let mut out = Vec::with_capacity(8 + v.len());
+    out.extend_from_slice(&min.to_le_bytes());
+    out.extend_from_slice(&scale.to_le_bytes());
+    for &x in v {
+        out.push(((x - min) / scale).round().clamp(0.0, 255.0) as u8);
+    }
+    out
+}
+
+/// Reconstruct an approximate `f32` vector from scalar-quantized bytes.
+fn scalar_decode(b: &[u8]) -> Vec<f32> {
+    if b.len() < 8 {
+        return Vec::new();
+    }
+    let min = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let scale = f32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+    b[8..].iter().map(|&q| min + q as f32 * scale).collect()
+}
+
+/// A node: its (possibly quantized) vector and its per-layer neighbour lists.
 struct Node {
-    vector: Vec<f32>,
+    vector: StoredVec,
     layers: Vec<Vec<usize>>,
 }
 
@@ -55,6 +178,7 @@ impl PartialOrd for Cand {
 /// An HNSW index over fixed-dimension vectors under one [`Metric`].
 pub struct Hnsw {
     metric: Metric,
+    quant: Quantization,
     m: usize,
     m0: usize,
     ef_construction: usize,
@@ -69,7 +193,7 @@ pub struct Hnsw {
 }
 
 impl Hnsw {
-    /// Create an index with the default parameters.
+    /// Create an index with the default parameters (full `f32` precision).
     pub fn new(metric: Metric) -> Self {
         Self::with_params(metric, DEFAULT_M, DEFAULT_EF_CONSTRUCTION)
     }
@@ -77,9 +201,20 @@ impl Hnsw {
     /// Create an index with explicit `m` (neighbours per layer) and
     /// `ef_construction` (build-time candidate breadth).
     pub fn with_params(metric: Metric, m: usize, ef_construction: usize) -> Self {
+        Self::with_quant(metric, Quantization::None, m, ef_construction)
+    }
+
+    /// Create an index with a storage quantization mode.
+    pub fn with_quant(
+        metric: Metric,
+        quant: Quantization,
+        m: usize,
+        ef_construction: usize,
+    ) -> Self {
         let m = m.max(2);
         Self {
             metric,
+            quant,
             m,
             m0: m * 2,
             ef_construction: ef_construction.max(m),
@@ -106,8 +241,9 @@ impl Hnsw {
     pub fn insert(&mut self, vector: Vec<f32>) -> usize {
         let id = self.nodes.len();
         let level = self.random_level();
+        let probe = self.quant.probe(&vector);
         self.nodes.push(Node {
-            vector,
+            vector: self.quant.encode(&vector),
             layers: vec![Vec::new(); level + 1],
         });
 
@@ -116,7 +252,6 @@ impl Hnsw {
             return id;
         };
 
-        let query = self.nodes[id].vector.clone();
         let top = self.nodes[entry].layers.len() - 1;
 
         // Descend greedily from the top down to just above the new node's level.
@@ -125,9 +260,10 @@ impl Hnsw {
             let w = Self::search_layer(
                 &self.nodes,
                 self.metric,
+                self.quant,
                 &mut self.visited,
                 &mut self.epoch,
-                &query,
+                &probe,
                 &[cur],
                 1,
                 layer,
@@ -141,9 +277,10 @@ impl Hnsw {
             let w = Self::search_layer(
                 &self.nodes,
                 self.metric,
+                self.quant,
                 &mut self.visited,
                 &mut self.epoch,
-                &query,
+                &probe,
                 &[cur],
                 self.ef_construction,
                 layer,
@@ -184,13 +321,15 @@ impl Hnsw {
         // build-time inserts, which reuse the index's scratch).
         let mut visited = Vec::new();
         let mut epoch = 0u32;
+        let probe = self.quant.probe(query);
         for layer in (1..=top).rev() {
             let w = Self::search_layer(
                 &self.nodes,
                 self.metric,
+                self.quant,
                 &mut visited,
                 &mut epoch,
-                query,
+                &probe,
                 &[cur],
                 1,
                 layer,
@@ -200,9 +339,10 @@ impl Hnsw {
         let w = Self::search_layer(
             &self.nodes,
             self.metric,
+            self.quant,
             &mut visited,
             &mut epoch,
-            query,
+            &probe,
             &[cur],
             ef_search.max(k),
             0,
@@ -217,9 +357,10 @@ impl Hnsw {
     fn search_layer(
         nodes: &[Node],
         metric: Metric,
+        quant: Quantization,
         visited: &mut Vec<u32>,
         epoch: &mut u32,
-        query: &[f32],
+        probe: &Probe,
         entries: &[usize],
         ef: usize,
         layer: usize,
@@ -244,7 +385,7 @@ impl Hnsw {
         let mut results: BinaryHeap<Cand> = BinaryHeap::new();
 
         for &ep in entries {
-            let d = metric.distance(query, &nodes[ep].vector);
+            let d = quant.dist(metric, probe, &nodes[ep].vector);
             let c = Cand { dist: d, id: ep };
             candidates.push(Reverse(c));
             results.push(c);
@@ -257,7 +398,7 @@ impl Hnsw {
             }
             for &nb in &nodes[c.id].layers[layer] {
                 if newly_visited(nb) {
-                    let d = metric.distance(query, &nodes[nb].vector);
+                    let d = quant.dist(metric, probe, &nodes[nb].vector);
                     let worst = results.peek().map(|w| w.dist).unwrap_or(f32::INFINITY);
                     if results.len() < ef || d < worst {
                         let cand = Cand { dist: d, id: nb };
@@ -280,12 +421,15 @@ impl Hnsw {
     fn prune(&mut self, node: usize, layer: usize, m: usize) {
         // Take the neighbour list out so we can borrow other nodes immutably.
         let ns = std::mem::take(&mut self.nodes[node].layers[layer]);
-        // Compute each distance exactly once (not per comparison).
+        // Compute each distance exactly once (not per comparison), with the
+        // pruned node itself as the query.
+        let node_probe = self.quant.probe_of(&self.nodes[node].vector);
         let mut scored: Vec<(f32, usize)> = ns
             .iter()
             .map(|&a| {
                 (
-                    self.dist(&self.nodes[node].vector, &self.nodes[a].vector),
+                    self.quant
+                        .dist(self.metric, &node_probe, &self.nodes[a].vector),
                     a,
                 )
             })
@@ -293,10 +437,6 @@ impl Hnsw {
         scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         scored.truncate(m);
         self.nodes[node].layers[layer] = scored.into_iter().map(|(_, id)| id).collect();
-    }
-
-    fn dist(&self, a: &[f32], b: &[f32]) -> f32 {
-        self.metric.distance(a, b)
     }
 
     /// Draw a level from a geometric distribution, `floor(-ln(U) * ml)`.
@@ -415,6 +555,61 @@ mod tests {
         let got = h.search(&data[0], 10, 50);
         for pair in got.windows(2) {
             assert!(pair[0].1 <= pair[1].1, "distances not ascending");
+        }
+    }
+
+    #[test]
+    fn binary_quantized_index_finds_near_neighbours() {
+        // Two well-separated sign-pattern clusters; binary (Hamming) must keep
+        // a query's own cluster nearest.
+        let mut h = Hnsw::with_quant(Metric::Cosine, Quantization::Binary, 16, 100);
+        let mut data = Vec::new();
+        for i in 0..200 {
+            // Cluster A: mostly positive; Cluster B: mostly negative.
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            let v: Vec<f32> = (0..32)
+                .map(|d| sign * ((d as f32 * 0.1 + i as f32 * 0.01).sin().abs() + 0.1))
+                .collect();
+            h.insert(v.clone());
+            data.push((i, v));
+        }
+        // Query from cluster A (even) → nearest should be an even index.
+        let (_, q) = &data[0];
+        let got = h.search(q, 5, 50);
+        assert!(!got.is_empty());
+        assert_eq!(
+            got[0].0 % 2,
+            0,
+            "nearest should share the query's sign cluster"
+        );
+    }
+
+    #[test]
+    fn scalar_quantized_index_matches_exact_ranking_closely() {
+        let data = corpus(300, 16);
+        let mut h = Hnsw::with_quant(Metric::L2, Quantization::Scalar, 16, 128);
+        for v in &data {
+            h.insert(v.clone());
+        }
+        // Query equal to a stored vector → it should still rank at the top
+        // (scalar quantization is near-lossless for the exact match).
+        let target = 42;
+        let got = h.search(&data[target], 3, 64);
+        assert!(got.iter().take(3).any(|(id, _)| *id == target));
+    }
+
+    #[test]
+    fn binary_encode_and_hamming() {
+        assert_eq!(binary_encode(&[1.0, -1.0, 2.0, -3.0]), vec![0b0000_0101]);
+        assert_eq!(hamming(&[0b1010], &[0b0011]), 2);
+    }
+
+    #[test]
+    fn scalar_roundtrip_is_approximate() {
+        let v = vec![0.0, 0.25, 0.5, 1.0];
+        let decoded = scalar_decode(&scalar_encode(&v));
+        for (a, b) in v.iter().zip(&decoded) {
+            assert!((a - b).abs() < 0.01, "{a} vs {b}");
         }
     }
 

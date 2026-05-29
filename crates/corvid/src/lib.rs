@@ -36,7 +36,7 @@ pub use error::{Error, Result};
 pub use filter::{CmpOp, Predicate, field};
 pub use fusion::{DEFAULT_RRF_K, mmr, reciprocal_rank_fusion};
 pub use geo::{GeoHit, haversine_km};
-pub use hnsw::Hnsw;
+pub use hnsw::{Hnsw, Quantization};
 pub use join::JoinRow;
 pub use query::{Hit, TextHit};
 pub use reactive::{ChangeEvent, ChangeKind, SubscriptionId};
