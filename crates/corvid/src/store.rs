@@ -204,10 +204,11 @@ impl Store {
 
     /// Stream every `(user_key, value)` in `collection` to `f`, in key order,
     /// without materializing the collection. Constant memory regardless of
-    /// collection size. `f`'s slices are valid only for the duration of the call.
+    /// collection size. `f` returns `false` to stop early. `f`'s slices are
+    /// valid only for the duration of the call.
     pub fn for_each<F>(&self, collection: &str, mut f: F) -> Result<()>
     where
-        F: FnMut(&[u8], &[u8]) -> Result<()>,
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
     {
         let txn = self.db.begin_read()?;
         let catalog = match txn.open_table(CATALOG) {
@@ -231,7 +232,9 @@ impl Store {
         for entry in records.range::<&[u8]>(bounds)? {
             let (k, v) = entry?;
             let key = k.value();
-            f(key.get(8..).unwrap_or(&[]), v.value())?;
+            if !f(key.get(8..).unwrap_or(&[]), v.value())? {
+                break;
+            }
         }
         Ok(())
     }

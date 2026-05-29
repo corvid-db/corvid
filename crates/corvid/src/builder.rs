@@ -220,7 +220,7 @@ impl QueryBuilder<'_> {
             if self.filters.iter().all(|p| p.eval(&doc)) {
                 n += 1;
             }
-            Ok(())
+            Ok(true)
         })?;
         Ok(n)
     }
@@ -239,7 +239,7 @@ impl QueryBuilder<'_> {
             {
                 *groups.entry(key).or_insert(0) += 1;
             }
-            Ok(())
+            Ok(true)
         })?;
         Ok(groups)
     }
@@ -324,6 +324,12 @@ impl QueryBuilder<'_> {
 
     /// Execute the query and return the ranked rows.
     pub fn run(self) -> Result<Vec<ResultRow>> {
+        // No retrieval sources → a pure filter/order/paginate query. Stream it
+        // with bounded memory instead of materializing the whole collection.
+        if self.sources.is_empty() {
+            return self.run_scan_only();
+        }
+
         // Use the ANN index when applicable; otherwise scan and filter exactly.
         let filtered: Vec<(Vec<u8>, Value)> = match self.ann_candidates()? {
             Some(candidates) => candidates,
@@ -402,6 +408,65 @@ impl QueryBuilder<'_> {
             .collect())
     }
 
+    /// Streaming execution for the no-retrieval-source case (filter / order /
+    /// paginate). Memory is bounded: with `limit`, at most ~`offset + limit`
+    /// rows are held (early-stop in key order; a periodically-pruned buffer
+    /// under `order_by`). Without `limit` and with `order_by`, all matching
+    /// rows are held (an unbounded sort, as any DB without a sort index does).
+    fn run_scan_only(self) -> Result<Vec<ResultRow>> {
+        let cap = self.limit.map(|l| self.offset.saturating_add(l));
+        let mut buf: Vec<(Vec<u8>, Value)> = Vec::new();
+
+        match &self.order_by {
+            // Key order: take only the `cap` window, stopping early.
+            None => {
+                self.collection.for_each_doc(|key, doc| {
+                    if self.filters.iter().all(|p| p.eval(&doc)) {
+                        buf.push((key.to_vec(), doc));
+                    }
+                    Ok(cap.is_none_or(|c| buf.len() < c))
+                })?;
+            }
+            // Ordered: keep the best `cap` via a periodically pruned buffer.
+            Some((field, descending)) => {
+                let prune_at = cap.map(|c| c.saturating_mul(2).max(1024));
+                self.collection.for_each_doc(|key, doc| {
+                    if self.filters.iter().all(|p| p.eval(&doc)) {
+                        buf.push((key.to_vec(), doc));
+                        if let (Some(p), Some(c)) = (prune_at, cap)
+                            && buf.len() >= p
+                        {
+                            sort_by_field(&mut buf, field, *descending);
+                            buf.truncate(c);
+                        }
+                    }
+                    Ok(true)
+                })?;
+                sort_by_field(&mut buf, field, *descending);
+            }
+        }
+
+        let start = self.offset.min(buf.len());
+        let mut window: Vec<(Vec<u8>, Value)> = buf.split_off(start);
+        if let Some(limit) = self.limit {
+            window.truncate(limit);
+        }
+        Ok(window
+            .into_iter()
+            .map(|(key, document)| {
+                let document = match &self.projection {
+                    Some(fields) => project(document, fields),
+                    None => document,
+                };
+                ResultRow {
+                    key,
+                    score: 0.0,
+                    document,
+                }
+            })
+            .collect())
+    }
+
     /// The first vector source's `(field, query, metric)`, if any.
     fn first_vector_source(&self) -> Option<(&str, &[f32], Metric)> {
         self.sources.iter().find_map(|s| match s {
@@ -425,6 +490,21 @@ fn group_key(v: &Value) -> Option<String> {
         Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }
+}
+
+/// Sort `(key, doc)` pairs by a scalar field, missing/incomparable last, ties
+/// by key. `descending` reverses the value comparison.
+fn sort_by_field(buf: &mut [(Vec<u8>, Value)], field: &str, descending: bool) {
+    buf.sort_by(|(ka, da), (kb, db)| match (da.get(field), db.get(field)) {
+        (Some(a), Some(b)) => {
+            let base = crate::filter::value_order(a, b).unwrap_or(Ordering::Equal);
+            let base = if descending { base.reverse() } else { base };
+            base.then_with(|| ka.cmp(kb))
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => ka.cmp(kb),
+    });
 }
 
 /// Narrow a document to the named field paths, which may be dotted

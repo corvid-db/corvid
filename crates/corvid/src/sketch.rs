@@ -142,7 +142,7 @@ impl Collection<'_> {
             if let Some(v) = doc.get(field) {
                 hll.add_bytes(&v.encode());
             }
-            Ok(())
+            Ok(true)
         })?;
         Ok(hll.estimate())
     }

@@ -142,7 +142,7 @@ impl Collection<'_> {
     /// Prefer this over [`Collection::scan`] for large collections.
     pub fn for_each_doc<F>(&self, mut f: F) -> Result<()>
     where
-        F: FnMut(&[u8], Value) -> Result<()>,
+        F: FnMut(&[u8], Value) -> Result<bool>,
     {
         self.db.store().for_each(self.name, |key, bytes| {
             let doc = Value::decode(bytes)?;
