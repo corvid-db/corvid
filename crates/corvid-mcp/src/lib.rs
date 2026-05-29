@@ -9,6 +9,7 @@
 
 pub mod convert;
 pub mod error;
+pub mod protocol;
 pub mod server;
 
 pub use error::ToolError;
