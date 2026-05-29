@@ -37,7 +37,7 @@
 //!    keep their fused order after the reranked ones.
 //! 5. Truncate to `limit`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::db::Collection;
 use crate::distance::Metric;
@@ -172,6 +172,37 @@ impl QueryBuilder<'_> {
         self
     }
 
+    /// Count the documents matching the filters. Retrieval sources, ranking,
+    /// limit, and projection are ignored — this is an aggregate over the
+    /// filtered set.
+    pub fn count(self) -> Result<usize> {
+        Ok(self
+            .collection
+            .scan()?
+            .into_iter()
+            .filter(|(_, doc)| self.filters.iter().all(|p| p.eval(doc)))
+            .count())
+    }
+
+    /// Count matching documents grouped by the value at `field`.
+    ///
+    /// Groups are keyed by a canonical string of the field value (text as-is;
+    /// int/float/bool stringified). Documents whose field is missing or is a
+    /// container are not counted. Like [`Self::count`], this aggregates over
+    /// the filtered set and ignores ranking.
+    pub fn group_count(self, field: &str) -> Result<BTreeMap<String, usize>> {
+        let mut groups: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, doc) in self.collection.scan()? {
+            if !self.filters.iter().all(|p| p.eval(&doc)) {
+                continue;
+            }
+            if let Some(key) = doc.get(field).and_then(group_key) {
+                *groups.entry(key).or_insert(0) += 1;
+            }
+        }
+        Ok(groups)
+    }
+
     /// Execute the query and return the ranked rows.
     pub fn run(self) -> Result<Vec<ResultRow>> {
         let filtered: Vec<(Vec<u8>, Value)> = self
@@ -239,6 +270,17 @@ impl QueryBuilder<'_> {
             } => Some((field.as_str(), query.as_slice(), *metric)),
             Source::Text { .. } => None,
         })
+    }
+}
+
+/// A canonical group key for a scalar value, or `None` for containers/null.
+fn group_key(v: &Value) -> Option<String> {
+    match v {
+        Value::Text(s) => Some(s.clone()),
+        Value::Int(i) => Some(i.to_string()),
+        Value::Float(f) => Some(f.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
     }
 }
 
@@ -524,6 +566,55 @@ mod tests {
             .run()
             .unwrap();
         assert_eq!(rows[0].document, Value::Int(42));
+    }
+
+    #[test]
+    fn count_counts_filtered_documents() {
+        let db = seed();
+        assert_eq!(db.collection("docs").query().count().unwrap(), 3);
+        let blogs = db
+            .collection("docs")
+            .query()
+            .filter(field("category").eq(Value::Text("blog".into())))
+            .count()
+            .unwrap();
+        assert_eq!(blogs, 2);
+    }
+
+    #[test]
+    fn group_count_buckets_by_field() {
+        let db = seed();
+        let groups = db
+            .collection("docs")
+            .query()
+            .group_count("category")
+            .unwrap();
+        assert_eq!(groups.get("blog"), Some(&2));
+        assert_eq!(groups.get("news"), Some(&1));
+    }
+
+    #[test]
+    fn group_count_skips_missing_and_container_fields() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &doc("blog", "x", vec![1.0])).unwrap();
+        c.insert(b"b", &Value::Int(5)).unwrap(); // no "category" field
+        let groups = c.query().group_count("category").unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups.get("blog"), Some(&1));
+    }
+
+    #[test]
+    fn group_count_respects_filters() {
+        let db = seed();
+        let groups = db
+            .collection("docs")
+            .query()
+            .filter(field("category").eq(Value::Text("blog".into())))
+            .group_count("category")
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups.get("blog"), Some(&2));
     }
 
     #[test]
