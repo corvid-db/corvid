@@ -82,6 +82,7 @@ pub struct QueryBuilder<'c> {
     rrf_k: f32,
     mmr_lambda: Option<f32>,
     limit: Option<usize>,
+    projection: Option<Vec<String>>,
 }
 
 impl<'c> Collection<'c> {
@@ -94,6 +95,7 @@ impl<'c> Collection<'c> {
             rrf_k: DEFAULT_RRF_K,
             mmr_lambda: None,
             limit: None,
+            projection: None,
         }
     }
 }
@@ -155,6 +157,21 @@ impl QueryBuilder<'_> {
         self
     }
 
+    /// Project each result document down to the named top-level fields.
+    ///
+    /// Only applies to [`Value::Map`] documents; missing fields are simply
+    /// absent from the projection, and non-map documents are returned
+    /// unchanged. Ranking and filtering still see the full document — only the
+    /// returned `document` is narrowed.
+    pub fn select<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.projection = Some(fields.into_iter().map(Into::into).collect());
+        self
+    }
+
     /// Execute the query and return the ranked rows.
     pub fn run(self) -> Result<Vec<ResultRow>> {
         let filtered: Vec<(Vec<u8>, Value)> = self
@@ -198,6 +215,10 @@ impl QueryBuilder<'_> {
             .into_iter()
             .map(|(key, score)| {
                 let document = docs.remove(&key).expect("key came from filtered set");
+                let document = match &self.projection {
+                    Some(fields) => project(document, fields),
+                    None => document,
+                };
                 ResultRow {
                     key,
                     score,
@@ -218,6 +239,18 @@ impl QueryBuilder<'_> {
             } => Some((field.as_str(), query.as_slice(), *metric)),
             Source::Text { .. } => None,
         })
+    }
+}
+
+/// Narrow a document to the named top-level fields. Non-map documents pass
+/// through unchanged.
+fn project(document: Value, fields: &[String]) -> Value {
+    match document {
+        Value::Map(mut map) => {
+            let kept = fields.iter().filter_map(|f| map.remove_entry(f)).collect();
+            Value::Map(kept)
+        }
+        other => other,
     }
 }
 
@@ -444,6 +477,53 @@ mod tests {
             .run()
             .unwrap();
         assert_eq!(rows[0].key, b"a".to_vec());
+    }
+
+    #[test]
+    fn select_projects_documents_to_named_fields() {
+        let db = seed();
+        let rows = db
+            .collection("docs")
+            .query()
+            .filter(field("category").eq(Value::Text("blog".into())))
+            .select(["category"])
+            .run()
+            .unwrap();
+        for row in &rows {
+            let map = match &row.document {
+                Value::Map(m) => m,
+                _ => panic!("expected map"),
+            };
+            assert_eq!(map.len(), 1);
+            assert!(map.contains_key("category"));
+            assert!(!map.contains_key("body"));
+        }
+    }
+
+    #[test]
+    fn select_missing_field_yields_empty_map() {
+        let db = seed();
+        let rows = db
+            .collection("docs")
+            .query()
+            .select(["does_not_exist"])
+            .limit(1)
+            .run()
+            .unwrap();
+        assert_eq!(rows[0].document, Value::Map(BTreeMap::new()));
+    }
+
+    #[test]
+    fn select_leaves_non_map_documents_unchanged() {
+        let db = Db::open_in_memory().unwrap();
+        db.collection("docs").insert(b"v", &Value::Int(42)).unwrap();
+        let rows = db
+            .collection("docs")
+            .query()
+            .select(["anything"])
+            .run()
+            .unwrap();
+        assert_eq!(rows[0].document, Value::Int(42));
     }
 
     #[test]
