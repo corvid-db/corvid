@@ -64,6 +64,7 @@ impl Server {
             "compare_and_set" => self.compare_and_set(params),
             "delete_where" => self.delete_where(params),
             "phrase_search" => self.phrase_search(params),
+            "page" => self.page(params),
             "create_geo_index" => self.create_geo_index(params),
             "create_compound_index" => self.create_compound_index(params),
             "backup" => self.backup(params),
@@ -116,6 +117,32 @@ impl Server {
             new,
         )?;
         Ok(json!({ "applied": applied }))
+    }
+
+    fn page(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let limit = uint_param(p, "limit")?;
+        let after = p.get("after").and_then(Json::as_str);
+        let after_bytes = after.map(str::as_bytes);
+        let handle = self.db.collection(collection);
+        let page = match p.get("filter") {
+            Some(f) => handle.page_where(after_bytes, limit, parse_predicate(f)?)?,
+            None => handle.page(after_bytes, limit)?,
+        };
+        let rows: Vec<Json> = page
+            .rows
+            .iter()
+            .map(|(k, d)| {
+                json!({
+                    "key": String::from_utf8_lossy(k),
+                    "document": value_to_json(d),
+                })
+            })
+            .collect();
+        let next = page
+            .next
+            .map(|c| Json::String(String::from_utf8_lossy(&c).into_owned()));
+        Ok(json!({ "rows": rows, "next": next.unwrap_or(Json::Null) }))
     }
 
     fn phrase_search(&self, p: &Json) -> Result<Json, ToolError> {

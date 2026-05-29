@@ -307,6 +307,20 @@ fn tools_list() -> Json {
                 }
             },
             {
+                "name": "page",
+                "description": "Keyset pagination in key order: up to 'limit' rows with key after the 'after' cursor (optional 'filter'). Returns {rows, next} where next is the cursor for the following page (null at end).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "limit": { "type": "integer" },
+                        "after": { "type": "string" },
+                        "filter": { "type": "object" }
+                    },
+                    "required": ["collection", "limit"]
+                }
+            },
+            {
                 "name": "phrase_search",
                 "description": "Find documents whose field text contains an exact phrase (consecutive in-order tokens). Returns ranked {key, score, document}.",
                 "inputSchema": {
@@ -486,6 +500,7 @@ mod tests {
             "patch",
             "compare_and_set",
             "delete_where",
+            "page",
             "phrase_search",
             "search",
             "create_index",

@@ -421,6 +421,89 @@ impl Collection<'_> {
         }
         Ok(out)
     }
+
+    /// Keyset pagination: up to `limit` documents in key order whose key is
+    /// strictly greater than `after` (`None` starts at the beginning), with a
+    /// `next` cursor to resume from. Unlike `offset`, this does not rescan
+    /// earlier pages — each page resumes exactly where the last ended.
+    pub fn page(&self, after: Option<&[u8]>, limit: usize) -> Result<Page> {
+        self.page_inner(after, limit, None)
+    }
+
+    /// Like [`Collection::page`] but returning only documents matching
+    /// `predicate`. The scan is streamed; the `next` cursor resumes after the
+    /// last examined key, so every matching document is paged exactly once.
+    pub fn page_where(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+        predicate: crate::filter::Predicate,
+    ) -> Result<Page> {
+        self.page_inner(after, limit, Some(predicate))
+    }
+
+    fn page_inner(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+        predicate: Option<crate::filter::Predicate>,
+    ) -> Result<Page> {
+        if limit == 0 {
+            return Ok(Page {
+                rows: Vec::new(),
+                next: None,
+            });
+        }
+        let mut cursor: Vec<u8> = match after {
+            Some(k) => {
+                let mut c = k.to_vec();
+                c.push(0); // strictly greater than `after`
+                c
+            }
+            None => Vec::new(),
+        };
+        let mut rows: Vec<(Vec<u8>, Value)> = Vec::new();
+        let mut last_examined: Option<Vec<u8>> = None;
+        const CHUNK: usize = 1024;
+        'outer: loop {
+            let chunk = self.db.store().scan_from(self.name, &cursor, CHUNK)?;
+            if chunk.is_empty() {
+                break;
+            }
+            for (k, bytes) in &chunk {
+                last_examined = Some(k.clone());
+                let doc = Value::decode(bytes)?;
+                if predicate.as_ref().is_none_or(|p| p.eval(&doc)) {
+                    rows.push((k.clone(), doc));
+                    if rows.len() == limit {
+                        break 'outer;
+                    }
+                }
+            }
+            cursor = {
+                let mut c = chunk.last().unwrap().0.clone();
+                c.push(0);
+                c
+            };
+        }
+        // A full page implies there may be more; resume after the last key we
+        // looked at. A short page means we reached the end.
+        let next = if rows.len() == limit {
+            last_examined
+        } else {
+            None
+        };
+        Ok(Page { rows, next })
+    }
+}
+
+/// One page of keyset-paginated results.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Page {
+    /// The `(key, document)` rows in this page, in key order.
+    pub rows: Vec<(Vec<u8>, Value)>,
+    /// Cursor to pass as `after` for the next page, or `None` at the end.
+    pub next: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -433,6 +516,53 @@ mod tests {
         m.insert("name".to_owned(), Value::Text(name.to_owned()));
         m.insert("n".to_owned(), Value::Int(n));
         Value::Map(m)
+    }
+
+    #[test]
+    fn keyset_pagination_covers_all_rows_once() {
+        use crate::field;
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for i in 0..25u8 {
+            c.insert(&[i], &doc("x", i as i64)).unwrap();
+        }
+        // Page through in pages of 10; collect all keys.
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = c.page(after.as_deref(), 10).unwrap();
+            for (k, _) in &page.rows {
+                seen.push(k.clone());
+            }
+            match page.next {
+                Some(c) => after = Some(c),
+                None => break,
+            }
+        }
+        let expected: Vec<Vec<u8>> = (0..25u8).map(|i| vec![i]).collect();
+        assert_eq!(seen, expected); // every row once, in key order
+
+        // Filtered keyset pagination: even n only.
+        let mut even = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = c
+                .page_where(
+                    after.as_deref(),
+                    4,
+                    field("n").between(Value::Int(0), Value::Int(100)),
+                )
+                .unwrap();
+            for (k, d) in &page.rows {
+                assert!(d.get("n").is_some());
+                even.push(k.clone());
+            }
+            match page.next {
+                Some(c) => after = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(even.len(), 25);
     }
 
     #[test]

@@ -38,6 +38,9 @@ format and API may change without backward-compatibility guarantees.
 - WASM: the engine compiles to `wasm32-unknown-unknown`; a `corvid-wasm` cdylib
   harness links it into a ≈0.2 MB gzipped bundle, CI-enforced under 2 MB. The
   engine also cross-compiles for aarch64 iOS/Android.
+- Keyset (cursor) pagination: `page`/`page_where(after, limit)` return a page
+  of rows plus a `next` cursor, resuming by key without offset rescans;
+  streamed and bounded. MCP `page`.
 - Identity-hashable query plans: `QueryBuilder::plan()` returns a canonical
   `QueryPlan` (equal iff the query shape is equal); `PlanCache` keys prepared
   work by shape (caches shape, not results, so never stale).
