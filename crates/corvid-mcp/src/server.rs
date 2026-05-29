@@ -230,10 +230,13 @@ impl Server {
         let collection = str_param(p, "collection")?;
         let field = str_param(p, "field")?;
         let metric = parse_metric(p.get("metric"))?;
-        let quant = parse_quant(p.get("quant"))?;
-        self.db
-            .collection(collection)
-            .create_vector_index_quantized(field, metric, quant)?;
+        let on_disk = p.get("on_disk").and_then(Json::as_bool).unwrap_or(false);
+        let c = self.db.collection(collection);
+        if on_disk {
+            c.create_vector_index_ondisk(field, metric)?;
+        } else {
+            c.create_vector_index_quantized(field, metric, parse_quant(p.get("quant"))?)?;
+        }
         Ok(json!({ "ok": true }))
     }
 

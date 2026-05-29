@@ -188,6 +188,47 @@ impl Store {
         Ok(out)
     }
 
+    /// Return up to `limit` `(key, value)` pairs in `collection` whose key is
+    /// `>= start`, in key order. For cursor pagination: pass an empty `start`,
+    /// then resume from `last_key` with a trailing `0` byte appended. An
+    /// unknown collection yields an empty vector.
+    pub fn scan_from(
+        &self,
+        collection: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let txn = self.db.begin_read()?;
+        let catalog = match txn.open_table(CATALOG) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let Some(id) = catalog.get(collection)?.map(|g| g.value()) else {
+            return Ok(Vec::new());
+        };
+        drop(catalog);
+
+        let records = txn.open_table(RECORDS)?;
+        let mut lower = id.to_be_bytes().to_vec();
+        lower.extend_from_slice(start);
+        let upper = id.checked_add(1).map(|n| n.to_be_bytes().to_vec());
+        let lower_slice: &[u8] = &lower;
+        let bounds: (Bound<&[u8]>, Bound<&[u8]>) = match &upper {
+            Some(u) => (Bound::Included(lower_slice), Bound::Excluded(u.as_slice())),
+            None => (Bound::Included(lower_slice), Bound::Unbounded),
+        };
+        let mut out = Vec::new();
+        for entry in records.range::<&[u8]>(bounds)? {
+            if out.len() >= limit {
+                break;
+            }
+            let (k, v) = entry?;
+            out.push((user_key(k.value()), v.value().to_vec()));
+        }
+        Ok(out)
+    }
+
     /// The maintained record count for `collection` (O(1), no scan).
     pub fn count(&self, collection: &str) -> Result<u64> {
         let txn = self.db.begin_read()?;

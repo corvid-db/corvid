@@ -435,16 +435,34 @@ impl Collection<'_> {
             Quantization::None,
             IndexKind::OnDisk,
         )?;
-        // Backfill existing documents, streaming (bounded memory).
+        // Backfill existing documents in chunks: read a page (read txn, which
+        // closes), then bulk-insert it (one write txn). Bounded memory, and far
+        // fewer commits than one-insert-per-transaction.
         let ns = disk_hnsw::namespace(self.name(), field);
         let params = DiskParams::new(metric, DEFAULT_M, DEFAULT_EF_CONSTRUCTION);
         let store = self.db().store();
-        self.for_each_doc(|key, doc| {
-            if let Some(v) = doc.get(field).and_then(Value::as_vector) {
-                disk_hnsw::insert(store, &ns, &params, key, v)?;
+        const CHUNK: usize = 2048;
+        let mut cursor: Vec<u8> = Vec::new();
+        loop {
+            let page = store.scan_from(self.name(), &cursor, CHUNK)?;
+            let Some((last_key, _)) = page.last() else {
+                break;
+            };
+            let mut next_cursor = last_key.clone();
+            next_cursor.push(0);
+
+            let mut batch: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
+            for (key, bytes) in &page {
+                let doc = Value::decode(bytes)?;
+                if let Some(v) = doc.get(field).and_then(Value::as_vector) {
+                    batch.push((key.clone(), v.to_vec()));
+                }
             }
-            Ok(true)
-        })?;
+            if !batch.is_empty() {
+                disk_hnsw::insert_many(store, &ns, &params, &batch)?;
+            }
+            cursor = next_cursor;
+        }
         Ok(())
     }
 }

@@ -132,7 +132,34 @@ fn main() {
                 .unwrap()
         });
     } else {
-        println!("  (vector index skipped: N > {vector_cap})");
+        println!("  (in-memory vector index skipped: N > {vector_cap})");
+    }
+
+    // On-disk vector index: bounded memory, persists. Build it on a fresh
+    // collection (its own namespace) to show it works at this N.
+    let ann = db.collection("ann");
+    time("ondisk index backfill insert", || {
+        let mut i = 0;
+        while i < n {
+            let end = (i + BATCH).min(n);
+            let owned: Vec<(Vec<u8>, Value)> = (i..end)
+                .map(|j| (format!("{j:012}").into_bytes(), doc(j)))
+                .collect();
+            let items: Vec<(&[u8], &Value)> =
+                owned.iter().map(|(k, v)| (k.as_slice(), v)).collect();
+            ann.insert_batch(&items).unwrap();
+            i = end;
+        }
+    });
+    if n > 0 {
+        time("ondisk create + backfill", || {
+            ann.create_vector_index_ondisk("embedding", Metric::Cosine)
+                .unwrap()
+        });
+        time("ondisk vector_search", || {
+            ann.vector_search("embedding", &embedding(7), 10, Metric::Cosine)
+                .unwrap()
+        });
     }
 
     println!();

@@ -214,8 +214,10 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 
 **Audit gaps resolved** (see the gap sweep): incremental+persistent indexes (#4/#7), inverted FTS (#3), filtered-ANN in builder (#5), order_by/offset (#10), reverse edges (#11), format version (#12), auto-keys (#8), MCP surface+caps (#13/#27), reserved-name & length & slicing hardening (#17/#18/#20), atomic edges + single-snapshot join (#2/#14), nested select + explain (#22/#26 partial), edge weights (#25), CI/LICENSE/CHANGELOG/MSRV + property/concurrency tests + benchmarks (#28–32).
 
+**On-disk vector index (DONE).** `create_vector_index_ondisk` stores the HNSW graph as redb entries; insert/search touch only nodes-per-op (bounded memory, not O(N)), the graph persists (no rebuild on open), and bulk backfill batches commits with a shared node cache. This is the billions-of-vectors-on-32GB path (build is a heavy offline op; search and memory are bounded). Quantization (binary ≈32×, scalar ≈4×) is also done for the in-memory index.
+
 **Deliberately deferred (large subsystems or environment-blocked, with reasons):**
-- **On-disk HNSW / quantization** (#16): the index is in-memory/derived (correct, rebuilds on open). On-disk graph and PQ/binary quantization are scale optimizations, not correctness gaps.
+- **PQ quantization on the on-disk index** (#16 remainder): on-disk stores f32; combining product/scalar quantization with the on-disk graph would further cut disk + cache. Binary/scalar exist for in-memory.
 - **Spatial index** (#6, geo): geo is an exact scan (correct); an R-tree/geohash index is the scale optimization, same pattern as the vector/text baselines.
 - **Secondary scalar index** (#6): `filter`/`count`/`group_count` scan; a B-tree secondary index is the optimization.
 - **Streaming result iterators** (#15): results are materialized; a streaming/cursor API is a larger refactor.

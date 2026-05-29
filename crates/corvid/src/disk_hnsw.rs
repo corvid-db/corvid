@@ -238,19 +238,71 @@ pub(crate) fn insert(
     vector: &[f32],
 ) -> Result<()> {
     store.transaction(|tx| {
+        let mut meta = read_meta(tx, ns)?;
         let mut cache = Cache::new();
-        let mut meta = match tx.get(ns, &[TAG_META])? {
-            Some(b) => decode_meta(&b),
-            None => Meta {
-                entry: None,
-                count: 0,
-            },
-        };
+        insert_in_txn(tx, ns, p, &mut cache, &mut meta, doc_key, vector)?;
+        tx.put(ns, &[TAG_META], &encode_meta(meta))?;
+        Ok(())
+    })
+}
 
+/// Cap on the shared node cache during a bulk insert: keeps hot nodes (entry
+/// point, upper layers) cached across inserts without unbounded growth. Dirty
+/// nodes are already flushed, so clearing is safe (reloads from the txn).
+const BULK_CACHE_CAP: usize = 50_000;
+
+/// Insert many vectors in a single transaction (one commit, one fsync). Each
+/// insert uses a fresh per-node cache and flushes its touched nodes before the
+/// next, so within-batch graph connectivity works via read-your-writes while
+/// memory stays bounded per insert. Far faster than repeated [`insert`] for
+/// bulk loads.
+pub(crate) fn insert_many(
+    store: &Store,
+    ns: &str,
+    p: &DiskParams,
+    items: &[(Vec<u8>, Vec<f32>)],
+) -> Result<()> {
+    store.transaction(|tx| {
+        let mut meta = read_meta(tx, ns)?;
+        let mut cache = Cache::new();
+        for (doc_key, vector) in items {
+            insert_in_txn(tx, ns, p, &mut cache, &mut meta, doc_key, vector)?;
+            if cache.nodes.len() > BULK_CACHE_CAP {
+                cache.nodes.clear(); // dirty already flushed; reloads on demand
+            }
+        }
+        tx.put(ns, &[TAG_META], &encode_meta(meta))?;
+        Ok(())
+    })
+}
+
+fn read_meta(tx: &crate::store::WriteBatch<'_>, ns: &str) -> Result<Meta> {
+    Ok(match tx.get(ns, &[TAG_META])? {
+        Some(b) => decode_meta(&b),
+        None => Meta {
+            entry: None,
+            count: 0,
+        },
+    })
+}
+
+/// Insert one vector within an open transaction, flushing its touched nodes
+/// (so a following insert in the same transaction sees them) and updating
+/// `meta` in place. The caller persists `meta` and commits.
+fn insert_in_txn(
+    tx: &mut crate::store::WriteBatch<'_>,
+    ns: &str,
+    p: &DiskParams,
+    cache: &mut Cache,
+    meta: &mut Meta,
+    doc_key: &[u8],
+    vector: &[f32],
+) -> Result<()> {
+    {
         // Overwrite: tombstone the previous node for this key.
         if let Some(old_bytes) = tx.get(ns, &keymap_key(doc_key))? {
             let old_id = u64::from_be_bytes(old_bytes.as_slice().try_into().unwrap_or([0; 8]));
-            if let Some(node) = load(tx, ns, &mut cache, old_id)? {
+            if let Some(node) = load(tx, ns, cache, old_id)? {
                 let mut node = node;
                 node.deleted = true;
                 cache.nodes.insert(old_id, node);
@@ -274,14 +326,14 @@ pub(crate) fn insert(
         tx.put(ns, &keymap_key(doc_key), &id.to_be_bytes())?;
 
         if let Some(entry) = meta.entry {
-            let top = load(tx, ns, &mut cache, entry)?
+            let top = load(tx, ns, cache, entry)?
                 .map(|n| n.layers.len() - 1)
                 .unwrap_or(0);
 
             // Greedy descent above the new node's level.
             let mut cur = entry;
             for layer in ((level + 1)..=top).rev() {
-                let w = search_layer(tx, ns, p, &mut cache, vector, &[cur], 1, layer)?;
+                let w = search_layer(tx, ns, p, cache, vector, &[cur], 1, layer)?;
                 if let Some(c) = w.first() {
                     cur = c.id;
                 }
@@ -290,16 +342,7 @@ pub(crate) fn insert(
             // Connect on each layer at/below the new node's level.
             let start = level.min(top);
             for layer in (0..=start).rev() {
-                let w = search_layer(
-                    tx,
-                    ns,
-                    p,
-                    &mut cache,
-                    vector,
-                    &[cur],
-                    p.ef_construction,
-                    layer,
-                )?;
+                let w = search_layer(tx, ns, p, cache, vector, &[cur], p.ef_construction, layer)?;
                 let m_layer = p.neighbors_at(layer);
                 let neighbors: Vec<u64> = w.iter().take(m_layer).map(|c| c.id).collect();
 
@@ -312,7 +355,7 @@ pub(crate) fn insert(
                         let overflow = node.layers[layer].len() > m_layer;
                         cache.dirty.insert(nb);
                         if overflow {
-                            prune(tx, ns, p, &mut cache, nb, layer, m_layer)?;
+                            prune(tx, ns, p, cache, nb, layer, m_layer)?;
                         }
                     }
                 }
@@ -328,16 +371,17 @@ pub(crate) fn insert(
             meta.entry = Some(id);
         }
 
-        // Flush dirty nodes and metadata.
-        let dirty: Vec<u64> = cache.dirty.iter().copied().collect();
+        // Flush this insert's touched nodes (so a later insert in the same
+        // transaction sees them via read-your-writes). Drain dirty but keep the
+        // nodes cached for reuse by the next insert in a bulk batch.
+        let dirty: Vec<u64> = cache.dirty.drain().collect();
         for nid in dirty {
             if let Some(node) = cache.nodes.get(&nid) {
                 tx.put(ns, &node_key(nid), &encode_node(node))?;
             }
         }
-        tx.put(ns, &[TAG_META], &encode_meta(meta))?;
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 /// Delete `doc_key` from the index (tombstone). Returns whether it existed.
