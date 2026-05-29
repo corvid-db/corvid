@@ -208,14 +208,17 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 - **L4 fluent builder** (`builder.rs`): `collection.query().filter().vector().text().fuse_rrf().rerank_mmr().select().limit().run()` — filter runs *before* ranking (true predicate). Plus `count`/`group_count` aggregation terminals. The keystone.
 - **HNSW index** (`hnsw.rs`, `index.rs`): in-memory HNSW, recall-tested vs the exact baseline. `Collection::create_vector_index` registers a derived index that `vector_search` uses transparently; documents are the source of truth and the index rebuilds on staleness after writes (reconcile-on-open path).
 - **Graph** (`graph.rs`): directed `link`/`unlink`/`neighbors`/bounded-BFS `traverse` over document keys, edges in a sibling namespace via prefix scan.
+- **Semantic cache** (`semantic_cache.rs`): vector-keyed cache (`put`/`get` within a distance threshold) over `vector_search`.
+- **Reactive** (`reactive.rs`): in-process `subscribe`/`unsubscribe` change feeds; deadlock-free synchronous notify on insert/delete.
+- **Sketches** (`sketch.rs`): HyperLogLog (`Collection::approx_distinct`) and a Bloom filter.
 - **Sidecar** (`corvid-mcp`): a runnable MCP server over stdio (`initialize`/`tools/list`/`tools/call`) exposing `store`/`get`/`delete`/`search`/`create_index`/`link`/`unlink`/`neighbors`/`traverse`, with a `main` binary and a CLI integration test.
 
 **Not yet built:**
 - Persisting the HNSW graph as redb entries (the full `(b) state-in-redb` form; today the index is in-memory/derived). Inverted index for BM25; secondary scalar B+-tree (filter/FTS are exact scans).
 - Cross-collection joins.
 - Wiring ANN into the builder's `.vector()` for the no-filter case (the standalone `vector_search` already uses it).
-- WASM/OPFS backend; mobile pread/pwrite hardening.
-- Everything under *Out of v0.1* not listed above (spatial, sketches, time-series, reactive, semantic cache).
+- WASM/OPFS backend; mobile pread/pwrite hardening (need a wasm toolchain / device harness, not exercisable in the current environment).
+- Remaining *Out of v0.1* peripherals not yet built: spatial (R-tree/H3), time-series compression, embedding-as-column-type auto-pipeline.
 
 ---
 
