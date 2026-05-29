@@ -29,20 +29,33 @@ impl Collection<'_> {
     /// shape (or a missing field, or no matching document) yields `right:
     /// None`. Rows are returned in this collection's key order.
     pub fn join(&self, other: &str, foreign_key_field: &str) -> Result<Vec<JoinRow>> {
-        let mut rows = Vec::new();
-        for (key, left) in self.scan()? {
-            let foreign_key = match left.get(foreign_key_field) {
-                Some(Value::Text(s)) => Some(s.clone().into_bytes()),
-                Some(Value::Bytes(b)) => Some(b.clone()),
-                _ => None,
-            };
-            let right = match &foreign_key {
-                Some(fk) => self.db().collection(other).get(fk)?,
-                None => None,
-            };
-            rows.push(JoinRow { key, left, right });
-        }
-        Ok(rows)
+        let left = self.scan()?;
+        // Resolve every right-hand reference within one read snapshot, rather
+        // than opening a fresh transaction per row.
+        self.db().store().read(|reader| {
+            let mut rows = Vec::with_capacity(left.len());
+            for (key, left_doc) in left {
+                let foreign_key = match left_doc.get(foreign_key_field) {
+                    Some(Value::Text(s)) => Some(s.clone().into_bytes()),
+                    Some(Value::Bytes(b)) => Some(b.clone()),
+                    Some(Value::Int(i)) => Some(i.to_string().into_bytes()),
+                    _ => None,
+                };
+                let right = match &foreign_key {
+                    Some(fk) => match reader.get(other, fk)? {
+                        Some(bytes) => Some(Value::decode(&bytes)?),
+                        None => None,
+                    },
+                    None => None,
+                };
+                rows.push(JoinRow {
+                    key,
+                    left: left_doc,
+                    right,
+                });
+            }
+            Ok(rows)
+        })
     }
 }
 

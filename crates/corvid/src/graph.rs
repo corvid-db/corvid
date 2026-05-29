@@ -21,25 +21,26 @@ impl Collection<'_> {
     /// `to`?".
     pub fn link(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<()> {
         self.ensure_writable()?;
-        self.db()
-            .store()
-            .put(&self.edges_name(), &edge_key(relation, from, to), b"")?;
-        self.db()
-            .store()
-            .put(&self.redges_name(), &edge_key(relation, to, from), b"")
+        let (forward, reverse) = (self.edges_name(), self.redges_name());
+        let (fwd_key, rev_key) = (edge_key(relation, from, to), edge_key(relation, to, from));
+        // Forward and reverse edges commit together — no half-linked state.
+        self.db().store().transaction(|tx| {
+            tx.put(&forward, &fwd_key, b"")?;
+            tx.put(&reverse, &rev_key, b"")?;
+            Ok(())
+        })
     }
 
-    /// Remove the edge `from --relation--> to` (and its reverse). Returns
-    /// whether the forward edge existed.
+    /// Remove the edge `from --relation--> to` (and its reverse), atomically.
+    /// Returns whether the forward edge existed.
     pub fn unlink(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<bool> {
-        let removed = self
-            .db()
-            .store()
-            .delete(&self.edges_name(), &edge_key(relation, from, to))?;
-        self.db()
-            .store()
-            .delete(&self.redges_name(), &edge_key(relation, to, from))?;
-        Ok(removed)
+        let (forward, reverse) = (self.edges_name(), self.redges_name());
+        let (fwd_key, rev_key) = (edge_key(relation, from, to), edge_key(relation, to, from));
+        self.db().store().transaction(|tx| {
+            let removed = tx.delete(&forward, &fwd_key)?;
+            tx.delete(&reverse, &rev_key)?;
+            Ok(removed)
+        })
     }
 
     /// Return the targets of every `from --relation--> ?` edge, in key order.
