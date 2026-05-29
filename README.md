@@ -80,6 +80,7 @@ computed among matching documents, never a post-hoc trim.
 | Reactive change feeds | ✅ |
 | Online consistent backup (`Db::backup`) | ✅ |
 | Optional declared schema (`set_schema`): types/required/unique | ✅ |
+| Per-record TTL / expiry (`insert_with_ttl`, `purge_expired`) | ✅ injected clock |
 | MCP sidecar over stdio | ✅ |
 | WASM build (engine, ≈0.2 MB gzipped, CI-enforced) | ✅ in-memory; OPFS persistence ⏳ |
 | Mobile cross-compile (aarch64 iOS/Android) | ✅ engine builds |

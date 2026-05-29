@@ -47,6 +47,9 @@ format and API may change without backward-compatibility guarantees.
 - Filter predicates (`field().gt()`, and/or/not, dotted paths, `within_km` geo).
 - Optional per-collection declared schema (`set_schema`): field types,
   `required`, and `unique` enforced on write; schemaless collections unaffected.
+- Per-record TTL/expiry (`insert_with_ttl`/`set_ttl`/`purge_expired`): time is
+  injected (no engine clock); `purge_expired(now)` reclaims due records via the
+  normal delete path. Sorted TTL index; persists across reopen.
 - Directed property graph: `link`/`unlink`/`neighbors`/`in_neighbors`/`traverse`.
 - Geospatial radius / bounding-box queries (haversine).
 - Cross-collection lookup joins, semantic (vector-keyed) cache, in-process

@@ -27,6 +27,7 @@ pub struct Db {
     scalar: Mutex<crate::scalar::ScalarState>,
     geo: Mutex<crate::geo_index::GeoState>,
     schemas: Mutex<crate::schema::SchemaState>,
+    ttl: Mutex<crate::ttl::TtlState>,
     subscribers: Mutex<Subscribers>,
 }
 
@@ -40,6 +41,7 @@ impl Db {
             scalar: crate::scalar::new_state(),
             geo: crate::geo_index::new_state(),
             schemas: crate::schema::new_state(),
+            ttl: crate::ttl::new_state(),
             subscribers: Mutex::new(Subscribers::default()),
         };
         db.load_index_defs()?;
@@ -48,6 +50,7 @@ impl Db {
         db.load_compound_defs()?;
         db.load_geo_defs()?;
         db.load_schemas()?;
+        db.load_ttl_collections()?;
         Ok(db)
     }
 
@@ -60,6 +63,7 @@ impl Db {
             scalar: crate::scalar::new_state(),
             geo: crate::geo_index::new_state(),
             schemas: crate::schema::new_state(),
+            ttl: crate::ttl::new_state(),
             subscribers: Mutex::new(Subscribers::default()),
         };
         db.load_index_defs()?;
@@ -68,6 +72,7 @@ impl Db {
         db.load_compound_defs()?;
         db.load_geo_defs()?;
         db.load_schemas()?;
+        db.load_ttl_collections()?;
         Ok(db)
     }
 
@@ -127,6 +132,11 @@ impl Db {
         &self.schemas
     }
 
+    /// The TTL/expiry registry.
+    pub(crate) fn ttl(&self) -> &Mutex<crate::ttl::TtlState> {
+        &self.ttl
+    }
+
     /// The change-feed subscriber registry.
     pub(crate) fn subscribers(&self) -> &Mutex<Subscribers> {
         &self.subscribers
@@ -173,6 +183,9 @@ impl Collection<'_> {
         self.db.scalar_on_insert(self.name, key, doc)?;
         self.db.compound_on_insert(self.name, key, doc)?;
         self.db.geo_on_insert(self.name, key, doc)?;
+        // A plain overwrite drops any prior expiry (a new expiry is set only via
+        // insert_with_ttl/set_ttl).
+        self.db.ttl_clear(self.name, key)?;
         self.db.notify(ChangeEvent {
             collection: self.name.to_owned(),
             key: key.to_vec(),
@@ -263,6 +276,7 @@ impl Collection<'_> {
             self.db.scalar_on_delete(self.name, key)?;
             self.db.compound_on_delete(self.name, key)?;
             self.db.geo_on_delete(self.name, key)?;
+            self.db.ttl_clear(self.name, key)?;
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
                 key: key.to_vec(),

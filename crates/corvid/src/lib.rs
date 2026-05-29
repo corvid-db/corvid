@@ -34,6 +34,7 @@ pub mod semantic_cache;
 pub mod sketch;
 pub mod store;
 pub mod text;
+pub mod ttl;
 pub mod value;
 
 pub use builder::{QueryBuilder, ResultRow};
