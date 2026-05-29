@@ -50,7 +50,8 @@ computed among matching documents, never a post-hoc trim.
   no networking).
 - **`corvid-mcp`** — a sidecar that exposes a corvid store to agentic coding
   tools over MCP (JSON-RPC on stdio). Run `corvid-mcp [PATH]` and point an MCP
-  client at it; tools: `store`, `get`, `delete`, `search`.
+  client at it; tools: `store`, `get`, `delete`, `search`, `create_index`,
+  `link`, `unlink`, `neighbors`, `traverse`.
 
 ## Capabilities (v0.1)
 
@@ -63,13 +64,18 @@ computed among matching documents, never a post-hoc trim.
 | Filter predicates (`field().gt()`, and/or/not, dotted paths) | ✅ |
 | Rank fusion (RRF) and MMR diversification | ✅ |
 | Fluent multi-modal query builder + projection + aggregation | ✅ |
-| HNSW approximate index | ✅ standalone (engine wiring in progress) |
+| HNSW approximate index (`create_vector_index`) | ✅ in-memory, derived |
+| Directed property graph (`link`/`neighbors`/`traverse`) | ✅ |
+| Semantic (vector-keyed) cache | ✅ |
 | MCP sidecar over stdio | ✅ |
-| Persistent ANN index, graph, WASM/browser, mobile | ⏳ planned |
+| Persisted ANN graph, WASM/browser, mobile | ⏳ planned |
 
-Vector and text search are currently **exact** (brute-force over a scan) — the
-correctness baseline. The HNSW index exists and is recall-tested against that
-baseline; wiring it into the transactional write path is the next step.
+Vector and text search are **exact** (brute-force over a scan) by default — the
+correctness baseline. Calling `create_vector_index` registers an HNSW index
+that `vector_search` then uses transparently (approximate, faster); the index
+is derived from the documents and rebuilt automatically after writes, so it is
+never stale at query time. Persisting the graph to disk (rather than rebuilding
+in memory on open) is planned.
 
 ## Design
 
