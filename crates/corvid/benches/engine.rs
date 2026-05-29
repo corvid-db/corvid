@@ -10,9 +10,15 @@ use criterion::{Criterion, criterion_group, criterion_main};
 fn nested_value() -> Value {
     let mut inner = BTreeMap::new();
     inner.insert("embedding".to_owned(), Value::Vector(vec![0.1; 64]));
-    inner.insert("tags".to_owned(), Value::Array(vec![Value::Text("a".into()); 8]));
+    inner.insert(
+        "tags".to_owned(),
+        Value::Array(vec![Value::Text("a".into()); 8]),
+    );
     let mut m = BTreeMap::new();
-    m.insert("title".to_owned(), Value::Text("a benchmark document".into()));
+    m.insert(
+        "title".to_owned(),
+        Value::Text("a benchmark document".into()),
+    );
     m.insert("n".to_owned(), Value::Int(42));
     m.insert("meta".to_owned(), Value::Map(inner));
     Value::Map(m)
@@ -64,12 +70,18 @@ fn bench_hnsw(c: &mut Criterion) {
 fn bench_text(c: &mut Criterion) {
     let db = Db::open_in_memory().unwrap();
     let coll = db.collection("docs");
-    let words = ["rust", "embedded", "database", "vector", "search", "graph", "fox", "dog"];
+    let words = [
+        "rust", "embedded", "database", "vector", "search", "graph", "fox", "dog",
+    ];
     for i in 0..2000 {
-        let body: String = (0..20).map(|j| words[(i + j) % words.len()]).collect::<Vec<_>>().join(" ");
+        let body: String = (0..20)
+            .map(|j| words[(i + j) % words.len()])
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut m = BTreeMap::new();
         m.insert("body".to_owned(), Value::Text(body));
-        coll.insert(format!("k{i}").as_bytes(), &Value::Map(m)).unwrap();
+        coll.insert(format!("k{i}").as_bytes(), &Value::Map(m))
+            .unwrap();
     }
     c.bench_function("bm25_exact_2k", |b| {
         b.iter(|| coll.text_search("body", "rust database", 10).unwrap())

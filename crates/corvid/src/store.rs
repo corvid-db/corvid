@@ -9,12 +9,16 @@
 //!
 //! Writes go through [`Store::transaction`], which exposes a [`WriteBatch`]
 //! and commits once at the end — every operation in the closure lands
-//! atomically or not at all. This is the foundation the cross-modal
-//! consistency invariant is built on: a row and all of its derived index
-//! entries are written in a single transaction. Reads go through
-//! [`Store::read`], which exposes a [`ReadBatch`] over one consistent
-//! snapshot. The single-op helpers ([`Store::put`] etc.) are thin wrappers
-//! over these.
+//! atomically or not at all. This underpins atomic multi-key writes such as a
+//! graph edge and its reverse. Reads go through [`Store::read`], which exposes
+//! a [`ReadBatch`] over one consistent snapshot. The single-op helpers
+//! ([`Store::put`] etc.) are thin wrappers over these.
+//!
+//! Derived indexes (vector, full-text) are *not* written inside the document's
+//! transaction. They are maintained incrementally in memory and rebuilt from
+//! the documents on open, so a query always sees an index consistent with the
+//! committed documents (documents are the source of truth); a crash can only
+//! lose in-memory index state, which is reconstructed on the next open.
 
 use std::ops::Bound;
 use std::path::Path;

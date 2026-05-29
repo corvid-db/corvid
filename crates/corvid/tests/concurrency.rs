@@ -43,7 +43,8 @@ fn concurrent_readers_and_a_writer_do_not_deadlock() {
     for i in 0..200i64 {
         let mut m = std::collections::BTreeMap::new();
         m.insert("v".to_owned(), Value::Vector(vec![i as f32, 0.0]));
-        c.insert(format!("k{i}").as_bytes(), &Value::Map(m)).unwrap();
+        c.insert(format!("k{i}").as_bytes(), &Value::Map(m))
+            .unwrap();
     }
 
     let mut handles = Vec::new();

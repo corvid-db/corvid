@@ -276,6 +276,46 @@ impl QueryBuilder<'_> {
         Ok(Some(out))
     }
 
+    /// Describe the query plan as a human-readable string (for debugging). Does
+    /// not execute the query, so it may be called before [`Self::run`].
+    pub fn explain(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(format!("scan({})", self.collection.name()));
+        if !self.filters.is_empty() {
+            parts.push(format!("filter x{}", self.filters.len()));
+        }
+        for src in &self.sources {
+            match src {
+                Source::Vector {
+                    field, k, metric, ..
+                } => parts.push(format!("vector({field}, k={k}, {metric:?})")),
+                Source::Text { field, k, .. } => parts.push(format!("text({field}, k={k})")),
+            }
+        }
+        if self.sources.len() > 1 {
+            parts.push(format!("rrf(k={})", self.rrf_k));
+        }
+        if let Some(l) = self.mmr_lambda {
+            parts.push(format!("mmr(lambda={l})"));
+        }
+        if self.approx {
+            parts.push("approx".to_owned());
+        }
+        if let Some((f, desc)) = &self.order_by {
+            parts.push(format!("order_by({f}{})", if *desc { " desc" } else { "" }));
+        }
+        if self.offset > 0 {
+            parts.push(format!("offset {}", self.offset));
+        }
+        if let Some(l) = self.limit {
+            parts.push(format!("limit {l}"));
+        }
+        if let Some(p) = &self.projection {
+            parts.push(format!("select [{}]", p.join(", ")));
+        }
+        parts.join(" | ")
+    }
+
     /// Execute the query and return the ranked rows.
     pub fn run(self) -> Result<Vec<ResultRow>> {
         // Use the ANN index when applicable; otherwise scan and filter exactly.
@@ -381,16 +421,48 @@ fn group_key(v: &Value) -> Option<String> {
     }
 }
 
-/// Narrow a document to the named top-level fields. Non-map documents pass
-/// through unchanged.
+/// Narrow a document to the named field paths, which may be dotted
+/// (`"meta.author"`); the projected structure is rebuilt nested. Missing paths
+/// are omitted. Non-map documents pass through unchanged.
 fn project(document: Value, fields: &[String]) -> Value {
-    match document {
-        Value::Map(mut map) => {
-            let kept = fields.iter().filter_map(|f| map.remove_entry(f)).collect();
-            Value::Map(kept)
-        }
-        other => other,
+    if !matches!(document, Value::Map(_)) {
+        return document;
     }
+    let mut out: BTreeMap<String, Value> = BTreeMap::new();
+    for path in fields {
+        if let Some(value) = resolve_path(&document, path) {
+            insert_path(&mut out, path, value.clone());
+        }
+    }
+    Value::Map(out)
+}
+
+/// Resolve a dotted path through nested maps.
+fn resolve_path<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = doc;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+/// Insert `value` at a dotted `path`, creating intermediate maps.
+fn insert_path(out: &mut BTreeMap<String, Value>, path: &str, value: Value) {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut cursor = out;
+    for seg in &parts[..parts.len() - 1] {
+        let entry = cursor
+            .entry((*seg).to_owned())
+            .or_insert_with(|| Value::Map(BTreeMap::new()));
+        if !matches!(entry, Value::Map(_)) {
+            *entry = Value::Map(BTreeMap::new());
+        }
+        cursor = match entry {
+            Value::Map(m) => m,
+            _ => unreachable!("just set to map"),
+        };
+    }
+    cursor.insert(parts[parts.len() - 1].to_owned(), value);
 }
 
 /// Rank the filtered set for one source and return its capped key list.
@@ -637,6 +709,49 @@ mod tests {
             assert!(map.contains_key("category"));
             assert!(!map.contains_key("body"));
         }
+    }
+
+    #[test]
+    fn select_supports_nested_paths() {
+        let db = Db::open_in_memory().unwrap();
+        let mut meta = BTreeMap::new();
+        meta.insert("author".to_owned(), Value::Text("rocky".into()));
+        meta.insert("year".to_owned(), Value::Int(2026));
+        let mut m = BTreeMap::new();
+        m.insert("title".to_owned(), Value::Text("hi".into()));
+        m.insert("meta".to_owned(), Value::Map(meta));
+        db.collection("docs").insert(b"k", &Value::Map(m)).unwrap();
+
+        let rows = db
+            .collection("docs")
+            .query()
+            .select(["title", "meta.author"])
+            .run()
+            .unwrap();
+        let mut expected_meta = BTreeMap::new();
+        expected_meta.insert("author".to_owned(), Value::Text("rocky".into()));
+        let mut expected = BTreeMap::new();
+        expected.insert("title".to_owned(), Value::Text("hi".into()));
+        expected.insert("meta".to_owned(), Value::Map(expected_meta));
+        assert_eq!(rows[0].document, Value::Map(expected));
+    }
+
+    #[test]
+    fn explain_describes_the_plan() {
+        let db = seed();
+        let q = db
+            .collection("docs")
+            .query()
+            .filter(field("category").eq(Value::Text("blog".into())))
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .order_by("category", true)
+            .limit(5);
+        let plan = q.explain();
+        assert!(plan.contains("scan(docs)"));
+        assert!(plan.contains("filter x1"));
+        assert!(plan.contains("vector(embedding"));
+        assert!(plan.contains("order_by(category desc)"));
+        assert!(plan.contains("limit 5"));
     }
 
     #[test]
