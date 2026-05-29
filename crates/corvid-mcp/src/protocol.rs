@@ -146,6 +146,74 @@ fn tools_list() -> Json {
                     },
                     "required": ["collection"]
                 }
+            },
+            {
+                "name": "create_index",
+                "description": "Create an HNSW vector index on a field to accelerate search.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "field": { "type": "string" },
+                        "metric": { "type": "string", "enum": ["cosine", "dot", "l2"] }
+                    },
+                    "required": ["collection", "field"]
+                }
+            },
+            {
+                "name": "link",
+                "description": "Add a directed edge from --relation--> to between document keys.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "from": { "type": "string" },
+                        "relation": { "type": "string" },
+                        "to": { "type": "string" }
+                    },
+                    "required": ["collection", "from", "relation", "to"]
+                }
+            },
+            {
+                "name": "unlink",
+                "description": "Remove a directed edge from --relation--> to.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "from": { "type": "string" },
+                        "relation": { "type": "string" },
+                        "to": { "type": "string" }
+                    },
+                    "required": ["collection", "from", "relation", "to"]
+                }
+            },
+            {
+                "name": "neighbors",
+                "description": "List the targets of from --relation--> ? edges.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "from": { "type": "string" },
+                        "relation": { "type": "string" }
+                    },
+                    "required": ["collection", "from", "relation"]
+                }
+            },
+            {
+                "name": "traverse",
+                "description": "Breadth-first traversal following a relation up to N hops.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "start": { "type": "string" },
+                        "relation": { "type": "string" },
+                        "hops": { "type": "integer" }
+                    },
+                    "required": ["collection", "start", "relation", "hops"]
+                }
             }
         ]
     })
@@ -217,7 +285,19 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec!["store", "get", "delete", "search"]);
+        for expected in [
+            "store",
+            "get",
+            "delete",
+            "search",
+            "create_index",
+            "link",
+            "unlink",
+            "neighbors",
+            "traverse",
+        ] {
+            assert!(names.contains(&expected), "missing tool {expected}");
+        }
     }
 
     #[test]

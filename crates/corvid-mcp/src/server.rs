@@ -53,6 +53,11 @@ impl Server {
             "get" => self.get(params),
             "delete" => self.delete(params),
             "search" => self.search(params),
+            "link" => self.link(params),
+            "unlink" => self.unlink(params),
+            "neighbors" => self.neighbors(params),
+            "traverse" => self.traverse(params),
+            "create_index" => self.create_index(params),
             other => Err(ToolError::UnknownTool(other.to_owned())),
         }
     }
@@ -153,6 +158,69 @@ impl Server {
             .collect();
         Ok(json!({ "results": results }))
     }
+
+    fn link(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let from = str_param(p, "from")?;
+        let relation = str_param(p, "relation")?;
+        let to = str_param(p, "to")?;
+        self.db
+            .collection(collection)
+            .link(from.as_bytes(), relation, to.as_bytes())?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn unlink(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let from = str_param(p, "from")?;
+        let relation = str_param(p, "relation")?;
+        let to = str_param(p, "to")?;
+        let removed =
+            self.db
+                .collection(collection)
+                .unlink(from.as_bytes(), relation, to.as_bytes())?;
+        Ok(json!({ "removed": removed }))
+    }
+
+    fn neighbors(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let from = str_param(p, "from")?;
+        let relation = str_param(p, "relation")?;
+        let neighbors = self
+            .db
+            .collection(collection)
+            .neighbors(from.as_bytes(), relation)?;
+        Ok(json!({ "neighbors": keys_to_json(&neighbors) }))
+    }
+
+    fn traverse(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let start = str_param(p, "start")?;
+        let relation = str_param(p, "relation")?;
+        let hops = uint_param(p, "hops")?;
+        let nodes = self
+            .db
+            .collection(collection)
+            .traverse(start.as_bytes(), relation, hops)?;
+        Ok(json!({ "nodes": keys_to_json(&nodes) }))
+    }
+
+    fn create_index(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let field = str_param(p, "field")?;
+        let metric = parse_metric(p.get("metric"))?;
+        self.db
+            .collection(collection)
+            .create_vector_index(field, metric);
+        Ok(json!({ "ok": true }))
+    }
+}
+
+/// Render a list of byte keys as JSON strings.
+fn keys_to_json(keys: &[Vec<u8>]) -> Vec<Json> {
+    keys.iter()
+        .map(|k| Json::String(String::from_utf8_lossy(k).into_owned()))
+        .collect()
 }
 
 /// Parse a filter predicate tree from JSON.
@@ -520,6 +588,99 @@ mod tests {
                 "expected BadParams for {bad}"
             );
         }
+    }
+
+    #[test]
+    fn graph_link_neighbors_unlink() {
+        let s = server();
+        s.handle(
+            "link",
+            &json!({"collection": "g", "from": "a", "relation": "knows", "to": "b"}),
+        )
+        .unwrap();
+        s.handle(
+            "link",
+            &json!({"collection": "g", "from": "a", "relation": "knows", "to": "c"}),
+        )
+        .unwrap();
+
+        let n = s
+            .handle(
+                "neighbors",
+                &json!({"collection": "g", "from": "a", "relation": "knows"}),
+            )
+            .unwrap();
+        assert_eq!(n["neighbors"], json!(["b", "c"]));
+
+        let r = s
+            .handle(
+                "unlink",
+                &json!({"collection": "g", "from": "a", "relation": "knows", "to": "b"}),
+            )
+            .unwrap();
+        assert_eq!(r["removed"], true);
+    }
+
+    #[test]
+    fn graph_traverse_multi_hop() {
+        let s = server();
+        for (from, to) in [("a", "b"), ("b", "c"), ("c", "d")] {
+            s.handle(
+                "link",
+                &json!({"collection": "g", "from": from, "relation": "r", "to": to}),
+            )
+            .unwrap();
+        }
+        let out = s
+            .handle(
+                "traverse",
+                &json!({"collection": "g", "start": "a", "relation": "r", "hops": 2}),
+            )
+            .unwrap();
+        assert_eq!(out["nodes"], json!(["b", "c"]));
+    }
+
+    #[test]
+    fn create_index_then_search_uses_it() {
+        let s = server();
+        store(&s, "a", json!({"embedding": {"$vector": [1.0, 0.0]}}));
+        store(&s, "b", json!({"embedding": {"$vector": [0.0, 1.0]}}));
+        let created = s
+            .handle(
+                "create_index",
+                &json!({"collection": "docs", "field": "embedding", "metric": "cosine"}),
+            )
+            .unwrap();
+        assert_eq!(created, json!({"ok": true}));
+
+        let out = s
+            .handle(
+                "search",
+                &json!({
+                    "collection": "docs",
+                    "vector": {"field": "embedding", "query": [1.0, 0.0], "k": 1, "metric": "cosine"}
+                }),
+            )
+            .unwrap();
+        assert_eq!(out["results"][0]["key"], "a");
+    }
+
+    #[test]
+    fn graph_tools_validate_params() {
+        let s = server();
+        assert!(matches!(
+            s.handle("link", &json!({"collection": "g", "from": "a"}))
+                .unwrap_err(),
+            ToolError::BadParams(_)
+        ));
+        assert!(matches!(
+            s.handle(
+                "traverse",
+                &json!({"collection": "g", "start": "a", "relation": "r"})
+            )
+            .unwrap_err(),
+            ToolError::BadParams(_)
+        ));
     }
 
     #[test]

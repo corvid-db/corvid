@@ -92,7 +92,6 @@ fn neighbor_prefix(relation: &str, from: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::Db;
 
     #[test]
