@@ -23,9 +23,10 @@ format and API may change without backward-compatibility guarantees.
   `create_vector_index_ondisk_quantized` for binary/scalar on-disk footprint),
   on-disk inverted text index (`create_text_index_ondisk`), and a scalar
   secondary index (`create_scalar_index`) making equality/range filters and
-  counts sub-linear instead of full scans, and a spatial index
-  (`create_geo_index`) making radius/bbox geo queries scan only nearby grid
-  cells.
+  counts sub-linear instead of full scans, a compound multi-field index
+  (`create_compound_index`) for prefix-equality + trailing-range queries, and a
+  spatial index (`create_geo_index`) making radius/bbox geo queries scan only
+  nearby grid cells.
 - Quantization extracted to a shared module used by both the in-memory and
   on-disk vector indexes.
 - Online backup: `Db::backup(path)` / `Store::backup(path)` (and MCP `backup`)

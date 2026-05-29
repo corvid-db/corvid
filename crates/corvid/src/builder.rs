@@ -427,13 +427,87 @@ impl QueryBuilder<'_> {
 
         let keys = match scalar_keys {
             Some(keys) => keys,
-            None => match self.geo_candidate_keys()? {
+            None => match self.compound_candidate_keys()? {
                 Some(keys) => keys,
-                None => return Ok(None),
+                None => match self.geo_candidate_keys()? {
+                    Some(keys) => keys,
+                    None => return Ok(None),
+                },
             },
         };
 
         self.verify_candidates(keys)
+    }
+
+    /// If a compound index's leading fields are pinned by equality filters
+    /// (optionally with a range on the next field), the candidate keys for that
+    /// prefix window (a verified superset), else `None`. Picks the index that
+    /// matches the longest equality prefix.
+    fn compound_candidate_keys(&self) -> Result<Option<Vec<Vec<u8>>>> {
+        const CANDIDATE_CAP: usize = 100_000;
+        let db = self.collection.db();
+        let coll = self.collection.name();
+
+        // Index this query's comparisons by field path.
+        let by_field = |field: &str| -> Vec<(CmpOp, &Value)> {
+            self.filters
+                .iter()
+                .filter_map(|p| match p {
+                    Predicate::Compare { path, op, value } if path == field => Some((*op, value)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let mut best: Option<(Vec<String>, usize, bool)> = None; // (fields, prefix_len, has_tail)
+        for fields in db.compound_indexes(coll) {
+            // Longest leading run of fields each constrained by an equality.
+            let mut prefix_len = 0;
+            while prefix_len < fields.len()
+                && by_field(&fields[prefix_len])
+                    .iter()
+                    .any(|(op, _)| *op == CmpOp::Eq)
+            {
+                prefix_len += 1;
+            }
+            // A range/eq on the field right after the prefix extends the window.
+            let has_tail = prefix_len < fields.len() && !by_field(&fields[prefix_len]).is_empty();
+            if prefix_len == 0 && !has_tail {
+                continue; // leading field unconstrained → index unusable
+            }
+            let score = prefix_len + has_tail as usize;
+            if best
+                .as_ref()
+                .is_none_or(|(_, b, t)| score > *b + *t as usize)
+            {
+                best = Some((fields, prefix_len, has_tail));
+            }
+        }
+
+        let Some((fields, prefix_len, has_tail)) = best else {
+            return Ok(None);
+        };
+
+        // Build the equality prefix values (first matching Eq per field).
+        let mut eq_prefix: Vec<&Value> = Vec::with_capacity(prefix_len);
+        for f in &fields[..prefix_len] {
+            let v = by_field(f).into_iter().find(|(op, _)| *op == CmpOp::Eq);
+            match v {
+                Some((_, value)) => eq_prefix.push(value),
+                None => return Ok(None),
+            }
+        }
+        // Tail constraints on the next field, if any.
+        let tail: Vec<crate::scalar::Constraint<'_>> = if has_tail {
+            by_field(&fields[prefix_len])
+                .into_iter()
+                .map(|(op, value)| crate::scalar::Constraint { op, value })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        db.compound_candidates(coll, &fields, &eq_prefix, &tail, CANDIDATE_CAP)
     }
 
     /// If a top-level `GeoWithin` filter targets a geo-indexed field, the

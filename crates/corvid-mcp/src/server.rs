@@ -61,6 +61,7 @@ impl Server {
             "create_text_index" => self.create_text_index(params),
             "create_scalar_index" => self.create_scalar_index(params),
             "create_geo_index" => self.create_geo_index(params),
+            "create_compound_index" => self.create_compound_index(params),
             "backup" => self.backup(params),
             "geo" => self.geo(params),
             "join" => self.join(params),
@@ -268,6 +269,26 @@ impl Server {
         let collection = str_param(p, "collection")?;
         let field = str_param(p, "field")?;
         self.db.collection(collection).create_geo_index(field)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn create_compound_index(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let fields = p
+            .get("fields")
+            .and_then(Json::as_array)
+            .ok_or_else(|| ToolError::BadParams("'fields' must be an array".into()))?;
+        let fields: Vec<&str> = fields
+            .iter()
+            .map(|f| f.as_str())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ToolError::BadParams("'fields' must be strings".into()))?;
+        if fields.is_empty() {
+            return Err(ToolError::BadParams("'fields' must be non-empty".into()));
+        }
+        self.db
+            .collection(collection)
+            .create_compound_index(&fields)?;
         Ok(json!({ "ok": true }))
     }
 

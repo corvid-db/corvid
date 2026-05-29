@@ -296,6 +296,18 @@ fn tools_list() -> Json {
                 }
             },
             {
+                "name": "create_compound_index",
+                "description": "Create a compound scalar index over an ordered list of fields, so queries with equality on a leading prefix (plus an optional range on the next field) are sub-linear.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "fields": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["collection", "fields"]
+                }
+            },
+            {
                 "name": "backup",
                 "description": "Write a consistent point-in-time backup of the whole database to a new file at the given path. Safe to run while writers are active.",
                 "inputSchema": {
@@ -421,6 +433,7 @@ mod tests {
             "create_text_index",
             "create_scalar_index",
             "create_geo_index",
+            "create_compound_index",
             "backup",
             "list_collections",
             "count",

@@ -37,19 +37,30 @@ const LANE_BOOL: u8 = 0x01;
 const LANE_NUM: u8 = 0x02;
 const LANE_TEXT: u8 = 0x03;
 
-/// Per-database scalar-index registry: the set of `(collection, field)` indexed.
+/// Reserved collection holding persisted compound-index definitions.
+const COMPOUND_DEFS: &str = "__cscalar_indexes__";
+
+/// Per-database scalar-index registry.
 #[derive(Default)]
 pub(crate) struct ScalarState {
+    /// Single-field indexes: `(collection, field)`.
     defs: std::collections::HashSet<(String, String)>,
+    /// Compound indexes: `(collection, ordered field list)`.
+    compound: Vec<(String, Vec<String>)>,
 }
 
 pub(crate) fn new_state() -> std::sync::Mutex<ScalarState> {
     std::sync::Mutex::new(ScalarState::default())
 }
 
-/// The reserved collection backing a scalar index.
+/// The reserved collection backing a single-field scalar index.
 pub(crate) fn namespace(collection: &str, field: &str) -> String {
     format!("__scalar__{collection}__{field}")
+}
+
+/// The reserved collection backing a compound index over `fields`.
+pub(crate) fn compound_namespace(collection: &str, fields: &[String]) -> String {
+    format!("__cscalar__{collection}__{}", fields.join("\u{1}"))
 }
 
 // ---- order-preserving encoding ----
@@ -308,6 +319,125 @@ fn next_after(key: &[u8]) -> Vec<u8> {
     k
 }
 
+// ---- compound (multi-field) index ----
+
+/// Encode an ordered tuple of values into one composite key prefix. Each value
+/// uses the same self-delimiting encoding, so concatenation stays
+/// order-preserving and parseable. `None` if any value is non-indexable.
+fn encode_tuple(values: &[&Value]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for v in values {
+        out.extend_from_slice(&encode_value(v)?);
+    }
+    Some(out)
+}
+
+/// Skip `n` self-delimiting value encodings from the start of `key`; returns the
+/// offset where the next field (or the doc key) begins.
+fn skip_values(key: &[u8], n: usize) -> Option<usize> {
+    let mut pos = 0;
+    for _ in 0..n {
+        let rel = terminator_pos(&key[pos..])?;
+        pos += rel + 2; // value bytes + 0x00 0x00 terminator
+    }
+    Some(pos)
+}
+
+/// Index `doc_key`'s tuple of field values (composite). Missing/non-indexable
+/// any field → the document is simply not in this index.
+fn compound_insert_in_txn(
+    tx: &mut crate::store::WriteBatch<'_>,
+    ns: &str,
+    doc_key: &[u8],
+    values: &[&Value],
+) -> Result<()> {
+    compound_remove_in_txn(tx, ns, doc_key)?;
+    if let Some(enc) = encode_tuple(values) {
+        let mut idx_key = enc.clone();
+        idx_key.extend_from_slice(doc_key);
+        tx.put(ns, &idx_key, &[])?;
+        tx.put(ns, &fwd_key(doc_key), &enc)?;
+    }
+    Ok(())
+}
+
+fn compound_remove_in_txn(
+    tx: &mut crate::store::WriteBatch<'_>,
+    ns: &str,
+    doc_key: &[u8],
+) -> Result<()> {
+    if let Some(enc) = tx.get(ns, &fwd_key(doc_key))? {
+        let mut idx_key = enc;
+        idx_key.extend_from_slice(doc_key);
+        tx.delete(ns, &idx_key)?;
+        tx.delete(ns, &fwd_key(doc_key))?;
+    }
+    Ok(())
+}
+
+/// Scan a compound index: a fixed equality `prefix` over the leading fields,
+/// then an optional range `window` over the next field. Returns a verified
+/// superset of doc keys, or `None` if it would exceed `cap`. `n_fields` is the
+/// index arity (to locate the doc key past all encoded values).
+fn compound_candidates(
+    store: &Store,
+    ns: &str,
+    prefix: &[u8],
+    tail: Option<(Vec<u8>, Option<Vec<u8>>)>,
+    n_fields: usize,
+    cap: usize,
+) -> Result<Option<Vec<Vec<u8>>>> {
+    // Start at prefix (+ tail lower bound); a missing lower bound starts right
+    // after the prefix.
+    let mut start = prefix.to_vec();
+    let upper = match &tail {
+        Some((lower, upper)) => {
+            start.extend_from_slice(lower);
+            upper.clone()
+        }
+        None => None,
+    };
+
+    let mut out = Vec::new();
+    let mut cursor = start;
+    loop {
+        let page = store.scan_from(ns, &cursor, PAGE)?;
+        if page.is_empty() {
+            break;
+        }
+        let mut advanced = false;
+        for (key, _) in &page {
+            if !key.starts_with(prefix) {
+                advanced = false;
+                break;
+            }
+            // Enforce the tail upper bound on the next field's value portion.
+            if let Some(up) = &upper {
+                let rest = &key[prefix.len()..];
+                match terminator_pos(rest) {
+                    Some(end) if &rest[..end] > up.as_slice() => {
+                        advanced = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(doc_start) = skip_values(key, n_fields) {
+                out.push(key[doc_start..].to_vec());
+                if out.len() > cap {
+                    return Ok(None);
+                }
+            }
+            advanced = true;
+        }
+        if !advanced {
+            break;
+        }
+        cursor = next_after(&page.last().unwrap().0);
+    }
+    Ok(Some(out))
+}
+
 impl Db {
     /// Load persisted scalar-index definitions. Called once on open.
     pub(crate) fn load_scalar_defs(&self) -> Result<()> {
@@ -390,6 +520,132 @@ impl Db {
         let ns = namespace(collection, field);
         window_candidates(self.store(), &ns, lane, &lower, upper.as_deref(), cap)
     }
+
+    /// Load persisted compound-index definitions. Called once on open.
+    pub(crate) fn load_compound_defs(&self) -> Result<()> {
+        let mut state = self.scalar().lock().expect("scalar lock");
+        for (key, _) in self.store().scan(COMPOUND_DEFS)? {
+            if let Some(def) = split_compound_def_key(&key) {
+                state.compound.push(def);
+            }
+        }
+        Ok(())
+    }
+
+    /// Register (or replace) a compound index over `fields` for `collection`.
+    pub(crate) fn register_compound_index(
+        &self,
+        collection: &str,
+        fields: &[String],
+    ) -> Result<()> {
+        self.store()
+            .put(COMPOUND_DEFS, &compound_def_key(collection, fields), b"")?;
+        let mut state = self.scalar().lock().expect("scalar lock");
+        let entry = (collection.to_owned(), fields.to_vec());
+        if !state.compound.contains(&entry) {
+            state.compound.push(entry);
+        }
+        Ok(())
+    }
+
+    /// Compound indexes registered on `collection` (ordered field lists).
+    pub(crate) fn compound_indexes(&self, collection: &str) -> Vec<Vec<String>> {
+        let state = self.scalar().lock().expect("scalar lock");
+        state
+            .compound
+            .iter()
+            .filter(|(c, _)| c == collection)
+            .map(|(_, f)| f.clone())
+            .collect()
+    }
+
+    /// Maintain every compound index on `collection` after a document write.
+    pub(crate) fn compound_on_insert(
+        &self,
+        collection: &str,
+        key: &[u8],
+        doc: &Value,
+    ) -> Result<()> {
+        for fields in self.compound_indexes(collection) {
+            let ns = compound_namespace(collection, &fields);
+            let values: Option<Vec<&Value>> = fields.iter().map(|f| doc.get(f)).collect();
+            self.store().transaction(|tx| match &values {
+                Some(vs) => compound_insert_in_txn(tx, &ns, key, vs),
+                None => compound_remove_in_txn(tx, &ns, key),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Remove `key` from every compound index on `collection` after a delete.
+    pub(crate) fn compound_on_delete(&self, collection: &str, key: &[u8]) -> Result<()> {
+        for fields in self.compound_indexes(collection) {
+            let ns = compound_namespace(collection, &fields);
+            self.store()
+                .transaction(|tx| compound_remove_in_txn(tx, &ns, key))?;
+        }
+        Ok(())
+    }
+
+    /// A verified superset of doc keys for a compound index `fields`: equality
+    /// `eq_prefix` over the leading fields, then optional range `tail`
+    /// constraints over the next field. `None` if no such index, the prefix is
+    /// empty with no tail, or the candidate set exceeds `cap`.
+    pub(crate) fn compound_candidates(
+        &self,
+        collection: &str,
+        fields: &[String],
+        eq_prefix: &[&Value],
+        tail: &[Constraint<'_>],
+        cap: usize,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        let known = {
+            let state = self.scalar().lock().expect("scalar lock");
+            state
+                .compound
+                .iter()
+                .any(|(c, f)| c == collection && f == fields)
+        };
+        if !known || (eq_prefix.is_empty() && tail.is_empty()) {
+            return Ok(None);
+        }
+        let Some(prefix) = encode_tuple(eq_prefix) else {
+            return Ok(None);
+        };
+        let tail_window = if tail.is_empty() {
+            None
+        } else {
+            match window(tail) {
+                Some((_lane, lower, upper)) => Some((lower, upper)),
+                None => return Ok(None),
+            }
+        };
+        let ns = compound_namespace(collection, fields);
+        compound_candidates(self.store(), &ns, &prefix, tail_window, fields.len(), cap)
+    }
+}
+
+fn compound_def_key(collection: &str, fields: &[String]) -> Vec<u8> {
+    let mut k = Vec::new();
+    k.extend_from_slice(collection.as_bytes());
+    for f in fields {
+        k.push(0);
+        k.extend_from_slice(f.as_bytes());
+    }
+    k
+}
+
+fn split_compound_def_key(key: &[u8]) -> Option<(String, Vec<String>)> {
+    let mut parts = key.split(|&b| b == 0);
+    let coll = std::str::from_utf8(parts.next()?).ok()?.to_owned();
+    let fields: Option<Vec<String>> = parts
+        .map(|p| std::str::from_utf8(p).ok().map(|s| s.to_owned()))
+        .collect();
+    let fields = fields?;
+    if fields.is_empty() {
+        return None;
+    }
+    Some((coll, fields))
 }
 
 fn def_key(collection: &str, field: &str) -> Vec<u8> {
@@ -434,6 +690,36 @@ impl Collection<'_> {
         }
         Ok(())
     }
+
+    /// Create (or replace) a compound index over an ordered list of `fields`,
+    /// backfilling existing documents. A query with equality on a leading
+    /// prefix of the fields (optionally plus a range on the next field) then
+    /// uses it. A document missing any of the fields is not indexed. On disk,
+    /// persists.
+    pub fn create_compound_index(&self, fields: &[&str]) -> Result<()> {
+        let fields: Vec<String> = fields.iter().map(|f| (*f).to_owned()).collect();
+        self.db().register_compound_index(self.name(), &fields)?;
+        let ns = compound_namespace(self.name(), &fields);
+        let mut cursor: Vec<u8> = Vec::new();
+        loop {
+            let page = self.db().store().scan_from(self.name(), &cursor, 2048)?;
+            if page.is_empty() {
+                break;
+            }
+            self.db().store().transaction(|tx| {
+                for (key, bytes) in &page {
+                    let doc = Value::decode(bytes)?;
+                    let values: Option<Vec<&Value>> = fields.iter().map(|f| doc.get(f)).collect();
+                    if let Some(vs) = &values {
+                        compound_insert_in_txn(tx, &ns, key, vs)?;
+                    }
+                }
+                Ok(())
+            })?;
+            cursor = next_after(&page.last().unwrap().0);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -446,6 +732,92 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("n".to_owned(), Value::Int(n));
         Value::Map(m)
+    }
+
+    #[test]
+    fn compound_index_matches_full_scan() {
+        use crate::field;
+        fn fill(c: &crate::Collection) {
+            for i in 0..120i64 {
+                let mut m = BTreeMap::new();
+                m.insert("a".to_owned(), Value::Text(format!("g{}", i % 4)));
+                m.insert("b".to_owned(), Value::Int(i % 10));
+                c.insert(&[i as u8], &Value::Map(m)).unwrap();
+            }
+        }
+        let plain = Db::open_in_memory().unwrap();
+        fill(&plain.collection("docs"));
+        let indexed = Db::open_in_memory().unwrap();
+        let ic = indexed.collection("docs");
+        fill(&ic);
+        ic.create_compound_index(&["a", "b"]).unwrap();
+
+        let run = |db: &Db| {
+            // Equality on the leading field + range on the next: a compound win.
+            db.collection("docs")
+                .query()
+                .filter(field("a").eq(Value::Text("g2".into())))
+                .filter(field("b").ge(Value::Int(5)))
+                .order_by("b", false)
+                .run()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(&plain), run(&indexed));
+        assert!(!run(&indexed).is_empty());
+    }
+
+    #[test]
+    fn compound_candidates_prefix_eq_only() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for i in 0..20i64 {
+            let mut m = BTreeMap::new();
+            m.insert("a".to_owned(), Value::Int(i % 3));
+            m.insert("b".to_owned(), Value::Int(i));
+            c.insert(&[i as u8], &Value::Map(m)).unwrap();
+        }
+        c.create_compound_index(&["a", "b"]).unwrap();
+        let fields = vec!["a".to_owned(), "b".to_owned()];
+        let a0 = Value::Int(0);
+        // Eq on the leading field only: all docs with a == 0.
+        let got = db
+            .compound_candidates("docs", &fields, &[&a0], &[], 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.len(), 7); // i in {0,3,6,9,12,15,18}
+        // Unregistered field list → None.
+        let other = vec!["a".to_owned()];
+        assert!(
+            db.compound_candidates("docs", &other, &[&a0], &[], 1000)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compound_definition_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvid.db");
+        {
+            let db = Db::open(&path).unwrap();
+            let c = db.collection("docs");
+            let mut m = BTreeMap::new();
+            m.insert("a".to_owned(), Value::Int(1));
+            m.insert("b".to_owned(), Value::Int(2));
+            c.insert(b"k", &Value::Map(m)).unwrap();
+            c.create_compound_index(&["a", "b"]).unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let fields = vec!["a".to_owned(), "b".to_owned()];
+        let (a, b) = (Value::Int(1), Value::Int(2));
+        let got = db
+            .compound_candidates("docs", &fields, &[&a, &b], &[], 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, vec![b"k".to_vec()]);
     }
 
     #[test]

@@ -43,6 +43,7 @@ impl Db {
         db.load_index_defs()?;
         db.load_text_defs()?;
         db.load_scalar_defs()?;
+        db.load_compound_defs()?;
         db.load_geo_defs()?;
         Ok(db)
     }
@@ -60,6 +61,7 @@ impl Db {
         db.load_index_defs()?;
         db.load_text_defs()?;
         db.load_scalar_defs()?;
+        db.load_compound_defs()?;
         db.load_geo_defs()?;
         Ok(db)
     }
@@ -158,6 +160,7 @@ impl Collection<'_> {
         self.db.index_on_insert(self.name, key, doc)?;
         self.db.fts_on_insert(self.name, key, doc)?;
         self.db.scalar_on_insert(self.name, key, doc)?;
+        self.db.compound_on_insert(self.name, key, doc)?;
         self.db.geo_on_insert(self.name, key, doc)?;
         self.db.notify(ChangeEvent {
             collection: self.name.to_owned(),
@@ -205,6 +208,7 @@ impl Collection<'_> {
             self.db.index_on_insert(self.name, key, doc)?;
             self.db.fts_on_insert(self.name, key, doc)?;
             self.db.scalar_on_insert(self.name, key, doc)?;
+            self.db.compound_on_insert(self.name, key, doc)?;
             self.db.geo_on_insert(self.name, key, doc)?;
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
@@ -242,6 +246,7 @@ impl Collection<'_> {
             self.db.index_on_delete(self.name, key)?;
             self.db.fts_on_delete(self.name, key)?;
             self.db.scalar_on_delete(self.name, key)?;
+            self.db.compound_on_delete(self.name, key)?;
             self.db.geo_on_delete(self.name, key)?;
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
