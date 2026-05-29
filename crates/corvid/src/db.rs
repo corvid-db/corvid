@@ -23,6 +23,7 @@ use crate::value::Value;
 pub struct Db {
     store: Store,
     indexes: Mutex<IndexState>,
+    fts: Mutex<crate::fts::FtsState>,
     subscribers: Mutex<Subscribers>,
 }
 
@@ -32,9 +33,11 @@ impl Db {
         let db = Self {
             store: Store::open(path)?,
             indexes: Mutex::new(IndexState::default()),
+            fts: crate::fts::new_state(),
             subscribers: Mutex::new(Subscribers::default()),
         };
         db.load_index_defs()?;
+        db.load_text_defs()?;
         Ok(db)
     }
 
@@ -43,9 +46,11 @@ impl Db {
         let db = Self {
             store: Store::open_in_memory()?,
             indexes: Mutex::new(IndexState::default()),
+            fts: crate::fts::new_state(),
             subscribers: Mutex::new(Subscribers::default()),
         };
         db.load_index_defs()?;
+        db.load_text_defs()?;
         Ok(db)
     }
 
@@ -64,6 +69,11 @@ impl Db {
     /// The in-memory derived-index cache.
     pub(crate) fn indexes(&self) -> &Mutex<IndexState> {
         &self.indexes
+    }
+
+    /// The full-text index state.
+    pub(crate) fn fts(&self) -> &Mutex<crate::fts::FtsState> {
+        &self.fts
     }
 
     /// The change-feed subscriber registry.
@@ -107,6 +117,7 @@ impl Collection<'_> {
         self.ensure_writable()?;
         self.db.store().put(self.name, key, &doc.encode())?;
         self.db.index_on_insert(self.name, key, doc);
+        self.db.fts_on_insert(self.name, key, doc);
         self.db.notify(ChangeEvent {
             collection: self.name.to_owned(),
             key: key.to_vec(),
@@ -128,6 +139,7 @@ impl Collection<'_> {
         let removed = self.db.store().delete(self.name, key)?;
         if removed {
             self.db.index_on_delete(self.name, key);
+            self.db.fts_on_delete(self.name, key);
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
                 key: key.to_vec(),

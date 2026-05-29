@@ -12,6 +12,7 @@ pub mod db;
 pub mod distance;
 pub mod error;
 pub mod filter;
+pub mod fts;
 pub mod fusion;
 pub mod geo;
 pub mod graph;

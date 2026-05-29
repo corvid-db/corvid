@@ -47,6 +47,21 @@ impl Collection<'_> {
     /// not part of the corpus. Documents that contain none of the query terms
     /// are omitted. Ties break by key order.
     pub fn text_search(&self, field: &str, query: &str, k: usize) -> Result<Vec<TextHit>> {
+        // Use an inverted index when one is registered; else exact over a scan.
+        if let Some(ranked) = self.db().fts_search(self.name(), field, query, k)? {
+            let mut out = Vec::with_capacity(ranked.len());
+            for (key, score) in ranked {
+                if let Some(document) = self.get(&key)? {
+                    out.push(TextHit {
+                        key,
+                        score,
+                        document,
+                    });
+                }
+            }
+            return Ok(out);
+        }
+
         let cands = self.scan()?;
         let mut ranked = ranked_bm25(&cands, field, query);
         ranked.truncate(k);
