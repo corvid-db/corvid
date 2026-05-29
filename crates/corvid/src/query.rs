@@ -1,9 +1,11 @@
-//! Query operations over a collection (engine layer L4, in progress).
+//! Retrieval primitives over a collection: exact vector KNN and BM25 text
+//! search, plus the shared ranking helpers the fluent builder composes.
 //!
-//! Today this provides exact (brute-force) k-nearest-neighbour vector search.
-//! It is correct and simple — the baseline every approximate index is measured
-//! against. An HNSW index can replace the scan behind [`Collection::vector_search`]
-//! later without changing the result contract.
+//! Both searches are exact (brute-force over a scan) in v0.1 — correct and
+//! simple, the baseline an approximate index is later measured against. The
+//! ranking helpers ([`ranked_vector`], [`ranked_bm25`]) operate on an
+//! already-gathered candidate set so the builder can pre-filter once and then
+//! rank, which keeps `filter` a true predicate rather than a post-filter.
 
 use std::collections::HashMap;
 
@@ -37,101 +39,37 @@ pub struct TextHit {
     pub document: Value,
 }
 
-/// A document's precomputed text statistics for one search.
-struct DocStats {
-    key: Vec<u8>,
-    document: Value,
-    term_freq: HashMap<String, u32>,
-    len: usize,
-}
-
 impl Collection<'_> {
     /// Return up to `k` documents ranked by BM25 relevance of their `field`
     /// text to `query`, most relevant first.
     ///
     /// Documents lacking the field or whose field is not [`Value::Text`] are
     /// not part of the corpus. Documents that contain none of the query terms
-    /// are omitted. Ties break by key order for determinism. Corpus statistics
-    /// (document frequency, average length) are computed over this call's
-    /// scan — the exact baseline an inverted index will later accelerate.
+    /// are omitted. Ties break by key order.
     pub fn text_search(&self, field: &str, query: &str, k: usize) -> Result<Vec<TextHit>> {
-        let params = Bm25Params::default();
-
-        let mut query_terms = tokenize(query);
-        query_terms.sort();
-        query_terms.dedup();
-        if query_terms.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut docs: Vec<DocStats> = Vec::new();
-        let mut doc_freq: HashMap<String, usize> = HashMap::new();
-        let mut total_len = 0usize;
-        for (key, document) in self.scan()? {
-            let Some(text) = document.get(field).and_then(Value::as_text) else {
-                continue;
-            };
-            let mut term_freq: HashMap<String, u32> = HashMap::new();
-            let mut len = 0usize;
-            for token in tokenize(text) {
-                *term_freq.entry(token).or_insert(0) += 1;
-                len += 1;
-            }
-            for term in term_freq.keys() {
-                *doc_freq.entry(term.clone()).or_insert(0) += 1;
-            }
-            total_len += len;
-            docs.push(DocStats {
-                key,
-                document,
-                term_freq,
-                len,
-            });
-        }
-
-        let n = docs.len();
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-        // Guard the all-empty-text corpus: avg_len 0 would divide by zero.
-        // Query-term frequencies are 0 there anyway, so scores stay 0.
-        let avg_len = match total_len as f32 / n as f32 {
-            0.0 => 1.0,
-            v => v,
-        };
-
-        let mut hits: Vec<TextHit> = Vec::new();
-        for doc in &docs {
-            let mut score = 0.0;
-            for term in &query_terms {
-                let tf = doc.term_freq.get(term).copied().unwrap_or(0);
-                if tf == 0 {
-                    continue;
-                }
-                let df = doc_freq.get(term).copied().unwrap_or(0);
-                score += term_score(tf, doc.len, avg_len, idf(n, df), params);
-            }
-            if score > 0.0 {
-                hits.push(TextHit {
-                    key: doc.key.clone(),
+        let cands = self.scan()?;
+        let mut ranked = ranked_bm25(&cands, field, query);
+        ranked.truncate(k);
+        let mut docs = doc_map(cands);
+        Ok(ranked
+            .into_iter()
+            .map(|(key, score)| {
+                let document = docs.remove(&key).expect("ranked key came from cands");
+                TextHit {
+                    key,
                     score,
-                    document: doc.document.clone(),
-                });
-            }
-        }
-
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
-        hits.truncate(k);
-        Ok(hits)
+                    document,
+                }
+            })
+            .collect())
     }
 
     /// Return the `k` documents whose embedding in field `field` is nearest to
     /// `query` under `metric`, nearest first.
     ///
     /// Documents that lack the field, whose field is not a [`Value::Vector`],
-    /// or whose dimension differs from `query` are skipped — a missing or
-    /// mismatched embedding is not an error under schema-on-read. Ties are
-    /// broken by key order for determinism.
+    /// or whose dimension differs from `query` are skipped (schema-on-read).
+    /// Ties break by key order.
     pub fn vector_search(
         &self,
         field: &str,
@@ -139,31 +77,124 @@ impl Collection<'_> {
         k: usize,
         metric: Metric,
     ) -> Result<Vec<Hit>> {
-        let mut hits: Vec<Hit> = Vec::new();
-        for (key, document) in self.scan()? {
-            let Some(vector) = document.get(field).and_then(Value::as_vector) else {
-                continue;
-            };
-            if vector.len() != query.len() {
+        let cands = self.scan()?;
+        let mut ranked = ranked_vector(&cands, field, query, metric);
+        ranked.truncate(k);
+        let mut docs = doc_map(cands);
+        Ok(ranked
+            .into_iter()
+            .map(|(key, distance)| {
+                let document = docs.remove(&key).expect("ranked key came from cands");
+                Hit {
+                    key,
+                    distance,
+                    document,
+                }
+            })
+            .collect())
+    }
+}
+
+/// Rank candidates by vector distance ascending (nearest first), keeping only
+/// those whose `field` holds a [`Value::Vector`] of matching dimension. Ties
+/// break by key.
+pub(crate) fn ranked_vector(
+    cands: &[(Vec<u8>, Value)],
+    field: &str,
+    query: &[f32],
+    metric: Metric,
+) -> Vec<(Vec<u8>, f32)> {
+    let mut ranked: Vec<(Vec<u8>, f32)> = cands
+        .iter()
+        .filter_map(|(key, doc)| {
+            let v = doc.get(field).and_then(Value::as_vector)?;
+            (v.len() == query.len()).then(|| (key.clone(), metric.distance(query, v)))
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+}
+
+/// Rank candidates by BM25 score descending over `field`, keeping only those
+/// with a positive score (i.e. containing at least one query term). Ties break
+/// by key.
+pub(crate) fn ranked_bm25(
+    cands: &[(Vec<u8>, Value)],
+    field: &str,
+    query: &str,
+) -> Vec<(Vec<u8>, f32)> {
+    let params = Bm25Params::default();
+
+    let mut query_terms = tokenize(query);
+    query_terms.sort();
+    query_terms.dedup();
+    if query_terms.is_empty() {
+        return Vec::new();
+    }
+
+    struct DocStats<'a> {
+        key: &'a [u8],
+        term_freq: HashMap<String, u32>,
+        len: usize,
+    }
+
+    let mut docs: Vec<DocStats> = Vec::new();
+    let mut doc_freq: HashMap<String, usize> = HashMap::new();
+    let mut total_len = 0usize;
+    for (key, doc) in cands {
+        let Some(text) = doc.get(field).and_then(Value::as_text) else {
+            continue;
+        };
+        let mut term_freq: HashMap<String, u32> = HashMap::new();
+        let mut len = 0usize;
+        for token in tokenize(text) {
+            *term_freq.entry(token).or_insert(0) += 1;
+            len += 1;
+        }
+        for term in term_freq.keys() {
+            *doc_freq.entry(term.clone()).or_insert(0) += 1;
+        }
+        total_len += len;
+        docs.push(DocStats {
+            key,
+            term_freq,
+            len,
+        });
+    }
+
+    let n = docs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Guard the all-empty-text corpus: avg_len 0 would divide by zero; query
+    // term frequencies are 0 there anyway so scores stay 0.
+    let avg_len = match total_len as f32 / n as f32 {
+        0.0 => 1.0,
+        v => v,
+    };
+
+    let mut ranked: Vec<(Vec<u8>, f32)> = Vec::new();
+    for doc in &docs {
+        let mut score = 0.0;
+        for term in &query_terms {
+            let tf = doc.term_freq.get(term).copied().unwrap_or(0);
+            if tf == 0 {
                 continue;
             }
-            let distance = metric.distance(query, vector);
-            hits.push(Hit {
-                key,
-                distance,
-                document,
-            });
+            let df = doc_freq.get(term).copied().unwrap_or(0);
+            score += term_score(tf, doc.len, avg_len, idf(n, df), params);
         }
-
-        // Sort by distance ascending; break ties by key for a stable result.
-        hits.sort_by(|a, b| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.key.cmp(&b.key))
-        });
-        hits.truncate(k);
-        Ok(hits)
+        if score > 0.0 {
+            ranked.push((doc.key.to_vec(), score));
+        }
     }
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+}
+
+/// Build a key → document lookup from a scanned candidate set.
+pub(crate) fn doc_map(cands: Vec<(Vec<u8>, Value)>) -> HashMap<Vec<u8>, Value> {
+    cands.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -267,7 +298,6 @@ mod tests {
     fn ties_break_by_key_order() {
         let db = Db::open_in_memory().unwrap();
         let c = db.collection("docs");
-        // Two identical vectors -> equal distance -> key order decides.
         c.insert(b"z", &doc_with_vec("z", vec![1.0, 0.0])).unwrap();
         c.insert(b"a", &doc_with_vec("a", vec![1.0, 0.0])).unwrap();
         let hits = c
@@ -312,7 +342,6 @@ mod tests {
             .collection("docs")
             .text_search("body", "fox", 10)
             .unwrap();
-        // Only docs a and c contain "fox".
         let keys: Vec<_> = hits.iter().map(|h| h.key.clone()).collect();
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&b"a".to_vec()));
@@ -336,7 +365,6 @@ mod tests {
             .collection("docs")
             .text_search("body", "fox dog", 10)
             .unwrap();
-        // Doc c contains both "fox" and "dog"; it should rank first.
         assert_eq!(hits[0].key, b"c".to_vec());
     }
 
@@ -364,7 +392,7 @@ mod tests {
         c.insert(b"text", &doc_with_text("hello world")).unwrap();
         c.insert(b"novec", &Value::Int(5)).unwrap();
         let mut m = BTreeMap::new();
-        m.insert("body".to_owned(), Value::Int(99)); // wrong type
+        m.insert("body".to_owned(), Value::Int(99));
         c.insert(b"wrongtype", &Value::Map(m)).unwrap();
         let hits = c.text_search("body", "hello", 10).unwrap();
         assert_eq!(hits.len(), 1);

@@ -1,0 +1,473 @@
+//! The fluent multi-modal query builder (engine layer L4).
+//!
+//! This is the engine's identity: one chained call composes filtering, vector
+//! search, text search, rank fusion, and diversifying rerank into a single
+//! result set. Example:
+//!
+//! ```
+//! use corvid::{Db, Metric, Value, field};
+//!
+//! let db = Db::open_in_memory().unwrap();
+//! // ... insert documents with "embedding" and "body" fields ...
+//! let rows = db
+//!     .collection("docs")
+//!     .query()
+//!     .filter(field("category").eq(Value::Text("blog".into())))
+//!     .vector("embedding", vec![1.0, 0.0], 100, Metric::Cosine)
+//!     .text("body", "rust embedded database", 100)
+//!     .rerank_mmr(0.7)
+//!     .limit(10)
+//!     .run()
+//!     .unwrap();
+//! assert!(rows.is_empty()); // empty db
+//! ```
+//!
+//! ## Execution model
+//!
+//! 1. Scan the collection once and apply every `filter` predicate. Filtering
+//!    happens *before* ranking, so `filter` is a true predicate over the
+//!    corpus — top-k is computed among matching documents, never post-hoc.
+//! 2. Rank the filtered set independently for each retrieval source (each
+//!    capped at its own `k`).
+//! 3. Fuse the per-source rankings with Reciprocal Rank Fusion (a single
+//!    source passes through unchanged; zero sources yields the filtered set in
+//!    key order).
+//! 4. Optionally reorder by Maximal Marginal Relevance, using the first vector
+//!    source's query, field, and metric. Candidates lacking a usable embedding
+//!    keep their fused order after the reranked ones.
+//! 5. Truncate to `limit`.
+
+use std::collections::HashMap;
+
+use crate::db::Collection;
+use crate::distance::Metric;
+use crate::error::Result;
+use crate::filter::Predicate;
+use crate::fusion::{DEFAULT_RRF_K, mmr, reciprocal_rank_fusion};
+use crate::query::{doc_map, ranked_bm25, ranked_vector};
+use crate::value::Value;
+
+/// One row of a query result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultRow {
+    /// The document's key within the collection.
+    pub key: Vec<u8>,
+    /// The rank score (RRF fused score, or `0.0` for a pure filter query).
+    pub score: f32,
+    /// The full stored document.
+    pub document: Value,
+}
+
+/// A retrieval source feeding the fusion step.
+enum Source {
+    Vector {
+        field: String,
+        query: Vec<f32>,
+        k: usize,
+        metric: Metric,
+    },
+    Text {
+        field: String,
+        query: String,
+        k: usize,
+    },
+}
+
+/// A composable multi-modal query over one collection. Built fluently and
+/// executed with [`QueryBuilder::run`].
+pub struct QueryBuilder<'c> {
+    collection: Collection<'c>,
+    filters: Vec<Predicate>,
+    sources: Vec<Source>,
+    rrf_k: f32,
+    mmr_lambda: Option<f32>,
+    limit: Option<usize>,
+}
+
+impl<'c> Collection<'c> {
+    /// Begin a fluent multi-modal query over this collection.
+    pub fn query(&self) -> QueryBuilder<'c> {
+        QueryBuilder {
+            collection: *self,
+            filters: Vec::new(),
+            sources: Vec::new(),
+            rrf_k: DEFAULT_RRF_K,
+            mmr_lambda: None,
+            limit: None,
+        }
+    }
+}
+
+impl QueryBuilder<'_> {
+    /// Restrict results to documents matching `predicate`. Multiple calls are
+    /// combined with logical AND.
+    pub fn filter(mut self, predicate: Predicate) -> Self {
+        self.filters.push(predicate);
+        self
+    }
+
+    /// Add a vector-search source over `field` for `query`, contributing up to
+    /// `k` candidates.
+    pub fn vector(
+        mut self,
+        field: impl Into<String>,
+        query: Vec<f32>,
+        k: usize,
+        metric: Metric,
+    ) -> Self {
+        self.sources.push(Source::Vector {
+            field: field.into(),
+            query,
+            k,
+            metric,
+        });
+        self
+    }
+
+    /// Add a text-search source over `field` for `query`, contributing up to
+    /// `k` candidates.
+    pub fn text(mut self, field: impl Into<String>, query: impl Into<String>, k: usize) -> Self {
+        self.sources.push(Source::Text {
+            field: field.into(),
+            query: query.into(),
+            k,
+        });
+        self
+    }
+
+    /// Set the Reciprocal Rank Fusion constant (default [`DEFAULT_RRF_K`]).
+    pub fn fuse_rrf(mut self, k: f32) -> Self {
+        self.rrf_k = k;
+        self
+    }
+
+    /// Diversify results with Maximal Marginal Relevance. `lambda` in `[0, 1]`
+    /// trades relevance (1.0) against diversity (0.0). Requires a vector source
+    /// to supply the query and metric; without one this is a no-op.
+    pub fn rerank_mmr(mut self, lambda: f32) -> Self {
+        self.mmr_lambda = Some(lambda);
+        self
+    }
+
+    /// Limit the result to at most `n` rows.
+    pub fn limit(mut self, n: usize) -> Self {
+        self.limit = Some(n);
+        self
+    }
+
+    /// Execute the query and return the ranked rows.
+    pub fn run(self) -> Result<Vec<ResultRow>> {
+        let filtered: Vec<(Vec<u8>, Value)> = self
+            .collection
+            .scan()?
+            .into_iter()
+            .filter(|(_, doc)| self.filters.iter().all(|p| p.eval(doc)))
+            .collect();
+
+        // 2. Rank the filtered set per source.
+        let rankings: Vec<Vec<Vec<u8>>> = self
+            .sources
+            .iter()
+            .map(|src| keys_for(src, &filtered))
+            .collect();
+
+        // 3. Fuse (or pass through the filtered set if there are no sources).
+        let fused: Vec<(Vec<u8>, f32)> = if self.sources.is_empty() {
+            filtered.iter().map(|(k, _)| (k.clone(), 0.0)).collect()
+        } else {
+            let refs: Vec<&[Vec<u8>]> = rankings.iter().map(Vec::as_slice).collect();
+            reciprocal_rank_fusion(&refs, self.rrf_k)
+        };
+
+        let mut docs = doc_map(filtered);
+
+        // 4. Optional MMR rerank, anchored on the first vector source.
+        let ordered = match (self.mmr_lambda, self.first_vector_source()) {
+            (Some(lambda), Some((field, query, metric))) => {
+                rerank_mmr(&fused, &docs, field, query, lambda, metric)
+            }
+            _ => fused,
+        };
+
+        // 5. Limit and assemble.
+        let mut ordered = ordered;
+        if let Some(limit) = self.limit {
+            ordered.truncate(limit);
+        }
+        Ok(ordered
+            .into_iter()
+            .map(|(key, score)| {
+                let document = docs.remove(&key).expect("key came from filtered set");
+                ResultRow {
+                    key,
+                    score,
+                    document,
+                }
+            })
+            .collect())
+    }
+
+    /// The first vector source's `(field, query, metric)`, if any.
+    fn first_vector_source(&self) -> Option<(&str, &[f32], Metric)> {
+        self.sources.iter().find_map(|s| match s {
+            Source::Vector {
+                field,
+                query,
+                metric,
+                ..
+            } => Some((field.as_str(), query.as_slice(), *metric)),
+            Source::Text { .. } => None,
+        })
+    }
+}
+
+/// Rank the filtered set for one source and return its capped key list.
+fn keys_for(src: &Source, filtered: &[(Vec<u8>, Value)]) -> Vec<Vec<u8>> {
+    let mut ranked = match src {
+        Source::Vector {
+            field,
+            query,
+            metric,
+            ..
+        } => ranked_vector(filtered, field, query, *metric),
+        Source::Text { field, query, .. } => ranked_bm25(filtered, field, query),
+    };
+    let k = match src {
+        Source::Vector { k, .. } | Source::Text { k, .. } => *k,
+    };
+    ranked.truncate(k);
+    ranked.into_iter().map(|(key, _)| key).collect()
+}
+
+/// Reorder a fused result by MMR, keeping fused scores. Candidates whose
+/// `field` lacks an embedding of `query`'s dimension keep their fused order
+/// after the reranked ones.
+fn rerank_mmr(
+    fused: &[(Vec<u8>, f32)],
+    docs: &HashMap<Vec<u8>, Value>,
+    field: &str,
+    query: &[f32],
+    lambda: f32,
+    metric: Metric,
+) -> Vec<(Vec<u8>, f32)> {
+    let scores: HashMap<&[u8], f32> = fused.iter().map(|(k, s)| (k.as_slice(), *s)).collect();
+
+    let mut with_vec: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
+    let mut tail: Vec<Vec<u8>> = Vec::new();
+    for (key, _) in fused {
+        match docs
+            .get(key)
+            .and_then(|d| d.get(field))
+            .and_then(Value::as_vector)
+        {
+            Some(v) if v.len() == query.len() => with_vec.push((key.clone(), v.to_vec())),
+            _ => tail.push(key.clone()),
+        }
+    }
+
+    let order = mmr(query, &with_vec, lambda, with_vec.len(), metric);
+    let mut out: Vec<(Vec<u8>, f32)> = Vec::with_capacity(fused.len());
+    for key in order.into_iter().chain(tail) {
+        let score = scores[key.as_slice()];
+        out.push((key, score));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Db, field};
+    use std::collections::BTreeMap;
+
+    fn doc(category: &str, body: &str, embedding: Vec<f32>) -> Value {
+        let mut m = BTreeMap::new();
+        m.insert("category".to_owned(), Value::Text(category.to_owned()));
+        m.insert("body".to_owned(), Value::Text(body.to_owned()));
+        m.insert("embedding".to_owned(), Value::Vector(embedding));
+        Value::Map(m)
+    }
+
+    fn seed() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &doc("blog", "rust embedded database", vec![1.0, 0.0]))
+            .unwrap();
+        c.insert(b"b", &doc("blog", "python web framework", vec![0.0, 1.0]))
+            .unwrap();
+        c.insert(
+            b"c",
+            &doc("news", "rust systems programming", vec![0.9, 0.1]),
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn filter_only_returns_matching_docs_in_key_order() {
+        let db = seed();
+        let rows = db
+            .collection("docs")
+            .query()
+            .filter(field("category").eq(Value::Text("blog".into())))
+            .run()
+            .unwrap();
+        let keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+        assert!(rows.iter().all(|r| r.score == 0.0));
+    }
+
+    #[test]
+    fn vector_only_ranks_by_distance() {
+        let db = seed();
+        let rows = db
+            .collection("docs")
+            .query()
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .run()
+            .unwrap();
+        // a is exact match, c is close, b is orthogonal.
+        assert_eq!(rows[0].key, b"a".to_vec());
+        assert_eq!(rows[1].key, b"c".to_vec());
+    }
+
+    #[test]
+    fn filter_constrains_vector_search() {
+        let db = seed();
+        let rows = db
+            .collection("docs")
+            .query()
+            .filter(field("category").eq(Value::Text("blog".into())))
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .run()
+            .unwrap();
+        // c is nearest after a, but it's "news" so it's filtered out.
+        let keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[test]
+    fn hybrid_fuses_vector_and_text() {
+        let db = seed();
+        let rows = db
+            .collection("docs")
+            .query()
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .text("body", "rust", 10)
+            .run()
+            .unwrap();
+        // "a" is both nearest by vector and contains "rust" → ranked first.
+        assert_eq!(rows[0].key, b"a".to_vec());
+        assert!(rows.len() >= 2);
+    }
+
+    #[test]
+    fn limit_truncates_results() {
+        let db = seed();
+        let rows = db
+            .collection("docs")
+            .query()
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .limit(1)
+            .run()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, b"a".to_vec());
+    }
+
+    #[test]
+    fn mmr_rerank_diversifies() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"dup1", &doc("x", "alpha", vec![1.0, 0.0]))
+            .unwrap();
+        c.insert(b"dup2", &doc("x", "beta", vec![0.99, 0.01]))
+            .unwrap();
+        c.insert(b"div", &doc("x", "gamma", vec![0.0, 1.0]))
+            .unwrap();
+        let rows = db
+            .collection("docs")
+            .query()
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .rerank_mmr(0.5)
+            .run()
+            .unwrap();
+        // After the top match, MMR prefers the diverse doc over the near-dup.
+        assert_eq!(rows[0].key, b"dup1".to_vec());
+        assert_eq!(rows[1].key, b"div".to_vec());
+    }
+
+    #[test]
+    fn mmr_without_vector_source_is_noop() {
+        let db = seed();
+        let rows = db
+            .collection("docs")
+            .query()
+            .text("body", "rust", 10)
+            .rerank_mmr(0.5)
+            .run()
+            .unwrap();
+        // Still returns the text matches; rerank had no anchor so order stands.
+        assert!(rows.iter().any(|r| r.key == b"a".to_vec()));
+        assert!(rows.iter().any(|r| r.key == b"c".to_vec()));
+    }
+
+    #[test]
+    fn empty_query_returns_whole_collection() {
+        let db = seed();
+        let rows = db.collection("docs").query().run().unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn combined_filters_are_anded() {
+        let db = seed();
+        let rows = db
+            .collection("docs")
+            .query()
+            .filter(field("category").eq(Value::Text("blog".into())))
+            .filter(field("body").exists())
+            .run()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn custom_rrf_constant_is_accepted() {
+        let db = seed();
+        let rows = db
+            .collection("docs")
+            .query()
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .text("body", "rust", 10)
+            .fuse_rrf(10.0)
+            .run()
+            .unwrap();
+        assert_eq!(rows[0].key, b"a".to_vec());
+    }
+
+    #[test]
+    fn mmr_keeps_docs_without_embeddings_after_reranked() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"vec", &doc("x", "has embedding", vec![1.0, 0.0]))
+            .unwrap();
+        // A doc matched by text but with no embedding field of the right dim.
+        let mut m = BTreeMap::new();
+        m.insert("body".to_owned(), Value::Text("rust text only".into()));
+        c.insert(b"txt", &Value::Map(m)).unwrap();
+        let rows = db
+            .collection("docs")
+            .query()
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .text("body", "rust", 10)
+            .rerank_mmr(0.5)
+            .run()
+            .unwrap();
+        // Both appear; the embedded one is reranked, the text-only one tails.
+        let keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+        assert!(keys.contains(&b"vec".to_vec()));
+        assert!(keys.contains(&b"txt".to_vec()));
+        assert_eq!(keys[0], b"vec".to_vec());
+    }
+}

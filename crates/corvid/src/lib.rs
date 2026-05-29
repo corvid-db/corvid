@@ -7,6 +7,7 @@
 //! The engine is built bottom-up. Today it exposes the L1 storage layer: a
 //! transactional byte-oriented key/value store over redb ([`Store`]).
 
+pub mod builder;
 pub mod db;
 pub mod distance;
 pub mod error;
@@ -17,6 +18,7 @@ pub mod store;
 pub mod text;
 pub mod value;
 
+pub use builder::{QueryBuilder, ResultRow};
 pub use db::{Collection, Db};
 pub use distance::Metric;
 pub use error::{Error, Result};

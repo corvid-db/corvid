@@ -44,6 +44,10 @@ impl Db {
 }
 
 /// A handle to one collection of documents.
+///
+/// Cheap to copy — it is just a borrow of the database and the collection
+/// name — so query builders can hold one by value.
+#[derive(Clone, Copy)]
 pub struct Collection<'a> {
     db: &'a Db,
     name: &'a str,
