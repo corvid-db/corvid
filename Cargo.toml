@@ -3,10 +3,14 @@ resolver = "3"
 members = ["crates/corvid", "crates/corvid-mcp"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 authors = ["Rocky <smrockypk@gmail.com>"]
 repository = "https://github.com/rocky/corvid"
+keywords = ["database", "embedded", "vector", "search", "ai"]
+categories = ["database-implementations"]
 
 [workspace.dependencies]
 redb = "4.1"

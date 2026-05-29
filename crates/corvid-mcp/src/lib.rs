@@ -7,6 +7,8 @@
 //! `tools/list`, `tools/call`) is a thin shell over [`Server::handle`], which
 //! holds all the behavior and is fully testable on its own.
 
+#![forbid(unsafe_code)]
+
 pub mod convert;
 pub mod error;
 pub mod protocol;

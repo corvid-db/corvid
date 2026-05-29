@@ -7,6 +7,8 @@
 //! The engine is built bottom-up. Today it exposes the L1 storage layer: a
 //! transactional byte-oriented key/value store over redb ([`Store`]).
 
+#![forbid(unsafe_code)]
+
 pub mod builder;
 pub mod db;
 pub mod distance;
