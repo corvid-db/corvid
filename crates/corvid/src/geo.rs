@@ -115,6 +115,32 @@ impl Collection<'_> {
         self.scan()
     }
 
+    /// Find the `k` documents whose `field` point is nearest to `(lat, lon)`,
+    /// nearest first, regardless of distance.
+    ///
+    /// Uses an expanding radius: once `k` points fall within radius `R`, they
+    /// are the true `k` nearest (every point outside `R` is farther than every
+    /// point inside it), so the result is exact. The radius search is
+    /// index-accelerated when a spatial index exists. Returns fewer than `k`
+    /// only when the collection has fewer points with a valid location.
+    pub fn geo_nearest(&self, field: &str, lat: f64, lon: f64, k: usize) -> Result<Vec<GeoHit>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        // Earth's max great-circle distance is ~20015 km; a radius past that
+        // covers every point, so the loop always terminates.
+        const MAX_KM: f64 = 20_100.0;
+        let mut radius = 1.0;
+        loop {
+            let mut hits = self.geo_within_radius(field, lat, lon, radius)?;
+            if hits.len() >= k || radius >= MAX_KM {
+                hits.truncate(k);
+                return Ok(hits);
+            }
+            radius *= 4.0;
+        }
+    }
+
     /// Find documents whose `field` point falls within the bounding box
     /// `[min_lat, max_lat] × [min_lon, max_lon]`, in key order.
     pub fn geo_within_bbox(
@@ -243,6 +269,71 @@ mod tests {
         assert!(keys.contains(&b"london".to_vec()));
         assert!(keys.contains(&b"greenwich".to_vec()));
         assert!(!keys.contains(&b"paris".to_vec()));
+    }
+
+    #[test]
+    fn geo_nearest_matches_brute_force() {
+        // Indexed and unindexed must both return the true k nearest.
+        fn fill(c: &crate::Collection) {
+            for i in 0..300i64 {
+                let lat = 40.0 + ((i * 7) % 100) as f64 * 0.05;
+                let lon = -75.0 + ((i * 13) % 100) as f64 * 0.05;
+                let mut m = BTreeMap::new();
+                m.insert("loc".to_owned(), point_array(lat, lon));
+                c.insert(&[i as u8], &Value::Map(m)).unwrap();
+            }
+        }
+        let plain = Db::open_in_memory().unwrap();
+        fill(&plain.collection("p"));
+        let indexed = Db::open_in_memory().unwrap();
+        let ic = indexed.collection("p");
+        fill(&ic);
+        ic.create_geo_index("loc").unwrap();
+
+        let (qlat, qlon) = (42.0, -73.0);
+        // Brute force: sort all by haversine.
+        let mut all: Vec<(Vec<u8>, f64)> = plain
+            .collection("p")
+            .scan()
+            .unwrap()
+            .into_iter()
+            .filter_map(|(k, d)| {
+                d.get("loc")
+                    .and_then(extract_point)
+                    .map(|(la, lo)| (k, haversine_km(qlat, qlon, la, lo)))
+            })
+            .collect();
+        all.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let want: Vec<Vec<u8>> = all.iter().take(10).map(|(k, _)| k.clone()).collect();
+
+        let pn: Vec<_> = plain
+            .collection("p")
+            .geo_nearest("loc", qlat, qlon, 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.key)
+            .collect();
+        let in_: Vec<_> = indexed
+            .collection("p")
+            .geo_nearest("loc", qlat, qlon, 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.key)
+            .collect();
+        assert_eq!(pn, want);
+        assert_eq!(in_, want);
+    }
+
+    #[test]
+    fn geo_nearest_returns_all_when_fewer_than_k() {
+        let db = seed(); // 3 places
+        let hits = db
+            .collection("places")
+            .geo_nearest("loc", 51.5, -0.1, 10)
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        // Sorted nearest-first.
+        assert!(hits[0].distance_km <= hits[1].distance_km);
     }
 
     #[test]

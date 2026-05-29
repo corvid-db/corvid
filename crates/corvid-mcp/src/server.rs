@@ -378,11 +378,14 @@ impl Server {
         let field = str_param(p, "field")?;
         let lat = f64_param(p, "lat")?;
         let lon = f64_param(p, "lon")?;
-        let radius_km = f64_param(p, "radius_km")?;
-        let mut hits = self
-            .db
-            .collection(collection)
-            .geo_within_radius(field, lat, lon, radius_km)?;
+        let handle = self.db.collection(collection);
+        // `k` (nearest-N) takes precedence over `radius_km` (within-radius).
+        let mut hits = if let Some(k) = p.get("k").and_then(Json::as_u64) {
+            handle.geo_nearest(field, lat, lon, k as usize)?
+        } else {
+            let radius_km = f64_param(p, "radius_km")?;
+            handle.geo_within_radius(field, lat, lon, radius_km)?
+        };
         hits.truncate(result_limit(p));
         let results: Vec<Json> = hits
             .iter()

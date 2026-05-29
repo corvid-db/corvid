@@ -266,7 +266,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "geo",
-                "description": "Find documents whose location field is within radius_km of (lat, lon), nearest first.",
+                "description": "Geo search around (lat, lon), nearest first: pass radius_km for within-radius, or k for nearest-N.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -274,9 +274,10 @@ fn tools_list() -> Json {
                         "field": { "type": "string" },
                         "lat": { "type": "number" },
                         "lon": { "type": "number" },
-                        "radius_km": { "type": "number" }
+                        "radius_km": { "type": "number" },
+                        "k": { "type": "integer" }
                     },
-                    "required": ["collection", "field", "lat", "lon", "radius_km"]
+                    "required": ["collection", "field", "lat", "lon"]
                 }
             },
             {

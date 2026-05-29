@@ -64,6 +64,8 @@ format and API may change without backward-compatibility guarantees.
   normal delete path. Sorted TTL index; persists across reopen.
 - Directed property graph: `link`/`unlink`/`neighbors`/`in_neighbors`/`traverse`.
 - Geospatial radius / bounding-box queries (haversine).
+- k-nearest geo (`geo_nearest`): the k closest points regardless of radius,
+  index-accelerated and exact (expanding radius); MCP `geo` accepts `k`.
 - Cross-collection lookup joins, semantic (vector-keyed) cache, in-process
   reactive change feeds, HyperLogLog / Bloom sketches.
 - `corvid-mcp`: a runnable MCP server over stdio exposing the engine as tools.
