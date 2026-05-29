@@ -112,6 +112,33 @@ fn tools_list() -> Json {
                 }
             },
             {
+                "name": "patch",
+                "description": "Merge fields into the document at key (creating it if absent), keeping indexes consistent.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "key": { "type": "string" },
+                        "patch": { "type": "object" }
+                    },
+                    "required": ["collection", "key", "patch"]
+                }
+            },
+            {
+                "name": "compare_and_set",
+                "description": "Atomically write 'new' (omit to delete) only if the current document equals 'expected' (omit for must-be-absent). Returns {applied}.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "key": { "type": "string" },
+                        "expected": {},
+                        "new": {}
+                    },
+                    "required": ["collection", "key"]
+                }
+            },
+            {
                 "name": "get",
                 "description": "Fetch the document stored at a key.",
                 "inputSchema": {
@@ -429,6 +456,8 @@ mod tests {
             "store",
             "get",
             "delete",
+            "patch",
+            "compare_and_set",
             "search",
             "create_index",
             "link",

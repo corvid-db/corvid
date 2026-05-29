@@ -60,6 +60,8 @@ impl Server {
             "create_index" => self.create_index(params),
             "create_text_index" => self.create_text_index(params),
             "create_scalar_index" => self.create_scalar_index(params),
+            "patch" => self.patch(params),
+            "compare_and_set" => self.compare_and_set(params),
             "create_geo_index" => self.create_geo_index(params),
             "create_compound_index" => self.create_compound_index(params),
             "backup" => self.backup(params),
@@ -83,6 +85,35 @@ impl Server {
             .collection(collection)
             .insert(key.as_bytes(), &json_to_value(doc))?;
         Ok(json!({ "ok": true }))
+    }
+
+    fn patch(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let key = str_param(p, "key")?;
+        let patch = p
+            .get("patch")
+            .ok_or_else(|| ToolError::BadParams("missing 'patch'".into()))?;
+        self.db
+            .collection(collection)
+            .patch(key.as_bytes(), &json_to_value(patch))?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn compare_and_set(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let key = str_param(p, "key")?;
+        // `expected`/`new` absent (or JSON null) means "absent" / "delete".
+        let expected = p
+            .get("expected")
+            .filter(|v| !v.is_null())
+            .map(json_to_value);
+        let new = p.get("new").filter(|v| !v.is_null()).map(json_to_value);
+        let applied = self.db.collection(collection).compare_and_set(
+            key.as_bytes(),
+            expected.as_ref(),
+            new,
+        )?;
+        Ok(json!({ "applied": applied }))
     }
 
     fn get(&self, p: &Json) -> Result<Json, ToolError> {

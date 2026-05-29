@@ -52,6 +52,9 @@ format and API may change without backward-compatibility guarantees.
 - More predicates: `is_in` (set membership), `between` (inclusive range),
   `starts_with`/`contains` (text); between/in/starts_with route through the
   scalar index (text prefix scan), the rest verify on scan.
+- Partial writes: `patch` (merge fields), `update` (read-modify-write), and
+  `compare_and_set` (atomic conditional write/delete/insert-if-absent). All keep
+  indexes consistent; exposed over MCP.
 - Optional per-collection declared schema (`set_schema`): field types,
   `required`, and `unique` enforced on write; schemaless collections unaffected.
 - Per-record TTL/expiry (`insert_with_ttl`/`set_ttl`/`purge_expired`): time is

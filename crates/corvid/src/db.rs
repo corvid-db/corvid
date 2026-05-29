@@ -141,6 +141,29 @@ impl Db {
     pub(crate) fn subscribers(&self) -> &Mutex<Subscribers> {
         &self.subscribers
     }
+
+    /// Maintain every index after `key`'s document was written (a plain write
+    /// clears any prior expiry).
+    fn maintain_insert(&self, collection: &str, key: &[u8], doc: &Value) -> Result<()> {
+        self.index_on_insert(collection, key, doc)?;
+        self.fts_on_insert(collection, key, doc)?;
+        self.scalar_on_insert(collection, key, doc)?;
+        self.compound_on_insert(collection, key, doc)?;
+        self.geo_on_insert(collection, key, doc)?;
+        self.ttl_clear(collection, key)?;
+        Ok(())
+    }
+
+    /// Maintain every index after `key` was removed.
+    fn maintain_delete(&self, collection: &str, key: &[u8]) -> Result<()> {
+        self.index_on_delete(collection, key)?;
+        self.fts_on_delete(collection, key)?;
+        self.scalar_on_delete(collection, key)?;
+        self.compound_on_delete(collection, key)?;
+        self.geo_on_delete(collection, key)?;
+        self.ttl_clear(collection, key)?;
+        Ok(())
+    }
 }
 
 /// A handle to one collection of documents.
@@ -178,20 +201,99 @@ impl Collection<'_> {
         self.ensure_writable()?;
         self.db.validate_schema(self.name, key, doc)?;
         self.db.store().put(self.name, key, &doc.encode())?;
-        self.db.index_on_insert(self.name, key, doc)?;
-        self.db.fts_on_insert(self.name, key, doc)?;
-        self.db.scalar_on_insert(self.name, key, doc)?;
-        self.db.compound_on_insert(self.name, key, doc)?;
-        self.db.geo_on_insert(self.name, key, doc)?;
-        // A plain overwrite drops any prior expiry (a new expiry is set only via
-        // insert_with_ttl/set_ttl).
-        self.db.ttl_clear(self.name, key)?;
+        self.db.maintain_insert(self.name, key, doc)?;
         self.db.notify(ChangeEvent {
             collection: self.name.to_owned(),
             key: key.to_vec(),
             kind: ChangeKind::Insert,
         });
         Ok(())
+    }
+
+    /// Read-modify-write `key`: `f` receives the current document (if any) and
+    /// returns the new document (`Some`) or a deletion (`None`). Indexes stay
+    /// consistent. This is a convenience over get-then-insert and is **not**
+    /// linearizable against concurrent writers to the same key — use
+    /// [`Collection::compare_and_set`] when that matters.
+    pub fn update<F>(&self, key: &[u8], f: F) -> Result<()>
+    where
+        F: FnOnce(Option<Value>) -> Option<Value>,
+    {
+        self.ensure_writable()?;
+        let current = self.get(key)?;
+        match f(current) {
+            Some(doc) => self.insert(key, &doc),
+            None => {
+                self.delete(key)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Merge the top-level fields of `patch` into the existing map document at
+    /// `key` (creating it if absent), then store. If either the existing
+    /// document or `patch` is not a map, the document is replaced by `patch`.
+    pub fn patch(&self, key: &[u8], patch: &Value) -> Result<()> {
+        self.update(key, |current| match (current, patch) {
+            (Some(Value::Map(mut m)), Value::Map(p)) => {
+                for (k, v) in p {
+                    m.insert(k.clone(), v.clone());
+                }
+                Some(Value::Map(m))
+            }
+            _ => Some(patch.clone()),
+        })
+    }
+
+    /// Atomically write `new` (or delete, with `new = None`) only if the current
+    /// value equals `expected` (`expected = None` means "must be absent").
+    /// Returns whether the write was applied. The compare-and-write is atomic at
+    /// the document level (one transaction); index maintenance follows.
+    pub fn compare_and_set(
+        &self,
+        key: &[u8],
+        expected: Option<&Value>,
+        new: Option<Value>,
+    ) -> Result<bool> {
+        self.ensure_writable()?;
+        if let Some(doc) = &new {
+            self.db.validate_schema(self.name, key, doc)?;
+        }
+        let expected_bytes = expected.map(Value::encode);
+        let applied = self.db.store().transaction(|tx| {
+            let current = tx.get(self.name, key)?;
+            if current != expected_bytes {
+                return Ok(false);
+            }
+            match &new {
+                Some(doc) => tx.put(self.name, key, &doc.encode())?,
+                None => {
+                    tx.delete(self.name, key)?;
+                }
+            }
+            Ok(true)
+        })?;
+        if applied {
+            match new {
+                Some(doc) => {
+                    self.db.maintain_insert(self.name, key, &doc)?;
+                    self.db.notify(ChangeEvent {
+                        collection: self.name.to_owned(),
+                        key: key.to_vec(),
+                        kind: ChangeKind::Insert,
+                    });
+                }
+                None => {
+                    self.db.maintain_delete(self.name, key)?;
+                    self.db.notify(ChangeEvent {
+                        collection: self.name.to_owned(),
+                        key: key.to_vec(),
+                        kind: ChangeKind::Delete,
+                    });
+                }
+            }
+        }
+        Ok(applied)
     }
 
     /// Stream every `(key, document)` in the collection to `f`, in key order,
@@ -233,11 +335,7 @@ impl Collection<'_> {
             Ok(())
         })?;
         for (key, doc) in items {
-            self.db.index_on_insert(self.name, key, doc)?;
-            self.db.fts_on_insert(self.name, key, doc)?;
-            self.db.scalar_on_insert(self.name, key, doc)?;
-            self.db.compound_on_insert(self.name, key, doc)?;
-            self.db.geo_on_insert(self.name, key, doc)?;
+            self.db.maintain_insert(self.name, key, doc)?;
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
                 key: key.to_vec(),
@@ -271,12 +369,7 @@ impl Collection<'_> {
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
         let removed = self.db.store().delete(self.name, key)?;
         if removed {
-            self.db.index_on_delete(self.name, key)?;
-            self.db.fts_on_delete(self.name, key)?;
-            self.db.scalar_on_delete(self.name, key)?;
-            self.db.compound_on_delete(self.name, key)?;
-            self.db.geo_on_delete(self.name, key)?;
-            self.db.ttl_clear(self.name, key)?;
+            self.db.maintain_delete(self.name, key)?;
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
                 key: key.to_vec(),
@@ -306,6 +399,93 @@ mod tests {
         m.insert("name".to_owned(), Value::Text(name.to_owned()));
         m.insert("n".to_owned(), Value::Int(n));
         Value::Map(m)
+    }
+
+    #[test]
+    fn patch_merges_fields() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"k", &doc("corvid", 1)).unwrap();
+        // Merge: set n=2, add a new field, keep name.
+        let mut p = BTreeMap::new();
+        p.insert("n".to_owned(), Value::Int(2));
+        p.insert("extra".to_owned(), Value::Bool(true));
+        c.patch(b"k", &Value::Map(p)).unwrap();
+        let got = c.get(b"k").unwrap().unwrap();
+        assert_eq!(got.get("name"), Some(&Value::Text("corvid".into())));
+        assert_eq!(got.get("n"), Some(&Value::Int(2)));
+        assert_eq!(got.get("extra"), Some(&Value::Bool(true)));
+        // Patch on an absent key creates it.
+        c.patch(b"new", &doc("x", 9)).unwrap();
+        assert_eq!(c.get(b"new").unwrap(), Some(doc("x", 9)));
+    }
+
+    #[test]
+    fn update_can_modify_or_delete() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"k", &doc("a", 1)).unwrap();
+        c.update(b"k", |cur| {
+            let mut m = match cur {
+                Some(Value::Map(m)) => m,
+                _ => BTreeMap::new(),
+            };
+            m.insert("n".to_owned(), Value::Int(5));
+            Some(Value::Map(m))
+        })
+        .unwrap();
+        assert_eq!(c.get(b"k").unwrap().unwrap().get("n"), Some(&Value::Int(5)));
+        // Return None → delete.
+        c.update(b"k", |_| None).unwrap();
+        assert_eq!(c.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn compare_and_set_is_conditional_and_maintains_indexes() {
+        use crate::field;
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.create_scalar_index("n").unwrap();
+        c.insert(b"k", &doc("a", 1)).unwrap();
+
+        // Wrong expected → not applied.
+        assert!(
+            !c.compare_and_set(b"k", Some(&doc("a", 999)), Some(doc("a", 2)))
+                .unwrap()
+        );
+        assert_eq!(c.get(b"k").unwrap(), Some(doc("a", 1)));
+        // Correct expected → applied; the scalar index reflects the new value.
+        assert!(
+            c.compare_and_set(b"k", Some(&doc("a", 1)), Some(doc("a", 2)))
+                .unwrap()
+        );
+        let hits: Vec<_> = c
+            .query()
+            .filter(field("n").eq(Value::Int(2)))
+            .run()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(hits, vec![b"k".to_vec()]);
+        assert!(
+            c.query()
+                .filter(field("n").eq(Value::Int(1)))
+                .run()
+                .unwrap()
+                .is_empty()
+        );
+        // Insert-if-absent: expected None on an existing key fails.
+        assert!(!c.compare_and_set(b"k", None, Some(doc("a", 3))).unwrap());
+        // Conditional delete.
+        assert!(c.compare_and_set(b"k", Some(&doc("a", 2)), None).unwrap());
+        assert_eq!(c.get(b"k").unwrap(), None);
+        // Insert-if-absent now succeeds.
+        assert!(
+            c.compare_and_set(b"fresh", None, Some(doc("z", 7)))
+                .unwrap()
+        );
+        assert_eq!(c.get(b"fresh").unwrap(), Some(doc("z", 7)));
     }
 
     #[test]
