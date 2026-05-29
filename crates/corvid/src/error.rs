@@ -33,6 +33,10 @@ pub enum Error {
     #[error("commit: {0}")]
     Commit(#[from] redb::CommitError),
 
+    /// Changing a transaction's durability failed.
+    #[error("durability: {0}")]
+    SetDurability(#[from] redb::SetDurabilityError),
+
     /// Stored bytes could not be decoded into a [`crate::Value`].
     #[error("decode: {0}")]
     Decode(String),

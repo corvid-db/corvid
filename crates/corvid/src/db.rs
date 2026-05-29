@@ -90,6 +90,27 @@ impl Db {
         self.store.backup(path)
     }
 
+    /// Run `f` as a bulk load under relaxed (eventual) durability: write
+    /// transactions inside `f` skip the per-commit fsync, then a single durable
+    /// flush at the end makes everything durable. A crash *during* the load can
+    /// lose the in-flight writes (the database stays consistent), so use this
+    /// only for rebuildable bulk ingestion, not for writes you must not lose.
+    ///
+    /// Turns an N-document load from ~N fsyncs into ~1.
+    pub fn bulk<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        self.store.set_relaxed_durability(true);
+        let result = f();
+        self.store.set_relaxed_durability(false);
+        // Make the bulk writes durable even if `f` failed partway.
+        let flush = self.store.flush();
+        let out = result?;
+        flush?;
+        Ok(out)
+    }
+
     /// List user collection names (engine-internal `__`-prefixed namespaces
     /// such as graph edges and index metadata are excluded), in name order.
     pub fn collections(&self) -> Result<Vec<String>> {
@@ -516,6 +537,31 @@ mod tests {
         m.insert("name".to_owned(), Value::Text(name.to_owned()));
         m.insert("n".to_owned(), Value::Int(n));
         Value::Map(m)
+    }
+
+    #[test]
+    fn bulk_load_is_durable_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.bulk(|| {
+                let c = db.collection("docs");
+                for i in 0..500u32 {
+                    c.insert(&i.to_le_bytes(), &doc("x", i as i64))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(db.collection("docs").len().unwrap(), 500);
+        }
+        // After the bulk flush + drop, everything is durable on reopen.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.collection("docs").len().unwrap(), 500);
+        assert_eq!(
+            db.collection("docs").get(&250u32.to_le_bytes()).unwrap(),
+            Some(doc("x", 250))
+        );
     }
 
     #[test]

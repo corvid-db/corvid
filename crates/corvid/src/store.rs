@@ -43,6 +43,11 @@ const FORMAT_VERSION: u64 = 1;
 /// An embedded transactional key/value store.
 pub struct Store {
     db: Database,
+    /// When set, write transactions commit without fsync (redb
+    /// `Durability::None`) — a bulk-load fast path. Committed data stays
+    /// consistent; the most recent writes may be lost on a crash until a
+    /// following durable commit ([`Store::flush`]).
+    relaxed: std::sync::atomic::AtomicBool,
 }
 
 impl Store {
@@ -50,6 +55,7 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let store = Self {
             db: Database::create(path)?,
+            relaxed: std::sync::atomic::AtomicBool::new(false),
         };
         store.check_format_version()?;
         Ok(store)
@@ -59,9 +65,22 @@ impl Store {
     pub fn open_in_memory() -> Result<Self> {
         let store = Self {
             db: Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?,
+            relaxed: std::sync::atomic::AtomicBool::new(false),
         };
         store.check_format_version()?;
         Ok(store)
+    }
+
+    /// Enter or leave relaxed (eventual) durability for write transactions.
+    pub fn set_relaxed_durability(&self, on: bool) {
+        self.relaxed.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Force a durable (fsync) commit, making all prior eventual writes durable.
+    pub fn flush(&self) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        txn.commit()?; // an immediate-durability commit fsyncs prior writes
+        Ok(())
     }
 
     /// Verify (or stamp) the on-disk format version. A file from an
@@ -170,7 +189,11 @@ impl Store {
     where
         F: FnOnce(&mut WriteBatch<'_>) -> Result<T>,
     {
-        let txn = self.db.begin_write()?;
+        let mut txn = self.db.begin_write()?;
+        if self.relaxed.load(std::sync::atomic::Ordering::Relaxed) {
+            // `None` skips the fsync; a later `Immediate` commit (flush) persists.
+            txn.set_durability(redb::Durability::None)?;
+        }
         let out = {
             let mut batch = WriteBatch { txn: &txn };
             f(&mut batch)?
