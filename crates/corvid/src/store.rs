@@ -83,6 +83,13 @@ impl Store {
         Ok(())
     }
 
+    /// Reclaim unused file space (e.g. after many deletes) by compacting the
+    /// underlying database. Returns whether compaction moved any data. Requires
+    /// exclusive access (`&mut self`); no concurrent readers/writers.
+    pub fn compact(&mut self) -> Result<bool> {
+        Ok(self.db.compact()?)
+    }
+
     /// Verify (or stamp) the on-disk format version. A file from an
     /// incompatible version is refused rather than silently mis-decoded.
     fn check_format_version(&self) -> Result<()> {

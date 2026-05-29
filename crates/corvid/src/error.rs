@@ -37,6 +37,10 @@ pub enum Error {
     #[error("durability: {0}")]
     SetDurability(#[from] redb::SetDurabilityError),
 
+    /// Compacting the database file failed.
+    #[error("compaction: {0}")]
+    Compaction(#[from] redb::CompactionError),
+
     /// Stored bytes could not be decoded into a [`crate::Value`].
     #[error("decode: {0}")]
     Decode(String),

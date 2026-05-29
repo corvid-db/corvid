@@ -35,6 +35,8 @@ format and API may change without backward-compatibility guarantees.
 - Logical dump/load migration (`Db::dump`/`Db::load`, MCP `dump`/`load`):
   version-stamped export of documents + index/schema/TTL definitions, replayed
   into a fresh DB (indexes rebuilt) — for migrating across format breaks.
+- Compaction: `Db::compact()` reclaims file space after heavy deletes (redb
+  compaction); offline maintenance (&mut self), data unchanged.
 - Bulk-load fast path: `Db::bulk(|| ..)` runs writes under non-fsync
   durability and flushes once at the end (~N fsyncs -> ~1); committed data
   stays consistent, in-flight writes may be lost on crash until the flush.

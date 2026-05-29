@@ -111,6 +111,14 @@ impl Db {
         Ok(out)
     }
 
+    /// Reclaim unused file space after heavy deletes by compacting the
+    /// database file. Returns whether any data was moved. Needs exclusive
+    /// access (`&mut self`) — run it as offline maintenance, not concurrently
+    /// with queries. Document data and index definitions are unchanged.
+    pub fn compact(&mut self) -> Result<bool> {
+        self.store.compact()
+    }
+
     /// List user collection names (engine-internal `__`-prefixed namespaces
     /// such as graph edges and index metadata are excluded), in name order.
     pub fn collections(&self) -> Result<Vec<String>> {
@@ -537,6 +545,35 @@ mod tests {
         m.insert("name".to_owned(), Value::Text(name.to_owned()));
         m.insert("n".to_owned(), Value::Int(n));
         Value::Map(m)
+    }
+
+    #[test]
+    fn compact_preserves_data_after_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let mut db = Db::open(&path).unwrap();
+            {
+                let c = db.collection("docs");
+                for i in 0..500u32 {
+                    c.insert(&i.to_le_bytes(), &doc("x", i as i64)).unwrap();
+                }
+                // Delete most of them to create reclaimable space.
+                for i in 0..450u32 {
+                    c.delete(&i.to_le_bytes()).unwrap();
+                }
+            }
+            // Compaction succeeds and leaves the surviving data intact.
+            db.compact().unwrap();
+            assert_eq!(db.collection("docs").len().unwrap(), 50);
+            assert_eq!(
+                db.collection("docs").get(&475u32.to_le_bytes()).unwrap(),
+                Some(doc("x", 475))
+            );
+        }
+        // And it reopens cleanly.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.collection("docs").len().unwrap(), 50);
     }
 
     #[test]
