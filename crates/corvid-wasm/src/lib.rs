@@ -3,7 +3,7 @@
 //! This crate exists to prove the engine links into a `wasm32-unknown-unknown`
 //! `cdylib` and to measure the resulting bundle size against the budget
 //! (< 2 MB gzipped). It is **not** the browser API: a real browser build wraps
-//! the engine with `wasm-bindgen` and an OPFS-backed [`StorageBackend`] (a
+//! the engine with `wasm-bindgen` and an OPFS-backed `StorageBackend` (a
 //! Worker-only concern, per `DESIGN.md`). Here a single exported entry point
 //! exercises a representative slice of the engine — store, value codec, the
 //! query builder, a vector index, a scalar filter — so the linker retains the
