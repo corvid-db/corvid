@@ -47,3 +47,14 @@ pub extern "C" fn corvid_wasm_smoke() -> u32 {
     };
     rows.len() as u32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke_runs_the_engine() {
+        // 12 docs match n >= 4 (n in 4..=15); the query limits to 8.
+        assert_eq!(corvid_wasm_smoke(), 8);
+    }
+}
