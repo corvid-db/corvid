@@ -47,6 +47,7 @@ format and API may change without backward-compatibility guarantees.
   whole collection.
 - Fluent multi-modal query builder: filter + vector + text + RRF fusion + MMR
   rerank + projection + `order_by`/`offset` pagination + `count`/`group_count`.
+- Aggregations: sum/avg/min/max/count_distinct globally and group_sum/group_avg grouped, over the filtered set (respecting filters and indexes).
 - Filter predicates (`field().gt()`, and/or/not, dotted paths, `within_km` geo).
 - Optional per-collection declared schema (`set_schema`): field types,
   `required`, and `unique` enforced on write; schemaless collections unaffected.

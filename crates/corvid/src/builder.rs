@@ -241,15 +241,124 @@ impl QueryBuilder<'_> {
     /// the filtered set and ignores ranking.
     pub fn group_count(self, field: &str) -> Result<BTreeMap<String, usize>> {
         let mut groups: BTreeMap<String, usize> = BTreeMap::new();
-        self.collection.for_each_doc(|_, doc| {
-            if self.filters.iter().all(|p| p.eval(&doc))
-                && let Some(key) = doc.get_path(field).and_then(group_key)
-            {
+        self.for_each_match(|doc| {
+            if let Some(key) = doc.get_path(field).and_then(group_key) {
                 *groups.entry(key).or_insert(0) += 1;
             }
-            Ok(true)
         })?;
         Ok(groups)
+    }
+
+    /// Stream each document matching the filters, reusing the scalar/geo index
+    /// fast path when a filter drives one, else a bounded scan.
+    fn for_each_match(&self, mut f: impl FnMut(&Value)) -> Result<()> {
+        if let Some(cands) = self.indexed_candidates()? {
+            for (_, doc) in &cands {
+                f(doc);
+            }
+            return Ok(());
+        }
+        self.collection.for_each_doc(|_, doc| {
+            if self.filters.iter().all(|p| p.eval(&doc)) {
+                f(&doc);
+            }
+            Ok(true)
+        })
+    }
+
+    /// Sum the numeric (`int`/`float`) values at `field` over the filtered set.
+    /// Missing or non-numeric values are skipped.
+    pub fn sum(self, field: &str) -> Result<f64> {
+        let mut total = 0.0;
+        self.for_each_match(|doc| {
+            if let Some(n) = doc.get_path(field).and_then(as_number) {
+                total += n;
+            }
+        })?;
+        Ok(total)
+    }
+
+    /// Mean of the numeric values at `field`, or `None` if there are none.
+    pub fn avg(self, field: &str) -> Result<Option<f64>> {
+        let (mut total, mut n) = (0.0, 0usize);
+        self.for_each_match(|doc| {
+            if let Some(x) = doc.get_path(field).and_then(as_number) {
+                total += x;
+                n += 1;
+            }
+        })?;
+        Ok((n > 0).then(|| total / n as f64))
+    }
+
+    /// The minimum comparable value at `field` (numeric or text), or `None`.
+    pub fn min(self, field: &str) -> Result<Option<Value>> {
+        self.extremum(field, Ordering::Less)
+    }
+
+    /// The maximum comparable value at `field` (numeric or text), or `None`.
+    pub fn max(self, field: &str) -> Result<Option<Value>> {
+        self.extremum(field, Ordering::Greater)
+    }
+
+    fn extremum(self, field: &str, want: Ordering) -> Result<Option<Value>> {
+        let mut best: Option<Value> = None;
+        self.for_each_match(|doc| {
+            if let Some(v) = doc.get_path(field) {
+                let replace = match &best {
+                    None => crate::filter::value_order(v, v).is_some(), // comparable at all
+                    Some(b) => crate::filter::value_order(v, b) == Some(want),
+                };
+                if replace {
+                    best = Some(v.clone());
+                }
+            }
+        })?;
+        Ok(best)
+    }
+
+    /// The number of distinct values at `field` over the filtered set (by the
+    /// canonical group key; missing/container values are ignored).
+    pub fn count_distinct(self, field: &str) -> Result<usize> {
+        let mut seen = std::collections::HashSet::new();
+        self.for_each_match(|doc| {
+            if let Some(k) = doc.get_path(field).and_then(group_key) {
+                seen.insert(k);
+            }
+        })?;
+        Ok(seen.len())
+    }
+
+    /// Sum `value_field` grouped by `group_field` (numeric values only).
+    pub fn group_sum(self, group_field: &str, value_field: &str) -> Result<BTreeMap<String, f64>> {
+        let mut groups: BTreeMap<String, f64> = BTreeMap::new();
+        self.for_each_match(|doc| {
+            if let (Some(g), Some(x)) = (
+                doc.get_path(group_field).and_then(group_key),
+                doc.get_path(value_field).and_then(as_number),
+            ) {
+                *groups.entry(g).or_insert(0.0) += x;
+            }
+        })?;
+        Ok(groups)
+    }
+
+    /// Mean of `value_field` grouped by `group_field` (numeric values only).
+    pub fn group_avg(self, group_field: &str, value_field: &str) -> Result<BTreeMap<String, f64>> {
+        let mut sums: BTreeMap<String, (f64, usize)> = BTreeMap::new();
+        self.for_each_match(|doc| {
+            if let (Some(g), Some(x)) = (
+                doc.get_path(group_field).and_then(group_key),
+                doc.get_path(value_field).and_then(as_number),
+            ) {
+                let e = sums.entry(g).or_insert((0.0, 0));
+                e.0 += x;
+                e.1 += 1;
+            }
+        })?;
+        Ok(sums
+            .into_iter()
+            .map(|(g, (s, n))| (g, s / n as f64))
+            .collect())
     }
 
     /// Try the ANN fast path: a single vector source whose field/metric has a
@@ -821,6 +930,15 @@ fn group_key(v: &Value) -> Option<String> {
         Value::Int(i) => Some(i.to_string()),
         Value::Float(f) => Some(f.to_string()),
         Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// A value as `f64` for numeric aggregation (int or float), else `None`.
+fn as_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
         _ => None,
     }
 }
@@ -1409,6 +1527,74 @@ mod tests {
             .count()
             .unwrap();
         assert_eq!(blogs, 2);
+    }
+
+    #[test]
+    fn aggregations_global_and_grouped() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        let rows = [("a", 10i64), ("a", 20), ("b", 30), ("b", 40), ("c", 5)];
+        for (i, (cat, n)) in rows.iter().enumerate() {
+            let mut m = BTreeMap::new();
+            m.insert("cat".to_owned(), Value::Text((*cat).to_owned()));
+            m.insert("n".to_owned(), Value::Int(*n));
+            c.insert(&[i as u8], &Value::Map(m)).unwrap();
+        }
+        // Global aggregates.
+        assert_eq!(c.query().sum("n").unwrap(), 105.0);
+        assert_eq!(c.query().avg("n").unwrap(), Some(21.0));
+        assert_eq!(c.query().min("n").unwrap(), Some(Value::Int(5)));
+        assert_eq!(c.query().max("n").unwrap(), Some(Value::Int(40)));
+        assert_eq!(c.query().count_distinct("cat").unwrap(), 3);
+        // Empty aggregates.
+        assert_eq!(c.query().avg("missing").unwrap(), None);
+        assert_eq!(c.query().min("missing").unwrap(), None);
+
+        // Grouped.
+        let gs = c.query().group_sum("cat", "n").unwrap();
+        assert_eq!(gs.get("a"), Some(&30.0));
+        assert_eq!(gs.get("b"), Some(&70.0));
+        assert_eq!(gs.get("c"), Some(&5.0));
+        let ga = c.query().group_avg("cat", "n").unwrap();
+        assert_eq!(ga.get("a"), Some(&15.0));
+        assert_eq!(ga.get("b"), Some(&35.0));
+    }
+
+    #[test]
+    fn aggregations_respect_filters() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for i in 0..10i64 {
+            let mut m = BTreeMap::new();
+            m.insert("n".to_owned(), Value::Int(i));
+            c.insert(&[i as u8], &Value::Map(m)).unwrap();
+        }
+        // sum of n for n >= 7 → 7+8+9 = 24.
+        let s = c
+            .query()
+            .filter(field("n").ge(Value::Int(7)))
+            .sum("n")
+            .unwrap();
+        assert_eq!(s, 24.0);
+    }
+
+    #[test]
+    fn min_max_work_on_text() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for (i, s) in ["banana", "apple", "cherry"].iter().enumerate() {
+            let mut m = BTreeMap::new();
+            m.insert("name".to_owned(), Value::Text((*s).to_owned()));
+            c.insert(&[i as u8], &Value::Map(m)).unwrap();
+        }
+        assert_eq!(
+            c.query().min("name").unwrap(),
+            Some(Value::Text("apple".into()))
+        );
+        assert_eq!(
+            c.query().max("name").unwrap(),
+            Some(Value::Text("cherry".into()))
+        );
     }
 
     #[test]
