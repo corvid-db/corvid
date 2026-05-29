@@ -41,6 +41,18 @@ pub enum Predicate {
     },
     /// True when the path resolves to a present value.
     Exists(String),
+    /// True when the path resolves to a point within `radius_km` of the given
+    /// center. The point is a `[lat, lon]` array or a `lat`/`lon` map.
+    GeoWithin {
+        /// Dotted field path holding the point.
+        path: String,
+        /// Center latitude in degrees.
+        lat: f64,
+        /// Center longitude in degrees.
+        lon: f64,
+        /// Inclusive radius in kilometres.
+        radius_km: f64,
+    },
     /// Logical conjunction.
     And(Box<Predicate>, Box<Predicate>),
     /// Logical disjunction.
@@ -72,6 +84,17 @@ impl Predicate {
                 Some(found) => compare(found, *op, value),
             },
             Predicate::Exists(path) => resolve(doc, path).is_some(),
+            Predicate::GeoWithin {
+                path,
+                lat,
+                lon,
+                radius_km,
+            } => match resolve(doc, path).and_then(crate::geo::extract_point) {
+                Some((plat, plon)) => {
+                    crate::geo::haversine_km(*lat, *lon, plat, plon) <= *radius_km
+                }
+                None => false,
+            },
             Predicate::And(a, b) => a.eval(doc) && b.eval(doc),
             Predicate::Or(a, b) => a.eval(doc) || b.eval(doc),
             Predicate::Not(p) => !p.eval(doc),
@@ -126,6 +149,17 @@ impl FieldRef {
     /// The path resolves to a present value.
     pub fn exists(self) -> Predicate {
         Predicate::Exists(self.path)
+    }
+
+    /// The path holds a point within `radius_km` of `(lat, lon)`. The point is
+    /// a `[lat, lon]` array or a map with `lat`/`lon` keys.
+    pub fn within_km(self, lat: f64, lon: f64, radius_km: f64) -> Predicate {
+        Predicate::GeoWithin {
+            path: self.path,
+            lat,
+            lon,
+            radius_km,
+        }
     }
 
     fn compare(self, op: CmpOp, value: Value) -> Predicate {
@@ -298,5 +332,20 @@ mod tests {
     fn path_through_non_map_is_none() {
         // "score" is an int; descending further yields nothing.
         assert!(!field("score.deeper").exists().eval(&doc()));
+    }
+
+    #[test]
+    fn geo_within_predicate() {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "loc".to_owned(),
+            Value::Array(vec![Value::Float(51.5074), Value::Float(-0.1278)]),
+        );
+        let d = Value::Map(m);
+        // Within 50 km of London center → true; within 1 km of (0,0) → false.
+        assert!(field("loc").within_km(51.5, -0.13, 50.0).eval(&d));
+        assert!(!field("loc").within_km(0.0, 0.0, 1.0).eval(&d));
+        // Missing point → false.
+        assert!(!field("missing").within_km(51.5, -0.13, 50.0).eval(&d));
     }
 }
