@@ -1,0 +1,49 @@
+name: Pages
+
+# Builds the landing page (site/) plus the rustdoc API reference and publishes
+# them to GitHub Pages on every push to master.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build API docs
+        run: cargo doc --no-deps -p corvid -p corvid-mcp
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp -r site/. _site/
+          mkdir -p _site/api
+          cp -r target/doc/. _site/api/
+          # Land /api on the engine crate.
+          printf '<!doctype html><meta http-equiv="refresh" content="0; url=corvid/index.html">' > _site/api/index.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

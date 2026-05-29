@@ -70,6 +70,8 @@ computed among matching documents, never a post-hoc trim.
   `insert_auto`.
 
 A task-oriented walkthrough of every feature is in the **[user guide](docs/GUIDE.md)**.
+The **[website](https://i-rocky.github.io/corvid/)** hosts an overview and the
+full **[API reference](https://i-rocky.github.io/corvid/api/corvid/)**.
 
 ## Capabilities (v0.1)
 
