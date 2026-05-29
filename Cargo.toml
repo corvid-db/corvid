@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/corvid", "crates/corvid-mcp"]
+members = ["crates/corvid", "crates/corvid-mcp", "crates/corvid-wasm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,3 +18,14 @@ thiserror = "2"
 tempfile = "3"
 serde_json = "1"
 corvid = { path = "crates/corvid" }
+
+# Size-optimized profile for the WASM bundle (keeps it under the 2 MB gzipped
+# budget). Used via `cargo build -p corvid-wasm --target wasm32-unknown-unknown
+# --profile wasm-release`.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

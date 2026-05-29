@@ -214,17 +214,21 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 
 **Audit gaps resolved** (see the gap sweep): incremental+persistent indexes (#4/#7), inverted FTS (#3), filtered-ANN in builder (#5), order_by/offset (#10), reverse edges (#11), format version (#12), auto-keys (#8), MCP surface+caps (#13/#27), reserved-name & length & slicing hardening (#17/#18/#20), atomic edges + single-snapshot join (#2/#14), nested select + explain (#22/#26 partial), edge weights (#25), CI/LICENSE/CHANGELOG/MSRV + property/concurrency tests + benchmarks (#28–32).
 
-**On-disk vector index (DONE).** `create_vector_index_ondisk` stores the HNSW graph as redb entries; insert/search touch only nodes-per-op (bounded memory, not O(N)), the graph persists (no rebuild on open), and bulk backfill batches commits with a shared node cache. This is the billions-of-vectors-on-32GB path (build is a heavy offline op; search and memory are bounded). Quantization (binary ≈32×, scalar ≈4×) is also done for the in-memory index.
+**On-disk indexes (DONE).** All three store state as redb entries, bound memory to the operation, and persist with no rebuild on open:
+- `create_vector_index_ondisk` — HNSW graph nodes on disk; insert/search touch only nodes-per-op; bulk backfill batches commits with a shared node cache. Now also supports **quantized on-disk storage** (`create_vector_index_ondisk_quantized`, binary ≈32× / scalar ≈4× smaller on disk + page cache) via the shared `quant` module — the footprint path for billions of vectors on a laptop. Recall holds (scalar ≥0.80 vs exact).
+- `create_text_index_ondisk` — BM25 postings on disk; a query touches only its query terms.
+- `create_scalar_index` — order-preserving keys; selective equality/range filters and counts go sub-linear (1M: 662ms scan → ~3ms eq / ~0.5ms 100-row range), with a candidate cap that falls back to the bounded streaming scan when a filter isn't selective.
 
-**Deliberately deferred (large subsystems or environment-blocked, with reasons):**
-- **PQ quantization on the on-disk index** (#16 remainder): on-disk stores f32; combining product/scalar quantization with the on-disk graph would further cut disk + cache. Binary/scalar exist for in-memory.
+**WASM / mobile (engine ready, measured).** The engine compiles to `wasm32-unknown-unknown`; a `cdylib` harness (`corvid-wasm`) links it and the bundle is **≈0.2 MB gzipped** — well under the 2 MB budget — enforced in CI. The engine also cross-compiles for `aarch64` iOS/Android (CI builds android). The remaining browser-runtime piece is the OPFS-SAHPool `StorageBackend` + `wasm-bindgen` surface (Worker-only, needs a browser to validate); in-memory works on wasm today.
+
+**Deliberately deferred (large subsystems, with reasons):**
+- **Product Quantization (PQ) codebook** (#16 remainder): binary/scalar quantization is done for both indexes; codebook-based PQ (k-means + asymmetric distance tables) is a further compression-vs-recall option, a distinct subsystem.
+- **OPFS browser StorageBackend** (#WASM): the engine is wasm-ready and size-validated; the OPFS-SAHPool VFS + JS bindings need a browser harness to validate end to end.
 - **Spatial index** (#6, geo): geo is an exact scan (correct); an R-tree/geohash index is the scale optimization, same pattern as the vector/text baselines.
-- **Secondary scalar index** (#6): `filter`/`count`/`group_count` scan; a B-tree secondary index is the optimization.
 - **Streaming result iterators** (#15): results are materialized; a streaming/cursor API is a larger refactor.
 - **Declared schema/constraints** (#9): schema-on-read today; a strict-schema layer is a future addition.
 - **Richer text analysis** (#23): single English-ish analyzer; stemming/stopwords/phrase/CJK are future.
 - **Plan-cache AST** (#26): `.explain()` exists; an identity-hashable cached plan is future.
-- **WASM/OPFS + mobile**: need a wasm toolchain / device harness not available in this environment.
 
 ---
 
@@ -420,3 +424,5 @@ These need answers before specific layers can be implemented. Listed in rough or
 | 2026-05-29 | Sidecar built as transport-agnostic tool layer first | `Server::handle` (JSON in/out) holds all behavior and is fully testable; MCP/stdio framing is mechanical glue deferred to wire against the MCP SDK. |
 | 2026-05-29 | On-disk indexes store state as redb entries, never a wrapped library's own persistence | Per CLAUDE.md. On-disk HNSW (graph nodes), on-disk inverted text (postings), and the scalar index (order-preserving keys) all persist as redb entries: bounded memory (touch only what the op needs), no rebuild on open. |
 | 2026-05-29 | Scalar index = order-preserving key encoding, returns a verified superset | Numbers (int+float) share a lane keyed by IEEE-754 total order of the f64; the i64→f64 cast is monotonic, so a range scan never excludes a true match. The builder re-checks every candidate against the exact predicate, so encoding ties only cost a few extra checks, never correctness. `Ne` is not serviced (a full anti-scan isn't sub-linear). |
+| 2026-05-29 | Quantization extracted to a shared `quant` module; on-disk index stores quantized vectors | One implementation (encode/probe/distance + binary/scalar codecs) backs both the in-memory and on-disk HNSW, so their recall matches. The on-disk graph stores the quantized form (decoded with the index's mode on read), cutting disk + page-cache footprint for the billions-of-vectors path. |
+| 2026-05-29 | WASM proven via a `cdylib` size harness, not a full browser build | The engine compiles to wasm32 and links into a ≈0.2 MB-gzipped bundle (CI-enforced < 2 MB). A real browser API (wasm-bindgen + OPFS StorageBackend) is Worker-only and needs a browser to validate — kept separate so the engine's wasm-readiness is checked every CI run without a browser harness. |

@@ -68,7 +68,7 @@ computed among matching documents, never a post-hoc trim.
 | Fluent multi-modal query builder + projection + aggregation | ✅ |
 | HNSW approximate index (`create_vector_index`) | ✅ in-memory, derived |
 | On-disk HNSW (`create_vector_index_ondisk`) | ✅ bounded memory, persists |
-| Vector quantization (binary ≈32×, scalar ≈4×) | ✅ in-memory footprint |
+| Vector quantization (binary ≈32×, scalar ≈4×) | ✅ in-memory **and** on-disk |
 | On-disk inverted text index (`create_text_index_ondisk`) | ✅ bounded memory, persists |
 | Scalar index (`create_scalar_index`): sub-linear eq/range filters | ✅ on disk, persists |
 | Directed property graph (`link`/`neighbors`/`traverse`) | ✅ |
@@ -78,7 +78,8 @@ computed among matching documents, never a post-hoc trim.
 | Probabilistic sketches (HyperLogLog, Bloom) | ✅ |
 | Reactive change feeds | ✅ |
 | MCP sidecar over stdio | ✅ |
-| WASM/browser, mobile | ⏳ planned |
+| WASM build (engine, ≈0.2 MB gzipped, CI-enforced) | ✅ in-memory; OPFS persistence ⏳ |
+| Mobile cross-compile (aarch64 iOS/Android) | ✅ engine builds |
 
 Image search is vector search over image embeddings: embed in your app (CLIP
 etc.), store the `$vector`, query — same engine as text vectors. corvid does

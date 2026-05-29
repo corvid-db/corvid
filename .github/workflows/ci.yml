@@ -37,3 +37,36 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Coverage gate
         run: cargo llvm-cov --workspace --fail-under-lines 90
+
+  wasm:
+    name: wasm build (< 2 MB gzipped)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build WASM bundle
+        run: cargo build -p corvid-wasm --target wasm32-unknown-unknown --profile wasm-release
+      - name: Enforce bundle-size budget
+        run: |
+          WASM=target/wasm32-unknown-unknown/wasm-release/corvid_wasm.wasm
+          GZ=$(gzip -9 -c "$WASM" | wc -c)
+          echo "gzipped bundle: $GZ bytes"
+          if [ "$GZ" -gt 2097152 ]; then
+            echo "::error::WASM bundle $GZ bytes exceeds the 2 MB gzipped budget"
+            exit 1
+          fi
+
+  mobile:
+    name: mobile cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Build engine for aarch64-android
+        run: cargo build -p corvid --target aarch64-linux-android --release
