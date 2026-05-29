@@ -65,6 +65,7 @@ computed among matching documents, never a post-hoc trim.
 | Rank fusion (RRF) and MMR diversification | ✅ |
 | Fluent multi-modal query builder + projection + aggregation | ✅ |
 | HNSW approximate index (`create_vector_index`) | ✅ in-memory, derived |
+| Vector quantization (binary ≈32×, scalar ≈4×) | ✅ in-memory footprint |
 | Directed property graph (`link`/`neighbors`/`traverse`) | ✅ |
 | Geospatial: radius / bounding-box / `within_km` filter | ✅ |
 | Cross-collection lookup joins | ✅ |
