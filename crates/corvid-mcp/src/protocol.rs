@@ -214,6 +214,21 @@ fn tools_list() -> Json {
                     },
                     "required": ["collection", "start", "relation", "hops"]
                 }
+            },
+            {
+                "name": "geo",
+                "description": "Find documents whose location field is within radius_km of (lat, lon), nearest first.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "field": { "type": "string" },
+                        "lat": { "type": "number" },
+                        "lon": { "type": "number" },
+                        "radius_km": { "type": "number" }
+                    },
+                    "required": ["collection", "field", "lat", "lon", "radius_km"]
+                }
             }
         ]
     })
@@ -295,6 +310,7 @@ mod tests {
             "unlink",
             "neighbors",
             "traverse",
+            "geo",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }

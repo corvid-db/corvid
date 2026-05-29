@@ -58,6 +58,7 @@ impl Server {
             "neighbors" => self.neighbors(params),
             "traverse" => self.traverse(params),
             "create_index" => self.create_index(params),
+            "geo" => self.geo(params),
             other => Err(ToolError::UnknownTool(other.to_owned())),
         }
     }
@@ -214,6 +215,29 @@ impl Server {
             .create_vector_index(field, metric);
         Ok(json!({ "ok": true }))
     }
+
+    fn geo(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let field = str_param(p, "field")?;
+        let lat = f64_param(p, "lat")?;
+        let lon = f64_param(p, "lon")?;
+        let radius_km = f64_param(p, "radius_km")?;
+        let hits = self
+            .db
+            .collection(collection)
+            .geo_within_radius(field, lat, lon, radius_km)?;
+        let results: Vec<Json> = hits
+            .iter()
+            .map(|h| {
+                json!({
+                    "key": String::from_utf8_lossy(&h.key),
+                    "distance_km": h.distance_km,
+                    "document": value_to_json(&h.document),
+                })
+            })
+            .collect();
+        Ok(json!({ "results": results }))
+    }
 }
 
 /// Render a list of byte keys as JSON strings.
@@ -257,6 +281,13 @@ fn parse_predicate(j: &Json) -> Result<Predicate, ToolError> {
             Ok(!parse_predicate(clause)?)
         }
         "exists" => Ok(field(field_param(obj)?).exists()),
+        "geo_within" => {
+            let f = field(field_param(obj)?);
+            let lat = obj_f64(obj, "lat")?;
+            let lon = obj_f64(obj, "lon")?;
+            let radius_km = obj_f64(obj, "radius_km")?;
+            Ok(f.within_km(lat, lon, radius_km))
+        }
         "eq" | "ne" | "lt" | "le" | "gt" | "ge" => {
             let f = field(field_param(obj)?);
             let value = obj
@@ -294,6 +325,18 @@ fn uint_param(p: &Json, key: &str) -> Result<usize, ToolError> {
         .and_then(Json::as_u64)
         .map(|n| n as usize)
         .ok_or_else(|| ToolError::BadParams(format!("missing non-negative integer '{key}'")))
+}
+
+fn f64_param(p: &Json, key: &str) -> Result<f64, ToolError> {
+    p.get(key)
+        .and_then(Json::as_f64)
+        .ok_or_else(|| ToolError::BadParams(format!("missing number '{key}'")))
+}
+
+fn obj_f64(obj: &serde_json::Map<String, Json>, key: &str) -> Result<f64, ToolError> {
+    obj.get(key)
+        .and_then(Json::as_f64)
+        .ok_or_else(|| ToolError::BadParams(format!("missing number '{key}'")))
 }
 
 fn f32_array(value: Option<&Json>) -> Result<Vec<f32>, ToolError> {
@@ -663,6 +706,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out["results"][0]["key"], "a");
+    }
+
+    #[test]
+    fn geo_tool_finds_nearby() {
+        let s = server();
+        store(&s, "london", json!({"loc": [51.5074, -0.1278]}));
+        store(&s, "paris", json!({"loc": [48.8566, 2.3522]}));
+        let out = s
+            .handle(
+                "geo",
+                &json!({"collection": "docs", "field": "loc", "lat": 51.5, "lon": -0.13, "radius_km": 50.0}),
+            )
+            .unwrap();
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["key"], "london");
+        assert!(results[0]["distance_km"].as_f64().unwrap() < 50.0);
+    }
+
+    #[test]
+    fn search_with_geo_within_filter() {
+        let s = server();
+        store(
+            &s,
+            "near",
+            json!({"loc": [51.5, -0.13], "body": "coffee shop"}),
+        );
+        store(
+            &s,
+            "far",
+            json!({"loc": [48.86, 2.35], "body": "coffee shop"}),
+        );
+        // "coffee near London" — text + geo filter in one query.
+        let out = s
+            .handle(
+                "search",
+                &json!({
+                    "collection": "docs",
+                    "filter": {"op": "geo_within", "field": "loc", "lat": 51.5, "lon": -0.13, "radius_km": 50.0},
+                    "text": {"field": "body", "query": "coffee", "k": 10}
+                }),
+            )
+            .unwrap();
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["key"], "near");
     }
 
     #[test]
