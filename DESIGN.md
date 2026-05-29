@@ -226,6 +226,39 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 
 ---
 
+## Scaling characteristics (measured)
+
+From the `scaling` example (file-backed, 16-dim embeddings), after the
+streaming/index optimizations. Times are indicative (one machine), the point is
+the *shape*.
+
+| Operation | 1k | 100k | 1M | memory |
+|---|---|---|---|---|
+| batch insert | ~16ms | ~0.6s | ~4.9s | bounded (per batch) |
+| `count()` (no filter) | µs | µs | ~12µs | O(1) — maintained counter |
+| point `get` | µs | ~15µs | ~22µs | O(1) |
+| filtered `count` / `group_count` | <1ms | ~55ms | ~0.55s | **constant** (streamed) |
+| `order_by` + `limit` | ~1ms | ~0.13s | ~0.58s | **bounded** (≈ page size) |
+| `text_search` (indexed) | µs | µs | µs | — (after build) |
+| HNSW build | — | ~15s | (minutes) | in-memory |
+
+**What scales (constant or bounded memory, O(1)/O(n) time):** storage, point
+ops, `count`/`len` (O(1)), streamed aggregates, ordered pagination, and the
+bounded-heap exact vector search. These hold at 50M (slower, but no OOM).
+
+**The honest walls at 1M–50M:**
+- **In-memory index build/rebuild.** HNSW and the inverted index live in RAM and
+  build lazily (and rebuild on open). At 1M the HNSW build is minutes; at 50M
+  neither fits in RAM. This is the **on-disk index** deferral (#16) — the real
+  frontier for large-scale vector/text *search*.
+- **No secondary scalar index.** `filter`/`order_by` are O(n) scans (constant
+  memory now, but linear time). A scalar B-tree index (#6) is the optimization.
+- **Exact (unindexed) search** is O(n) time — correct and OOM-free (streamed),
+  but you want an index past ~100k.
+
+So: everything except large-scale *index build/search* scales to 50M with
+bounded memory today; large-scale search needs the deferred on-disk indexes.
+
 ## Transaction model
 
 - **Single writer (whole database)**, multi-reader MVCC. Inherited from redb.
