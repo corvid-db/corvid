@@ -307,6 +307,20 @@ fn tools_list() -> Json {
                 }
             },
             {
+                "name": "phrase_search",
+                "description": "Find documents whose field text contains an exact phrase (consecutive in-order tokens). Returns ranked {key, score, document}.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "field": { "type": "string" },
+                        "phrase": { "type": "string" },
+                        "k": { "type": "integer" }
+                    },
+                    "required": ["collection", "field", "phrase", "k"]
+                }
+            },
+            {
                 "name": "create_text_index",
                 "description": "Create an inverted full-text index on a field to accelerate text search. Set on_disk for bounded memory on large corpora (persists, no rebuild).",
                 "inputSchema": {
@@ -472,6 +486,7 @@ mod tests {
             "patch",
             "compare_and_set",
             "delete_where",
+            "phrase_search",
             "search",
             "create_index",
             "link",

@@ -63,6 +63,7 @@ impl Server {
             "patch" => self.patch(params),
             "compare_and_set" => self.compare_and_set(params),
             "delete_where" => self.delete_where(params),
+            "phrase_search" => self.phrase_search(params),
             "create_geo_index" => self.create_geo_index(params),
             "create_compound_index" => self.create_compound_index(params),
             "backup" => self.backup(params),
@@ -115,6 +116,28 @@ impl Server {
             new,
         )?;
         Ok(json!({ "applied": applied }))
+    }
+
+    fn phrase_search(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let field = str_param(p, "field")?;
+        let phrase = str_param(p, "phrase")?;
+        let k = uint_param(p, "k")?;
+        let hits = self
+            .db
+            .collection(collection)
+            .phrase_search(field, phrase, k)?;
+        let results: Vec<Json> = hits
+            .iter()
+            .map(|h| {
+                json!({
+                    "key": String::from_utf8_lossy(&h.key),
+                    "score": h.score,
+                    "document": value_to_json(&h.document),
+                })
+            })
+            .collect();
+        Ok(json!({ "results": results }))
     }
 
     fn delete_where(&self, p: &Json) -> Result<Json, ToolError> {

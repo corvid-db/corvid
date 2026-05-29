@@ -61,8 +61,9 @@ pub(crate) struct FtsState {
 /// An inverted index over one text field.
 #[derive(Default)]
 struct Inverted {
-    /// term -> (doc key -> term frequency).
-    postings: HashMap<String, HashMap<Vec<u8>, u32>>,
+    /// term -> (doc key -> sorted token positions). The term frequency is the
+    /// number of positions; positions enable phrase queries.
+    postings: HashMap<String, HashMap<Vec<u8>, Vec<u32>>>,
     /// doc key -> token count.
     doc_len: HashMap<Vec<u8>, usize>,
     /// doc key -> its distinct terms (forward index, for removal).
@@ -74,22 +75,22 @@ impl Inverted {
     /// Index (or re-index) `key`'s text. An existing entry is removed first.
     fn add(&mut self, key: &[u8], text: &str) {
         self.remove(key);
-        let mut tf: HashMap<String, u32> = HashMap::new();
-        let mut len = 0usize;
-        for token in analyze(text) {
-            *tf.entry(token).or_insert(0) += 1;
+        let mut len = 0u32;
+        let mut terms: Vec<String> = Vec::new();
+        for (pos, token) in analyze(text).into_iter().enumerate() {
+            let entry = self.postings.entry(token.clone()).or_default();
+            let positions = entry.entry(key.to_vec()).or_default();
+            if positions.is_empty() {
+                terms.push(token);
+            }
+            positions.push(pos as u32);
             len += 1;
         }
-        for (term, count) in &tf {
-            self.postings
-                .entry(term.clone())
-                .or_default()
-                .insert(key.to_vec(), *count);
-        }
-        self.doc_terms
-            .insert(key.to_vec(), tf.keys().cloned().collect());
-        self.doc_len.insert(key.to_vec(), len);
-        self.total_len += len;
+        terms.sort();
+        terms.dedup();
+        self.doc_terms.insert(key.to_vec(), terms);
+        self.doc_len.insert(key.to_vec(), len as usize);
+        self.total_len += len as usize;
     }
 
     /// Remove `key` from the index if present.
@@ -131,10 +132,10 @@ impl Inverted {
                 continue;
             };
             let term_idf = idf(n, posting.len());
-            for (doc, &tf) in posting {
+            for (doc, positions) in posting {
                 let dl = self.doc_len.get(doc).copied().unwrap_or(0);
                 *scores.entry(doc.clone()).or_insert(0.0) +=
-                    term_score(tf, dl, avg_len, term_idf, params);
+                    term_score(positions.len() as u32, dl, avg_len, term_idf, params);
             }
         }
 
@@ -144,6 +145,72 @@ impl Inverted {
         ranked.truncate(k);
         ranked
     }
+
+    /// BM25-ranked docs that contain the analyzed `phrase` as a consecutive
+    /// run of tokens (in order). Scored by the phrase terms' BM25 sum.
+    fn phrase_search(&self, phrase: &str, k: usize) -> RankedKeys {
+        let params = Bm25Params::default();
+        let n = self.doc_len.len();
+        let terms = analyze(phrase);
+        if n == 0 || k == 0 || terms.is_empty() {
+            return Vec::new();
+        }
+        let avg_len = match self.total_len as f32 / n as f32 {
+            0.0 => 1.0,
+            v => v,
+        };
+        // Candidate docs: those containing the first phrase term.
+        let Some(first) = self.postings.get(&terms[0]) else {
+            return Vec::new();
+        };
+        let mut ranked: Vec<(Vec<u8>, f32)> = Vec::new();
+        'docs: for (doc, first_pos) in first {
+            // Collect each term's positions in this doc.
+            let mut per_term: Vec<&Vec<u32>> = Vec::with_capacity(terms.len());
+            per_term.push(first_pos);
+            for t in &terms[1..] {
+                match self.postings.get(t).and_then(|m| m.get(doc)) {
+                    Some(ps) => per_term.push(ps),
+                    None => continue 'docs,
+                }
+            }
+            if !phrase_aligned(&per_term) {
+                continue;
+            }
+            let dl = self.doc_len.get(doc).copied().unwrap_or(0);
+            let score: f32 = terms
+                .iter()
+                .zip(&per_term)
+                .map(|(t, ps)| {
+                    let df = self.postings.get(t).map(|m| m.len()).unwrap_or(1);
+                    term_score(ps.len() as u32, dl, avg_len, idf(n, df), params)
+                })
+                .sum();
+            ranked.push((doc.clone(), score));
+        }
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(k);
+        ranked
+    }
+}
+
+/// Whether there is a start position `p` such that `per_term[i]` contains
+/// `p + i` for every `i` — i.e. the terms occur consecutively and in order.
+/// Each positions list is sorted ascending.
+fn phrase_aligned(per_term: &[&Vec<u32>]) -> bool {
+    if per_term.len() == 1 {
+        return !per_term[0].is_empty();
+    }
+    for &start in per_term[0] {
+        if (1..per_term.len()).all(|i| {
+            start
+                .checked_add(i as u32)
+                .is_some_and(|want| per_term[i].binary_search(&want).is_ok())
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 impl Db {
@@ -272,6 +339,40 @@ impl Db {
 
         let state = self.fts().lock().expect("fts lock");
         Ok(state.built.get(&map_key).map(|inv| inv.search(query, k)))
+    }
+
+    /// Like [`Db::fts_search`] but matching `phrase` as a consecutive in-order
+    /// run of tokens (positions). `None` if `field` has no text index.
+    pub(crate) fn fts_phrase_search(
+        &self,
+        collection: &str,
+        field: &str,
+        phrase: &str,
+        k: usize,
+    ) -> Result<Option<RankedKeys>> {
+        let map_key = (collection.to_owned(), field.to_owned());
+        let needs_build = {
+            let state = self.fts().lock().expect("fts lock");
+            match state.defs.get(&map_key) {
+                None => return Ok(None),
+                Some(TextKind::OnDisk) => {
+                    let ns = disk_fts::namespace(collection, field);
+                    drop(state);
+                    return Ok(Some(disk_fts::phrase_search(self.store(), &ns, phrase, k)?));
+                }
+                Some(TextKind::InMemory) => !state.built.contains_key(&map_key),
+            }
+        };
+        if needs_build {
+            let inv = build_inverted(self.store(), collection, field)?;
+            let mut state = self.fts().lock().expect("fts lock");
+            state.built.entry(map_key.clone()).or_insert(inv);
+        }
+        let state = self.fts().lock().expect("fts lock");
+        Ok(state
+            .built
+            .get(&map_key)
+            .map(|inv| inv.phrase_search(phrase, k)))
     }
 }
 
@@ -496,6 +597,53 @@ mod tests {
                 .iter()
                 .any(|h| h.key == b"b".to_vec())
         );
+    }
+
+    #[test]
+    fn phrase_search_requires_adjacency_in_order() {
+        for on_disk in [false, true] {
+            let db = Db::open_in_memory().unwrap();
+            let c = db.collection("docs");
+            c.insert(b"a", &doc("the quick brown fox jumps")).unwrap();
+            c.insert(b"b", &doc("a brown quick fox")).unwrap(); // wrong order
+            c.insert(b"c", &doc("the quick brown dog")).unwrap();
+            if on_disk {
+                c.create_text_index_ondisk("body").unwrap();
+            } else {
+                c.create_text_index("body").unwrap();
+            }
+            // "quick brown" is adjacent+in-order in a and c, not in b.
+            let hits = c.phrase_search("body", "quick brown", 10).unwrap();
+            let keys: std::collections::HashSet<_> = hits.iter().map(|h| h.key.clone()).collect();
+            assert!(keys.contains(b"a".as_slice()), "on_disk={on_disk}");
+            assert!(keys.contains(b"c".as_slice()), "on_disk={on_disk}");
+            assert!(!keys.contains(b"b".as_slice()), "on_disk={on_disk}");
+            // A phrase not present anywhere → empty.
+            assert!(
+                c.phrase_search("body", "brown fox", 10)
+                    .unwrap()
+                    .iter()
+                    .all(|h| h.key != b"b".to_vec())
+            );
+            assert!(
+                !c.phrase_search("body", "quick fox", 10)
+                    .unwrap()
+                    .iter()
+                    .any(|h| h.key == b"a".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn phrase_search_without_index_scans() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &doc("alpha beta gamma")).unwrap();
+        c.insert(b"b", &doc("beta alpha gamma")).unwrap();
+        // No text index → exact scan fallback.
+        let hits = c.phrase_search("body", "alpha beta", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, b"a".to_vec());
     }
 
     #[test]

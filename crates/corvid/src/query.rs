@@ -79,6 +79,55 @@ impl Collection<'_> {
             .collect())
     }
 
+    /// Return up to `k` documents whose `field` text contains `phrase` as a
+    /// consecutive, in-order run of (analyzed) tokens, most relevant first.
+    ///
+    /// Uses the text index's stored positions when one is registered; otherwise
+    /// scans exactly. Analysis (stop words, stemming) applies to the phrase too,
+    /// so `"the quick fox"` matches on the analyzed tokens. Ties break by key.
+    pub fn phrase_search(&self, field: &str, phrase: &str, k: usize) -> Result<Vec<TextHit>> {
+        if let Some(ranked) = self.db().fts_phrase_search(self.name(), field, phrase, k)? {
+            let mut out = Vec::with_capacity(ranked.len());
+            for (key, score) in ranked {
+                if let Some(document) = self.get(&key)? {
+                    out.push(TextHit {
+                        key,
+                        score,
+                        document,
+                    });
+                }
+            }
+            return Ok(out);
+        }
+
+        // Exact fallback: scan, matching the phrase as a token-sequence window.
+        let phrase_terms = analyze(phrase);
+        if phrase_terms.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut hits: Vec<TextHit> = Vec::new();
+        self.for_each_doc(|key, doc| {
+            if let Some(text) = doc.get_path(field).and_then(Value::as_text) {
+                let tokens = analyze(text);
+                let occurrences = tokens
+                    .windows(phrase_terms.len())
+                    .filter(|w| *w == phrase_terms.as_slice())
+                    .count();
+                if occurrences > 0 {
+                    hits.push(TextHit {
+                        key: key.to_vec(),
+                        score: occurrences as f32,
+                        document: doc,
+                    });
+                }
+            }
+            Ok(true)
+        })?;
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
+        hits.truncate(k);
+        Ok(hits)
+    }
+
     /// Return the `k` documents whose embedding in field `field` is nearest to
     /// `query` under `metric`, nearest first.
     ///

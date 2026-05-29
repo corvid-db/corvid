@@ -49,21 +49,44 @@ fn fwd_key(doc_key: &[u8]) -> Vec<u8> {
     k
 }
 
-fn encode_posting(tf: u32, doc_len: u32) -> Vec<u8> {
-    let mut v = Vec::with_capacity(8);
-    v.extend_from_slice(&tf.to_le_bytes());
+/// Posting value: `doc_len(u32) ‖ n_pos(u32) ‖ positions(u32 each)`. The term
+/// frequency is `n_pos`; the positions enable phrase queries.
+fn encode_posting(positions: &[u32], doc_len: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + positions.len() * 4);
     v.extend_from_slice(&doc_len.to_le_bytes());
+    v.extend_from_slice(&(positions.len() as u32).to_le_bytes());
+    for p in positions {
+        v.extend_from_slice(&p.to_le_bytes());
+    }
     v
 }
 
+/// Decode a posting into `(tf, doc_len)`.
 fn decode_posting(b: &[u8]) -> Option<(u32, u32)> {
     if b.len() < 8 {
         return None;
     }
-    Some((
-        u32::from_le_bytes(b[0..4].try_into().unwrap()),
-        u32::from_le_bytes(b[4..8].try_into().unwrap()),
-    ))
+    let doc_len = u32::from_le_bytes(b[0..4].try_into().unwrap());
+    let n_pos = u32::from_le_bytes(b[4..8].try_into().unwrap());
+    Some((n_pos, doc_len))
+}
+
+/// Decode a posting's positions list (for phrase matching).
+fn decode_positions(b: &[u8]) -> Vec<u32> {
+    if b.len() < 8 {
+        return Vec::new();
+    }
+    let n_pos = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+    let mut out = Vec::with_capacity(n_pos);
+    let mut pos = 8;
+    for _ in 0..n_pos {
+        match b.get(pos..pos + 4) {
+            Some(chunk) => out.push(u32::from_le_bytes(chunk.try_into().unwrap())),
+            None => break,
+        }
+        pos += 4;
+    }
+    out
 }
 
 fn encode_fwd(doc_len: u32, terms: &[String]) -> Vec<u8> {
@@ -186,22 +209,26 @@ fn index_in_txn(
     // Replace any existing entry first.
     remove_in_txn(tx, ns, meta, doc_key)?;
 
-    let mut tf: HashMap<String, u32> = HashMap::new();
+    let mut positions: HashMap<String, Vec<u32>> = HashMap::new();
     let mut len = 0u32;
-    for token in analyze(text) {
-        *tf.entry(token).or_insert(0) += 1;
+    for (pos, token) in analyze(text).into_iter().enumerate() {
+        positions.entry(token).or_default().push(pos as u32);
         len += 1;
     }
-    if tf.is_empty() {
+    if positions.is_empty() {
         // Still counts as a document (length 0) for corpus stats parity.
         tx.put(ns, &fwd_key(doc_key), &encode_fwd(0, &[]))?;
         meta.n += 1;
         return Ok(());
     }
 
-    let terms: Vec<String> = tf.keys().cloned().collect();
-    for (term, &count) in &tf {
-        tx.put(ns, &posting_key(term, doc_key), &encode_posting(count, len))?;
+    let terms: Vec<String> = positions.keys().cloned().collect();
+    for (term, pos_list) in &positions {
+        tx.put(
+            ns,
+            &posting_key(term, doc_key),
+            &encode_posting(pos_list, len),
+        )?;
     }
     tx.put(ns, &fwd_key(doc_key), &encode_fwd(len, &terms))?;
     meta.n += 1;
@@ -255,6 +282,99 @@ pub(crate) fn search(store: &Store, ns: &str, query: &str, k: usize) -> Result<R
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     ranked.truncate(k);
     Ok(ranked)
+}
+
+/// Phrase search: BM25-ranked docs containing the analyzed `phrase` as a
+/// consecutive in-order run of tokens, using stored positions.
+pub(crate) fn phrase_search(store: &Store, ns: &str, phrase: &str, k: usize) -> Result<Ranked> {
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    let meta = store
+        .get(ns, &[TAG_META])?
+        .map(|b| decode_meta(&b))
+        .unwrap_or_default();
+    let n = meta.n as usize;
+    let terms = analyze(phrase);
+    if n == 0 || terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let avg_len = match meta.total_len as f32 / n as f32 {
+        0.0 => 1.0,
+        v => v,
+    };
+    let params = Bm25Params::default();
+
+    // For each term, map doc_key -> (positions, doc_len), and remember df.
+    type DocPostings = HashMap<Vec<u8>, (Vec<u32>, u32)>;
+    let mut per_term: Vec<(DocPostings, usize)> = Vec::with_capacity(terms.len());
+    for term in &terms {
+        let prefix = term_prefix(term);
+        let postings = store.scan_prefix(ns, &prefix)?;
+        let df = postings.len();
+        if df == 0 {
+            return Ok(Vec::new()); // a term absent everywhere → no phrase match
+        }
+        let mut m = HashMap::with_capacity(df);
+        for (key, value) in postings {
+            let doc_key = key.get(prefix.len()..).unwrap_or(&[]).to_vec();
+            let (_, doc_len) = decode_posting(&value).unwrap_or((0, 0));
+            m.insert(doc_key, (decode_positions(&value), doc_len));
+        }
+        per_term.push((m, df));
+    }
+
+    // Candidate docs are those containing the first term; verify alignment.
+    let (first_map, _) = &per_term[0];
+    let mut ranked: Vec<(Vec<u8>, f32)> = Vec::new();
+    'docs: for (doc, (first_pos, doc_len)) in first_map {
+        let mut lists: Vec<&Vec<u32>> = Vec::with_capacity(terms.len());
+        lists.push(first_pos);
+        for (map, _) in &per_term[1..] {
+            match map.get(doc) {
+                Some((ps, _)) => lists.push(ps),
+                None => continue 'docs,
+            }
+        }
+        if !phrase_aligned(&lists) {
+            continue;
+        }
+        let score: f32 = per_term
+            .iter()
+            .zip(&lists)
+            .map(|((_, df), ps)| {
+                term_score(
+                    ps.len() as u32,
+                    *doc_len as usize,
+                    avg_len,
+                    idf(n, *df),
+                    params,
+                )
+            })
+            .sum();
+        ranked.push((doc.clone(), score));
+    }
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(k);
+    Ok(ranked)
+}
+
+/// Whether the sorted position lists occur consecutively and in order: some
+/// `p` with `lists[i]` containing `p + i` for all `i`.
+fn phrase_aligned(lists: &[&Vec<u32>]) -> bool {
+    if lists.len() == 1 {
+        return !lists[0].is_empty();
+    }
+    for &start in lists[0] {
+        if (1..lists.len()).all(|i| {
+            start
+                .checked_add(i as u32)
+                .is_some_and(|want| lists[i].binary_search(&want).is_ok())
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
