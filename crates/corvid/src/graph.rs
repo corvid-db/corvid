@@ -31,6 +31,35 @@ impl Collection<'_> {
         })
     }
 
+    /// Add a directed edge carrying a `weight` (e.g. confidence or cost). Like
+    /// [`Collection::link`] but the weight is stored on the edge and readable
+    /// via [`Collection::neighbors_weighted`].
+    pub fn link_weighted(&self, from: &[u8], relation: &str, to: &[u8], weight: f64) -> Result<()> {
+        self.ensure_writable()?;
+        let (forward, reverse) = (self.edges_name(), self.redges_name());
+        let (fwd_key, rev_key) = (edge_key(relation, from, to), edge_key(relation, to, from));
+        let value = weight.to_le_bytes();
+        self.db().store().transaction(|tx| {
+            tx.put(&forward, &fwd_key, &value)?;
+            tx.put(&reverse, &rev_key, &value)?;
+            Ok(())
+        })
+    }
+
+    /// Return `(target, weight)` for every `from --relation--> ?` edge.
+    /// Unweighted edges report a weight of `1.0`.
+    pub fn neighbors_weighted(&self, from: &[u8], relation: &str) -> Result<Vec<(Vec<u8>, f64)>> {
+        let prefix = neighbor_prefix(relation, from);
+        let edges = self.db().store().scan_prefix(&self.edges_name(), &prefix)?;
+        Ok(edges
+            .into_iter()
+            .map(|(key, value)| {
+                let to = key.get(prefix.len()..).unwrap_or(&[]).to_vec();
+                (to, decode_weight(&value))
+            })
+            .collect())
+    }
+
     /// Remove the edge `from --relation--> to` (and its reverse), atomically.
     /// Returns whether the forward edge existed.
     pub fn unlink(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<bool> {
@@ -105,6 +134,15 @@ impl Collection<'_> {
     }
 }
 
+/// Decode an edge weight value: an 8-byte little-endian f64, or `1.0` if the
+/// edge carries no weight (empty value).
+fn decode_weight(value: &[u8]) -> f64 {
+    match value.try_into() {
+        Ok(bytes) => f64::from_le_bytes(bytes),
+        Err(_) => 1.0,
+    }
+}
+
 /// Encode an edge key: `len(relation) ‖ relation ‖ len(from) ‖ from ‖ to`.
 fn edge_key(relation: &str, from: &[u8], to: &[u8]) -> Vec<u8> {
     let mut k = neighbor_prefix(relation, from);
@@ -171,6 +209,21 @@ mod tests {
         );
         assert_eq!(c.in_neighbors(b"y", "knows").unwrap(), vec![b"a".to_vec()]);
         assert!(c.in_neighbors(b"nobody", "knows").unwrap().is_empty());
+    }
+
+    #[test]
+    fn weighted_edges_carry_weight() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("nodes");
+        c.link_weighted(b"a", "rel", b"b", 0.8).unwrap();
+        c.link_weighted(b"a", "rel", b"c", 0.2).unwrap();
+        c.link(b"a", "rel", b"d").unwrap(); // unweighted -> 1.0
+        let weighted = c.neighbors_weighted(b"a", "rel").unwrap();
+        assert_eq!(weighted.len(), 3);
+        let w: std::collections::HashMap<_, _> = weighted.into_iter().collect();
+        assert!((w[&b"b".to_vec()] - 0.8).abs() < 1e-9);
+        assert!((w[&b"c".to_vec()] - 0.2).abs() < 1e-9);
+        assert!((w[&b"d".to_vec()] - 1.0).abs() < 1e-9);
     }
 
     #[test]
