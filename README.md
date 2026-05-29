@@ -51,7 +51,9 @@ computed among matching documents, never a post-hoc trim.
 - **`corvid-mcp`** — a sidecar that exposes a corvid store to agentic coding
   tools over MCP (JSON-RPC on stdio). Run `corvid-mcp [PATH]` and point an MCP
   client at it; tools: `store`, `get`, `delete`, `search`, `create_index`,
-  `link`, `unlink`, `neighbors`, `traverse`.
+  `create_text_index`, `create_scalar_index`, `count`, `geo`, `join`, `link`,
+  `unlink`, `neighbors`, `in_neighbors`, `traverse`, `list_collections`,
+  `insert_auto`.
 
 ## Capabilities (v0.1)
 
@@ -65,7 +67,10 @@ computed among matching documents, never a post-hoc trim.
 | Rank fusion (RRF) and MMR diversification | ✅ |
 | Fluent multi-modal query builder + projection + aggregation | ✅ |
 | HNSW approximate index (`create_vector_index`) | ✅ in-memory, derived |
+| On-disk HNSW (`create_vector_index_ondisk`) | ✅ bounded memory, persists |
 | Vector quantization (binary ≈32×, scalar ≈4×) | ✅ in-memory footprint |
+| On-disk inverted text index (`create_text_index_ondisk`) | ✅ bounded memory, persists |
+| Scalar index (`create_scalar_index`): sub-linear eq/range filters | ✅ on disk, persists |
 | Directed property graph (`link`/`neighbors`/`traverse`) | ✅ |
 | Geospatial: radius / bounding-box / `within_km` filter | ✅ |
 | Cross-collection lookup joins | ✅ |
@@ -73,7 +78,7 @@ computed among matching documents, never a post-hoc trim.
 | Probabilistic sketches (HyperLogLog, Bloom) | ✅ |
 | Reactive change feeds | ✅ |
 | MCP sidecar over stdio | ✅ |
-| Persisted ANN graph, WASM/browser, mobile | ⏳ planned |
+| WASM/browser, mobile | ⏳ planned |
 
 Image search is vector search over image embeddings: embed in your app (CLIP
 etc.), store the `$vector`, query — same engine as text vectors. corvid does
@@ -83,8 +88,17 @@ Vector and text search are **exact** (brute-force over a scan) by default — th
 correctness baseline. Calling `create_vector_index` registers an HNSW index
 that `vector_search` then uses transparently (approximate, faster); the index
 is derived from the documents and rebuilt automatically after writes, so it is
-never stale at query time. Persisting the graph to disk (rather than rebuilding
-in memory on open) is planned.
+never stale at query time.
+
+For scale beyond what fits in RAM, the index can live on disk: an insert or
+search touches only the nodes/postings it needs, so memory is bounded by the
+operation, not the collection, and the index persists across reopen with no
+rebuild. `create_vector_index_ondisk` (graph nodes), `create_text_index_ondisk`
+(BM25 postings), and `create_scalar_index` (order-preserving keys for sub-linear
+equality/range filters and counts) all store their state as ordinary records.
+The scalar index returns a verified candidate superset and falls back to a
+bounded scan when a filter isn't selective, so it never trades memory or
+correctness for speed.
 
 ## Design
 
