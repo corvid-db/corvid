@@ -193,6 +193,30 @@ Smallest coherent thing that's usable for my own AI work. Target: usable within 
 
 ---
 
+## Implementation status (living)
+
+As of the first build pass. All code is tested (≥90% line coverage, mostly ~99%), fmt + clippy clean under `-D warnings`.
+
+**Built and working:**
+- **L1 storage** (`store.rs`): collections over one redb table (BE id-prefixed keys), `put/get/delete/scan`, atomic multi-op `transaction(|tx| …)` and snapshot `read(|r| …)`, file-backed and in-memory.
+- **L2 values** (`value.rs`): `Value` (null/bool/int/float/text/bytes/array/map/vector) with a deterministic tag/length codec; field accessors.
+- **Document layer** (`db.rs`): `Db` + `Collection` handle over typed `Value` documents.
+- **Vector search** (`distance.rs`, `query.rs`): cosine/dot/L2 kernels; exact (brute-force) KNN — the correctness baseline.
+- **Full-text** (`text.rs`, `query.rs`): tokenizer + BM25, exact over a scan.
+- **Fusion** (`fusion.rs`): Reciprocal Rank Fusion + MMR.
+- **Filters** (`filter.rs`): `field("a.b").gt(…)` predicate tree, and/or/not, dotted paths.
+- **L4 fluent builder** (`builder.rs`): `collection.query().filter().vector().text().fuse_rrf().rerank_mmr().select().limit().run()` — filter runs *before* ranking (true predicate). The keystone.
+- **Sidecar core** (`corvid-mcp`): transport-agnostic JSON tool layer (`store/get/delete/search`) with a filter DSL; the byte-level MCP/stdio framing is the remaining glue.
+
+**Not yet built (the exact baselines stand in for these behind a stable API):**
+- Real indexes: HNSW (replaces brute-force KNN), inverted index + state-in-redb (replaces scan-time BM25), secondary scalar B+-tree. The `(b) state-in-redb` invariant work lands here.
+- Joins / group-by (algebra is single-collection so far).
+- WASM/OPFS backend; mobile pread/pwrite hardening.
+- The MCP/stdio transport shell over `Server::handle`.
+- Everything under *Out of v0.1*.
+
+---
+
 ## Transaction model
 
 - **Single writer (whole database)**, multi-reader MVCC. Inherited from redb.
@@ -348,3 +372,5 @@ These need answers before specific layers can be implemented. Listed in rough or
 | 2026-05-29 | License: MIT only | User's call. |
 | 2026-05-29 | Name: `corvid` (engine), `corvid-mcp` (sidecar) | `neodb` was taken on crates.io. Corvid = crows/ravens: eat anything, highly intelligent, cache food across thousands of remembered locations — "stores everything and recalls it" maps onto an AI memory store. Confirmed available on crates.io. |
 | 2026-05-29 | Filtered vector search = true predicate (correct by default, `.approx()` opts out) | Correctness-first; the filter is a real predicate, not top-k-then-drop. |
+| 2026-05-29 | First build pass: L1–L4 + sidecar core, exact baselines for vector/FTS | Ship a usable, fully-tested core fast; HNSW/inverted indexes slot in behind the stable API later. Builder applies filters before ranking to honor the true-predicate contract. |
+| 2026-05-29 | Sidecar built as transport-agnostic tool layer first | `Server::handle` (JSON in/out) holds all behavior and is fully testable; MCP/stdio framing is mechanical glue deferred to wire against the MCP SDK. |
