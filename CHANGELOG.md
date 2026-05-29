@@ -58,6 +58,9 @@ format and API may change without backward-compatibility guarantees.
 - Phrase search (`phrase_search`): exact consecutive in-order token matches,
   via positions stored in both inverted indexes (in-memory + on-disk); MCP
   `phrase_search`. Falls back to an exact scan when no text index.
+- OR queries use an index union: a top-level OR whose disjuncts are all
+  index-serviceable scans each index and unions the candidates, instead of a
+  full scan.
 - More predicates: `is_in` (set membership), `between` (inclusive range),
   `starts_with`/`contains` (text); between/in/starts_with route through the
   scalar index (text prefix scan), the rest verify on scan.

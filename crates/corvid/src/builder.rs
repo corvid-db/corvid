@@ -543,11 +543,116 @@ impl QueryBuilder<'_> {
             k
         } else if let Some(k) = self.geo_candidate_keys()? {
             k
+        } else if let Some(k) = self.or_candidate_keys()? {
+            k
         } else {
             return Ok(None);
         };
 
         self.verify_candidates(keys)
+    }
+
+    /// Index-serviceable candidate keys for a *single* predicate (eq/range/in/
+    /// between/starts_with on a scalar index, or geo within), else `None`.
+    fn predicate_candidates(&self, pred: &Predicate) -> Result<Option<Vec<Vec<u8>>>> {
+        const CAP: usize = 100_000;
+        let db = self.collection.db();
+        let coll = self.collection.name();
+        match pred {
+            Predicate::Compare { path, op, value }
+                if matches!(
+                    op,
+                    CmpOp::Eq | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge
+                ) && db.has_scalar_index(coll, path) =>
+            {
+                let cons = [crate::scalar::Constraint { op: *op, value }];
+                db.scalar_candidates(coll, path, &cons, CAP)
+            }
+            Predicate::Between { path, low, high } if db.has_scalar_index(coll, path) => {
+                let cons = [
+                    crate::scalar::Constraint {
+                        op: CmpOp::Ge,
+                        value: low,
+                    },
+                    crate::scalar::Constraint {
+                        op: CmpOp::Le,
+                        value: high,
+                    },
+                ];
+                db.scalar_candidates(coll, path, &cons, CAP)
+            }
+            Predicate::In { path, values } if db.has_scalar_index(coll, path) => {
+                let mut seen = std::collections::HashSet::new();
+                let mut out = Vec::new();
+                for v in values {
+                    let cons = [crate::scalar::Constraint {
+                        op: CmpOp::Eq,
+                        value: v,
+                    }];
+                    match db.scalar_candidates(coll, path, &cons, CAP)? {
+                        Some(ks) => {
+                            for k in ks {
+                                if seen.insert(k.clone()) {
+                                    out.push(k);
+                                }
+                            }
+                        }
+                        None => return Ok(None),
+                    }
+                }
+                Ok(Some(out))
+            }
+            Predicate::StartsWith { path, prefix } if db.has_scalar_index(coll, path) => {
+                db.scalar_prefix_candidates(coll, path, prefix, CAP)
+            }
+            Predicate::GeoWithin {
+                path,
+                lat,
+                lon,
+                radius_km,
+            } if db.has_geo_index(coll, path) => {
+                match crate::geo_index::radius_bbox(*lat, *lon, *radius_km) {
+                    Some((mn_lat, mn_lon, mx_lat, mx_lon)) => {
+                        db.geo_candidates(coll, path, mn_lat, mn_lon, mx_lat, mx_lon)
+                    }
+                    None => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// If a top-level filter is an `OR` whose every disjunct is index-
+    /// serviceable, the union of their candidate key sets (deduped, capped) — so
+    /// a disjunction stays sub-linear. `None` if any disjunct can't use an index
+    /// (then the whole thing must scan, to avoid missing matches).
+    fn or_candidate_keys(&self) -> Result<Option<Vec<Vec<u8>>>> {
+        const CAP: usize = 100_000;
+        for pred in &self.filters {
+            if matches!(pred, Predicate::Or(..)) {
+                let mut disjuncts = Vec::new();
+                flatten_or(pred, &mut disjuncts);
+                let mut seen = std::collections::HashSet::new();
+                let mut out = Vec::new();
+                for d in disjuncts {
+                    match self.predicate_candidates(d)? {
+                        Some(ks) => {
+                            for k in ks {
+                                if seen.insert(k.clone()) {
+                                    out.push(k);
+                                    if out.len() > CAP {
+                                        return Ok(None);
+                                    }
+                                }
+                            }
+                        }
+                        None => return Ok(None),
+                    }
+                }
+                return Ok(Some(out));
+            }
+        }
+        Ok(None)
     }
 
     /// Candidate keys for the first index-serviceable `Between` / `In` /
@@ -987,6 +1092,17 @@ fn group_key(v: &Value) -> Option<String> {
         Value::Float(f) => Some(f.to_string()),
         Value::Bool(b) => Some(b.to_string()),
         _ => None,
+    }
+}
+
+/// Flatten a (possibly nested) `OR` predicate tree into its disjuncts.
+fn flatten_or<'a>(pred: &'a Predicate, out: &mut Vec<&'a Predicate>) {
+    match pred {
+        Predicate::Or(a, b) => {
+            flatten_or(a, out);
+            flatten_or(b, out);
+        }
+        other => out.push(other),
     }
 }
 
@@ -1463,6 +1579,47 @@ mod tests {
         assert!(keys.contains(&b"a".to_vec()));
         assert!(keys.contains(&b"c".to_vec()));
         assert!(!keys.contains(&b"b".to_vec())); // "python web framework"
+    }
+
+    #[test]
+    fn or_predicate_uses_index_union_matching_scan() {
+        fn fill(c: &crate::Collection) {
+            for i in 0..60i64 {
+                let mut m = BTreeMap::new();
+                m.insert("n".to_owned(), Value::Int(i));
+                m.insert("cat".to_owned(), Value::Text(format!("c{}", i % 5)));
+                c.insert(&[i as u8], &Value::Map(m)).unwrap();
+            }
+        }
+        let plain = Db::open_in_memory().unwrap();
+        fill(&plain.collection("docs"));
+        let indexed = Db::open_in_memory().unwrap();
+        let ic = indexed.collection("docs");
+        fill(&ic);
+        ic.create_scalar_index("n").unwrap();
+        ic.create_scalar_index("cat").unwrap();
+
+        let run = |db: &Db| {
+            let mut k: Vec<_> = db
+                .collection("docs")
+                .query()
+                // n == 3  OR  n >= 58  OR  cat == "c2"
+                .filter(
+                    field("n")
+                        .eq(Value::Int(3))
+                        .or(field("n").ge(Value::Int(58)))
+                        .or(field("cat").eq(Value::Text("c2".into()))),
+                )
+                .run()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>();
+            k.sort();
+            k
+        };
+        assert_eq!(run(&plain), run(&indexed));
+        assert!(!run(&indexed).is_empty());
     }
 
     #[test]
