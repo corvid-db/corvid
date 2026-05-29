@@ -205,15 +205,17 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 - **Full-text** (`text.rs`, `query.rs`): tokenizer + BM25, exact over a scan.
 - **Fusion** (`fusion.rs`): Reciprocal Rank Fusion + MMR.
 - **Filters** (`filter.rs`): `field("a.b").gt(…)` predicate tree, and/or/not, dotted paths.
-- **L4 fluent builder** (`builder.rs`): `collection.query().filter().vector().text().fuse_rrf().rerank_mmr().select().limit().run()` — filter runs *before* ranking (true predicate). The keystone.
-- **Sidecar core** (`corvid-mcp`): transport-agnostic JSON tool layer (`store/get/delete/search`) with a filter DSL; the byte-level MCP/stdio framing is the remaining glue.
+- **L4 fluent builder** (`builder.rs`): `collection.query().filter().vector().text().fuse_rrf().rerank_mmr().select().limit().run()` — filter runs *before* ranking (true predicate). Plus `count`/`group_count` aggregation terminals. The keystone.
+- **HNSW index** (`hnsw.rs`, `index.rs`): in-memory HNSW, recall-tested vs the exact baseline. `Collection::create_vector_index` registers a derived index that `vector_search` uses transparently; documents are the source of truth and the index rebuilds on staleness after writes (reconcile-on-open path).
+- **Graph** (`graph.rs`): directed `link`/`unlink`/`neighbors`/bounded-BFS `traverse` over document keys, edges in a sibling namespace via prefix scan.
+- **Sidecar** (`corvid-mcp`): a runnable MCP server over stdio (`initialize`/`tools/list`/`tools/call`) exposing `store`/`get`/`delete`/`search`/`create_index`/`link`/`unlink`/`neighbors`/`traverse`, with a `main` binary and a CLI integration test.
 
-**Not yet built (the exact baselines stand in for these behind a stable API):**
-- Real indexes: HNSW (replaces brute-force KNN), inverted index + state-in-redb (replaces scan-time BM25), secondary scalar B+-tree. The `(b) state-in-redb` invariant work lands here.
-- Joins / group-by (algebra is single-collection so far).
+**Not yet built:**
+- Persisting the HNSW graph as redb entries (the full `(b) state-in-redb` form; today the index is in-memory/derived). Inverted index for BM25; secondary scalar B+-tree (filter/FTS are exact scans).
+- Cross-collection joins.
+- Wiring ANN into the builder's `.vector()` for the no-filter case (the standalone `vector_search` already uses it).
 - WASM/OPFS backend; mobile pread/pwrite hardening.
-- The MCP/stdio transport shell over `Server::handle`.
-- Everything under *Out of v0.1*.
+- Everything under *Out of v0.1* not listed above (spatial, sketches, time-series, reactive, semantic cache).
 
 ---
 
