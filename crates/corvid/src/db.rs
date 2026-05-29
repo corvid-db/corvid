@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use crate::error::Result;
 use crate::index::IndexState;
+use crate::reactive::{ChangeEvent, ChangeKind, Subscribers};
 use crate::store::Store;
 use crate::value::Value;
 
@@ -22,6 +23,7 @@ use crate::value::Value;
 pub struct Db {
     store: Store,
     indexes: Mutex<IndexState>,
+    subscribers: Mutex<Subscribers>,
 }
 
 impl Db {
@@ -30,6 +32,7 @@ impl Db {
         Ok(Self {
             store: Store::open(path)?,
             indexes: Mutex::new(IndexState::default()),
+            subscribers: Mutex::new(Subscribers::default()),
         })
     }
 
@@ -38,6 +41,7 @@ impl Db {
         Ok(Self {
             store: Store::open_in_memory()?,
             indexes: Mutex::new(IndexState::default()),
+            subscribers: Mutex::new(Subscribers::default()),
         })
     }
 
@@ -56,6 +60,11 @@ impl Db {
     /// The in-memory derived-index cache.
     pub(crate) fn indexes(&self) -> &Mutex<IndexState> {
         &self.indexes
+    }
+
+    /// The change-feed subscriber registry.
+    pub(crate) fn subscribers(&self) -> &Mutex<Subscribers> {
+        &self.subscribers
     }
 
     /// Record a write to `collection`, invalidating its derived indexes.
@@ -89,6 +98,11 @@ impl Collection<'_> {
     pub fn insert(&self, key: &[u8], doc: &Value) -> Result<()> {
         self.db.store().put(self.name, key, &doc.encode())?;
         self.db.bump_gen(self.name);
+        self.db.notify(ChangeEvent {
+            collection: self.name.to_owned(),
+            key: key.to_vec(),
+            kind: ChangeKind::Insert,
+        });
         Ok(())
     }
 
@@ -105,6 +119,11 @@ impl Collection<'_> {
         let removed = self.db.store().delete(self.name, key)?;
         if removed {
             self.db.bump_gen(self.name);
+            self.db.notify(ChangeEvent {
+                collection: self.name.to_owned(),
+                key: key.to_vec(),
+                kind: ChangeKind::Delete,
+            });
         }
         Ok(removed)
     }
