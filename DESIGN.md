@@ -201,24 +201,28 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 - **L1 storage** (`store.rs`): collections over one redb table (BE id-prefixed keys), `put/get/delete/scan`, atomic multi-op `transaction(|tx| …)` and snapshot `read(|r| …)`, file-backed and in-memory.
 - **L2 values** (`value.rs`): `Value` (null/bool/int/float/text/bytes/array/map/vector) with a deterministic tag/length codec; field accessors.
 - **Document layer** (`db.rs`): `Db` + `Collection` handle over typed `Value` documents.
-- **Vector search** (`distance.rs`, `query.rs`): cosine/dot/L2 kernels; exact (brute-force) KNN — the correctness baseline.
-- **Full-text** (`text.rs`, `query.rs`): tokenizer + BM25, exact over a scan.
+- **Vector search** (`distance.rs`, `query.rs`): cosine/dot/L2 kernels; exact KNN baseline + HNSW index.
+- **HNSW index** (`hnsw.rs`, `index.rs`): **incremental and persistent-definition**. `create_vector_index` registers a derived index maintained with O(log n) inserts/tombstones per write (no per-write rebuild); definitions reload on open; `vector_search` and the builder use it (the latter via `.approx()` for filtered queries). Documents are the source of truth.
+- **Full-text** (`text.rs`, `fts.rs`): tokenizer + BM25 exact baseline **plus an incremental inverted index** (`create_text_index`) so queries touch only query-term postings.
 - **Fusion** (`fusion.rs`): Reciprocal Rank Fusion + MMR.
-- **Filters** (`filter.rs`): `field("a.b").gt(…)` predicate tree, and/or/not, dotted paths.
-- **L4 fluent builder** (`builder.rs`): `collection.query().filter().vector().text().fuse_rrf().rerank_mmr().select().limit().run()` — filter runs *before* ranking (true predicate). Plus `count`/`group_count` aggregation terminals. The keystone.
-- **HNSW index** (`hnsw.rs`, `index.rs`): in-memory HNSW, recall-tested vs the exact baseline. `Collection::create_vector_index` registers a derived index that `vector_search` uses transparently; documents are the source of truth and the index rebuilds on staleness after writes (reconcile-on-open path).
-- **Graph** (`graph.rs`): directed `link`/`unlink`/`neighbors`/bounded-BFS `traverse` over document keys, edges in a sibling namespace via prefix scan.
-- **Semantic cache** (`semantic_cache.rs`): vector-keyed cache (`put`/`get` within a distance threshold) over `vector_search`.
-- **Reactive** (`reactive.rs`): in-process `subscribe`/`unsubscribe` change feeds; deadlock-free synchronous notify on insert/delete.
-- **Sketches** (`sketch.rs`): HyperLogLog (`Collection::approx_distinct`) and a Bloom filter.
-- **Sidecar** (`corvid-mcp`): a runnable MCP server over stdio (`initialize`/`tools/list`/`tools/call`) exposing `store`/`get`/`delete`/`search`/`create_index`/`link`/`unlink`/`neighbors`/`traverse`, with a `main` binary and a CLI integration test.
+- **Filters** (`filter.rs`): `field("a.b").gt(…)` predicate tree, and/or/not, dotted paths, `within_km` geo.
+- **L4 fluent builder** (`builder.rs`): filter → vector → text → RRF → MMR → `order_by`/`offset` → `select` (nested paths) → `limit`; `count`/`group_count`; `.approx()`; `.explain()`.
+- **Graph** (`graph.rs`): `link`/`link_weighted`/`unlink`/`neighbors`/`neighbors_weighted`/`in_neighbors`/`traverse`; edges atomic (forward+reverse in one txn).
+- **Geo** (`geo.rs`): haversine radius / bbox, composable as a builder filter.
+- **Join, semantic cache, reactive feeds, sketches, document layer** as before; auto-keys (`insert_auto`), `collections()` listing, on-disk format version.
+- **Sidecar** (`corvid-mcp`): MCP server over stdio exposing store/get/delete/search/create_index/create_text_index/link/unlink/neighbors/in_neighbors/traverse/geo/join/list_collections/count/insert_auto, with default result caps.
 
-**Not yet built:**
-- Persisting the HNSW graph as redb entries (the full `(b) state-in-redb` form; today the index is in-memory/derived). Inverted index for BM25; secondary scalar B+-tree (filter/FTS are exact scans).
-- Cross-collection joins.
-- Wiring ANN into the builder's `.vector()` for the no-filter case (the standalone `vector_search` already uses it).
-- WASM/OPFS backend; mobile pread/pwrite hardening (need a wasm toolchain / device harness, not exercisable in the current environment).
-- Remaining *Out of v0.1* peripherals not yet built: spatial (R-tree/H3), time-series compression, embedding-as-column-type auto-pipeline.
+**Audit gaps resolved** (see the gap sweep): incremental+persistent indexes (#4/#7), inverted FTS (#3), filtered-ANN in builder (#5), order_by/offset (#10), reverse edges (#11), format version (#12), auto-keys (#8), MCP surface+caps (#13/#27), reserved-name & length & slicing hardening (#17/#18/#20), atomic edges + single-snapshot join (#2/#14), nested select + explain (#22/#26 partial), edge weights (#25), CI/LICENSE/CHANGELOG/MSRV + property/concurrency tests + benchmarks (#28–32).
+
+**Deliberately deferred (large subsystems or environment-blocked, with reasons):**
+- **On-disk HNSW / quantization** (#16): the index is in-memory/derived (correct, rebuilds on open). On-disk graph and PQ/binary quantization are scale optimizations, not correctness gaps.
+- **Spatial index** (#6, geo): geo is an exact scan (correct); an R-tree/geohash index is the scale optimization, same pattern as the vector/text baselines.
+- **Secondary scalar index** (#6): `filter`/`count`/`group_count` scan; a B-tree secondary index is the optimization.
+- **Streaming result iterators** (#15): results are materialized; a streaming/cursor API is a larger refactor.
+- **Declared schema/constraints** (#9): schema-on-read today; a strict-schema layer is a future addition.
+- **Richer text analysis** (#23): single English-ish analyzer; stemming/stopwords/phrase/CJK are future.
+- **Plan-cache AST** (#26): `.explain()` exists; an identity-hashable cached plan is future.
+- **WASM/OPFS + mobile**: need a wasm toolchain / device harness not available in this environment.
 
 ---
 
