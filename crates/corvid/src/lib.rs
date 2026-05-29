@@ -29,6 +29,7 @@ pub mod quant;
 pub mod query;
 pub mod reactive;
 pub mod scalar;
+pub mod schema;
 pub mod semantic_cache;
 pub mod sketch;
 pub mod store;

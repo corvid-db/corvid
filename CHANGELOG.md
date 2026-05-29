@@ -45,6 +45,8 @@ format and API may change without backward-compatibility guarantees.
 - Fluent multi-modal query builder: filter + vector + text + RRF fusion + MMR
   rerank + projection + `order_by`/`offset` pagination + `count`/`group_count`.
 - Filter predicates (`field().gt()`, and/or/not, dotted paths, `within_km` geo).
+- Optional per-collection declared schema (`set_schema`): field types,
+  `required`, and `unique` enforced on write; schemaless collections unaffected.
 - Directed property graph: `link`/`unlink`/`neighbors`/`in_neighbors`/`traverse`.
 - Geospatial radius / bounding-box queries (haversine).
 - Cross-collection lookup joins, semantic (vector-keyed) cache, in-process

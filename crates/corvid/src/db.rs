@@ -26,6 +26,7 @@ pub struct Db {
     fts: Mutex<crate::fts::FtsState>,
     scalar: Mutex<crate::scalar::ScalarState>,
     geo: Mutex<crate::geo_index::GeoState>,
+    schemas: Mutex<crate::schema::SchemaState>,
     subscribers: Mutex<Subscribers>,
 }
 
@@ -38,6 +39,7 @@ impl Db {
             fts: crate::fts::new_state(),
             scalar: crate::scalar::new_state(),
             geo: crate::geo_index::new_state(),
+            schemas: crate::schema::new_state(),
             subscribers: Mutex::new(Subscribers::default()),
         };
         db.load_index_defs()?;
@@ -45,6 +47,7 @@ impl Db {
         db.load_scalar_defs()?;
         db.load_compound_defs()?;
         db.load_geo_defs()?;
+        db.load_schemas()?;
         Ok(db)
     }
 
@@ -56,6 +59,7 @@ impl Db {
             fts: crate::fts::new_state(),
             scalar: crate::scalar::new_state(),
             geo: crate::geo_index::new_state(),
+            schemas: crate::schema::new_state(),
             subscribers: Mutex::new(Subscribers::default()),
         };
         db.load_index_defs()?;
@@ -63,6 +67,7 @@ impl Db {
         db.load_scalar_defs()?;
         db.load_compound_defs()?;
         db.load_geo_defs()?;
+        db.load_schemas()?;
         Ok(db)
     }
 
@@ -117,6 +122,11 @@ impl Db {
         &self.geo
     }
 
+    /// The declared-schema registry.
+    pub(crate) fn schemas(&self) -> &Mutex<crate::schema::SchemaState> {
+        &self.schemas
+    }
+
     /// The change-feed subscriber registry.
     pub(crate) fn subscribers(&self) -> &Mutex<Subscribers> {
         &self.subscribers
@@ -156,6 +166,7 @@ impl Collection<'_> {
     /// Insert or overwrite the document stored at `key`.
     pub fn insert(&self, key: &[u8], doc: &Value) -> Result<()> {
         self.ensure_writable()?;
+        self.db.validate_schema(self.name, key, doc)?;
         self.db.store().put(self.name, key, &doc.encode())?;
         self.db.index_on_insert(self.name, key, doc)?;
         self.db.fts_on_insert(self.name, key, doc)?;
@@ -198,6 +209,10 @@ impl Collection<'_> {
     /// and subscribers are updated after the commit.
     pub fn insert_batch(&self, items: &[(&[u8], &Value)]) -> Result<()> {
         self.ensure_writable()?;
+        // Validate the whole batch before committing any of it.
+        for (key, doc) in items {
+            self.db.validate_schema(self.name, key, doc)?;
+        }
         self.db.store().transaction(|tx| {
             for (key, doc) in items {
                 tx.put(self.name, key, &doc.encode())?;

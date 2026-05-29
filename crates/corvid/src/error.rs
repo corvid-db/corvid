@@ -55,4 +55,8 @@ pub enum Error {
     /// codebook on (or with parameters the sample can't satisfy).
     #[error("cannot train a PQ codebook: no usable training vectors")]
     EmptyIndexTraining,
+
+    /// A write violated the collection's declared schema.
+    #[error("schema violation: {0}")]
+    SchemaViolation(String),
 }
