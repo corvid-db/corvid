@@ -11,14 +11,14 @@
 //! transactional write path (the `state-in-redb` invariant) is a later step.
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 
 use crate::distance::Metric;
 
 /// Default maximum neighbours per node above layer 0.
 pub const DEFAULT_M: usize = 16;
 /// Default candidate-list size during construction.
-pub const DEFAULT_EF_CONSTRUCTION: usize = 200;
+pub const DEFAULT_EF_CONSTRUCTION: usize = 128;
 
 /// A node: its vector and its neighbour lists, one per layer it lives on.
 struct Node {
@@ -62,6 +62,10 @@ pub struct Hnsw {
     rng: u64,
     entry: Option<usize>,
     nodes: Vec<Node>,
+    /// Build-time scratch: per-node "visited" epoch stamps, reused across
+    /// inserts to avoid allocating a visited set on every layer search.
+    visited: Vec<u32>,
+    epoch: u32,
 }
 
 impl Hnsw {
@@ -83,6 +87,8 @@ impl Hnsw {
             rng: 0x9E3779B97F4A7C15,
             entry: None,
             nodes: Vec::new(),
+            visited: Vec::new(),
+            epoch: 0,
         }
     }
 
@@ -116,14 +122,32 @@ impl Hnsw {
         // Descend greedily from the top down to just above the new node's level.
         let mut cur = entry;
         for layer in ((level + 1)..=top).rev() {
-            let w = self.search_layer(&query, &[cur], 1, layer);
+            let w = Self::search_layer(
+                &self.nodes,
+                self.metric,
+                &mut self.visited,
+                &mut self.epoch,
+                &query,
+                &[cur],
+                1,
+                layer,
+            );
             cur = w[0].id;
         }
 
         // Connect on every layer from min(level, top) down to 0.
         let start = level.min(top);
         for layer in (0..=start).rev() {
-            let w = self.search_layer(&query, &[cur], self.ef_construction, layer);
+            let w = Self::search_layer(
+                &self.nodes,
+                self.metric,
+                &mut self.visited,
+                &mut self.epoch,
+                &query,
+                &[cur],
+                self.ef_construction,
+                layer,
+            );
             let m_layer = if layer == 0 { self.m0 } else { self.m };
             let neighbors: Vec<usize> = w.iter().take(m_layer).map(|c| c.id).collect();
 
@@ -156,38 +180,84 @@ impl Hnsw {
 
         let mut cur = entry;
         let top = self.nodes[entry].layers.len() - 1;
+        // Query-time search uses a local scratch (queries are far rarer than
+        // build-time inserts, which reuse the index's scratch).
+        let mut visited = Vec::new();
+        let mut epoch = 0u32;
         for layer in (1..=top).rev() {
-            let w = self.search_layer(query, &[cur], 1, layer);
+            let w = Self::search_layer(
+                &self.nodes,
+                self.metric,
+                &mut visited,
+                &mut epoch,
+                query,
+                &[cur],
+                1,
+                layer,
+            );
             cur = w[0].id;
         }
-        let w = self.search_layer(query, &[cur], ef_search.max(k), 0);
+        let w = Self::search_layer(
+            &self.nodes,
+            self.metric,
+            &mut visited,
+            &mut epoch,
+            query,
+            &[cur],
+            ef_search.max(k),
+            0,
+        );
         w.into_iter().take(k).map(|c| (c.id, c.dist)).collect()
     }
 
     /// Greedy best-first search on one layer, returning up to `ef` closest
-    /// nodes sorted nearest-first.
-    fn search_layer(&self, query: &[f32], entries: &[usize], ef: usize, layer: usize) -> Vec<Cand> {
-        let mut visited: HashSet<usize> = HashSet::new();
+    /// nodes sorted nearest-first. Uses an epoch-stamped `visited` buffer
+    /// (reused across calls) instead of allocating a set each time.
+    #[allow(clippy::too_many_arguments)]
+    fn search_layer(
+        nodes: &[Node],
+        metric: Metric,
+        visited: &mut Vec<u32>,
+        epoch: &mut u32,
+        query: &[f32],
+        entries: &[usize],
+        ef: usize,
+        layer: usize,
+    ) -> Vec<Cand> {
+        if visited.len() < nodes.len() {
+            visited.resize(nodes.len(), 0);
+        }
+        *epoch = epoch.wrapping_add(1);
+        if *epoch == 0 {
+            visited.iter_mut().for_each(|v| *v = 0);
+            *epoch = 1;
+        }
+        let mark = *epoch;
+        // Returns true if `id` was not yet visited this search (and marks it).
+        let mut newly_visited = |id: usize| -> bool {
+            let unseen = visited[id] != mark;
+            visited[id] = mark;
+            unseen
+        };
+
         let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
         let mut results: BinaryHeap<Cand> = BinaryHeap::new();
 
         for &ep in entries {
-            let d = self.dist(query, &self.nodes[ep].vector);
+            let d = metric.distance(query, &nodes[ep].vector);
             let c = Cand { dist: d, id: ep };
             candidates.push(Reverse(c));
             results.push(c);
-            visited.insert(ep);
+            newly_visited(ep);
         }
 
         while let Some(Reverse(c)) = candidates.pop() {
-            // Stop once the nearest unexpanded candidate is farther than the
-            // current worst kept result and we already hold `ef` of them.
             if results.len() >= ef && c.dist > results.peek().expect("non-empty").dist {
                 break;
             }
-            for &nb in &self.nodes[c.id].layers[layer] {
-                if visited.insert(nb) {
-                    let d = self.dist(query, &self.nodes[nb].vector);
+            for &nb in &nodes[c.id].layers[layer] {
+                if newly_visited(nb) {
+                    let d = metric.distance(query, &nodes[nb].vector);
                     let worst = results.peek().map(|w| w.dist).unwrap_or(f32::INFINITY);
                     if results.len() < ef || d < worst {
                         let cand = Cand { dist: d, id: nb };
@@ -208,15 +278,21 @@ impl Hnsw {
 
     /// Keep only the `m` nearest neighbours of `node` on `layer`.
     fn prune(&mut self, node: usize, layer: usize, m: usize) {
-        let base = self.nodes[node].vector.clone();
-        let mut ns = std::mem::take(&mut self.nodes[node].layers[layer]);
-        ns.sort_by(|&a, &b| {
-            self.dist(&base, &self.nodes[a].vector)
-                .total_cmp(&self.dist(&base, &self.nodes[b].vector))
-                .then(a.cmp(&b))
-        });
-        ns.truncate(m);
-        self.nodes[node].layers[layer] = ns;
+        // Take the neighbour list out so we can borrow other nodes immutably.
+        let ns = std::mem::take(&mut self.nodes[node].layers[layer]);
+        // Compute each distance exactly once (not per comparison).
+        let mut scored: Vec<(f32, usize)> = ns
+            .iter()
+            .map(|&a| {
+                (
+                    self.dist(&self.nodes[node].vector, &self.nodes[a].vector),
+                    a,
+                )
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        scored.truncate(m);
+        self.nodes[node].layers[layer] = scored.into_iter().map(|(_, id)| id).collect();
     }
 
     fn dist(&self, a: &[f32], b: &[f32]) -> f32 {
@@ -244,6 +320,7 @@ impl Hnsw {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     /// Deterministic pseudo-random vectors for reproducible recall tests.
     fn corpus(n: usize, dim: usize) -> Vec<Vec<f32>> {
