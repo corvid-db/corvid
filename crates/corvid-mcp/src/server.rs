@@ -61,6 +61,7 @@ impl Server {
             "create_text_index" => self.create_text_index(params),
             "create_scalar_index" => self.create_scalar_index(params),
             "create_geo_index" => self.create_geo_index(params),
+            "backup" => self.backup(params),
             "geo" => self.geo(params),
             "join" => self.join(params),
             "in_neighbors" => self.in_neighbors(params),
@@ -268,6 +269,12 @@ impl Server {
         let field = str_param(p, "field")?;
         self.db.collection(collection).create_geo_index(field)?;
         Ok(json!({ "ok": true }))
+    }
+
+    fn backup(&self, p: &Json) -> Result<Json, ToolError> {
+        let path = str_param(p, "path")?;
+        self.db.backup(path)?;
+        Ok(json!({ "ok": true, "path": path }))
     }
 
     fn list_collections(&self) -> Result<Json, ToolError> {
@@ -965,6 +972,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out["results"][0]["key"], "a");
+    }
+
+    #[test]
+    fn backup_writes_a_reopenable_copy() {
+        let s = server();
+        store(&s, "a", json!({"n": 1}));
+        store(&s, "b", json!({"n": 2}));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bak.db");
+        let out = s
+            .handle("backup", &json!({"path": path.to_str().unwrap()}))
+            .unwrap();
+        assert_eq!(out["ok"], json!(true));
+        // The backup opens as a full database with the data.
+        let reopened = corvid::Db::open(&path).unwrap();
+        assert_eq!(reopened.collection("docs").len().unwrap(), 2);
     }
 
     #[test]

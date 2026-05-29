@@ -124,6 +124,43 @@ impl Store {
         Ok(id)
     }
 
+    /// Write a consistent copy of the store to a fresh database file at `path`.
+    ///
+    /// The copy is taken from one read snapshot, so it is point-in-time
+    /// consistent and safe to call while writers are active (a concurrent
+    /// commit simply isn't included). `path` must not already exist as a redb
+    /// file you care about — it is created/overwritten. The result is a
+    /// complete, independent database openable with [`Store::open`].
+    pub fn backup(&self, path: impl AsRef<Path>) -> Result<()> {
+        let src = self.db.begin_read()?;
+        let dst = Database::create(path)?;
+        let wtx = dst.begin_write()?;
+
+        // Copy each table from the snapshot. A table absent in the source
+        // (never written) is simply skipped.
+        macro_rules! copy_table {
+            ($def:expr) => {{
+                match src.open_table($def) {
+                    Ok(rt) => {
+                        let mut wt = wtx.open_table($def)?;
+                        for entry in rt.iter()? {
+                            let (k, v) = entry?;
+                            wt.insert(k.value(), v.value())?;
+                        }
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }};
+        }
+        copy_table!(RECORDS);
+        copy_table!(CATALOG);
+        copy_table!(META);
+
+        wtx.commit()?;
+        Ok(())
+    }
+
     /// Run `f` inside a single write transaction and commit once.
     ///
     /// Every operation performed on the [`WriteBatch`] commits together. If
@@ -519,6 +556,78 @@ mod tests {
     fn get_missing_key_in_missing_collection_is_none() {
         let s = mem();
         assert_eq!(s.get("nope", b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn backup_copies_all_data_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("src.db");
+        let bak_path = dir.path().join("backup.db");
+        {
+            let s = Store::open(&src_path).unwrap();
+            for i in 0..50u8 {
+                s.put("docs", &[i], &[i, i]).unwrap();
+            }
+            s.put("other", b"x", b"y").unwrap();
+            s.backup(&bak_path).unwrap();
+        }
+        // The backup is an independent, complete database.
+        let b = Store::open(&bak_path).unwrap();
+        assert_eq!(b.count("docs").unwrap(), 50);
+        assert_eq!(b.get("docs", &[7]).unwrap(), Some(vec![7, 7]));
+        assert_eq!(b.get("other", b"x").unwrap(), Some(b"y".to_vec()));
+        let cols = b.collections().unwrap();
+        assert!(cols.contains(&"docs".to_owned()) && cols.contains(&"other".to_owned()));
+    }
+
+    #[test]
+    fn backup_of_empty_store_is_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let bak = dir.path().join("empty.db");
+        mem().backup(&bak).unwrap();
+        let b = Store::open(&bak).unwrap();
+        assert_eq!(b.get("docs", b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn backup_is_consistent_under_concurrent_writes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("src.db");
+        let s = Arc::new(Store::open(&src_path).unwrap());
+        for i in 0..100u32 {
+            s.put("docs", &i.to_be_bytes(), b"v").unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let s = Arc::clone(&s);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut i = 100u32;
+                while !stop.load(Ordering::Relaxed) {
+                    s.put("docs", &i.to_be_bytes(), b"v").unwrap();
+                    i += 1;
+                }
+            })
+        };
+        let bak = dir.path().join("snap.db");
+        s.backup(&bak).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        // The snapshot is internally consistent: every record it contains is a
+        // real committed record, and the maintained count matches the data.
+        let b = Store::open(&bak).unwrap();
+        let mut n = 0u64;
+        b.for_each("docs", |_, v| {
+            assert_eq!(v, b"v");
+            n += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(n, b.count("docs").unwrap());
+        assert!(n >= 100, "backup must include all pre-existing records");
     }
 
     #[test]

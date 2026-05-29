@@ -296,6 +296,17 @@ fn tools_list() -> Json {
                 }
             },
             {
+                "name": "backup",
+                "description": "Write a consistent point-in-time backup of the whole database to a new file at the given path. Safe to run while writers are active.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
                 "name": "list_collections",
                 "description": "List user collection names.",
                 "inputSchema": { "type": "object", "properties": {} }
@@ -410,6 +421,7 @@ mod tests {
             "create_text_index",
             "create_scalar_index",
             "create_geo_index",
+            "backup",
             "list_collections",
             "count",
             "insert_auto",

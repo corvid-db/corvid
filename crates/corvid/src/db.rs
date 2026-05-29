@@ -70,6 +70,14 @@ impl Db {
         Collection { db: self, name }
     }
 
+    /// Write a consistent, point-in-time backup of the entire database
+    /// (documents, indexes, graph, all reserved state) to a fresh file at
+    /// `path`. Safe to call while writers are active — the copy is taken from
+    /// one read snapshot. Reopen it with [`Db::open`].
+    pub fn backup(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        self.store.backup(path)
+    }
+
     /// List user collection names (engine-internal `__`-prefixed namespaces
     /// such as graph edges and index metadata are excluded), in name order.
     pub fn collections(&self) -> Result<Vec<String>> {
@@ -272,6 +280,35 @@ mod tests {
         let d = doc("corvid", 8);
         db.collection("docs").insert(b"k1", &d).unwrap();
         assert_eq!(db.collection("docs").get(b"k1").unwrap(), Some(d));
+    }
+
+    #[test]
+    fn backup_preserves_documents_and_indexes() {
+        use crate::field;
+        let dir = tempfile::tempdir().unwrap();
+        let bak = dir.path().join("backup.db");
+        {
+            let db = Db::open_in_memory().unwrap();
+            let c = db.collection("docs");
+            for i in 0..20i64 {
+                c.insert(&[i as u8], &doc("d", i)).unwrap();
+            }
+            c.create_scalar_index("n").unwrap();
+            db.backup(&bak).unwrap();
+        }
+        // Reopen the backup: documents present and the scalar index still
+        // serves a filtered query (its definition was copied and reloads).
+        let db = Db::open(&bak).unwrap();
+        let c = db.collection("docs");
+        assert_eq!(c.len().unwrap(), 20);
+        let rows = c
+            .query()
+            .filter(field("n").ge(Value::Int(18)))
+            .run()
+            .unwrap();
+        let mut keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+        keys.sort();
+        assert_eq!(keys, vec![vec![18u8], vec![19u8]]);
     }
 
     #[test]

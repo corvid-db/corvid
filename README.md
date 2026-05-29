@@ -78,6 +78,7 @@ computed among matching documents, never a post-hoc trim.
 | Semantic (vector-keyed) cache | ✅ |
 | Probabilistic sketches (HyperLogLog, Bloom) | ✅ |
 | Reactive change feeds | ✅ |
+| Online consistent backup (`Db::backup`) | ✅ |
 | MCP sidecar over stdio | ✅ |
 | WASM build (engine, ≈0.2 MB gzipped, CI-enforced) | ✅ in-memory; OPFS persistence ⏳ |
 | Mobile cross-compile (aarch64 iOS/Android) | ✅ engine builds |

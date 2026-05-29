@@ -25,6 +25,9 @@ format and API may change without backward-compatibility guarantees.
   cells.
 - Quantization extracted to a shared module used by both the in-memory and
   on-disk vector indexes.
+- Online backup: `Db::backup(path)` / `Store::backup(path)` (and MCP `backup`)
+  write a consistent point-in-time copy from one read snapshot, safe to run
+  while writers are active.
 - WASM: the engine compiles to `wasm32-unknown-unknown`; a `corvid-wasm` cdylib
   harness links it into a ≈0.2 MB gzipped bundle, CI-enforced under 2 MB. The
   engine also cross-compiles for aarch64 iOS/Android.
