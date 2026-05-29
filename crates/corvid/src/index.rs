@@ -48,7 +48,7 @@ struct VectorDef {
 
 impl VectorDef {
     fn disk_params(&self) -> DiskParams {
-        DiskParams::new(self.metric, DEFAULT_M, DEFAULT_EF_CONSTRUCTION)
+        DiskParams::with_quant(self.metric, self.quant, DEFAULT_M, DEFAULT_EF_CONSTRUCTION)
     }
 }
 
@@ -201,7 +201,7 @@ impl Db {
                             disk_hnsw::insert(self.store(), &ns, &def.disk_params(), key, v)?
                         }
                         None => {
-                            disk_hnsw::delete(self.store(), &ns, key)?;
+                            disk_hnsw::delete(self.store(), &ns, def.quant, key)?;
                         }
                     }
                 }
@@ -237,7 +237,7 @@ impl Db {
             match def.kind {
                 IndexKind::OnDisk => {
                     let ns = disk_hnsw::namespace(collection, &field);
-                    disk_hnsw::delete(self.store(), &ns, key)?;
+                    disk_hnsw::delete(self.store(), &ns, def.quant, key)?;
                 }
                 IndexKind::InMemory => {
                     let map_key = (collection.to_owned(), field);
@@ -428,18 +428,26 @@ impl Collection<'_> {
     /// bounded by nodes touched per query rather than by collection size —
     /// suitable for very large collections. Existing documents are backfilled.
     pub fn create_vector_index_ondisk(&self, field: &str, metric: Metric) -> Result<()> {
-        self.db().register_vector_index(
-            self.name(),
-            field,
-            metric,
-            Quantization::None,
-            IndexKind::OnDisk,
-        )?;
+        self.create_vector_index_ondisk_quantized(field, metric, Quantization::None)
+    }
+
+    /// Like [`Collection::create_vector_index_ondisk`] but storing each vector
+    /// quantized (binary ≈32× / scalar ≈4× smaller on disk and in the page
+    /// cache), trading a little recall for a much smaller footprint — the path
+    /// for billions of vectors on a laptop.
+    pub fn create_vector_index_ondisk_quantized(
+        &self,
+        field: &str,
+        metric: Metric,
+        quant: Quantization,
+    ) -> Result<()> {
+        self.db()
+            .register_vector_index(self.name(), field, metric, quant, IndexKind::OnDisk)?;
         // Backfill existing documents in chunks: read a page (read txn, which
         // closes), then bulk-insert it (one write txn). Bounded memory, and far
         // fewer commits than one-insert-per-transaction.
         let ns = disk_hnsw::namespace(self.name(), field);
-        let params = DiskParams::new(metric, DEFAULT_M, DEFAULT_EF_CONSTRUCTION);
+        let params = DiskParams::with_quant(metric, quant, DEFAULT_M, DEFAULT_EF_CONSTRUCTION);
         let store = self.db().store();
         const CHUNK: usize = 2048;
         let mut cursor: Vec<u8> = Vec::new();
@@ -654,6 +662,32 @@ mod tests {
             assert_eq!(hits[1].key, b"c".to_vec());
         }
         // Reopen: on-disk graph is used directly — no rebuild.
+        let db = Db::open(&path).unwrap();
+        let hits = db
+            .collection("docs")
+            .vector_search("embedding", &[0.0, 1.0], 1, Metric::L2)
+            .unwrap();
+        assert_eq!(hits[0].key, b"b".to_vec());
+    }
+
+    #[test]
+    fn ondisk_quantized_index_is_used_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvid.db");
+        {
+            let db = Db::open(&path).unwrap();
+            let c = db.collection("docs");
+            c.insert(b"a", &doc(vec![1.0, 0.0])).unwrap(); // backfilled
+            c.create_vector_index_ondisk_quantized("embedding", Metric::L2, Quantization::Scalar)
+                .unwrap();
+            c.insert(b"b", &doc(vec![0.0, 1.0])).unwrap(); // incremental
+            let hits = c
+                .vector_search("embedding", &[1.0, 0.0], 1, Metric::L2)
+                .unwrap();
+            assert_eq!(hits[0].key, b"a".to_vec());
+        }
+        // Reopen: the scalar-quantized on-disk graph decodes with its stored
+        // mode and is used directly — no rebuild.
         let db = Db::open(&path).unwrap();
         let hits = db
             .collection("docs")

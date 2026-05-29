@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use crate::distance::Metric;
 use crate::error::Result;
+use crate::quant::{Quantization, StoredVec};
 use crate::store::Store;
 
 const TAG_NODE: u8 = b'n';
@@ -28,6 +29,7 @@ const TAG_META: u8 = b'm';
 #[derive(Clone, Copy)]
 pub(crate) struct DiskParams {
     pub metric: Metric,
+    pub quant: Quantization,
     pub m: usize,
     pub m0: usize,
     pub ef_construction: usize,
@@ -35,10 +37,16 @@ pub(crate) struct DiskParams {
 }
 
 impl DiskParams {
-    pub fn new(metric: Metric, m: usize, ef_construction: usize) -> Self {
+    pub fn with_quant(
+        metric: Metric,
+        quant: Quantization,
+        m: usize,
+        ef_construction: usize,
+    ) -> Self {
         let m = m.max(2);
         Self {
             metric,
+            quant,
             m,
             m0: m * 2,
             ef_construction: ef_construction.max(m),
@@ -56,7 +64,8 @@ impl DiskParams {
 struct Node {
     deleted: bool,
     doc_key: Vec<u8>,
-    vector: Vec<f32>,
+    /// The vector in the index's storage form (full or quantized).
+    vector: StoredVec,
     /// neighbour ids per layer (`layers[l]`).
     layers: Vec<Vec<u64>>,
 }
@@ -91,10 +100,9 @@ fn encode_node(node: &Node) -> Vec<u8> {
     out.push(node.deleted as u8);
     put_u32(&mut out, node.doc_key.len());
     out.extend_from_slice(&node.doc_key);
-    put_u32(&mut out, node.vector.len());
-    for &x in &node.vector {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
+    let vec_bytes = node.vector.to_bytes();
+    put_u32(&mut out, vec_bytes.len());
+    out.extend_from_slice(&vec_bytes);
     put_u32(&mut out, node.layers.len());
     for layer in &node.layers {
         put_u32(&mut out, layer.len());
@@ -105,16 +113,13 @@ fn encode_node(node: &Node) -> Vec<u8> {
     out
 }
 
-fn decode_node(b: &[u8]) -> Option<Node> {
+fn decode_node(b: &[u8], quant: Quantization) -> Option<Node> {
     let mut c = Cursor { b, pos: 0 };
     let deleted = c.u8()? != 0;
     let dk_len = c.u32()?;
     let doc_key = c.take(dk_len)?.to_vec();
-    let dim = c.u32()?;
-    let mut vector = Vec::with_capacity(dim);
-    for _ in 0..dim {
-        vector.push(f32::from_le_bytes(c.take(4)?.try_into().ok()?));
-    }
+    let vec_len = c.u32()?;
+    let vector = StoredVec::from_bytes(quant, c.take(vec_len)?);
     let n_layers = c.u32()?;
     let mut layers = Vec::with_capacity(n_layers);
     for _ in 0..n_layers {
@@ -302,7 +307,7 @@ fn insert_in_txn(
         // Overwrite: tombstone the previous node for this key.
         if let Some(old_bytes) = tx.get(ns, &keymap_key(doc_key))? {
             let old_id = u64::from_be_bytes(old_bytes.as_slice().try_into().unwrap_or([0; 8]));
-            if let Some(node) = load(tx, ns, cache, old_id)? {
+            if let Some(node) = load(tx, ns, cache, p.quant, old_id)? {
                 let mut node = node;
                 node.deleted = true;
                 cache.nodes.insert(old_id, node);
@@ -318,7 +323,7 @@ fn insert_in_txn(
             Node {
                 deleted: false,
                 doc_key: doc_key.to_vec(),
-                vector: vector.to_vec(),
+                vector: p.quant.encode(vector),
                 layers: vec![Vec::new(); level + 1],
             },
         );
@@ -326,7 +331,7 @@ fn insert_in_txn(
         tx.put(ns, &keymap_key(doc_key), &id.to_be_bytes())?;
 
         if let Some(entry) = meta.entry {
-            let top = load(tx, ns, cache, entry)?
+            let top = load(tx, ns, cache, p.quant, entry)?
                 .map(|n| n.layers.len() - 1)
                 .unwrap_or(0);
 
@@ -385,14 +390,14 @@ fn insert_in_txn(
 }
 
 /// Delete `doc_key` from the index (tombstone). Returns whether it existed.
-pub(crate) fn delete(store: &Store, ns: &str, doc_key: &[u8]) -> Result<bool> {
+pub(crate) fn delete(store: &Store, ns: &str, quant: Quantization, doc_key: &[u8]) -> Result<bool> {
     store.transaction(|tx| {
         let Some(id_bytes) = tx.get(ns, &keymap_key(doc_key))? else {
             return Ok(false);
         };
         let id = u64::from_be_bytes(id_bytes.as_slice().try_into().unwrap_or([0; 8]));
         if let Some(bytes) = tx.get(ns, &node_key(id))?
-            && let Some(mut node) = decode_node(&bytes)
+            && let Some(mut node) = decode_node(&bytes, quant)
         {
             node.deleted = true;
             tx.put(ns, &node_key(id), &encode_node(&node))?;
@@ -423,7 +428,7 @@ pub(crate) fn search(
             return Ok(Vec::new());
         };
         let mut cache = Cache::new();
-        let top = load_r(r, ns, &mut cache, entry)?
+        let top = load_r(r, ns, &mut cache, p.quant, entry)?
             .map(|n| n.layers.len() - 1)
             .unwrap_or(0);
 
@@ -467,6 +472,7 @@ fn load(
     tx: &crate::store::WriteBatch<'_>,
     ns: &str,
     cache: &mut Cache,
+    quant: Quantization,
     id: u64,
 ) -> Result<Option<Node>> {
     if let Some(n) = cache.nodes.get(&id) {
@@ -474,7 +480,7 @@ fn load(
     }
     match tx.get(ns, &node_key(id))? {
         Some(b) => {
-            let node = decode_node(&b);
+            let node = decode_node(&b, quant);
             if let Some(n) = &node {
                 cache.nodes.insert(id, n.clone());
             }
@@ -488,6 +494,7 @@ fn load_r(
     r: &crate::store::ReadBatch<'_>,
     ns: &str,
     cache: &mut Cache,
+    quant: Quantization,
     id: u64,
 ) -> Result<Option<Node>> {
     if let Some(n) = cache.nodes.get(&id) {
@@ -495,7 +502,7 @@ fn load_r(
     }
     match r.get(ns, &node_key(id))? {
         Some(b) => {
-            let node = decode_node(&b);
+            let node = decode_node(&b, quant);
             if let Some(n) = &node {
                 cache.nodes.insert(id, n.clone());
             }
@@ -520,13 +527,14 @@ macro_rules! search_layer_impl {
         ) -> Result<Vec<Cand>> {
             use std::cmp::Reverse;
             use std::collections::{BinaryHeap, HashSet};
+            let probe = p.quant.probe(query);
             let mut visited: HashSet<u64> = HashSet::new();
             let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
             let mut results: BinaryHeap<Cand> = BinaryHeap::new();
 
             for &ep in entries {
-                if let Some(node) = $loader(src, ns, cache, ep)? {
-                    let d = p.metric.distance(query, &node.vector);
+                if let Some(node) = $loader(src, ns, cache, p.quant, ep)? {
+                    let d = p.quant.dist(p.metric, &probe, &node.vector);
                     candidates.push(Reverse(Cand { dist: d, id: ep }));
                     results.push(Cand { dist: d, id: ep });
                     visited.insert(ep);
@@ -545,8 +553,8 @@ macro_rules! search_layer_impl {
                 };
                 for nb in neighbors {
                     if visited.insert(nb) {
-                        if let Some(node) = $loader(src, ns, cache, nb)? {
-                            let d = p.metric.distance(query, &node.vector);
+                        if let Some(node) = $loader(src, ns, cache, p.quant, nb)? {
+                            let d = p.quant.dist(p.metric, &probe, &node.vector);
                             let worst = results.peek().map(|w| w.dist).unwrap_or(f32::INFINITY);
                             if results.len() < ef || d < worst {
                                 candidates.push(Reverse(Cand { dist: d, id: nb }));
@@ -584,6 +592,7 @@ fn prune(
         Some(n) => n.vector.clone(),
         None => return Ok(()),
     };
+    let probe = p.quant.probe_of(&base);
     let ns_ids: Vec<u64> = cache
         .nodes
         .get(&node)
@@ -591,8 +600,8 @@ fn prune(
         .unwrap_or_default();
     let mut scored: Vec<(f32, u64)> = Vec::with_capacity(ns_ids.len());
     for nb in ns_ids {
-        if let Some(other) = load(tx, ns, cache, nb)? {
-            scored.push((p.metric.distance(&base, &other.vector), nb));
+        if let Some(other) = load(tx, ns, cache, p.quant, nb)? {
+            scored.push((p.quant.dist(p.metric, &probe, &other.vector), nb));
         }
     }
     scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -632,7 +641,7 @@ mod tests {
     #[test]
     fn empty_search_is_empty() {
         let store = Store::open_in_memory().unwrap();
-        let p = DiskParams::new(Metric::L2, 16, 128);
+        let p = DiskParams::with_quant(Metric::L2, Quantization::None, 16, 128);
         assert!(
             search(&store, "ix", &p, &[1.0, 2.0], 5, 50)
                 .unwrap()
@@ -643,7 +652,7 @@ mod tests {
     #[test]
     fn single_then_found() {
         let store = Store::open_in_memory().unwrap();
-        let p = DiskParams::new(Metric::L2, 16, 128);
+        let p = DiskParams::with_quant(Metric::L2, Quantization::None, 16, 128);
         insert(&store, "ix", &p, b"a", &[1.0, 2.0, 3.0]).unwrap();
         let got = search(&store, "ix", &p, &[1.0, 2.0, 3.0], 1, 50).unwrap();
         assert_eq!(got[0].0, b"a".to_vec());
@@ -653,7 +662,7 @@ mod tests {
     #[test]
     fn recall_against_exact() {
         let store = Store::open_in_memory().unwrap();
-        let p = DiskParams::new(Metric::L2, 16, 128);
+        let p = DiskParams::with_quant(Metric::L2, Quantization::None, 16, 128);
         let data = corpus(400, 16);
         for (i, v) in data.iter().enumerate() {
             insert(&store, "ix", &p, format!("k{i}").as_bytes(), v).unwrap();
@@ -678,7 +687,7 @@ mod tests {
     fn persists_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("idx.db");
-        let p = DiskParams::new(Metric::L2, 16, 128);
+        let p = DiskParams::with_quant(Metric::L2, Quantization::None, 16, 128);
         let data = corpus(150, 8);
         {
             let store = Store::open(&path).unwrap();
@@ -695,20 +704,92 @@ mod tests {
     #[test]
     fn delete_then_absent() {
         let store = Store::open_in_memory().unwrap();
-        let p = DiskParams::new(Metric::L2, 16, 128);
+        let p = DiskParams::with_quant(Metric::L2, Quantization::None, 16, 128);
         let data = corpus(100, 8);
         for (i, v) in data.iter().enumerate() {
             insert(&store, "ix", &p, format!("k{i}").as_bytes(), v).unwrap();
         }
-        assert!(delete(&store, "ix", b"k20").unwrap());
+        assert!(delete(&store, "ix", Quantization::None, b"k20").unwrap());
         let got = search(&store, "ix", &p, &data[20], 5, 80).unwrap();
         assert!(!got.iter().any(|(key, _)| key == b"k20"));
+    }
+
+    /// Center a corpus around zero so sign bits vary (binary quantization is
+    /// degenerate on all-positive data — every bit would be 1).
+    fn centered(mut data: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+        for v in &mut data {
+            for x in v {
+                *x -= 0.5;
+            }
+        }
+        data
+    }
+
+    fn quantized_recall(quant: Quantization, metric: Metric, center: bool, floor: f64) {
+        let store = Store::open_in_memory().unwrap();
+        let p = DiskParams::with_quant(metric, quant, 16, 128);
+        let mut data = corpus(400, 16);
+        let mut queries = corpus(15, 16);
+        if center {
+            data = centered(data);
+            queries = centered(queries);
+        }
+        for (i, v) in data.iter().enumerate() {
+            insert(&store, "ix", &p, format!("k{i}").as_bytes(), v).unwrap();
+        }
+        let k = 10;
+        let mut total = 0.0;
+        for q in &queries {
+            let approx: HashSet<usize> = search(&store, "ix", &p, q, k, 100)
+                .unwrap()
+                .into_iter()
+                .map(|(key, _)| String::from_utf8(key).unwrap()[1..].parse().unwrap())
+                .collect();
+            let want: HashSet<usize> = exact(&data, q, k).into_iter().collect();
+            total += approx.intersection(&want).count() as f64 / k as f64;
+        }
+        let recall = total / queries.len() as f64;
+        assert!(
+            recall >= floor,
+            "on-disk {quant:?} recall {recall} < {floor}"
+        );
+    }
+
+    #[test]
+    fn scalar_quantized_ondisk_recall() {
+        // Scalar quantization is near-lossless: recall stays high.
+        quantized_recall(Quantization::Scalar, Metric::L2, false, 0.80);
+    }
+
+    #[test]
+    fn binary_quantized_ondisk_finds_neighbours() {
+        // Binary is lossy but on sign-varied data it still retrieves a
+        // meaningful fraction of the true neighbours under cosine.
+        quantized_recall(Quantization::Binary, Metric::Cosine, true, 0.30);
+    }
+
+    #[test]
+    fn quantized_persists_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.db");
+        let p = DiskParams::with_quant(Metric::L2, Quantization::Scalar, 16, 128);
+        let data = corpus(120, 8);
+        {
+            let store = Store::open(&path).unwrap();
+            for (i, v) in data.iter().enumerate() {
+                insert(&store, "ix", &p, format!("k{i}").as_bytes(), v).unwrap();
+            }
+        }
+        // Reopen: the quantized graph decodes with the same mode, no rebuild.
+        let store = Store::open(&path).unwrap();
+        let got = search(&store, "ix", &p, &data[20], 1, 50).unwrap();
+        assert_eq!(got[0].0, b"k20".to_vec());
     }
 
     #[test]
     fn overwrite_updates_vector() {
         let store = Store::open_in_memory().unwrap();
-        let p = DiskParams::new(Metric::L2, 16, 128);
+        let p = DiskParams::with_quant(Metric::L2, Quantization::None, 16, 128);
         insert(&store, "ix", &p, b"x", &[0.0, 0.0]).unwrap();
         insert(&store, "ix", &p, b"far", &[10.0, 10.0]).unwrap();
         // Move x next to far; querying near far should surface both.

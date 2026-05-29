@@ -232,11 +232,12 @@ impl Server {
         let field = str_param(p, "field")?;
         let metric = parse_metric(p.get("metric"))?;
         let on_disk = p.get("on_disk").and_then(Json::as_bool).unwrap_or(false);
+        let quant = parse_quant(p.get("quant"))?;
         let c = self.db.collection(collection);
         if on_disk {
-            c.create_vector_index_ondisk(field, metric)?;
+            c.create_vector_index_ondisk_quantized(field, metric, quant)?;
         } else {
-            c.create_vector_index_quantized(field, metric, parse_quant(p.get("quant"))?)?;
+            c.create_vector_index_quantized(field, metric, quant)?;
         }
         Ok(json!({ "ok": true }))
     }
