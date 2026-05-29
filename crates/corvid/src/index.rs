@@ -132,7 +132,50 @@ impl BuiltIndex {
     }
 }
 
+/// How a dumped vector index should be recreated.
+pub(crate) enum VectorMode {
+    InMemory,
+    OnDisk,
+    OnDiskPq { m: usize, k: usize },
+}
+
+/// A vector index definition in portable form (for dump/migrate).
+pub(crate) struct VectorSpec {
+    pub collection: String,
+    pub field: String,
+    pub metric: Metric,
+    pub quant: Quantization,
+    pub mode: VectorMode,
+}
+
 impl Db {
+    /// Enumerate vector index definitions in portable form.
+    pub(crate) fn vector_specs(&self) -> Vec<VectorSpec> {
+        let state = self.indexes().lock().expect("index lock");
+        state
+            .defs
+            .iter()
+            .map(|((c, f), d)| {
+                let mode = match (d.kind, &d.pq) {
+                    (IndexKind::InMemory, _) => VectorMode::InMemory,
+                    (IndexKind::OnDisk, _) => VectorMode::OnDisk,
+                    (IndexKind::OnDiskPq, Some(pq)) => {
+                        let (m, k) = pq.params();
+                        VectorMode::OnDiskPq { m, k }
+                    }
+                    (IndexKind::OnDiskPq, None) => VectorMode::OnDisk,
+                };
+                VectorSpec {
+                    collection: c.clone(),
+                    field: f.clone(),
+                    metric: d.metric,
+                    quant: d.quant,
+                    mode,
+                }
+            })
+            .collect()
+    }
+
     /// Load persisted index definitions. Called once on open.
     pub(crate) fn load_index_defs(&self) -> Result<()> {
         let mut state = self.indexes().lock().expect("index lock");

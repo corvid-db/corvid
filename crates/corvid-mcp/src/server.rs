@@ -68,6 +68,8 @@ impl Server {
             "create_geo_index" => self.create_geo_index(params),
             "create_compound_index" => self.create_compound_index(params),
             "backup" => self.backup(params),
+            "dump" => self.dump(params),
+            "load" => self.load(params),
             "geo" => self.geo(params),
             "join" => self.join(params),
             "in_neighbors" => self.in_neighbors(params),
@@ -396,6 +398,22 @@ impl Server {
         let path = str_param(p, "path")?;
         self.db.backup(path)?;
         Ok(json!({ "ok": true, "path": path }))
+    }
+
+    fn dump(&self, p: &Json) -> Result<Json, ToolError> {
+        let path = str_param(p, "path")?;
+        let file = std::fs::File::create(path)
+            .map_err(|e| ToolError::BadParams(format!("cannot create dump file: {e}")))?;
+        self.db.dump(std::io::BufWriter::new(file))?;
+        Ok(json!({ "ok": true, "path": path }))
+    }
+
+    fn load(&self, p: &Json) -> Result<Json, ToolError> {
+        let path = str_param(p, "path")?;
+        let file = std::fs::File::open(path)
+            .map_err(|e| ToolError::BadParams(format!("cannot open dump file: {e}")))?;
+        self.db.load(std::io::BufReader::new(file))?;
+        Ok(json!({ "ok": true }))
     }
 
     fn list_collections(&self) -> Result<Json, ToolError> {
@@ -1126,6 +1144,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out["results"][0]["key"], "a");
+    }
+
+    #[test]
+    fn dump_then_load_round_trips() {
+        let s = server();
+        store(&s, "a", json!({"n": 1}));
+        store(&s, "b", json!({"n": 2}));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.bin");
+        let ps = path.to_str().unwrap();
+        assert_eq!(
+            s.handle("dump", &json!({"path": ps})).unwrap()["ok"],
+            json!(true)
+        );
+        // Load into a fresh server.
+        let s2 = server();
+        assert_eq!(
+            s2.handle("load", &json!({"path": ps})).unwrap()["ok"],
+            json!(true)
+        );
+        let got = s2
+            .handle("get", &json!({"collection": "docs", "key": "b"}))
+            .unwrap();
+        assert_eq!(got["document"]["n"], json!(2));
     }
 
     #[test]

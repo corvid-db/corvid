@@ -49,7 +49,7 @@ impl FieldType {
         )
     }
 
-    fn to_byte(self) -> u8 {
+    pub(crate) fn to_byte(self) -> u8 {
         match self {
             FieldType::Any => 0,
             FieldType::Bool => 1,
@@ -63,7 +63,7 @@ impl FieldType {
         }
     }
 
-    fn from_byte(b: u8) -> Option<FieldType> {
+    pub(crate) fn from_byte(b: u8) -> Option<FieldType> {
         Some(match b {
             0 => FieldType::Any,
             1 => FieldType::Bool,
@@ -134,6 +134,11 @@ impl Schema {
         self
     }
 
+    /// The declared fields, in order.
+    pub fn fields(&self) -> &[Field] {
+        &self.fields
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.fields.len() as u32).to_le_bytes());
@@ -200,6 +205,16 @@ impl Db {
         let mut state = self.schemas().lock().expect("schema lock");
         state.schemas.insert(collection.to_owned(), schema.clone());
         Ok(())
+    }
+
+    /// All declared schemas as `(collection, schema)` (for dump/migrate).
+    pub(crate) fn schema_specs(&self) -> Vec<(String, Schema)> {
+        let state = self.schemas().lock().expect("schema lock");
+        state
+            .schemas
+            .iter()
+            .map(|(c, s)| (c.clone(), s.clone()))
+            .collect()
     }
 
     fn schema_of(&self, collection: &str) -> Option<Schema> {

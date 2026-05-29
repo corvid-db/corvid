@@ -592,6 +592,18 @@ impl Db {
         Ok(())
     }
 
+    /// All single-field scalar index definitions (for dump/migrate).
+    pub(crate) fn scalar_specs(&self) -> Vec<(String, String)> {
+        let state = self.scalar().lock().expect("scalar lock");
+        state.defs.iter().cloned().collect()
+    }
+
+    /// All compound index definitions (for dump/migrate).
+    pub(crate) fn compound_specs(&self) -> Vec<(String, Vec<String>)> {
+        let state = self.scalar().lock().expect("scalar lock");
+        state.compound.clone()
+    }
+
     /// Compound indexes registered on `collection` (ordered field lists).
     pub(crate) fn compound_indexes(&self, collection: &str) -> Vec<Vec<String>> {
         let state = self.scalar().lock().expect("scalar lock");

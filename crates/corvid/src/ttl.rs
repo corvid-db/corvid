@@ -106,6 +106,25 @@ impl Db {
         self.store().transaction(|tx| remove_in_txn(tx, &ns, key))
     }
 
+    /// All per-record expiries as `(collection, doc_key, expires_at)` (dump).
+    pub(crate) fn ttl_specs(&self) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        let collections: Vec<String> = {
+            let state = self.ttl().lock().expect("ttl lock");
+            state.collections.iter().cloned().collect()
+        };
+        let mut out = Vec::new();
+        for coll in collections {
+            let ns = namespace(&coll);
+            // Forward entries: [0x00] ‖ doc_key -> enc_ts.
+            for (key, value) in self.store().scan_prefix(&ns, &[TAG_FWD])? {
+                if key.len() > 1 && value.len() == 8 {
+                    out.push((coll.clone(), key[1..].to_vec(), dec_ts(&value)));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// `key`'s expiry timestamp, if one is set.
     pub(crate) fn ttl_of(&self, collection: &str, key: &[u8]) -> Result<Option<i64>> {
         let ns = namespace(collection);

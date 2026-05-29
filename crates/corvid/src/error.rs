@@ -59,4 +59,12 @@ pub enum Error {
     /// A write violated the collection's declared schema.
     #[error("schema violation: {0}")]
     SchemaViolation(String),
+
+    /// A dump stream was malformed or from an unknown dump version.
+    #[error("invalid dump: {0}")]
+    InvalidDump(String),
+
+    /// An I/O error reading or writing a dump stream.
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }

@@ -395,6 +395,24 @@ fn tools_list() -> Json {
                 }
             },
             {
+                "name": "dump",
+                "description": "Write a logical, version-stamped export (documents + index/schema/TTL definitions) to a file, for migration across storage-format changes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "load",
+                "description": "Replay a dump file (from 'dump') into this database, recreating documents and indexes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            },
+            {
                 "name": "list_collections",
                 "description": "List user collection names.",
                 "inputSchema": { "type": "object", "properties": {} }
@@ -516,6 +534,8 @@ mod tests {
             "create_geo_index",
             "create_compound_index",
             "backup",
+            "dump",
+            "load",
             "list_collections",
             "count",
             "insert_auto",

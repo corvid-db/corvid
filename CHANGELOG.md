@@ -32,6 +32,9 @@ format and API may change without backward-compatibility guarantees.
 - Product Quantization: `create_vector_index_ondisk_pq(field, metric, m, k)`
   (and MCP `create_index` with `pq:{m,k}`) stores vectors as m code bytes via a
   trained, persisted codebook — the smallest vector footprint.
+- Logical dump/load migration (`Db::dump`/`Db::load`, MCP `dump`/`load`):
+  version-stamped export of documents + index/schema/TTL definitions, replayed
+  into a fresh DB (indexes rebuilt) — for migrating across format breaks.
 - Online backup: `Db::backup(path)` / `Store::backup(path)` (and MCP `backup`)
   write a consistent point-in-time copy from one read snapshot, safe to run
   while writers are active.

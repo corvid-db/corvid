@@ -43,6 +43,11 @@ impl Pq {
         self.dim
     }
 
+    /// The training parameters `(m, k)` (subspaces, centroids per subspace).
+    pub fn params(&self) -> (usize, usize) {
+        (self.m, self.k)
+    }
+
     /// Train a quantizer on `sample` with `m` subspaces and `k` centroids
     /// (`2 ≤ k ≤ 256`). Returns `None` if the parameters or sample are
     /// unusable (empty sample, `dim` not divisible by `m`, ragged vectors).

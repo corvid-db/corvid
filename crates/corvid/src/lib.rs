@@ -24,6 +24,7 @@ pub mod graph;
 pub mod hnsw;
 pub mod index;
 pub mod join;
+pub mod migrate;
 pub mod plan;
 pub mod pq;
 pub mod quant;

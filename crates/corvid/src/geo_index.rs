@@ -266,6 +266,12 @@ impl Db {
             .collect()
     }
 
+    /// All geo index definitions (for dump/migrate).
+    pub(crate) fn geo_specs(&self) -> Vec<(String, String)> {
+        let state = self.geo().lock().expect("geo lock");
+        state.defs.iter().cloned().collect()
+    }
+
     pub(crate) fn has_geo_index(&self, collection: &str, field: &str) -> bool {
         let state = self.geo().lock().expect("geo lock");
         state

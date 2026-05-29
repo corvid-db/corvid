@@ -225,6 +225,16 @@ impl Db {
         Ok(())
     }
 
+    /// All text index definitions as `(collection, field, on_disk)` (for dump).
+    pub(crate) fn text_specs(&self) -> Vec<(String, String, bool)> {
+        let state = self.fts().lock().expect("fts lock");
+        state
+            .defs
+            .iter()
+            .map(|((c, f), kind)| (c.clone(), f.clone(), *kind == TextKind::OnDisk))
+            .collect()
+    }
+
     /// Register (or replace) a text index on `field` for `collection`.
     pub(crate) fn register_text_index(
         &self,
