@@ -14,6 +14,7 @@ pub mod error;
 pub mod filter;
 pub mod fusion;
 pub mod hnsw;
+pub mod index;
 pub mod query;
 pub mod store;
 pub mod text;

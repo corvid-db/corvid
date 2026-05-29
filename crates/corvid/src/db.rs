@@ -6,13 +6,22 @@
 //! `db.collection("docs").insert(...)` — which is the shape the fluent query
 //! builder will extend with vector / text / filter operations.
 
+use std::sync::Mutex;
+
 use crate::error::Result;
+use crate::index::IndexState;
 use crate::store::Store;
 use crate::value::Value;
 
 /// An embedded document database.
+///
+/// Holds the persistent byte store plus an in-memory cache of derived ANN
+/// indexes. Documents are the source of truth; an index is rebuilt from them
+/// whenever a write to its collection invalidates it, so queries never observe
+/// a stale index.
 pub struct Db {
     store: Store,
+    indexes: Mutex<IndexState>,
 }
 
 impl Db {
@@ -20,6 +29,7 @@ impl Db {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         Ok(Self {
             store: Store::open(path)?,
+            indexes: Mutex::new(IndexState::default()),
         })
     }
 
@@ -27,6 +37,7 @@ impl Db {
     pub fn open_in_memory() -> Result<Self> {
         Ok(Self {
             store: Store::open_in_memory()?,
+            indexes: Mutex::new(IndexState::default()),
         })
     }
 
@@ -41,6 +52,16 @@ impl Db {
     pub(crate) fn store(&self) -> &Store {
         &self.store
     }
+
+    /// The in-memory derived-index cache.
+    pub(crate) fn indexes(&self) -> &Mutex<IndexState> {
+        &self.indexes
+    }
+
+    /// Record a write to `collection`, invalidating its derived indexes.
+    pub(crate) fn bump_gen(&self, collection: &str) {
+        self.indexes.lock().expect("index lock").bump(collection);
+    }
 }
 
 /// A handle to one collection of documents.
@@ -54,9 +75,21 @@ pub struct Collection<'a> {
 }
 
 impl Collection<'_> {
+    /// The owning database. Engine-internal.
+    pub(crate) fn db(&self) -> &Db {
+        self.db
+    }
+
+    /// This collection's name. Engine-internal.
+    pub(crate) fn name(&self) -> &str {
+        self.name
+    }
+
     /// Insert or overwrite the document stored at `key`.
     pub fn insert(&self, key: &[u8], doc: &Value) -> Result<()> {
-        self.db.store().put(self.name, key, &doc.encode())
+        self.db.store().put(self.name, key, &doc.encode())?;
+        self.db.bump_gen(self.name);
+        Ok(())
     }
 
     /// Fetch and decode the document at `key`, if present.
@@ -69,7 +102,11 @@ impl Collection<'_> {
 
     /// Remove the document at `key`. Returns whether one was removed.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
-        self.db.store().delete(self.name, key)
+        let removed = self.db.store().delete(self.name, key)?;
+        if removed {
+            self.db.bump_gen(self.name);
+        }
+        Ok(removed)
     }
 
     /// Return every `(key, document)` pair, in key order.

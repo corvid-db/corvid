@@ -67,9 +67,12 @@ impl Collection<'_> {
     /// Return the `k` documents whose embedding in field `field` is nearest to
     /// `query` under `metric`, nearest first.
     ///
-    /// Documents that lack the field, whose field is not a [`Value::Vector`],
-    /// or whose dimension differs from `query` are skipped (schema-on-read).
-    /// Ties break by key order.
+    /// If a matching ANN index was created with
+    /// [`Collection::create_vector_index`](crate::Collection::create_vector_index)
+    /// it is used (approximate, faster); otherwise the search is exact
+    /// (brute-force). Documents that lack the field, whose field is not a
+    /// [`Value::Vector`], or whose dimension differs from `query` are skipped
+    /// (schema-on-read). Ties break by key order.
     pub fn vector_search(
         &self,
         field: &str,
@@ -77,6 +80,21 @@ impl Collection<'_> {
         k: usize,
         metric: Metric,
     ) -> Result<Vec<Hit>> {
+        // Use a registered ANN index when one matches; else fall back to exact.
+        if let Some(ranked) = self.db().ann_search(self.name(), field, query, k, metric)? {
+            let mut out = Vec::with_capacity(ranked.len());
+            for (key, distance) in ranked {
+                if let Some(document) = self.get(&key)? {
+                    out.push(Hit {
+                        key,
+                        distance,
+                        document,
+                    });
+                }
+            }
+            return Ok(out);
+        }
+
         let cands = self.scan()?;
         let mut ranked = ranked_vector(&cands, field, query, metric);
         ranked.truncate(k);
