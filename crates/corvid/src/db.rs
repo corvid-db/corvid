@@ -128,7 +128,7 @@ impl Collection<'_> {
         self.ensure_writable()?;
         self.db.store().put(self.name, key, &doc.encode())?;
         self.db.index_on_insert(self.name, key, doc)?;
-        self.db.fts_on_insert(self.name, key, doc);
+        self.db.fts_on_insert(self.name, key, doc)?;
         self.db.notify(ChangeEvent {
             collection: self.name.to_owned(),
             key: key.to_vec(),
@@ -173,7 +173,7 @@ impl Collection<'_> {
         })?;
         for (key, doc) in items {
             self.db.index_on_insert(self.name, key, doc)?;
-            self.db.fts_on_insert(self.name, key, doc);
+            self.db.fts_on_insert(self.name, key, doc)?;
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
                 key: key.to_vec(),
@@ -208,7 +208,7 @@ impl Collection<'_> {
         let removed = self.db.store().delete(self.name, key)?;
         if removed {
             self.db.index_on_delete(self.name, key)?;
-            self.db.fts_on_delete(self.name, key);
+            self.db.fts_on_delete(self.name, key)?;
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
                 key: key.to_vec(),

@@ -11,6 +11,7 @@
 
 pub mod builder;
 pub mod db;
+pub mod disk_fts;
 pub mod disk_hnsw;
 pub mod distance;
 pub mod error;

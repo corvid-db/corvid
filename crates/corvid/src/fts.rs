@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::db::{Collection, Db};
+use crate::disk_fts;
 use crate::error::Result;
 use crate::store::Store;
 use crate::text::{Bm25Params, idf, term_score, tokenize};
@@ -25,12 +26,35 @@ const TEXT_DEFS: &str = "__text_indexes__";
 /// Ranked `(key, score)` results, most relevant first.
 type RankedKeys = Vec<(Vec<u8>, f32)>;
 
+/// Where a text index lives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextKind {
+    /// Postings held in RAM, built lazily on first query, rebuilt on open.
+    InMemory,
+    /// Postings stored as redb entries: bounded memory, persists across reopen.
+    OnDisk,
+}
+
+fn kind_byte(k: TextKind) -> u8 {
+    match k {
+        TextKind::InMemory => 0,
+        TextKind::OnDisk => 1,
+    }
+}
+
+fn kind_from(b: Option<&u8>) -> TextKind {
+    match b {
+        Some(1) => TextKind::OnDisk,
+        _ => TextKind::InMemory,
+    }
+}
+
 /// Per-database full-text index state.
 #[derive(Default)]
 pub(crate) struct FtsState {
-    /// Registered `(collection, field)` text indexes.
-    defs: std::collections::HashSet<(String, String)>,
-    /// Built inverted indexes, populated lazily.
+    /// Registered `(collection, field)` text indexes and where each lives.
+    defs: HashMap<(String, String), TextKind>,
+    /// Built in-memory inverted indexes, populated lazily.
     built: HashMap<(String, String), Inverted>,
 }
 
@@ -126,59 +150,93 @@ impl Db {
     /// Load persisted text-index definitions. Called once on open.
     pub(crate) fn load_text_defs(&self) -> Result<()> {
         let mut state = self.fts().lock().expect("fts lock");
-        for (key, _) in self.store().scan(TEXT_DEFS)? {
+        for (key, value) in self.store().scan(TEXT_DEFS)? {
             if let Some(def) = split_def_key(&key) {
-                state.defs.insert(def);
+                state.defs.insert(def, kind_from(value.first()));
             }
         }
         Ok(())
     }
 
     /// Register (or replace) a text index on `field` for `collection`.
-    pub(crate) fn register_text_index(&self, collection: &str, field: &str) -> Result<()> {
+    pub(crate) fn register_text_index(
+        &self,
+        collection: &str,
+        field: &str,
+        kind: TextKind,
+    ) -> Result<()> {
         self.store()
-            .put(TEXT_DEFS, &def_key(collection, field), b"")?;
+            .put(TEXT_DEFS, &def_key(collection, field), &[kind_byte(kind)])?;
         let mut state = self.fts().lock().expect("fts lock");
         let key = (collection.to_owned(), field.to_owned());
-        state.defs.insert(key.clone());
+        state.defs.insert(key.clone(), kind);
         state.built.remove(&key);
         Ok(())
     }
 
     /// Maintain every text index on `collection` after a document write.
-    pub(crate) fn fts_on_insert(&self, collection: &str, key: &[u8], doc: &Value) {
-        let mut state = self.fts().lock().expect("fts lock");
-        let fields: Vec<String> = state
-            .defs
-            .iter()
-            .filter(|(c, _)| c == collection)
-            .map(|(_, f)| f.clone())
-            .collect();
-        for field in fields {
-            let map_key = (collection.to_owned(), field.clone());
-            if let Some(inv) = state.built.get_mut(&map_key) {
-                match doc.get(&field).and_then(Value::as_text) {
-                    Some(text) => inv.add(key, text),
-                    None => inv.remove(key),
+    pub(crate) fn fts_on_insert(&self, collection: &str, key: &[u8], doc: &Value) -> Result<()> {
+        let fields: Vec<(String, TextKind)> = {
+            let state = self.fts().lock().expect("fts lock");
+            state
+                .defs
+                .iter()
+                .filter(|((c, _), _)| c == collection)
+                .map(|((_, f), k)| (f.clone(), *k))
+                .collect()
+        };
+        for (field, kind) in fields {
+            let text = doc.get(&field).and_then(Value::as_text);
+            match kind {
+                TextKind::OnDisk => {
+                    let ns = disk_fts::namespace(collection, &field);
+                    match text {
+                        Some(t) => disk_fts::insert(self.store(), &ns, key, t)?,
+                        None => disk_fts::delete(self.store(), &ns, key)?,
+                    }
+                }
+                TextKind::InMemory => {
+                    let map_key = (collection.to_owned(), field.clone());
+                    let mut state = self.fts().lock().expect("fts lock");
+                    if let Some(inv) = state.built.get_mut(&map_key) {
+                        match text {
+                            Some(t) => inv.add(key, t),
+                            None => inv.remove(key),
+                        }
+                    }
                 }
             }
         }
+        Ok(())
     }
 
-    /// Remove `key` from every built text index on `collection` after a delete.
-    pub(crate) fn fts_on_delete(&self, collection: &str, key: &[u8]) {
-        let mut state = self.fts().lock().expect("fts lock");
-        let map_keys: Vec<(String, String)> = state
-            .built
-            .keys()
-            .filter(|(c, _)| c == collection)
-            .cloned()
-            .collect();
-        for mk in map_keys {
-            if let Some(inv) = state.built.get_mut(&mk) {
-                inv.remove(key);
+    /// Remove `key` from every text index on `collection` after a delete.
+    pub(crate) fn fts_on_delete(&self, collection: &str, key: &[u8]) -> Result<()> {
+        let defs: Vec<(String, TextKind)> = {
+            let state = self.fts().lock().expect("fts lock");
+            state
+                .defs
+                .iter()
+                .filter(|((c, _), _)| c == collection)
+                .map(|((_, f), k)| (f.clone(), *k))
+                .collect()
+        };
+        for (field, kind) in defs {
+            match kind {
+                TextKind::OnDisk => {
+                    let ns = disk_fts::namespace(collection, &field);
+                    disk_fts::delete(self.store(), &ns, key)?;
+                }
+                TextKind::InMemory => {
+                    let map_key = (collection.to_owned(), field);
+                    let mut state = self.fts().lock().expect("fts lock");
+                    if let Some(inv) = state.built.get_mut(&map_key) {
+                        inv.remove(key);
+                    }
+                }
             }
         }
+        Ok(())
     }
 
     /// If a text index is registered, return the BM25-ranked top `k` keys;
@@ -194,10 +252,17 @@ impl Db {
 
         let needs_build = {
             let state = self.fts().lock().expect("fts lock");
-            if !state.defs.contains(&map_key) {
-                return Ok(None);
+            match state.defs.get(&map_key) {
+                None => return Ok(None),
+                // On-disk postings are maintained on every write; no build,
+                // no lock held during the scan.
+                Some(TextKind::OnDisk) => {
+                    let ns = disk_fts::namespace(collection, field);
+                    drop(state);
+                    return Ok(Some(disk_fts::search(self.store(), &ns, query, k)?));
+                }
+                Some(TextKind::InMemory) => !state.built.contains_key(&map_key),
             }
-            !state.built.contains_key(&map_key)
         };
         if needs_build {
             let inv = build_inverted(self.store(), collection, field)?;
@@ -249,8 +314,47 @@ impl Collection<'_> {
     /// maintained incrementally. [`Collection::text_search`] on the same field
     /// then uses it instead of rescanning the corpus.
     pub fn create_text_index(&self, field: &str) -> Result<()> {
-        self.db().register_text_index(self.name(), field)
+        self.db()
+            .register_text_index(self.name(), field, TextKind::InMemory)
     }
+
+    /// Create (or replace) an **on-disk** inverted text index on `field`.
+    ///
+    /// Postings are stored as redb entries, so memory stays bounded by the
+    /// query terms (not the corpus) and the index persists across reopen with
+    /// no rebuild. Existing documents are backfilled now; later writes maintain
+    /// it incrementally.
+    pub fn create_text_index_ondisk(&self, field: &str) -> Result<()> {
+        self.db()
+            .register_text_index(self.name(), field, TextKind::OnDisk)?;
+        let ns = disk_fts::namespace(self.name(), field);
+        let mut cursor: Vec<u8> = Vec::new();
+        loop {
+            let page = self.db().store().scan_from(self.name(), &cursor, 2048)?;
+            if page.is_empty() {
+                break;
+            }
+            let mut batch: Vec<(Vec<u8>, String)> = Vec::new();
+            for (key, bytes) in &page {
+                let doc = Value::decode(bytes)?;
+                if let Some(text) = doc.get(field).and_then(Value::as_text) {
+                    batch.push((key.clone(), text.to_owned()));
+                }
+            }
+            if !batch.is_empty() {
+                disk_fts::insert_many(self.db().store(), &ns, &batch)?;
+            }
+            cursor = next_key(&page.last().unwrap().0);
+        }
+        Ok(())
+    }
+}
+
+/// The smallest key strictly greater than `key` (append a zero byte).
+fn next_key(key: &[u8]) -> Vec<u8> {
+    let mut k = key.to_vec();
+    k.push(0);
+    k
 }
 
 #[cfg(test)]
@@ -335,6 +439,63 @@ mod tests {
             .text_search("body", "fox", 10)
             .unwrap();
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn ondisk_index_matches_inmemory_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvid.db");
+        let expected = {
+            let db = Db::open(&path).unwrap();
+            seed(&db);
+            let c = db.collection("docs");
+            c.create_text_index_ondisk("body").unwrap();
+            let hits = c.text_search("body", "fox dog", 10).unwrap();
+            assert_eq!(hits[0].key, b"c".to_vec()); // matches both terms
+            hits.iter().map(|h| h.key.clone()).collect::<Vec<_>>()
+        };
+        // Reopen: no rebuild, postings already on disk.
+        let db = Db::open(&path).unwrap();
+        let c = db.collection("docs");
+        let reopened = c
+            .text_search("body", "fox dog", 10)
+            .unwrap()
+            .iter()
+            .map(|h| h.key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(expected, reopened);
+    }
+
+    #[test]
+    fn ondisk_index_maintained_on_write_and_delete() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db);
+        let c = db.collection("docs");
+        c.create_text_index_ondisk("body").unwrap();
+
+        c.insert(b"d", &doc("another fox appears")).unwrap();
+        assert!(
+            c.text_search("body", "fox", 10)
+                .unwrap()
+                .iter()
+                .any(|h| h.key == b"d".to_vec())
+        );
+
+        c.insert(b"a", &doc("totally different content")).unwrap();
+        assert!(
+            !c.text_search("body", "quick", 10)
+                .unwrap()
+                .iter()
+                .any(|h| h.key == b"a".to_vec())
+        );
+
+        c.delete(b"b").unwrap();
+        assert!(
+            !c.text_search("body", "dog", 10)
+                .unwrap()
+                .iter()
+                .any(|h| h.key == b"b".to_vec())
+        );
     }
 
     #[test]
