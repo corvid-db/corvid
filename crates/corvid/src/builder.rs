@@ -211,12 +211,18 @@ impl QueryBuilder<'_> {
     /// limit, and projection are ignored — this is an aggregate over the
     /// filtered set.
     pub fn count(self) -> Result<usize> {
-        Ok(self
-            .collection
-            .scan()?
-            .into_iter()
-            .filter(|(_, doc)| self.filters.iter().all(|p| p.eval(doc)))
-            .count())
+        // No filters → use the maintained O(1) counter.
+        if self.filters.is_empty() {
+            return self.collection.len();
+        }
+        let mut n = 0usize;
+        self.collection.for_each_doc(|_, doc| {
+            if self.filters.iter().all(|p| p.eval(&doc)) {
+                n += 1;
+            }
+            Ok(())
+        })?;
+        Ok(n)
     }
 
     /// Count matching documents grouped by the value at `field`.
@@ -227,14 +233,14 @@ impl QueryBuilder<'_> {
     /// the filtered set and ignores ranking.
     pub fn group_count(self, field: &str) -> Result<BTreeMap<String, usize>> {
         let mut groups: BTreeMap<String, usize> = BTreeMap::new();
-        for (_, doc) in self.collection.scan()? {
-            if !self.filters.iter().all(|p| p.eval(&doc)) {
-                continue;
-            }
-            if let Some(key) = doc.get(field).and_then(group_key) {
+        self.collection.for_each_doc(|_, doc| {
+            if self.filters.iter().all(|p| p.eval(&doc))
+                && let Some(key) = doc.get(field).and_then(group_key)
+            {
                 *groups.entry(key).or_insert(0) += 1;
             }
-        }
+            Ok(())
+        })?;
         Ok(groups)
     }
 

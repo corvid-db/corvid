@@ -137,6 +137,52 @@ impl Collection<'_> {
         Ok(())
     }
 
+    /// Stream every `(key, document)` in the collection to `f`, in key order,
+    /// decoding one document at a time — constant memory regardless of size.
+    /// Prefer this over [`Collection::scan`] for large collections.
+    pub fn for_each_doc<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], Value) -> Result<()>,
+    {
+        self.db.store().for_each(self.name, |key, bytes| {
+            let doc = Value::decode(bytes)?;
+            f(key, doc)
+        })
+    }
+
+    /// The number of documents in the collection (O(1), maintained counter).
+    pub fn len(&self) -> Result<usize> {
+        Ok(self.db.store().count(self.name)? as usize)
+    }
+
+    /// Whether the collection is empty.
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Insert many documents in a single transaction (bulk load). Far faster
+    /// than repeated [`Collection::insert`] (one commit instead of N). Indexes
+    /// and subscribers are updated after the commit.
+    pub fn insert_batch(&self, items: &[(&[u8], &Value)]) -> Result<()> {
+        self.ensure_writable()?;
+        self.db.store().transaction(|tx| {
+            for (key, doc) in items {
+                tx.put(self.name, key, &doc.encode())?;
+            }
+            Ok(())
+        })?;
+        for (key, doc) in items {
+            self.db.index_on_insert(self.name, key, doc);
+            self.db.fts_on_insert(self.name, key, doc);
+            self.db.notify(ChangeEvent {
+                collection: self.name.to_owned(),
+                key: key.to_vec(),
+                kind: ChangeKind::Insert,
+            });
+        }
+        Ok(())
+    }
+
     /// Insert `doc` under a freshly generated, monotonically increasing key
     /// (big-endian, so keys sort in insertion order). Returns the new key.
     pub fn insert_auto(&self, doc: &Value) -> Result<Vec<u8>> {

@@ -138,11 +138,12 @@ impl Collection<'_> {
     /// collection, using HyperLogLog. Documents lacking the field are ignored.
     pub fn approx_distinct(&self, field: &str) -> Result<u64> {
         let mut hll = HyperLogLog::new();
-        for (_, doc) in self.scan()? {
+        self.for_each_doc(|_, doc| {
             if let Some(v) = doc.get(field) {
                 hll.add_bytes(&v.encode());
             }
-        }
+            Ok(())
+        })?;
         Ok(hll.estimate())
     }
 }

@@ -188,6 +188,54 @@ impl Store {
         Ok(out)
     }
 
+    /// The maintained record count for `collection` (O(1), no scan).
+    pub fn count(&self, collection: &str) -> Result<u64> {
+        let txn = self.db.begin_read()?;
+        let meta = match txn.open_table(META) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(meta
+            .get(count_key(collection).as_str())?
+            .map(|g| g.value())
+            .unwrap_or(0))
+    }
+
+    /// Stream every `(user_key, value)` in `collection` to `f`, in key order,
+    /// without materializing the collection. Constant memory regardless of
+    /// collection size. `f`'s slices are valid only for the duration of the call.
+    pub fn for_each<F>(&self, collection: &str, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        let txn = self.db.begin_read()?;
+        let catalog = match txn.open_table(CATALOG) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let Some(id) = catalog.get(collection)?.map(|g| g.value()) else {
+            return Ok(());
+        };
+        drop(catalog);
+
+        let records = txn.open_table(RECORDS)?;
+        let lower = id.to_be_bytes().to_vec();
+        let upper = id.checked_add(1).map(|n| n.to_be_bytes().to_vec());
+        let lower_slice: &[u8] = &lower;
+        let bounds: (Bound<&[u8]>, Bound<&[u8]>) = match &upper {
+            Some(u) => (Bound::Included(lower_slice), Bound::Excluded(u.as_slice())),
+            None => (Bound::Included(lower_slice), Bound::Unbounded),
+        };
+        for entry in records.range::<&[u8]>(bounds)? {
+            let (k, v) = entry?;
+            let key = k.value();
+            f(key.get(8..).unwrap_or(&[]), v.value())?;
+        }
+        Ok(())
+    }
+
     /// Return all `(key, value)` pairs in `collection` whose key starts with
     /// `prefix`, in key order. An unknown collection yields an empty vector.
     pub fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -234,8 +282,15 @@ impl WriteBatch<'_> {
     /// collection on first use.
     pub fn put(&mut self, collection: &str, key: &[u8], value: &[u8]) -> Result<()> {
         let id = self.ensure_id(collection)?;
-        let mut records = self.txn.open_table(RECORDS)?;
-        records.insert(physical_key(id, key).as_slice(), value)?;
+        let existed = {
+            let mut records = self.txn.open_table(RECORDS)?;
+            records
+                .insert(physical_key(id, key).as_slice(), value)?
+                .is_some()
+        };
+        if !existed {
+            self.adjust_count(collection, 1)?;
+        }
         Ok(())
     }
 
@@ -257,8 +312,24 @@ impl WriteBatch<'_> {
         let Some(id) = self.lookup_id(collection)? else {
             return Ok(false);
         };
-        let mut records = self.txn.open_table(RECORDS)?;
-        Ok(records.remove(physical_key(id, key).as_slice())?.is_some())
+        let removed = {
+            let mut records = self.txn.open_table(RECORDS)?;
+            records.remove(physical_key(id, key).as_slice())?.is_some()
+        };
+        if removed {
+            self.adjust_count(collection, -1)?;
+        }
+        Ok(removed)
+    }
+
+    /// Adjust the maintained record count for `collection` by `delta`.
+    fn adjust_count(&self, collection: &str, delta: i64) -> Result<()> {
+        let mut meta = self.txn.open_table(META)?;
+        let key = count_key(collection);
+        let current = meta.get(key.as_str())?.map(|g| g.value()).unwrap_or(0);
+        let updated = current.saturating_add_signed(delta);
+        meta.insert(key.as_str(), updated)?;
+        Ok(())
     }
 
     /// Return all `(key, value)` pairs in `collection`, in key order.
@@ -356,6 +427,11 @@ where
         out.push((user_key(k.value()), v.value().to_vec()));
     }
     Ok(out)
+}
+
+/// The [`META`] key holding `collection`'s maintained record count.
+fn count_key(collection: &str) -> String {
+    format!("cnt:{collection}")
 }
 
 /// Compose a physical record key: `collection_id (BE) ++ user_key`.
