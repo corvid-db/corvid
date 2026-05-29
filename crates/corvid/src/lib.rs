@@ -12,11 +12,12 @@ pub mod distance;
 pub mod error;
 pub mod query;
 pub mod store;
+pub mod text;
 pub mod value;
 
 pub use db::{Collection, Db};
 pub use distance::Metric;
 pub use error::{Error, Result};
-pub use query::Hit;
+pub use query::{Hit, TextHit};
 pub use store::Store;
 pub use value::Value;
