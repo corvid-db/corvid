@@ -242,6 +242,60 @@ fn tools_list() -> Json {
                     },
                     "required": ["collection", "other", "foreign_key_field"]
                 }
+            },
+            {
+                "name": "in_neighbors",
+                "description": "List the sources of incoming ? --relation--> to edges.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "to": { "type": "string" },
+                        "relation": { "type": "string" }
+                    },
+                    "required": ["collection", "to", "relation"]
+                }
+            },
+            {
+                "name": "create_text_index",
+                "description": "Create an inverted full-text index on a field to accelerate text search.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "field": { "type": "string" }
+                    },
+                    "required": ["collection", "field"]
+                }
+            },
+            {
+                "name": "list_collections",
+                "description": "List user collection names.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "count",
+                "description": "Count documents in a collection, optionally filtered.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "filter": { "type": "object" }
+                    },
+                    "required": ["collection"]
+                }
+            },
+            {
+                "name": "insert_auto",
+                "description": "Insert a document under an auto-generated ordered key; returns the key.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "document": {}
+                    },
+                    "required": ["collection", "document"]
+                }
             }
         ]
     })
@@ -325,6 +379,11 @@ mod tests {
             "traverse",
             "geo",
             "join",
+            "in_neighbors",
+            "create_text_index",
+            "list_collections",
+            "count",
+            "insert_auto",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }

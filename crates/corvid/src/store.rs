@@ -168,6 +168,22 @@ impl Store {
         self.read(|r| r.scan(collection))
     }
 
+    /// List every collection name known to the catalog, in name order.
+    pub fn collections(&self) -> Result<Vec<String>> {
+        let txn = self.db.begin_read()?;
+        let catalog = match txn.open_table(CATALOG) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in catalog.iter()? {
+            let (name, _) = entry?;
+            out.push(name.value().to_owned());
+        }
+        Ok(out)
+    }
+
     /// Return all `(key, value)` pairs in `collection` whose key starts with
     /// `prefix`, in key order. An unknown collection yields an empty vector.
     pub fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {

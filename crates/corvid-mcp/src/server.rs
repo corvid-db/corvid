@@ -58,8 +58,13 @@ impl Server {
             "neighbors" => self.neighbors(params),
             "traverse" => self.traverse(params),
             "create_index" => self.create_index(params),
+            "create_text_index" => self.create_text_index(params),
             "geo" => self.geo(params),
             "join" => self.join(params),
+            "in_neighbors" => self.in_neighbors(params),
+            "list_collections" => self.list_collections(),
+            "count" => self.count(params),
+            "insert_auto" => self.insert_auto(params),
             other => Err(ToolError::UnknownTool(other.to_owned())),
         }
     }
@@ -188,10 +193,23 @@ impl Server {
         let collection = str_param(p, "collection")?;
         let from = str_param(p, "from")?;
         let relation = str_param(p, "relation")?;
-        let neighbors = self
+        let mut neighbors = self
             .db
             .collection(collection)
             .neighbors(from.as_bytes(), relation)?;
+        neighbors.truncate(result_limit(p));
+        Ok(json!({ "neighbors": keys_to_json(&neighbors) }))
+    }
+
+    fn in_neighbors(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let to = str_param(p, "to")?;
+        let relation = str_param(p, "relation")?;
+        let mut neighbors = self
+            .db
+            .collection(collection)
+            .in_neighbors(to.as_bytes(), relation)?;
+        neighbors.truncate(result_limit(p));
         Ok(json!({ "neighbors": keys_to_json(&neighbors) }))
     }
 
@@ -200,10 +218,11 @@ impl Server {
         let start = str_param(p, "start")?;
         let relation = str_param(p, "relation")?;
         let hops = uint_param(p, "hops")?;
-        let nodes = self
-            .db
-            .collection(collection)
-            .traverse(start.as_bytes(), relation, hops)?;
+        let mut nodes =
+            self.db
+                .collection(collection)
+                .traverse(start.as_bytes(), relation, hops)?;
+        nodes.truncate(result_limit(p));
         Ok(json!({ "nodes": keys_to_json(&nodes) }))
     }
 
@@ -217,16 +236,49 @@ impl Server {
         Ok(json!({ "ok": true }))
     }
 
+    fn create_text_index(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let field = str_param(p, "field")?;
+        self.db.collection(collection).create_text_index(field)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn list_collections(&self) -> Result<Json, ToolError> {
+        Ok(json!({ "collections": self.db.collections()? }))
+    }
+
+    fn count(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let mut q = self.db.collection(collection).query();
+        if let Some(f) = p.get("filter") {
+            q = q.filter(parse_predicate(f)?);
+        }
+        Ok(json!({ "count": q.count()? }))
+    }
+
+    fn insert_auto(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let doc = p
+            .get("document")
+            .ok_or_else(|| ToolError::BadParams("missing 'document'".into()))?;
+        let key = self
+            .db
+            .collection(collection)
+            .insert_auto(&json_to_value(doc))?;
+        Ok(json!({ "key": String::from_utf8_lossy(&key) }))
+    }
+
     fn geo(&self, p: &Json) -> Result<Json, ToolError> {
         let collection = str_param(p, "collection")?;
         let field = str_param(p, "field")?;
         let lat = f64_param(p, "lat")?;
         let lon = f64_param(p, "lon")?;
         let radius_km = f64_param(p, "radius_km")?;
-        let hits = self
+        let mut hits = self
             .db
             .collection(collection)
             .geo_within_radius(field, lat, lon, radius_km)?;
+        hits.truncate(result_limit(p));
         let results: Vec<Json> = hits
             .iter()
             .map(|h| {
@@ -244,7 +296,8 @@ impl Server {
         let collection = str_param(p, "collection")?;
         let other = str_param(p, "other")?;
         let fk = str_param(p, "foreign_key_field")?;
-        let rows = self.db.collection(collection).join(other, fk)?;
+        let mut rows = self.db.collection(collection).join(other, fk)?;
+        rows.truncate(result_limit(p));
         let out: Vec<Json> = rows
             .iter()
             .map(|r| {
@@ -337,6 +390,18 @@ fn str_param<'a>(p: &'a Json, key: &str) -> Result<&'a str, ToolError> {
     p.get(key)
         .and_then(Json::as_str)
         .ok_or_else(|| ToolError::BadParams(format!("missing string '{key}'")))
+}
+
+/// Default cap on list-returning tools so a single call can't dump an
+/// unbounded payload. Overridable per call via a `limit` param.
+const DEFAULT_LIST_LIMIT: usize = 1000;
+
+/// The result cap for a list-returning tool: the `limit` param, or the default.
+fn result_limit(p: &Json) -> usize {
+    p.get("limit")
+        .and_then(Json::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_LIST_LIMIT)
 }
 
 fn uint_param(p: &Json, key: &str) -> Result<usize, ToolError> {
@@ -795,6 +860,92 @@ mod tests {
         let rows = out["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["right"], json!({"name": "Rocky"}));
+    }
+
+    #[test]
+    fn list_collections_count_and_insert_auto() {
+        let s = server();
+        let a = s
+            .handle(
+                "insert_auto",
+                &json!({"collection": "events", "document": {"n": 1}}),
+            )
+            .unwrap();
+        let key = a["key"].as_str().unwrap().to_owned();
+        // The auto key round-trips through get.
+        let got = s
+            .handle("get", &json!({"collection": "events", "key": key}))
+            .unwrap();
+        assert_eq!(got, json!({"document": {"n": 1}}));
+
+        store(&s, "k", json!({"x": 1})); // collection "docs"
+        let cols = s.handle("list_collections", &json!({})).unwrap();
+        let names: Vec<&str> = cols["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"events"));
+        assert!(names.contains(&"docs"));
+
+        let c = s.handle("count", &json!({"collection": "events"})).unwrap();
+        assert_eq!(c["count"], 1);
+    }
+
+    #[test]
+    fn in_neighbors_tool() {
+        let s = server();
+        s.handle(
+            "link",
+            &json!({"collection": "g", "from": "a", "relation": "knows", "to": "x"}),
+        )
+        .unwrap();
+        let out = s
+            .handle(
+                "in_neighbors",
+                &json!({"collection": "g", "to": "x", "relation": "knows"}),
+            )
+            .unwrap();
+        assert_eq!(out["neighbors"], json!(["a"]));
+    }
+
+    #[test]
+    fn create_text_index_then_search() {
+        let s = server();
+        store(&s, "a", json!({"body": "rust embedded database"}));
+        store(&s, "b", json!({"body": "python web"}));
+        s.handle(
+            "create_text_index",
+            &json!({"collection": "docs", "field": "body"}),
+        )
+        .unwrap();
+        let out = s
+            .handle(
+                "search",
+                &json!({"collection": "docs", "text": {"field": "body", "query": "rust", "k": 5}}),
+            )
+            .unwrap();
+        assert_eq!(out["results"][0]["key"], "a");
+    }
+
+    #[test]
+    fn list_tools_respect_limit() {
+        let s = server();
+        for to in ["x", "y", "z"] {
+            s.handle(
+                "link",
+                &json!({"collection": "g", "from": "a", "relation": "r", "to": to}),
+            )
+            .unwrap();
+        }
+        let out = s
+            .handle(
+                "neighbors",
+                &json!({"collection": "g", "from": "a", "relation": "r", "limit": 2}),
+            )
+            .unwrap();
+        assert_eq!(out["neighbors"].as_array().unwrap().len(), 2);
     }
 
     #[test]

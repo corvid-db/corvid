@@ -60,6 +60,17 @@ impl Db {
         Collection { db: self, name }
     }
 
+    /// List user collection names (engine-internal `__`-prefixed namespaces
+    /// such as graph edges and index metadata are excluded), in name order.
+    pub fn collections(&self) -> Result<Vec<String>> {
+        Ok(self
+            .store
+            .collections()?
+            .into_iter()
+            .filter(|n| !n.starts_with("__"))
+            .collect())
+    }
+
     /// Access the underlying byte store (e.g. for multi-collection
     /// transactions). Intended for engine-internal and advanced use.
     pub(crate) fn store(&self) -> &Store {
@@ -131,7 +142,9 @@ impl Collection<'_> {
     pub fn insert_auto(&self, doc: &Value) -> Result<Vec<u8>> {
         self.ensure_writable()?;
         let id = self.db.store().next_auto_id(self.name)?;
-        let key = id.to_be_bytes().to_vec();
+        // Zero-padded decimal: UTF-8 (round-trips through text APIs like MCP)
+        // and lexicographically ordered by id.
+        let key = format!("{id:020}").into_bytes();
         self.insert(&key, doc)?;
         Ok(key)
     }
@@ -248,6 +261,18 @@ mod tests {
             c.get(b"v").unwrap(),
             Some(Value::Vector(vec![1.0, 2.0, 3.0]))
         );
+    }
+
+    #[test]
+    fn collections_lists_user_collections_only() {
+        let db = Db::open_in_memory().unwrap();
+        db.collection("docs").insert(b"k", &Value::Int(1)).unwrap();
+        db.collection("notes").insert(b"k", &Value::Int(1)).unwrap();
+        // A graph edge creates a reserved __edges__ collection that must be hidden.
+        db.collection("docs").link(b"a", "r", b"b").unwrap();
+        let mut names = db.collections().unwrap();
+        names.sort();
+        assert_eq!(names, vec!["docs".to_string(), "notes".to_string()]);
     }
 
     #[test]
