@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/corvid"]
+members = ["crates/corvid", "crates/corvid-mcp"]
 
 [workspace.package]
 edition = "2024"
@@ -12,3 +12,5 @@ repository = "https://github.com/rocky/corvid"
 redb = "4.1"
 thiserror = "2"
 tempfile = "3"
+serde_json = "1"
+corvid = { path = "crates/corvid" }
