@@ -763,7 +763,7 @@ impl QueryBuilder<'_> {
         Ok(Some(out))
     }
 
-    /// A canonical, hashable [`QueryPlan`] capturing this query's full shape
+    /// A canonical, hashable [`QueryPlan`](crate::plan::QueryPlan) capturing this query's full shape
     /// (collection, filters, sources, fusion/rerank params, ordering,
     /// pagination, projection). Identically-configured builders produce equal
     /// plans; any difference produces a different plan. Use it to deduplicate

@@ -567,7 +567,7 @@ impl Collection<'_> {
     /// dimension must be divisible by `m`. The codebook persists with the index.
     ///
     /// Requires existing documents to train on (a codebook can't be learned
-    /// from nothing); returns [`Error::EmptyIndexTraining`] if none have a
+    /// from nothing); returns [`Error::EmptyIndexTraining`](crate::Error::EmptyIndexTraining) if none have a
     /// usable vector at `field`.
     pub fn create_vector_index_ondisk_pq(
         &self,

@@ -9,7 +9,7 @@
 //!
 //! ## Encoding
 //!
-//! A point `(lat, lon)` maps to integer cell coordinates at [`CELL_DEG`]
+//! A point `(lat, lon)` maps to integer cell coordinates at a fixed `CELL_DEG`
 //! resolution. The index key is `lat_cell(u32 BE) ‖ lon_cell(u32 BE) ‖ doc_key`,
 //! so all points in a cell share a prefix and a row of cells (fixed `lat_cell`,
 //! a `lon_cell` range) is one contiguous key range.

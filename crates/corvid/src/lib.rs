@@ -4,8 +4,17 @@
 //! `DESIGN.md` at the repository root for the architecture and `CLAUDE.md`
 //! for the rules this code is held to.
 //!
-//! The engine is built bottom-up. Today it exposes the L1 storage layer: a
-//! transactional byte-oriented key/value store over redb ([`Store`]).
+//! Open a [`Db`], take a [`Collection`], and compose vector search, full-text
+//! search ([`Collection::text_search`], [`Collection::phrase_search`]), metadata
+//! filtering ([`field`]), rank fusion (RRF), and MMR reranking into one
+//! transactionally consistent [`QueryBuilder`] call. Secondary indexes (HNSW —
+//! in-memory and on-disk, with quantization and product quantization — inverted
+//! text, scalar/compound, and geo) are derived from the documents and kept
+//! consistent on every write, so a query never sees a stale index. Also here: a
+//! directed property graph, geospatial queries, joins, an optional declared
+//! schema, per-record TTL, reactive change feeds, a semantic cache, and
+//! probabilistic sketches. The API is synchronous; a [`Store`] is the
+//! byte-oriented KV layer underneath.
 
 #![forbid(unsafe_code)]
 

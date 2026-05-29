@@ -206,11 +206,11 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 - **Full-text** (`text.rs`, `fts.rs`): tokenizer + BM25 exact baseline **plus an incremental inverted index** (`create_text_index`) so queries touch only query-term postings.
 - **Fusion** (`fusion.rs`): Reciprocal Rank Fusion + MMR.
 - **Filters** (`filter.rs`): `field("a.b").gt(…)` predicate tree, and/or/not, dotted paths, `within_km` geo.
-- **L4 fluent builder** (`builder.rs`): filter → vector → text → RRF → MMR → `order_by`/`offset` → `select` (nested paths) → `limit`; `count`/`group_count`; `.approx()`; `.explain()`.
+- **L4 fluent builder** (`builder.rs`): filter → vector → text → RRF → MMR → `order_by`/`offset` → `select` (nested paths) → `limit`; aggregations (`count`, `sum`, `avg`, `min`, `max`, `count_distinct`, `group_count`, `group_sum`, `group_avg`); `.approx()`; `.explain()`; `.plan()` (identity-hashable `QueryPlan` for `PlanCache`). Filter predicates extend to `is_in`/`between`/`starts_with`/`contains` alongside the comparison/and/or/not core. Keyset pagination via `page`/`page_where`; `phrase_search` for exact in-order matches.
 - **Graph** (`graph.rs`): `link`/`link_weighted`/`unlink`/`neighbors`/`neighbors_weighted`/`in_neighbors`/`traverse`; edges atomic (forward+reverse in one txn).
 - **Geo** (`geo.rs`): haversine radius / bbox, composable as a builder filter.
 - **Join, semantic cache, reactive feeds, sketches, document layer** as before; auto-keys (`insert_auto`), `collections()` listing, on-disk format version.
-- **Sidecar** (`corvid-mcp`): MCP server over stdio exposing store/get/delete/search/create_index/create_text_index/link/unlink/neighbors/in_neighbors/traverse/geo/join/list_collections/count/insert_auto, with default result caps.
+- **Sidecar** (`corvid-mcp`): MCP server over stdio exposing 27 tools — `store`, `patch`, `compare_and_set`, `get`, `delete`, `delete_where`, `page`, `search`, `phrase_search`, `count`, `geo`, `join`, `link`, `unlink`, `neighbors`, `in_neighbors`, `traverse`, `create_index`, `create_text_index`, `create_scalar_index`, `create_compound_index`, `create_geo_index`, `backup`, `dump`, `load`, `list_collections`, `insert_auto` — with default result caps.
 
 **Audit gaps resolved** (see the gap sweep): incremental+persistent indexes (#4/#7), inverted FTS (#3), filtered-ANN in builder (#5), order_by/offset (#10), reverse edges (#11), format version (#12), auto-keys (#8), MCP surface+caps (#13/#27), reserved-name & length & slicing hardening (#17/#18/#20), atomic edges + single-snapshot join (#2/#14), nested select + explain (#22/#26 partial), edge weights (#25), CI/LICENSE/CHANGELOG/MSRV + property/concurrency tests + benchmarks (#28–32).
 
@@ -225,11 +225,11 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 **Product Quantization (DONE).** `create_vector_index_ondisk_pq(field, metric, m, k)` trains a deterministic per-subspace codebook (k-means) from a bounded sample of existing vectors, stores each vector as `m` code bytes, and persists the codebook in the index namespace (reloaded on open). Distance is by reconstruction (decode + metric, metric-agnostic) with an L2 asymmetric-distance table available. The `pq.rs` core is standalone and validated (recall ≥0.6 at 8× compression).
 
 **Deliberately deferred (large subsystems, with reasons):**
-- **In-memory PQ + ADC in the HNSW hot path**: PQ is wired into the on-disk index (the footprint-critical path); using it for the in-memory index and switching distance to the table-based ADC are follow-ons on the same `pq.rs` core.
+- **In-memory PQ in the HNSW hot path**: PQ is wired into the on-disk index (the footprint-critical path), and its L2 distance now has the table-based ADC (asymmetric-distance) fast path. Using PQ for the *in-memory* index is still a follow-on — the in-memory HNSW supports `None`/`Binary`/`Scalar` quantization but not PQ. ADC for non-L2 metrics is also future.
 - **Browser support (OPFS StorageBackend + wasm-bindgen)** — *deferred by decision (2026-05-29)*. The engine is wasm-ready and size-validated (≈0.2 MB gzipped, CI-enforced) and runs in-memory on wasm; the browser-persistence layer (OPFS-SAHPool VFS, Worker RPC, JS bindings) is explicitly out of scope for now. Desktop + server is the focus.
-- **Cursor/iterator result API** (#15 remainder): single-source ranked queries are now bounded (index fast paths + streaming top-k), and filter-only queries already stream; a public streaming *cursor* over arbitrary result sets (incremental pull) is still a larger API addition. Multi-source RRF fusion still materializes the candidate set.
-- **Phrase / positional text queries** (#23 remainder): the analyzer now does stop-word removal + S-stemming (shared by index and query); phrase/positional matching needs positions in the postings and is a larger format change. CJK segmentation also future.
-- **Cost-based planning**: `.plan()` gives an identity-hashable [`QueryPlan`] and `PlanCache` keys prepared work by shape; choosing *between* viable index paths by estimated cost (statistics-driven) is future.
+- **Streaming cursor over ranked result sets**: keyset (cursor) pagination over a collection shipped (`page`/`page_where`, with a `next` cursor, no offset rescans); single-source ranked queries are bounded (index fast paths + streaming top-k) and filter-only queries stream. What remains is a public streaming *cursor* over arbitrary *ranked* result sets (incremental pull) — multi-source RRF fusion still materializes the candidate set.
+- **CJK / positional analysis**: phrase / positional text search shipped (`phrase_search`, positions stored in both the in-memory and on-disk inverted indexes; the analyzer does stop-word removal + S-stemming, shared by index and query). CJK segmentation is still future.
+- **Statistics-driven cost-based planning**: selectivity-driven index selection shipped — the builder probes every serviceable index (each capped) and drives on the smallest candidate set, so the most selective index wins without persisted statistics; `.plan()` gives an identity-hashable [`QueryPlan`] and `PlanCache` keys prepared work by shape. Choosing between viable index paths by an estimated *cost model* over persisted statistics is still future.
 
 ---
 
@@ -253,18 +253,27 @@ the *shape*.
 ops, `count`/`len` (O(1)), streamed aggregates, ordered pagination, and the
 bounded-heap exact vector search. These hold at 50M (slower, but no OOM).
 
-**The honest walls at 1M–50M:**
-- **In-memory index build/rebuild.** HNSW and the inverted index live in RAM and
-  build lazily (and rebuild on open). At 1M the HNSW build is minutes; at 50M
-  neither fits in RAM. This is the **on-disk index** deferral (#16) — the real
-  frontier for large-scale vector/text *search*.
-- **No secondary scalar index.** `filter`/`order_by` are O(n) scans (constant
-  memory now, but linear time). A scalar B-tree index (#6) is the optimization.
+**The walls at 1M–50M — and what now addresses each:**
+- **In-memory index build/rebuild.** The *in-memory* HNSW and inverted index
+  live in RAM and rebuild on open; at 1M the in-memory HNSW build is minutes, at
+  50M they don't fit. The **on-disk** variants (`create_vector_index_ondisk`,
+  `create_text_index_ondisk`, plus the quantized/PQ on-disk vector indexes)
+  remove this wall — state lives as redb entries, an op touches only the
+  nodes/postings it needs, and the index persists with no rebuild on open. Use
+  the in-memory variants up to ~100k–1M, on-disk above.
+- **Unindexed `filter`/`order_by`** are O(n) scans (constant memory, linear
+  time). The **scalar / compound / geo indexes** (`create_scalar_index`,
+  `create_compound_index`, `create_geo_index`) make selective equality/range,
+  prefix-equality + trailing-range, and radius/bbox/nearest queries sub-linear;
+  the builder picks the most selective available index automatically and falls
+  back to a bounded scan when none is selective enough.
 - **Exact (unindexed) search** is O(n) time — correct and OOM-free (streamed),
   but you want an index past ~100k.
 
-So: everything except large-scale *index build/search* scales to 50M with
-bounded memory today; large-scale search needs the deferred on-disk indexes.
+So: storage, point ops, counts, streamed aggregates, and ordered pagination
+scale to 50M with bounded memory; large-scale *search* and *selective filters*
+are served by the on-disk and scalar/compound/geo indexes — leaving only the
+in-memory index variants' RAM build as a deliberate small-scale convenience.
 
 ## Transaction model
 
@@ -427,3 +436,5 @@ These need answers before specific layers can be implemented. Listed in rough or
 | 2026-05-29 | Scalar index = order-preserving key encoding, returns a verified superset | Numbers (int+float) share a lane keyed by IEEE-754 total order of the f64; the i64→f64 cast is monotonic, so a range scan never excludes a true match. The builder re-checks every candidate against the exact predicate, so encoding ties only cost a few extra checks, never correctness. `Ne` is not serviced (a full anti-scan isn't sub-linear). |
 | 2026-05-29 | Quantization extracted to a shared `quant` module; on-disk index stores quantized vectors | One implementation (encode/probe/distance + binary/scalar codecs) backs both the in-memory and on-disk HNSW, so their recall matches. The on-disk graph stores the quantized form (decoded with the index's mode on read), cutting disk + page-cache footprint for the billions-of-vectors path. |
 | 2026-05-29 | WASM proven via a `cdylib` size harness, not a full browser build | The engine compiles to wasm32 and links into a ≈0.2 MB-gzipped bundle (CI-enforced < 2 MB). A real browser API (wasm-bindgen + OPFS StorageBackend) is Worker-only and needs a browser to validate — kept separate so the engine's wasm-readiness is checked every CI run without a browser harness. |
+| 2026-05-29 | Released v0.1.0 then v0.1.1; multi-platform release binaries | v0.1.0 shipped a Linux-only binary; v0.1.1 builds `corvid-mcp` for Linux (x86_64 + aarch64), macOS (Intel + Apple Silicon), and Windows via a matrix. v0.1.0's published release is left intact; a new tag is cleaner than rewriting a published one. |
+| 2026-05-29 | Docs reconciled to the shipped surface; `cargo doc -D warnings` gated in CI | Verified every README/GUIDE/DESIGN claim against the code. Confirmed in-memory PQ is **not** shipped (in-memory HNSW supports None/Binary/Scalar only; PQ + the L2 ADC fast path are on-disk), corrected the stale "deferred" list and scaling walls, fixed broken/redundant rustdoc links, and added a CI doc-lint so the API reference can't silently rot. |

@@ -3,7 +3,7 @@
 //!
 //! Both searches are exact (brute-force over a scan) in v0.1 — correct and
 //! simple, the baseline an approximate index is later measured against. The
-//! ranking helpers ([`ranked_vector`], [`ranked_bm25`]) operate on an
+//! ranking helpers (`ranked_vector`, `ranked_bm25`) operate on an
 //! already-gathered candidate set so the builder can pre-filter once and then
 //! rank, which keeps `filter` a true predicate rather than a post-filter.
 

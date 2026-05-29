@@ -1,6 +1,6 @@
 //! The document database surface (bridges L1 storage and L2 values).
 //!
-//! [`Db`] wraps the byte [`Store`](crate::Store) and speaks in typed
+//! [`Db`] wraps the byte [`Store`] and speaks in typed
 //! [`Value`]s: a document is any `Value` (typically a [`Value::Map`]) encoded
 //! with the deterministic codec. Access goes through a [`Collection`] handle —
 //! `db.collection("docs").insert(...)` — which is the shape the fluent query

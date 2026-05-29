@@ -6,7 +6,7 @@
 //! without a schema are entirely unaffected. The schema persists across reopen.
 //!
 //! Enforcement is opt-in and strict: a write that violates the schema fails
-//! with [`Error::SchemaViolation`](crate::Error::SchemaViolation) and nothing
+//! with [`Error::SchemaViolation`] and nothing
 //! is stored.
 
 use std::collections::HashMap;

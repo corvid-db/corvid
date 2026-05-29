@@ -4,7 +4,14 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/). Until 1.0 the on-disk
 format and API may change without backward-compatibility guarantees.
 
-## [Unreleased]
+## [0.1.1] - 2026-05-29
+
+### Changed
+- Release workflow builds the `corvid-mcp` binary for all desktop/server
+  platforms — Linux (x86_64 + aarch64), macOS (Intel + Apple Silicon), and
+  Windows (x86_64) — attaching each to the tagged GitHub release.
+
+## [0.1.0] - 2026-05-29
 
 ### Added
 - Embedded transactional KV store over redb with atomic multi-op transactions
@@ -92,4 +99,13 @@ format and API may change without backward-compatibility guarantees.
 - `corvid-mcp`: a runnable MCP server over stdio exposing the engine as tools.
 - On-disk format version marker (refuses incompatible files).
 
-[Unreleased]: https://github.com/rocky/corvid
+### Performance
+- Autovectorized distance kernels (`dot`/`l2_squared` via multi-accumulator
+  chunks; cosine builds on `dot`), under `#![forbid(unsafe_code)]`.
+- On-disk HNSW build speedup: an `Rc`-shared node cache and once-per-batch
+  dirty flush cut bulk-backfill time materially.
+- On-disk PQ distance: asymmetric-distance (ADC) fast path for the L2 metric,
+  scoring codes against a per-query table built from the codebook.
+
+[0.1.1]: https://github.com/i-rocky/corvid/releases/tag/v0.1.1
+[0.1.0]: https://github.com/i-rocky/corvid/releases/tag/v0.1.0

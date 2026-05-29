@@ -1,7 +1,8 @@
 //! Filter predicates over documents.
 //!
 //! Predicates form a small tree built fluently — `field("score").gt(Value::Int(5))`
-//! combined with [`Predicate::and`] / [`Predicate::or`] / [`Predicate::not`].
+//! combined with [`Predicate::and`] / [`Predicate::or`], and negated with the
+//! `!` operator.
 //! They evaluate against a [`Value`] document and are the `filter` arm of the
 //! query builder. Field paths are dotted and traverse nested maps
 //! (`"meta.author"`).
