@@ -223,7 +223,7 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 
 **Deliberately deferred (large subsystems, with reasons):**
 - **Product Quantization (PQ) codebook** (#16 remainder): binary/scalar quantization is done for both indexes; codebook-based PQ (k-means + asymmetric distance tables) is a further compression-vs-recall option, a distinct subsystem.
-- **OPFS browser StorageBackend** (#WASM): the engine is wasm-ready and size-validated; the OPFS-SAHPool VFS + JS bindings need a browser harness to validate end to end.
+- **Browser support (OPFS StorageBackend + wasm-bindgen)** — *deferred by decision (2026-05-29)*. The engine is wasm-ready and size-validated (≈0.2 MB gzipped, CI-enforced) and runs in-memory on wasm; the browser-persistence layer (OPFS-SAHPool VFS, Worker RPC, JS bindings) is explicitly out of scope for now. Desktop + server is the focus.
 - **Spatial index** (#6, geo): geo is an exact scan (correct); an R-tree/geohash index is the scale optimization, same pattern as the vector/text baselines.
 - **Streaming result iterators** (#15): results are materialized; a streaming/cursor API is a larger refactor.
 - **Declared schema/constraints** (#9): schema-on-read today; a strict-schema layer is a future addition.
