@@ -32,4 +32,8 @@ pub enum Error {
     /// Committing a write transaction failed.
     #[error("commit: {0}")]
     Commit(#[from] redb::CommitError),
+
+    /// Stored bytes could not be decoded into a [`crate::Value`].
+    #[error("decode: {0}")]
+    Decode(String),
 }
