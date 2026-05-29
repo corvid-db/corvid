@@ -37,20 +37,47 @@ impl Metric {
     }
 }
 
+/// SIMD width the kernels accumulate over. Eight independent `f32` lanes give
+/// LLVM the freedom to vectorize (a single `sum()` can't be reordered because
+/// `f32` addition isn't associative); the partial sums are combined at the end.
+const LANES: usize = 8;
+
 /// Dot product of two equal-length vectors.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    let mut acc = [0.0f32; LANES];
+    let mut ca = a.chunks_exact(LANES);
+    let mut cb = b.chunks_exact(LANES);
+    for (x, y) in ca.by_ref().zip(cb.by_ref()) {
+        // `x`/`y` are exactly LANES long, so the bounds checks elide and the
+        // loop vectorizes into a multiply-accumulate over the lanes.
+        for j in 0..LANES {
+            acc[j] += x[j] * y[j];
+        }
+    }
+    let mut sum: f32 = acc.iter().sum();
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        sum += x * y;
+    }
+    sum
 }
 
 /// Squared Euclidean distance.
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
+    let mut acc = [0.0f32; LANES];
+    let mut ca = a.chunks_exact(LANES);
+    let mut cb = b.chunks_exact(LANES);
+    for (x, y) in ca.by_ref().zip(cb.by_ref()) {
+        for j in 0..LANES {
+            let d = x[j] - y[j];
+            acc[j] += d * d;
+        }
+    }
+    let mut sum: f32 = acc.iter().sum();
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        let d = x - y;
+        sum += d * d;
+    }
+    sum
 }
 
 /// Cosine distance, `1 - cos_sim`. Returns the maximum distance (`1.0`) when

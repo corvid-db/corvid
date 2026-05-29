@@ -93,5 +93,14 @@ fn bench_text(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_codec, bench_hnsw, bench_text);
+fn bench_distance(c: &mut Criterion) {
+    use corvid::distance::{cosine_distance, dot, l2_squared};
+    let a: Vec<f32> = (0..768).map(|i| (i as f32 * 0.013).sin()).collect();
+    let b: Vec<f32> = (0..768).map(|i| (i as f32 * 0.017).cos()).collect();
+    c.bench_function("dot_768d", |bn| bn.iter(|| dot(&a, &b)));
+    c.bench_function("l2_768d", |bn| bn.iter(|| l2_squared(&a, &b)));
+    c.bench_function("cosine_768d", |bn| bn.iter(|| cosine_distance(&a, &b)));
+}
+
+criterion_group!(benches, bench_codec, bench_hnsw, bench_text, bench_distance);
 criterion_main!(benches);
