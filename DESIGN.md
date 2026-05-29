@@ -229,7 +229,7 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 - **Browser support (OPFS StorageBackend + wasm-bindgen)** — *deferred by decision (2026-05-29)*. The engine is wasm-ready and size-validated (≈0.2 MB gzipped, CI-enforced) and runs in-memory on wasm; the browser-persistence layer (OPFS-SAHPool VFS, Worker RPC, JS bindings) is explicitly out of scope for now. Desktop + server is the focus.
 - **Cursor/iterator result API** (#15 remainder): single-source ranked queries are now bounded (index fast paths + streaming top-k), and filter-only queries already stream; a public streaming *cursor* over arbitrary result sets (incremental pull) is still a larger API addition. Multi-source RRF fusion still materializes the candidate set.
 - **Phrase / positional text queries** (#23 remainder): the analyzer now does stop-word removal + S-stemming (shared by index and query); phrase/positional matching needs positions in the postings and is a larger format change. CJK segmentation also future.
-- **Plan-cache AST** (#26): `.explain()` exists; an identity-hashable cached plan is future.
+- **Cost-based planning**: `.plan()` gives an identity-hashable [`QueryPlan`] and `PlanCache` keys prepared work by shape; choosing *between* viable index paths by estimated cost (statistics-driven) is future.
 
 ---
 

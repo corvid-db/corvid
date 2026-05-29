@@ -66,6 +66,7 @@ pub struct ResultRow {
 }
 
 /// A retrieval source feeding the fusion step.
+#[derive(Debug)]
 enum Source {
     Vector {
         field: String,
@@ -544,6 +545,33 @@ impl QueryBuilder<'_> {
             }
         }
         Ok(Some(out))
+    }
+
+    /// A canonical, hashable [`QueryPlan`] capturing this query's full shape
+    /// (collection, filters, sources, fusion/rerank params, ordering,
+    /// pagination, projection). Identically-configured builders produce equal
+    /// plans; any difference produces a different plan. Use it to deduplicate
+    /// or key a [`crate::plan::PlanCache`] on a query shape.
+    pub fn plan(&self) -> crate::plan::QueryPlan {
+        use std::fmt::Write;
+        let mut s = String::new();
+        // `Debug` of these shape components is deterministic for a given shape
+        // (floats render by value), so it is a sound canonical key.
+        let _ = writeln!(s, "collection={}", self.collection.name());
+        for f in &self.filters {
+            let _ = writeln!(s, "filter={f:?}");
+        }
+        for src in &self.sources {
+            let _ = writeln!(s, "source={src:?}");
+        }
+        let _ = writeln!(s, "rrf_k={}", self.rrf_k.to_bits());
+        let _ = writeln!(s, "mmr={:?}", self.mmr_lambda.map(f32::to_bits));
+        let _ = writeln!(s, "order_by={:?}", self.order_by);
+        let _ = writeln!(s, "offset={}", self.offset);
+        let _ = writeln!(s, "limit={:?}", self.limit);
+        let _ = writeln!(s, "select={:?}", self.projection);
+        let _ = writeln!(s, "approx={}", self.approx);
+        crate::plan::QueryPlan(s)
     }
 
     /// Describe the query plan as a human-readable string (for debugging). Does
