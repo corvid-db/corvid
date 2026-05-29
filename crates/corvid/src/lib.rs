@@ -13,6 +13,7 @@ pub mod distance;
 pub mod error;
 pub mod filter;
 pub mod fusion;
+pub mod graph;
 pub mod hnsw;
 pub mod index;
 pub mod query;

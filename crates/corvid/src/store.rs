@@ -99,6 +99,38 @@ impl Store {
     pub fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.read(|r| r.scan(collection))
     }
+
+    /// Return all `(key, value)` pairs in `collection` whose key starts with
+    /// `prefix`, in key order. An unknown collection yields an empty vector.
+    pub fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let txn = self.db.begin_read()?;
+        let catalog = match txn.open_table(CATALOG) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let Some(id) = catalog.get(collection)?.map(|g| g.value()) else {
+            return Ok(Vec::new());
+        };
+        drop(catalog);
+
+        let records = txn.open_table(RECORDS)?;
+        let mut lower = id.to_be_bytes().to_vec();
+        lower.extend_from_slice(prefix);
+        let upper = next_key(&lower);
+        let lower_slice: &[u8] = &lower;
+        let bounds: (Bound<&[u8]>, Bound<&[u8]>) = match &upper {
+            Some(u) => (Bound::Included(lower_slice), Bound::Excluded(u.as_slice())),
+            None => (Bound::Included(lower_slice), Bound::Unbounded),
+        };
+
+        let mut out = Vec::new();
+        for entry in records.range::<&[u8]>(bounds)? {
+            let (k, v) = entry?;
+            out.push((user_key(k.value()), v.value().to_vec()));
+        }
+        Ok(out)
+    }
 }
 
 /// A set of writes (and reads) executed inside one transaction.
@@ -249,6 +281,21 @@ fn physical_key(id: u64, key: &[u8]) -> Vec<u8> {
 /// Strip the 8-byte collection id prefix from a physical key.
 fn user_key(physical: &[u8]) -> Vec<u8> {
     physical[8..].to_vec()
+}
+
+/// The smallest byte string strictly greater than every string starting with
+/// `bytes` — i.e. the exclusive upper bound for a prefix range. `None` when
+/// `bytes` is empty or all `0xFF` (range is unbounded above).
+fn next_key(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = bytes.to_vec();
+    while let Some(last) = out.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return Some(out);
+        }
+        out.pop();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -461,6 +508,58 @@ mod tests {
             .unwrap();
         assert_eq!(a, Some(b"1".to_vec()));
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn scan_prefix_returns_matching_keys_in_order() {
+        let s = mem();
+        s.put("c", b"ax", b"1").unwrap();
+        s.put("c", b"ay", b"2").unwrap();
+        s.put("c", b"bz", b"3").unwrap();
+        assert_eq!(
+            s.scan_prefix("c", b"a").unwrap(),
+            vec![
+                (b"ax".to_vec(), b"1".to_vec()),
+                (b"ay".to_vec(), b"2".to_vec())
+            ]
+        );
+        assert_eq!(
+            s.scan_prefix("c", b"b").unwrap(),
+            vec![(b"bz".to_vec(), b"3".to_vec())]
+        );
+    }
+
+    #[test]
+    fn scan_prefix_empty_prefix_returns_all() {
+        let s = mem();
+        s.put("c", b"x", b"1").unwrap();
+        s.put("c", b"y", b"2").unwrap();
+        assert_eq!(s.scan_prefix("c", b"").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn scan_prefix_no_match_and_missing_collection() {
+        let s = mem();
+        s.put("c", b"x", b"1").unwrap();
+        assert!(s.scan_prefix("c", b"z").unwrap().is_empty());
+        assert!(s.scan_prefix("ghost", b"a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_prefix_handles_all_0xff_prefix() {
+        let s = mem();
+        s.put("c", &[0xff, 0xff], b"hi").unwrap();
+        s.put("c", b"a", b"lo").unwrap();
+        let got = s.scan_prefix("c", &[0xff, 0xff]).unwrap();
+        assert_eq!(got, vec![(vec![0xff, 0xff], b"hi".to_vec())]);
+    }
+
+    #[test]
+    fn next_key_increments_and_overflows() {
+        assert_eq!(next_key(b"a"), Some(b"b".to_vec()));
+        assert_eq!(next_key(&[1, 0xff]), Some(vec![2]));
+        assert_eq!(next_key(&[0xff, 0xff]), None);
+        assert_eq!(next_key(b""), None);
     }
 
     #[test]
