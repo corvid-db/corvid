@@ -24,6 +24,7 @@ pub mod graph;
 pub mod hnsw;
 pub mod index;
 pub mod join;
+pub mod pq;
 pub mod quant;
 pub mod query;
 pub mod reactive;
