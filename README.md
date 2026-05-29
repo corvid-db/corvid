@@ -66,6 +66,15 @@ computed among matching documents, never a post-hoc trim.
 | Filter predicates (`field().gt()`, and/or/not, dotted paths) | ✅ |
 | Rank fusion (RRF) and MMR diversification | ✅ |
 | Fluent multi-modal query builder + projection + aggregation | ✅ |
+| Aggregations (sum/avg/min/max/distinct, grouped) | ✅ |
+| Predicates: in / between / starts_with / contains (+ indexed) | ✅ |
+| Nested/dotted-path field indexing | ✅ |
+| patch / update / compare-and-set; delete-by-query | ✅ |
+| Phrase / positional text search | ✅ |
+| k-nearest geo (`geo_nearest`) | ✅ |
+| Keyset (cursor) pagination (`page`) | ✅ |
+| Compound (multi-field) scalar index | ✅ |
+| Logical dump/load migration (`Db::dump`/`load`) | ✅ |
 | HNSW approximate index (`create_vector_index`) | ✅ in-memory, derived |
 | On-disk HNSW (`create_vector_index_ondisk`) | ✅ bounded memory, persists |
 | Vector quantization (binary ≈32×, scalar ≈4×) | ✅ in-memory **and** on-disk |
