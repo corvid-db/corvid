@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 
 use crate::db::{Collection, Db};
+use crate::disk_hnsw::{self, DiskParams};
 use crate::distance::Metric;
 use crate::error::Result;
 use crate::hnsw::{DEFAULT_EF_CONSTRUCTION, DEFAULT_M, Hnsw, Quantization};
@@ -28,11 +29,27 @@ const INDEX_DEFS: &str = "__indexes__";
 /// Ranked `(key, distance)` results, nearest first.
 type RankedKeys = Vec<(Vec<u8>, f32)>;
 
+/// Where a vector index lives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexKind {
+    /// HNSW graph held in RAM, rebuilt lazily on open.
+    InMemory,
+    /// HNSW graph stored on disk (redb); bounded memory, persists across open.
+    OnDisk,
+}
+
 /// A registered vector index definition.
 #[derive(Clone, Copy)]
 struct VectorDef {
     metric: Metric,
     quant: Quantization,
+    kind: IndexKind,
+}
+
+impl VectorDef {
+    fn disk_params(&self) -> DiskParams {
+        DiskParams::new(self.metric, DEFAULT_M, DEFAULT_EF_CONSTRUCTION)
+    }
 }
 
 /// Per-database derived-index state, guarded by a mutex on the [`Db`].
@@ -109,14 +126,23 @@ impl Db {
                 split_def_key(&key),
                 value.first().and_then(metric_from_byte),
             ) {
-                // Quantization byte is optional (older defs are metric-only).
+                // Quantization and kind bytes are optional (older defs lack them).
                 let quant = value
                     .get(1)
                     .and_then(quant_from_byte)
                     .unwrap_or(Quantization::None);
-                state
-                    .defs
-                    .insert((coll, field), VectorDef { metric, quant });
+                let kind = value
+                    .get(2)
+                    .and_then(kind_from_byte)
+                    .unwrap_or(IndexKind::InMemory);
+                state.defs.insert(
+                    (coll, field),
+                    VectorDef {
+                        metric,
+                        quant,
+                        kind,
+                    },
+                );
             }
         }
         Ok(())
@@ -131,56 +157,98 @@ impl Db {
         field: &str,
         metric: Metric,
         quant: Quantization,
+        kind: IndexKind,
     ) -> Result<()> {
         self.store().put(
             INDEX_DEFS,
             &def_key(collection, field),
-            &[metric_byte(metric), quant_byte(quant)],
+            &[metric_byte(metric), quant_byte(quant), kind_byte(kind)],
         )?;
         let mut state = self.indexes().lock().expect("index lock");
         let key = (collection.to_owned(), field.to_owned());
-        state.defs.insert(key.clone(), VectorDef { metric, quant });
-        // Drop any built graph so it rebuilds with the (possibly new) def.
+        state.defs.insert(
+            key.clone(),
+            VectorDef {
+                metric,
+                quant,
+                kind,
+            },
+        );
+        // Drop any built in-memory graph so it rebuilds with the (possibly new) def.
         state.built.remove(&key);
         Ok(())
     }
 
     /// Maintain every index on `collection` after a document write.
-    pub(crate) fn index_on_insert(&self, collection: &str, key: &[u8], doc: &Value) {
-        let mut state = self.indexes().lock().expect("index lock");
-        let fields: Vec<String> = state
-            .defs
-            .keys()
-            .filter(|(c, _)| c == collection)
-            .map(|(_, f)| f.clone())
-            .collect();
-        for field in fields {
-            let map_key = (collection.to_owned(), field.clone());
-            // Only maintain an already-built graph; an unbuilt one will pick
-            // this write up when it builds lazily from a scan.
-            if let Some(built) = state.built.get_mut(&map_key) {
-                match doc.get(&field).and_then(Value::as_vector) {
-                    Some(v) => built.add(key, v.to_vec()),
-                    None => built.tombstone(key),
+    pub(crate) fn index_on_insert(&self, collection: &str, key: &[u8], doc: &Value) -> Result<()> {
+        // Snapshot the relevant defs, then work without holding the lock for
+        // on-disk I/O.
+        let defs: Vec<(String, VectorDef)> = {
+            let state = self.indexes().lock().expect("index lock");
+            state
+                .defs
+                .iter()
+                .filter(|((c, _), _)| c == collection)
+                .map(|((_, f), d)| (f.clone(), *d))
+                .collect()
+        };
+        for (field, def) in defs {
+            match def.kind {
+                IndexKind::OnDisk => {
+                    let ns = disk_hnsw::namespace(collection, &field);
+                    match doc.get(&field).and_then(Value::as_vector) {
+                        Some(v) => {
+                            disk_hnsw::insert(self.store(), &ns, &def.disk_params(), key, v)?
+                        }
+                        None => {
+                            disk_hnsw::delete(self.store(), &ns, key)?;
+                        }
+                    }
+                }
+                IndexKind::InMemory => {
+                    let map_key = (collection.to_owned(), field.clone());
+                    let mut state = self.indexes().lock().expect("index lock");
+                    // Only maintain an already-built graph; an unbuilt one picks
+                    // this up when it builds lazily.
+                    if let Some(built) = state.built.get_mut(&map_key) {
+                        match doc.get(&field).and_then(Value::as_vector) {
+                            Some(v) => built.add(key, v.to_vec()),
+                            None => built.tombstone(key),
+                        }
+                    }
                 }
             }
         }
+        Ok(())
     }
 
-    /// Tombstone `key` in every built index on `collection` after a delete.
-    pub(crate) fn index_on_delete(&self, collection: &str, key: &[u8]) {
-        let mut state = self.indexes().lock().expect("index lock");
-        let map_keys: Vec<(String, String)> = state
-            .built
-            .keys()
-            .filter(|(c, _)| c == collection)
-            .cloned()
-            .collect();
-        for mk in map_keys {
-            if let Some(built) = state.built.get_mut(&mk) {
-                built.tombstone(key);
+    /// Remove `key` from every index on `collection` after a delete.
+    pub(crate) fn index_on_delete(&self, collection: &str, key: &[u8]) -> Result<()> {
+        let defs: Vec<(String, VectorDef)> = {
+            let state = self.indexes().lock().expect("index lock");
+            state
+                .defs
+                .iter()
+                .filter(|((c, _), _)| c == collection)
+                .map(|((_, f), d)| (f.clone(), *d))
+                .collect()
+        };
+        for (field, def) in defs {
+            match def.kind {
+                IndexKind::OnDisk => {
+                    let ns = disk_hnsw::namespace(collection, &field);
+                    disk_hnsw::delete(self.store(), &ns, key)?;
+                }
+                IndexKind::InMemory => {
+                    let map_key = (collection.to_owned(), field);
+                    let mut state = self.indexes().lock().expect("index lock");
+                    if let Some(built) = state.built.get_mut(&map_key) {
+                        built.tombstone(key);
+                    }
+                }
             }
         }
+        Ok(())
     }
 
     /// If a matching index is registered, return the approximate nearest `k`
@@ -203,6 +271,21 @@ impl Db {
                 _ => return Ok(None), // no index, or metric mismatch → exact
             }
         };
+
+        // On-disk indexes are served directly from the store (bounded memory).
+        if def.kind == IndexKind::OnDisk {
+            let ns = disk_hnsw::namespace(collection, field);
+            let ef = (k * 4).max(64);
+            return Ok(Some(disk_hnsw::search(
+                self.store(),
+                &ns,
+                &def.disk_params(),
+                query,
+                k,
+                ef,
+            )?));
+        }
+
         let needs_build = !self
             .indexes()
             .lock()
@@ -296,6 +379,21 @@ fn quant_from_byte(b: &u8) -> Option<Quantization> {
     }
 }
 
+fn kind_byte(k: IndexKind) -> u8 {
+    match k {
+        IndexKind::InMemory => 0,
+        IndexKind::OnDisk => 1,
+    }
+}
+
+fn kind_from_byte(b: &u8) -> Option<IndexKind> {
+    match b {
+        0 => Some(IndexKind::InMemory),
+        1 => Some(IndexKind::OnDisk),
+        _ => None,
+    }
+}
+
 impl Collection<'_> {
     /// Create (or replace) a full-precision in-memory HNSW index on `field`.
     ///
@@ -303,8 +401,13 @@ impl Collection<'_> {
     /// then maintained incrementally. [`Collection::vector_search`] on the same
     /// `field`/`metric` uses it; other fields/metrics stay exact.
     pub fn create_vector_index(&self, field: &str, metric: Metric) -> Result<()> {
-        self.db()
-            .register_vector_index(self.name(), field, metric, Quantization::None)
+        self.db().register_vector_index(
+            self.name(),
+            field,
+            metric,
+            Quantization::None,
+            IndexKind::InMemory,
+        )
     }
 
     /// Like [`Collection::create_vector_index`] but storing vectors with a
@@ -317,7 +420,32 @@ impl Collection<'_> {
         quant: Quantization,
     ) -> Result<()> {
         self.db()
-            .register_vector_index(self.name(), field, metric, quant)
+            .register_vector_index(self.name(), field, metric, quant, IndexKind::InMemory)
+    }
+
+    /// Create an **on-disk** HNSW index on `field`. The graph is stored in the
+    /// database (not RAM) and persists across reopen, so search memory is
+    /// bounded by nodes touched per query rather than by collection size —
+    /// suitable for very large collections. Existing documents are backfilled.
+    pub fn create_vector_index_ondisk(&self, field: &str, metric: Metric) -> Result<()> {
+        self.db().register_vector_index(
+            self.name(),
+            field,
+            metric,
+            Quantization::None,
+            IndexKind::OnDisk,
+        )?;
+        // Backfill existing documents, streaming (bounded memory).
+        let ns = disk_hnsw::namespace(self.name(), field);
+        let params = DiskParams::new(metric, DEFAULT_M, DEFAULT_EF_CONSTRUCTION);
+        let store = self.db().store();
+        self.for_each_doc(|key, doc| {
+            if let Some(v) = doc.get(field).and_then(Value::as_vector) {
+                disk_hnsw::insert(store, &ns, &params, key, v)?;
+            }
+            Ok(true)
+        })?;
+        Ok(())
     }
 }
 
@@ -485,6 +613,50 @@ mod tests {
             .vector_search("embedding", &[1.0, 1.0], 1, Metric::Cosine)
             .unwrap();
         assert_eq!(hits[0].key, b"pos".to_vec());
+    }
+
+    #[test]
+    fn ondisk_index_searches_persists_and_backfills() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvid.db");
+        {
+            let db = Db::open(&path).unwrap();
+            let c = db.collection("docs");
+            // Insert BEFORE creating the index → exercises backfill.
+            c.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
+            c.insert(b"b", &doc(vec![0.0, 1.0])).unwrap();
+            c.create_vector_index_ondisk("embedding", Metric::L2)
+                .unwrap();
+            // Insert AFTER → exercises incremental on-disk maintenance.
+            c.insert(b"c", &doc(vec![0.9, 0.1])).unwrap();
+            let hits = c
+                .vector_search("embedding", &[1.0, 0.0], 2, Metric::L2)
+                .unwrap();
+            assert_eq!(hits[0].key, b"a".to_vec());
+            assert_eq!(hits[1].key, b"c".to_vec());
+        }
+        // Reopen: on-disk graph is used directly — no rebuild.
+        let db = Db::open(&path).unwrap();
+        let hits = db
+            .collection("docs")
+            .vector_search("embedding", &[0.0, 1.0], 1, Metric::L2)
+            .unwrap();
+        assert_eq!(hits[0].key, b"b".to_vec());
+    }
+
+    #[test]
+    fn ondisk_index_reflects_delete() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.create_vector_index_ondisk("embedding", Metric::L2)
+            .unwrap();
+        c.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
+        c.insert(b"b", &doc(vec![0.0, 1.0])).unwrap();
+        c.delete(b"a").unwrap();
+        let hits = c
+            .vector_search("embedding", &[1.0, 0.0], 5, Metric::L2)
+            .unwrap();
+        assert!(!hits.iter().any(|h| h.key == b"a".to_vec()));
     }
 
     #[test]

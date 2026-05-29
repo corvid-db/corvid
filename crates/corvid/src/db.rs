@@ -127,7 +127,7 @@ impl Collection<'_> {
     pub fn insert(&self, key: &[u8], doc: &Value) -> Result<()> {
         self.ensure_writable()?;
         self.db.store().put(self.name, key, &doc.encode())?;
-        self.db.index_on_insert(self.name, key, doc);
+        self.db.index_on_insert(self.name, key, doc)?;
         self.db.fts_on_insert(self.name, key, doc);
         self.db.notify(ChangeEvent {
             collection: self.name.to_owned(),
@@ -172,7 +172,7 @@ impl Collection<'_> {
             Ok(())
         })?;
         for (key, doc) in items {
-            self.db.index_on_insert(self.name, key, doc);
+            self.db.index_on_insert(self.name, key, doc)?;
             self.db.fts_on_insert(self.name, key, doc);
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
@@ -207,7 +207,7 @@ impl Collection<'_> {
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
         let removed = self.db.store().delete(self.name, key)?;
         if removed {
-            self.db.index_on_delete(self.name, key);
+            self.db.index_on_delete(self.name, key)?;
             self.db.fts_on_delete(self.name, key);
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
