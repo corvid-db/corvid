@@ -7,7 +7,7 @@
 //! already-gathered candidate set so the builder can pre-filter once and then
 //! rank, which keeps `filter` a true predicate rather than a post-filter.
 
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 
 use crate::db::Collection;
 use crate::distance::Metric;
@@ -110,21 +110,66 @@ impl Collection<'_> {
             return Ok(out);
         }
 
-        let cands = self.scan()?;
-        let mut ranked = ranked_vector(&cands, field, query, metric);
-        ranked.truncate(k);
-        let mut docs = doc_map(cands);
-        Ok(ranked
-            .into_iter()
-            .map(|(key, distance)| {
-                let document = docs.remove(&key).expect("ranked key came from cands");
-                Hit {
-                    key,
-                    distance,
-                    document,
+        // Exact search streams the collection through a bounded top-k heap:
+        // O(n) time but O(k) memory, so an unindexed search never materializes
+        // the whole collection.
+        let mut heap: BinaryHeap<NearCand> = BinaryHeap::new();
+        self.for_each_doc(|key, doc| {
+            if let Some(v) = doc.get(field).and_then(Value::as_vector)
+                && v.len() == query.len()
+            {
+                let cand = NearCand {
+                    dist: metric.distance(query, v),
+                    key: key.to_vec(),
+                    doc,
+                };
+                if heap.len() < k {
+                    heap.push(cand);
+                } else if heap.peek().is_some_and(|worst| cand < *worst) {
+                    heap.pop();
+                    heap.push(cand);
                 }
+            }
+            Ok(true)
+        })?;
+        let mut out: Vec<NearCand> = heap.into_vec();
+        out.sort_by(|a, b| a.dist.total_cmp(&b.dist).then_with(|| a.key.cmp(&b.key)));
+        Ok(out
+            .into_iter()
+            .map(|c| Hit {
+                key: c.key,
+                distance: c.dist,
+                document: c.doc,
             })
             .collect())
+    }
+}
+
+/// A nearest-neighbour candidate for the bounded top-k heap. Ordered by
+/// `(distance, key)` so the max-heap's top is the current worst kept result.
+/// The document is carried along but excluded from ordering.
+struct NearCand {
+    dist: f32,
+    key: Vec<u8>,
+    doc: Value,
+}
+
+impl PartialEq for NearCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist == other.dist && self.key == other.key
+    }
+}
+impl Eq for NearCand {}
+impl Ord for NearCand {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dist
+            .total_cmp(&other.dist)
+            .then_with(|| self.key.cmp(&other.key))
+    }
+}
+impl PartialOrd for NearCand {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
