@@ -322,28 +322,63 @@ impl QueryBuilder<'_> {
                 best_eq = is_eq;
             }
         }
-        let Some(field) = target else {
-            return Ok(None);
+        // Scalar index drives the scan when a comparison field is indexed;
+        // otherwise try a spatial index for a GeoWithin filter.
+        let scalar_keys = if let Some(field) = target {
+            let constraints: Vec<crate::scalar::Constraint<'_>> = self
+                .filters
+                .iter()
+                .filter_map(|p| match p {
+                    Predicate::Compare { path, op, value } if path == field => {
+                        Some(crate::scalar::Constraint { op: *op, value })
+                    }
+                    _ => None,
+                })
+                .collect();
+            // Cap candidates so a low-selectivity filter falls back to a bounded
+            // scan instead of materialising a huge set in memory.
+            const CANDIDATE_CAP: usize = 100_000;
+            db.scalar_candidates(coll, field, &constraints, CANDIDATE_CAP)?
+        } else {
+            None
         };
 
-        let constraints: Vec<crate::scalar::Constraint<'_>> = self
-            .filters
-            .iter()
-            .filter_map(|p| match p {
-                Predicate::Compare { path, op, value } if path == field => {
-                    Some(crate::scalar::Constraint { op: *op, value })
-                }
-                _ => None,
-            })
-            .collect();
-
-        // Cap candidates so a low-selectivity filter falls back to a bounded
-        // scan instead of materialising a huge set in memory.
-        const CANDIDATE_CAP: usize = 100_000;
-        let Some(keys) = db.scalar_candidates(coll, field, &constraints, CANDIDATE_CAP)? else {
-            return Ok(None);
+        let keys = match scalar_keys {
+            Some(keys) => keys,
+            None => match self.geo_candidate_keys()? {
+                Some(keys) => keys,
+                None => return Ok(None),
+            },
         };
 
+        self.verify_candidates(keys)
+    }
+
+    /// If a top-level `GeoWithin` filter targets a geo-indexed field, the
+    /// candidate doc keys for its bounding box (a verified superset), else
+    /// `None`.
+    fn geo_candidate_keys(&self) -> Result<Option<Vec<Vec<u8>>>> {
+        let db = self.collection.db();
+        let coll = self.collection.name();
+        for pred in &self.filters {
+            if let Predicate::GeoWithin {
+                path,
+                lat,
+                lon,
+                radius_km,
+            } = pred
+                && db.has_geo_index(coll, path)
+                && let Some((min_lat, min_lon, max_lat, max_lon)) =
+                    crate::geo_index::radius_bbox(*lat, *lon, *radius_km)
+            {
+                return db.geo_candidates(coll, path, min_lat, min_lon, max_lat, max_lon);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Fetch each candidate key's document and keep those passing every filter.
+    fn verify_candidates(&self, keys: Vec<Vec<u8>>) -> Result<Option<Candidates>> {
         let mut out = Vec::new();
         for key in keys {
             if let Some(doc) = self.collection.get(&key)?

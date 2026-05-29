@@ -218,13 +218,13 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 - `create_vector_index_ondisk` — HNSW graph nodes on disk; insert/search touch only nodes-per-op; bulk backfill batches commits with a shared node cache. Now also supports **quantized on-disk storage** (`create_vector_index_ondisk_quantized`, binary ≈32× / scalar ≈4× smaller on disk + page cache) via the shared `quant` module — the footprint path for billions of vectors on a laptop. Recall holds (scalar ≥0.80 vs exact).
 - `create_text_index_ondisk` — BM25 postings on disk; a query touches only its query terms.
 - `create_scalar_index` — order-preserving keys; selective equality/range filters and counts go sub-linear (1M: 662ms scan → ~3ms eq / ~0.5ms 100-row range), with a candidate cap that falls back to the bounded streaming scan when a filter isn't selective.
+- `create_geo_index` — fixed-resolution grid cells (~0.1°) as order-preserving keys; radius/bbox queries (and the builder's `within_km` filter) scan only the cells the bounding box overlaps, then verify exact haversine. Cap-fallback to a scan for continental-scale or antimeridian-wrapping queries.
 
 **WASM / mobile (engine ready, measured).** The engine compiles to `wasm32-unknown-unknown`; a `cdylib` harness (`corvid-wasm`) links it and the bundle is **≈0.2 MB gzipped** — well under the 2 MB budget — enforced in CI. The engine also cross-compiles for `aarch64` iOS/Android (CI builds android). The remaining browser-runtime piece is the OPFS-SAHPool `StorageBackend` + `wasm-bindgen` surface (Worker-only, needs a browser to validate); in-memory works on wasm today.
 
 **Deliberately deferred (large subsystems, with reasons):**
 - **Product Quantization (PQ) codebook** (#16 remainder): binary/scalar quantization is done for both indexes; codebook-based PQ (k-means + asymmetric distance tables) is a further compression-vs-recall option, a distinct subsystem.
 - **Browser support (OPFS StorageBackend + wasm-bindgen)** — *deferred by decision (2026-05-29)*. The engine is wasm-ready and size-validated (≈0.2 MB gzipped, CI-enforced) and runs in-memory on wasm; the browser-persistence layer (OPFS-SAHPool VFS, Worker RPC, JS bindings) is explicitly out of scope for now. Desktop + server is the focus.
-- **Spatial index** (#6, geo): geo is an exact scan (correct); an R-tree/geohash index is the scale optimization, same pattern as the vector/text baselines.
 - **Streaming result iterators** (#15): results are materialized; a streaming/cursor API is a larger refactor.
 - **Declared schema/constraints** (#9): schema-on-read today; a strict-schema layer is a future addition.
 - **Richer text analysis** (#23): single English-ish analyzer; stemming/stopwords/phrase/CJK are future.

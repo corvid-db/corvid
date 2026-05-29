@@ -284,6 +284,18 @@ fn tools_list() -> Json {
                 }
             },
             {
+                "name": "create_geo_index",
+                "description": "Create a spatial index on a point field so radius/bbox geo queries scan only nearby grid cells instead of the whole collection.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "field": { "type": "string" }
+                    },
+                    "required": ["collection", "field"]
+                }
+            },
+            {
                 "name": "list_collections",
                 "description": "List user collection names.",
                 "inputSchema": { "type": "object", "properties": {} }
@@ -397,6 +409,7 @@ mod tests {
             "in_neighbors",
             "create_text_index",
             "create_scalar_index",
+            "create_geo_index",
             "list_collections",
             "count",
             "insert_auto",

@@ -73,6 +73,7 @@ computed among matching documents, never a post-hoc trim.
 | Scalar index (`create_scalar_index`): sub-linear eq/range filters | ✅ on disk, persists |
 | Directed property graph (`link`/`neighbors`/`traverse`) | ✅ |
 | Geospatial: radius / bounding-box / `within_km` filter | ✅ |
+| Spatial index (`create_geo_index`): sub-linear radius/bbox | ✅ on disk, persists |
 | Cross-collection lookup joins | ✅ |
 | Semantic (vector-keyed) cache | ✅ |
 | Probabilistic sketches (HyperLogLog, Bloom) | ✅ |

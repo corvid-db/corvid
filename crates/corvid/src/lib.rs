@@ -19,6 +19,7 @@ pub mod filter;
 pub mod fts;
 pub mod fusion;
 pub mod geo;
+pub mod geo_index;
 pub mod graph;
 pub mod hnsw;
 pub mod index;

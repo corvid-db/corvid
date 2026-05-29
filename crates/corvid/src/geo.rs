@@ -64,8 +64,14 @@ impl Collection<'_> {
         lon: f64,
         radius_km: f64,
     ) -> Result<Vec<GeoHit>> {
+        // Spatial-index fast path: scan only the cells the circle's bounding box
+        // overlaps, then verify exact haversine distance. Falls back to a full
+        // scan when there is no index or the area is too large / wraps.
+        let bbox = crate::geo_index::radius_bbox(lat, lon, radius_km);
+        let scanned = self.geo_scan_set(field, bbox)?;
+
         let mut hits: Vec<GeoHit> = Vec::new();
-        for (key, document) in self.scan()? {
+        for (key, document) in scanned {
             if let Some((plat, plon)) = document.get(field).and_then(extract_point) {
                 let distance_km = haversine_km(lat, lon, plat, plon);
                 if distance_km <= radius_km {
@@ -85,6 +91,30 @@ impl Collection<'_> {
         Ok(hits)
     }
 
+    /// The set of `(key, document)` to evaluate a geo predicate against: the
+    /// indexed candidate set for `bbox` if a spatial index serves it, else the
+    /// full collection scan. `bbox` is `(min_lat, min_lon, max_lat, max_lon)`.
+    fn geo_scan_set(
+        &self,
+        field: &str,
+        bbox: Option<(f64, f64, f64, f64)>,
+    ) -> Result<Vec<(Vec<u8>, Value)>> {
+        if let Some((min_lat, min_lon, max_lat, max_lon)) = bbox
+            && let Some(keys) =
+                self.db()
+                    .geo_candidates(self.name(), field, min_lat, min_lon, max_lat, max_lon)?
+        {
+            let mut out = Vec::with_capacity(keys.len());
+            for key in keys {
+                if let Some(doc) = self.get(&key)? {
+                    out.push((key, doc));
+                }
+            }
+            return Ok(out);
+        }
+        self.scan()
+    }
+
     /// Find documents whose `field` point falls within the bounding box
     /// `[min_lat, max_lat] × [min_lon, max_lon]`, in key order.
     pub fn geo_within_bbox(
@@ -95,8 +125,9 @@ impl Collection<'_> {
         max_lat: f64,
         max_lon: f64,
     ) -> Result<Vec<(Vec<u8>, Value)>> {
+        let scanned = self.geo_scan_set(field, Some((min_lat, min_lon, max_lat, max_lon)))?;
         let mut out = Vec::new();
-        for (key, document) in self.scan()? {
+        for (key, document) in scanned {
             if let Some((lat, lon)) = document.get(field).and_then(extract_point)
                 && (min_lat..=max_lat).contains(&lat)
                 && (min_lon..=max_lon).contains(&lon)
@@ -212,6 +243,67 @@ mod tests {
         assert!(keys.contains(&b"london".to_vec()));
         assert!(keys.contains(&b"greenwich".to_vec()));
         assert!(!keys.contains(&b"paris".to_vec()));
+    }
+
+    #[test]
+    fn indexed_radius_matches_unindexed() {
+        // Same data, one collection indexed, one not → identical results.
+        fn fill(c: &crate::Collection) {
+            for i in 0..200i64 {
+                let lat = 51.0 + (i as f64) * 0.01;
+                let lon = -0.5 + (i as f64) * 0.005;
+                let mut m = BTreeMap::new();
+                m.insert("loc".to_owned(), point_array(lat, lon));
+                m.insert("n".to_owned(), Value::Int(i));
+                c.insert(&[i as u8], &Value::Map(m)).unwrap();
+            }
+        }
+        let plain = Db::open_in_memory().unwrap();
+        fill(&plain.collection("p"));
+        let indexed = Db::open_in_memory().unwrap();
+        let ic = indexed.collection("p");
+        fill(&ic);
+        ic.create_geo_index("loc").unwrap();
+
+        let a = plain
+            .collection("p")
+            .geo_within_radius("loc", 51.5, -0.3, 30.0)
+            .unwrap();
+        let b = indexed
+            .collection("p")
+            .geo_within_radius("loc", 51.5, -0.3, 30.0)
+            .unwrap();
+        assert_eq!(a, b);
+        assert!(!a.is_empty());
+
+        // bbox parity too.
+        let ba = plain
+            .collection("p")
+            .geo_within_bbox("loc", 51.2, -0.4, 51.8, 0.0)
+            .unwrap();
+        let bb = indexed
+            .collection("p")
+            .geo_within_bbox("loc", 51.2, -0.4, 51.8, 0.0)
+            .unwrap();
+        assert_eq!(ba, bb);
+    }
+
+    #[test]
+    fn builder_geo_filter_uses_index() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("places");
+        c.insert(b"london", &place("London", 51.5074, -0.1278))
+            .unwrap();
+        c.insert(b"paris", &place("Paris", 48.8566, 2.3522))
+            .unwrap();
+        c.create_geo_index("loc").unwrap();
+        let rows = c
+            .query()
+            .filter(crate::field("loc").within_km(51.5, -0.13, 50.0))
+            .run()
+            .unwrap();
+        let keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+        assert_eq!(keys, vec![b"london".to_vec()]);
     }
 
     #[test]

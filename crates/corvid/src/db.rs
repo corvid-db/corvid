@@ -25,6 +25,7 @@ pub struct Db {
     indexes: Mutex<IndexState>,
     fts: Mutex<crate::fts::FtsState>,
     scalar: Mutex<crate::scalar::ScalarState>,
+    geo: Mutex<crate::geo_index::GeoState>,
     subscribers: Mutex<Subscribers>,
 }
 
@@ -36,11 +37,13 @@ impl Db {
             indexes: Mutex::new(IndexState::default()),
             fts: crate::fts::new_state(),
             scalar: crate::scalar::new_state(),
+            geo: crate::geo_index::new_state(),
             subscribers: Mutex::new(Subscribers::default()),
         };
         db.load_index_defs()?;
         db.load_text_defs()?;
         db.load_scalar_defs()?;
+        db.load_geo_defs()?;
         Ok(db)
     }
 
@@ -51,11 +54,13 @@ impl Db {
             indexes: Mutex::new(IndexState::default()),
             fts: crate::fts::new_state(),
             scalar: crate::scalar::new_state(),
+            geo: crate::geo_index::new_state(),
             subscribers: Mutex::new(Subscribers::default()),
         };
         db.load_index_defs()?;
         db.load_text_defs()?;
         db.load_scalar_defs()?;
+        db.load_geo_defs()?;
         Ok(db)
     }
 
@@ -95,6 +100,11 @@ impl Db {
     /// The scalar secondary-index state.
     pub(crate) fn scalar(&self) -> &Mutex<crate::scalar::ScalarState> {
         &self.scalar
+    }
+
+    /// The spatial-index state.
+    pub(crate) fn geo(&self) -> &Mutex<crate::geo_index::GeoState> {
+        &self.geo
     }
 
     /// The change-feed subscriber registry.
@@ -140,6 +150,7 @@ impl Collection<'_> {
         self.db.index_on_insert(self.name, key, doc)?;
         self.db.fts_on_insert(self.name, key, doc)?;
         self.db.scalar_on_insert(self.name, key, doc)?;
+        self.db.geo_on_insert(self.name, key, doc)?;
         self.db.notify(ChangeEvent {
             collection: self.name.to_owned(),
             key: key.to_vec(),
@@ -186,6 +197,7 @@ impl Collection<'_> {
             self.db.index_on_insert(self.name, key, doc)?;
             self.db.fts_on_insert(self.name, key, doc)?;
             self.db.scalar_on_insert(self.name, key, doc)?;
+            self.db.geo_on_insert(self.name, key, doc)?;
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
                 key: key.to_vec(),
@@ -222,6 +234,7 @@ impl Collection<'_> {
             self.db.index_on_delete(self.name, key)?;
             self.db.fts_on_delete(self.name, key)?;
             self.db.scalar_on_delete(self.name, key)?;
+            self.db.geo_on_delete(self.name, key)?;
             self.db.notify(ChangeEvent {
                 collection: self.name.to_owned(),
                 key: key.to_vec(),

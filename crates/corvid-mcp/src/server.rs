@@ -60,6 +60,7 @@ impl Server {
             "create_index" => self.create_index(params),
             "create_text_index" => self.create_text_index(params),
             "create_scalar_index" => self.create_scalar_index(params),
+            "create_geo_index" => self.create_geo_index(params),
             "geo" => self.geo(params),
             "join" => self.join(params),
             "in_neighbors" => self.in_neighbors(params),
@@ -259,6 +260,13 @@ impl Server {
         let collection = str_param(p, "collection")?;
         let field = str_param(p, "field")?;
         self.db.collection(collection).create_scalar_index(field)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn create_geo_index(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let field = str_param(p, "field")?;
+        self.db.collection(collection).create_geo_index(field)?;
         Ok(json!({ "ok": true }))
     }
 
