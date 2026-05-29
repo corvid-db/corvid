@@ -16,25 +16,50 @@ use crate::db::Collection;
 use crate::error::Result;
 
 impl Collection<'_> {
-    /// Add a directed edge `from --relation--> to`. Idempotent.
+    /// Add a directed edge `from --relation--> to`. Idempotent. A reverse edge
+    /// is stored too, so [`Collection::in_neighbors`] can answer "who links to
+    /// `to`?".
     pub fn link(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<()> {
         self.ensure_writable()?;
         self.db()
             .store()
-            .put(&self.edges_name(), &edge_key(relation, from, to), b"")
-    }
-
-    /// Remove the edge `from --relation--> to`. Returns whether one existed.
-    pub fn unlink(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<bool> {
+            .put(&self.edges_name(), &edge_key(relation, from, to), b"")?;
         self.db()
             .store()
-            .delete(&self.edges_name(), &edge_key(relation, from, to))
+            .put(&self.redges_name(), &edge_key(relation, to, from), b"")
+    }
+
+    /// Remove the edge `from --relation--> to` (and its reverse). Returns
+    /// whether the forward edge existed.
+    pub fn unlink(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<bool> {
+        let removed = self
+            .db()
+            .store()
+            .delete(&self.edges_name(), &edge_key(relation, from, to))?;
+        self.db()
+            .store()
+            .delete(&self.redges_name(), &edge_key(relation, to, from))?;
+        Ok(removed)
     }
 
     /// Return the targets of every `from --relation--> ?` edge, in key order.
     pub fn neighbors(&self, from: &[u8], relation: &str) -> Result<Vec<Vec<u8>>> {
         let prefix = neighbor_prefix(relation, from);
         let edges = self.db().store().scan_prefix(&self.edges_name(), &prefix)?;
+        Ok(edges
+            .into_iter()
+            .map(|(key, _)| key.get(prefix.len()..).unwrap_or(&[]).to_vec())
+            .collect())
+    }
+
+    /// Return the sources of every `? --relation--> to` edge, in key order
+    /// (incoming edges).
+    pub fn in_neighbors(&self, to: &[u8], relation: &str) -> Result<Vec<Vec<u8>>> {
+        let prefix = neighbor_prefix(relation, to);
+        let edges = self
+            .db()
+            .store()
+            .scan_prefix(&self.redges_name(), &prefix)?;
         Ok(edges
             .into_iter()
             .map(|(key, _)| key.get(prefix.len()..).unwrap_or(&[]).to_vec())
@@ -68,9 +93,14 @@ impl Collection<'_> {
         Ok(result)
     }
 
-    /// The sibling collection holding this collection's edges.
+    /// The sibling collection holding this collection's forward edges.
     fn edges_name(&self) -> String {
         format!("__edges__{}", self.name())
+    }
+
+    /// The sibling collection holding this collection's reverse edges.
+    fn redges_name(&self) -> String {
+        format!("__redges__{}", self.name())
     }
 }
 
@@ -124,6 +154,31 @@ mod tests {
         c.link(b"a", "r", b"b").unwrap();
         c.link(b"a", "r", b"b").unwrap();
         assert_eq!(c.neighbors(b"a", "r").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn in_neighbors_finds_incoming_edges() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("nodes");
+        c.link(b"a", "knows", b"x").unwrap();
+        c.link(b"b", "knows", b"x").unwrap();
+        c.link(b"a", "knows", b"y").unwrap();
+        // Who knows x? a and b.
+        assert_eq!(
+            c.in_neighbors(b"x", "knows").unwrap(),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+        assert_eq!(c.in_neighbors(b"y", "knows").unwrap(), vec![b"a".to_vec()]);
+        assert!(c.in_neighbors(b"nobody", "knows").unwrap().is_empty());
+    }
+
+    #[test]
+    fn unlink_removes_reverse_edge_too() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("nodes");
+        c.link(b"a", "knows", b"x").unwrap();
+        c.unlink(b"a", "knows", b"x").unwrap();
+        assert!(c.in_neighbors(b"x", "knows").unwrap().is_empty());
     }
 
     #[test]
