@@ -37,6 +37,7 @@
 //!    keep their fused order after the reranked ones.
 //! 5. Truncate to `limit`.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::db::Collection;
@@ -85,6 +86,8 @@ pub struct QueryBuilder<'c> {
     rrf_k: f32,
     mmr_lambda: Option<f32>,
     limit: Option<usize>,
+    offset: usize,
+    order_by: Option<(String, bool)>,
     projection: Option<Vec<String>>,
     approx: bool,
 }
@@ -99,6 +102,8 @@ impl<'c> Collection<'c> {
             rrf_k: DEFAULT_RRF_K,
             mmr_lambda: None,
             limit: None,
+            offset: 0,
+            order_by: None,
             projection: None,
             approx: false,
         }
@@ -159,6 +164,22 @@ impl QueryBuilder<'_> {
     /// Limit the result to at most `n` rows.
     pub fn limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
+        self
+    }
+
+    /// Skip the first `n` rows (pagination). Applied after ordering, before
+    /// `limit`.
+    pub fn offset(mut self, n: usize) -> Self {
+        self.offset = n;
+        self
+    }
+
+    /// Order results by a scalar field instead of by rank. `descending`
+    /// reverses the order. Rows missing the field (or with an incomparable
+    /// value) sort to the end. Comparable values: int/float (numeric), text
+    /// (lexical).
+    pub fn order_by(mut self, field: impl Into<String>, descending: bool) -> Self {
+        self.order_by = Some((field.into(), descending));
         self
     }
 
@@ -293,8 +314,28 @@ impl QueryBuilder<'_> {
             _ => fused,
         };
 
-        // 5. Limit and assemble.
+        // 5. Optional ORDER BY a field (replaces rank order), then paginate.
         let mut ordered = ordered;
+        if let Some((field, descending)) = &self.order_by {
+            ordered.sort_by(|(ka, _), (kb, _)| {
+                let va = docs.get(ka).and_then(|d| d.get(field));
+                let vb = docs.get(kb).and_then(|d| d.get(field));
+                match (va, vb) {
+                    (Some(a), Some(b)) => {
+                        let base = crate::filter::value_order(a, b).unwrap_or(Ordering::Equal);
+                        let base = if *descending { base.reverse() } else { base };
+                        base.then_with(|| ka.cmp(kb))
+                    }
+                    (Some(_), None) => Ordering::Less, // present sorts before missing
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => ka.cmp(kb),
+                }
+            });
+        }
+
+        // 6. Offset + limit, then assemble.
+        let start = self.offset.min(ordered.len());
+        let mut ordered = ordered.split_off(start);
         if let Some(limit) = self.limit {
             ordered.truncate(limit);
         }
@@ -672,6 +713,71 @@ mod tests {
             .unwrap();
         assert_eq!(rows[0].key, b"a".to_vec());
         assert!(!rows.iter().any(|r| r.key == b"c".to_vec()));
+    }
+
+    #[test]
+    fn order_by_field_ascending_and_descending() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for (k, n) in [(b"a", 3), (b"b", 1), (b"c", 2)] {
+            let mut m = BTreeMap::new();
+            m.insert("n".to_owned(), Value::Int(n));
+            c.insert(k, &Value::Map(m)).unwrap();
+        }
+        let asc = c.query().order_by("n", false).run().unwrap();
+        assert_eq!(
+            asc.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+            vec![b"b".to_vec(), b"c".to_vec(), b"a".to_vec()]
+        );
+        let desc = c.query().order_by("n", true).run().unwrap();
+        assert_eq!(
+            desc.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+            vec![b"a".to_vec(), b"c".to_vec(), b"b".to_vec()]
+        );
+    }
+
+    #[test]
+    fn order_by_puts_missing_field_last() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        let mut m = BTreeMap::new();
+        m.insert("n".to_owned(), Value::Int(5));
+        c.insert(b"has", &Value::Map(m)).unwrap();
+        c.insert(b"missing", &Value::Map(BTreeMap::new())).unwrap();
+        let rows = c.query().order_by("n", false).run().unwrap();
+        assert_eq!(rows[0].key, b"has".to_vec());
+        assert_eq!(rows[1].key, b"missing".to_vec());
+    }
+
+    #[test]
+    fn offset_and_limit_paginate() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for i in 0..10u8 {
+            let mut m = BTreeMap::new();
+            m.insert("n".to_owned(), Value::Int(i as i64));
+            c.insert(&[i], &Value::Map(m)).unwrap();
+        }
+        let page = c
+            .query()
+            .order_by("n", false)
+            .offset(3)
+            .limit(2)
+            .run()
+            .unwrap();
+        let ns: Vec<i64> = page
+            .iter()
+            .map(|r| r.document.get("n").unwrap().as_int().unwrap())
+            .collect();
+        assert_eq!(ns, vec![3, 4]);
+    }
+
+    #[test]
+    fn offset_past_end_is_empty() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &Value::Int(1)).unwrap();
+        assert!(c.query().offset(100).run().unwrap().is_empty());
     }
 
     #[test]

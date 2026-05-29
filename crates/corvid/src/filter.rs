@@ -185,10 +185,16 @@ fn compare(found: &Value, op: CmpOp, rhs: &Value) -> bool {
     match op {
         CmpOp::Eq => found == rhs,
         CmpOp::Ne => found != rhs,
-        CmpOp::Lt => order(found, rhs) == Some(Ordering::Less),
-        CmpOp::Le => matches!(order(found, rhs), Some(Ordering::Less | Ordering::Equal)),
-        CmpOp::Gt => order(found, rhs) == Some(Ordering::Greater),
-        CmpOp::Ge => matches!(order(found, rhs), Some(Ordering::Greater | Ordering::Equal)),
+        CmpOp::Lt => value_order(found, rhs) == Some(Ordering::Less),
+        CmpOp::Le => matches!(
+            value_order(found, rhs),
+            Some(Ordering::Less | Ordering::Equal)
+        ),
+        CmpOp::Gt => value_order(found, rhs) == Some(Ordering::Greater),
+        CmpOp::Ge => matches!(
+            value_order(found, rhs),
+            Some(Ordering::Greater | Ordering::Equal)
+        ),
     }
 }
 
@@ -196,7 +202,7 @@ fn compare(found: &Value, op: CmpOp, rhs: &Value) -> bool {
 ///
 /// Numbers compare numerically (ints and floats interoperate), text compares
 /// lexically. Everything else (bools, containers, mixed kinds) is unordered.
-fn order(a: &Value, b: &Value) -> Option<Ordering> {
+pub(crate) fn value_order(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
