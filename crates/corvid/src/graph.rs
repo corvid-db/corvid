@@ -18,6 +18,7 @@ use crate::error::Result;
 impl Collection<'_> {
     /// Add a directed edge `from --relation--> to`. Idempotent.
     pub fn link(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
         self.db()
             .store()
             .put(&self.edges_name(), &edge_key(relation, from, to), b"")
@@ -36,7 +37,7 @@ impl Collection<'_> {
         let edges = self.db().store().scan_prefix(&self.edges_name(), &prefix)?;
         Ok(edges
             .into_iter()
-            .map(|(key, _)| key[prefix.len()..].to_vec())
+            .map(|(key, _)| key.get(prefix.len()..).unwrap_or(&[]).to_vec())
             .collect())
     }
 

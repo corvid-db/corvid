@@ -278,9 +278,10 @@ fn physical_key(id: u64, key: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Strip the 8-byte collection id prefix from a physical key.
+/// Strip the 8-byte collection id prefix from a physical key. Defensive
+/// against malformed (too-short) keys: returns empty rather than panicking.
 fn user_key(physical: &[u8]) -> Vec<u8> {
-    physical[8..].to_vec()
+    physical.get(8..).unwrap_or(&[]).to_vec()
 }
 
 /// The smallest byte string strictly greater than every string starting with

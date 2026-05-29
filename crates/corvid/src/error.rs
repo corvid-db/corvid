@@ -36,4 +36,8 @@ pub enum Error {
     /// Stored bytes could not be decoded into a [`crate::Value`].
     #[error("decode: {0}")]
     Decode(String),
+
+    /// A collection name used the engine-reserved `__` prefix.
+    #[error("reserved collection name: {0}")]
+    ReservedCollection(String),
 }

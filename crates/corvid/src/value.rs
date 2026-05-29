@@ -181,9 +181,13 @@ impl Value {
 }
 
 /// Append a length as a little-endian `u32`.
+///
+/// Panics if `n` exceeds `u32::MAX` (4 GiB): a single value that large is a
+/// misuse, and failing loudly is far better than silently truncating the
+/// length prefix and corrupting the encoding.
 fn put_len(out: &mut Vec<u8>, n: usize) {
-    debug_assert!(n <= u32::MAX as usize, "length exceeds u32");
-    out.extend_from_slice(&(n as u32).to_le_bytes());
+    let n = u32::try_from(n).expect("value length exceeds 4 GiB");
+    out.extend_from_slice(&n.to_le_bytes());
 }
 
 /// A cursor over an encoded byte buffer.

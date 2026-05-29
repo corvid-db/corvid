@@ -94,8 +94,18 @@ impl Collection<'_> {
         self.name
     }
 
+    /// Reject writes to engine-reserved collection names (the `__` prefix is
+    /// used for internal namespaces such as graph edges).
+    pub(crate) fn ensure_writable(&self) -> Result<()> {
+        if self.name.starts_with("__") {
+            return Err(crate::Error::ReservedCollection(self.name.to_owned()));
+        }
+        Ok(())
+    }
+
     /// Insert or overwrite the document stored at `key`.
     pub fn insert(&self, key: &[u8], doc: &Value) -> Result<()> {
+        self.ensure_writable()?;
         self.db.store().put(self.name, key, &doc.encode())?;
         self.db.bump_gen(self.name);
         self.db.notify(ChangeEvent {
@@ -217,6 +227,15 @@ mod tests {
             c.get(b"v").unwrap(),
             Some(Value::Vector(vec![1.0, 2.0, 3.0]))
         );
+    }
+
+    #[test]
+    fn reserved_collection_names_are_rejected_on_write() {
+        let db = Db::open_in_memory().unwrap();
+        let err = db.collection("__edges__docs").insert(b"k", &Value::Int(1));
+        assert!(matches!(err, Err(crate::Error::ReservedCollection(_))));
+        // A normal collection is fine.
+        assert!(db.collection("docs").insert(b"k", &Value::Int(1)).is_ok());
     }
 
     #[test]
