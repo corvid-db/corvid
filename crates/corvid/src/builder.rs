@@ -47,6 +47,9 @@ use crate::fusion::{DEFAULT_RRF_K, mmr, reciprocal_rank_fusion};
 use crate::query::{doc_map, ranked_bm25, ranked_vector};
 use crate::value::Value;
 
+/// A set of candidate `(key, document)` pairs.
+type Candidates = Vec<(Vec<u8>, Value)>;
+
 /// One row of a query result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResultRow {
@@ -83,6 +86,7 @@ pub struct QueryBuilder<'c> {
     mmr_lambda: Option<f32>,
     limit: Option<usize>,
     projection: Option<Vec<String>>,
+    approx: bool,
 }
 
 impl<'c> Collection<'c> {
@@ -96,6 +100,7 @@ impl<'c> Collection<'c> {
             mmr_lambda: None,
             limit: None,
             projection: None,
+            approx: false,
         }
     }
 }
@@ -157,6 +162,15 @@ impl QueryBuilder<'_> {
         self
     }
 
+    /// Allow approximate execution: when a single vector source has a matching
+    /// ANN index, use it even if filters are present (over-fetch then filter).
+    /// Faster, but a highly selective filter may return fewer than `limit`
+    /// rows. Without this, filtered vector queries run exactly (full scan).
+    pub fn approx(mut self) -> Self {
+        self.approx = true;
+        self
+    }
+
     /// Project each result document down to the named top-level fields.
     ///
     /// Only applies to [`Value::Map`] documents; missing fields are simply
@@ -203,14 +217,56 @@ impl QueryBuilder<'_> {
         Ok(groups)
     }
 
+    /// Try the ANN fast path: a single vector source whose field/metric has a
+    /// registered index. Returns the (already filtered) candidate set, or
+    /// `None` to fall back to an exact scan. Filtered queries only take this
+    /// path under [`Self::approx`].
+    fn ann_candidates(&self) -> Result<Option<Candidates>> {
+        if self.sources.len() != 1 {
+            return Ok(None);
+        }
+        let Source::Vector {
+            field,
+            query,
+            k,
+            metric,
+        } = &self.sources[0]
+        else {
+            return Ok(None);
+        };
+        if !self.filters.is_empty() && !self.approx {
+            return Ok(None);
+        }
+        let Some(ranked) =
+            self.collection
+                .db()
+                .ann_search(self.collection.name(), field, query, *k, *metric)?
+        else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        for (key, _dist) in ranked {
+            if let Some(doc) = self.collection.get(&key)?
+                && self.filters.iter().all(|p| p.eval(&doc))
+            {
+                out.push((key, doc));
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Execute the query and return the ranked rows.
     pub fn run(self) -> Result<Vec<ResultRow>> {
-        let filtered: Vec<(Vec<u8>, Value)> = self
-            .collection
-            .scan()?
-            .into_iter()
-            .filter(|(_, doc)| self.filters.iter().all(|p| p.eval(doc)))
-            .collect();
+        // Use the ANN index when applicable; otherwise scan and filter exactly.
+        let filtered: Vec<(Vec<u8>, Value)> = match self.ann_candidates()? {
+            Some(candidates) => candidates,
+            None => self
+                .collection
+                .scan()?
+                .into_iter()
+                .filter(|(_, doc)| self.filters.iter().all(|p| p.eval(doc)))
+                .collect(),
+        };
 
         // 2. Rank the filtered set per source.
         let rankings: Vec<Vec<Vec<u8>>> = self
@@ -566,6 +622,56 @@ mod tests {
             .run()
             .unwrap();
         assert_eq!(rows[0].document, Value::Int(42));
+    }
+
+    #[test]
+    fn builder_uses_ann_index_for_vector_only_query() {
+        let db = seed();
+        let c = db.collection("docs");
+        c.create_vector_index("embedding", Metric::Cosine).unwrap();
+        let rows = c
+            .query()
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .run()
+            .unwrap();
+        // Same top result as the exact path, now served via the index.
+        assert_eq!(rows[0].key, b"a".to_vec());
+    }
+
+    #[test]
+    fn approx_filtered_vector_query_uses_index_and_respects_filter() {
+        let db = seed();
+        let c = db.collection("docs");
+        c.create_vector_index("embedding", Metric::Cosine).unwrap();
+        let rows = c
+            .query()
+            .filter(field("category").eq(Value::Text("blog".into())))
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .approx()
+            .run()
+            .unwrap();
+        // c (news) is nearest after a, but filtered out; only blog docs remain.
+        assert!(
+            rows.iter()
+                .all(|r| r.document.get("category") == Some(&Value::Text("blog".into())))
+        );
+        assert_eq!(rows[0].key, b"a".to_vec());
+    }
+
+    #[test]
+    fn filtered_vector_query_without_approx_is_exact_but_correct() {
+        let db = seed();
+        let c = db.collection("docs");
+        c.create_vector_index("embedding", Metric::Cosine).unwrap();
+        // No .approx(): exact path, still correct, still filtered.
+        let rows = c
+            .query()
+            .filter(field("category").eq(Value::Text("blog".into())))
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .run()
+            .unwrap();
+        assert_eq!(rows[0].key, b"a".to_vec());
+        assert!(!rows.iter().any(|r| r.key == b"c".to_vec()));
     }
 
     #[test]
