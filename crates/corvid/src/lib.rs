@@ -8,11 +8,15 @@
 //! transactional byte-oriented key/value store over redb ([`Store`]).
 
 pub mod db;
+pub mod distance;
 pub mod error;
+pub mod query;
 pub mod store;
 pub mod value;
 
 pub use db::{Collection, Db};
+pub use distance::Metric;
 pub use error::{Error, Result};
+pub use query::Hit;
 pub use store::Store;
 pub use value::Value;

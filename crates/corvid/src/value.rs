@@ -56,6 +56,62 @@ impl Value {
         out
     }
 
+    /// If this is a [`Value::Map`], get the field named `key`.
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        match self {
+            Value::Map(m) => m.get(key),
+            _ => None,
+        }
+    }
+
+    /// Borrow the contents if this is a [`Value::Bool`].
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Borrow the contents if this is a [`Value::Int`].
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Borrow the contents if this is a [`Value::Float`].
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            Value::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// Borrow the contents if this is a [`Value::Text`].
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Value::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Borrow the contents if this is a [`Value::Bytes`].
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Value::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Borrow the contents if this is a [`Value::Vector`].
+    pub fn as_vector(&self) -> Option<&[f32]> {
+        match self {
+            Value::Vector(v) => Some(v),
+            _ => None,
+        }
+    }
+
     /// Decode a value previously produced by [`Value::encode`].
     ///
     /// Fails if the bytes are malformed or have trailing content.
@@ -353,5 +409,39 @@ mod tests {
         bytes.push(0);
         let err = Value::decode(&bytes).unwrap_err();
         assert!(format!("{err}").contains("trailing"));
+    }
+
+    #[test]
+    fn accessors_return_inner_value_on_match() {
+        assert_eq!(Value::Bool(true).as_bool(), Some(true));
+        assert_eq!(Value::Int(7).as_int(), Some(7));
+        assert_eq!(Value::Float(1.5).as_float(), Some(1.5));
+        assert_eq!(Value::Text("hi".into()).as_text(), Some("hi"));
+        assert_eq!(Value::Bytes(vec![1, 2]).as_bytes(), Some(&[1u8, 2][..]));
+        assert_eq!(
+            Value::Vector(vec![1.0, 2.0]).as_vector(),
+            Some(&[1.0f32, 2.0][..])
+        );
+    }
+
+    #[test]
+    fn accessors_return_none_on_mismatch() {
+        assert_eq!(Value::Null.as_bool(), None);
+        assert_eq!(Value::Null.as_int(), None);
+        assert_eq!(Value::Null.as_float(), None);
+        assert_eq!(Value::Null.as_text(), None);
+        assert_eq!(Value::Null.as_bytes(), None);
+        assert_eq!(Value::Null.as_vector(), None);
+    }
+
+    #[test]
+    fn get_reads_map_fields_only() {
+        let mut m = BTreeMap::new();
+        m.insert("a".to_owned(), Value::Int(1));
+        let v = Value::Map(m);
+        assert_eq!(v.get("a"), Some(&Value::Int(1)));
+        assert_eq!(v.get("missing"), None);
+        // Non-map values have no fields.
+        assert_eq!(Value::Int(1).get("a"), None);
     }
 }
