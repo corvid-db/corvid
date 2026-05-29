@@ -15,21 +15,28 @@
 //! graph is never left half-updated.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::distance::Metric;
 use crate::error::Result;
-use crate::quant::{Quantization, StoredVec};
+use crate::pq::Pq;
+use crate::quant::{Probe, Quantization, StoredVec};
 use crate::store::Store;
 
 const TAG_NODE: u8 = b'n';
 const TAG_KEYMAP: u8 = b'k';
 const TAG_META: u8 = b'm';
+/// Key holding the persisted PQ codebook (only present for PQ indexes).
+pub(crate) const TAG_PQ: u8 = b'q';
 
 /// Build/search parameters for an on-disk index.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct DiskParams {
     pub metric: Metric,
     pub quant: Quantization,
+    /// When set, vectors are stored as PQ codes and distances use this codebook
+    /// (overrides `quant`).
+    pub pq: Option<Arc<Pq>>,
     pub m: usize,
     pub m0: usize,
     pub ef_construction: usize,
@@ -47,6 +54,7 @@ impl DiskParams {
         Self {
             metric,
             quant,
+            pq: None,
             m,
             m0: m * 2,
             ef_construction: ef_construction.max(m),
@@ -54,9 +62,64 @@ impl DiskParams {
         }
     }
 
+    /// Set the PQ codebook (storage becomes PQ codes).
+    pub fn with_pq(mut self, pq: Arc<Pq>) -> Self {
+        self.pq = Some(pq);
+        self
+    }
+
     fn neighbors_at(&self, layer: usize) -> usize {
         if layer == 0 { self.m0 } else { self.m }
     }
+
+    /// Encode a query vector into the form distances are computed against.
+    fn make_probe(&self, query: &[f32]) -> DProbe {
+        match &self.pq {
+            Some(_) => DProbe::Pq(query.to_vec()),
+            None => DProbe::Q(self.quant.probe(query)),
+        }
+    }
+
+    /// Build a probe from an already-stored vector (for neighbour pruning).
+    fn probe_of(&self, stored: &StoredVec) -> DProbe {
+        match (&self.pq, stored) {
+            (Some(pq), StoredVec::Packed(code)) => DProbe::Pq(pq.decode(code)),
+            (Some(_), StoredVec::Full(_)) => DProbe::Pq(Vec::new()),
+            (None, _) => DProbe::Q(self.quant.probe_of(stored)),
+        }
+    }
+
+    /// Distance from a probe to a stored vector.
+    fn dist(&self, probe: &DProbe, stored: &StoredVec) -> f32 {
+        match (probe, &self.pq, stored) {
+            (DProbe::Pq(q), Some(pq), StoredVec::Packed(code)) => pq.distance(self.metric, q, code),
+            (DProbe::Q(p), None, _) => self.quant.dist(self.metric, p, stored),
+            _ => f32::INFINITY,
+        }
+    }
+
+    /// Encode a vector for storage.
+    fn encode(&self, v: &[f32]) -> StoredVec {
+        match &self.pq {
+            Some(pq) => StoredVec::Packed(pq.encode(v)),
+            None => self.quant.encode(v),
+        }
+    }
+
+    /// Decode stored bytes into a [`StoredVec`] (PQ codes stay packed).
+    fn decode_stored(&self, bytes: &[u8]) -> StoredVec {
+        match &self.pq {
+            Some(_) => StoredVec::Packed(bytes.to_vec()),
+            None => StoredVec::from_bytes(self.quant, bytes),
+        }
+    }
+}
+
+/// A query in the representation used for distance: a quantization probe, or a
+/// full vector for the PQ reconstruction path.
+enum DProbe {
+    Q(Probe),
+    Pq(Vec<f32>),
 }
 
 /// A graph node as stored on disk.
@@ -113,13 +176,13 @@ fn encode_node(node: &Node) -> Vec<u8> {
     out
 }
 
-fn decode_node(b: &[u8], quant: Quantization) -> Option<Node> {
+fn decode_node(b: &[u8], p: &DiskParams) -> Option<Node> {
     let mut c = Cursor { b, pos: 0 };
     let deleted = c.u8()? != 0;
     let dk_len = c.u32()?;
     let doc_key = c.take(dk_len)?.to_vec();
     let vec_len = c.u32()?;
-    let vector = StoredVec::from_bytes(quant, c.take(vec_len)?);
+    let vector = p.decode_stored(c.take(vec_len)?);
     let n_layers = c.u32()?;
     let mut layers = Vec::with_capacity(n_layers);
     for _ in 0..n_layers {
@@ -307,7 +370,7 @@ fn insert_in_txn(
         // Overwrite: tombstone the previous node for this key.
         if let Some(old_bytes) = tx.get(ns, &keymap_key(doc_key))? {
             let old_id = u64::from_be_bytes(old_bytes.as_slice().try_into().unwrap_or([0; 8]));
-            if let Some(node) = load(tx, ns, cache, p.quant, old_id)? {
+            if let Some(node) = load(tx, ns, cache, p, old_id)? {
                 let mut node = node;
                 node.deleted = true;
                 cache.nodes.insert(old_id, node);
@@ -323,7 +386,7 @@ fn insert_in_txn(
             Node {
                 deleted: false,
                 doc_key: doc_key.to_vec(),
-                vector: p.quant.encode(vector),
+                vector: p.encode(vector),
                 layers: vec![Vec::new(); level + 1],
             },
         );
@@ -331,7 +394,7 @@ fn insert_in_txn(
         tx.put(ns, &keymap_key(doc_key), &id.to_be_bytes())?;
 
         if let Some(entry) = meta.entry {
-            let top = load(tx, ns, cache, p.quant, entry)?
+            let top = load(tx, ns, cache, p, entry)?
                 .map(|n| n.layers.len() - 1)
                 .unwrap_or(0);
 
@@ -390,14 +453,14 @@ fn insert_in_txn(
 }
 
 /// Delete `doc_key` from the index (tombstone). Returns whether it existed.
-pub(crate) fn delete(store: &Store, ns: &str, quant: Quantization, doc_key: &[u8]) -> Result<bool> {
+pub(crate) fn delete(store: &Store, ns: &str, p: &DiskParams, doc_key: &[u8]) -> Result<bool> {
     store.transaction(|tx| {
         let Some(id_bytes) = tx.get(ns, &keymap_key(doc_key))? else {
             return Ok(false);
         };
         let id = u64::from_be_bytes(id_bytes.as_slice().try_into().unwrap_or([0; 8]));
         if let Some(bytes) = tx.get(ns, &node_key(id))?
-            && let Some(mut node) = decode_node(&bytes, quant)
+            && let Some(mut node) = decode_node(&bytes, p)
         {
             node.deleted = true;
             tx.put(ns, &node_key(id), &encode_node(&node))?;
@@ -428,7 +491,7 @@ pub(crate) fn search(
             return Ok(Vec::new());
         };
         let mut cache = Cache::new();
-        let top = load_r(r, ns, &mut cache, p.quant, entry)?
+        let top = load_r(r, ns, &mut cache, p, entry)?
             .map(|n| n.layers.len() - 1)
             .unwrap_or(0);
 
@@ -463,6 +526,16 @@ pub(crate) fn namespace(collection: &str, field: &str) -> String {
     format!("__dann__{collection}__{field}")
 }
 
+/// Persist a PQ codebook in the index namespace.
+pub(crate) fn store_codebook(store: &Store, ns: &str, pq: &Pq) -> Result<()> {
+    store.put(ns, &[TAG_PQ], &pq.to_bytes())
+}
+
+/// Load a persisted PQ codebook from the index namespace, if present.
+pub(crate) fn load_codebook(store: &Store, ns: &str) -> Result<Option<Pq>> {
+    Ok(store.get(ns, &[TAG_PQ])?.and_then(|b| Pq::from_bytes(&b)))
+}
+
 // ---- internal graph algorithm (generic over read source) ----
 //
 // Two thin wrappers (write-txn `tx` and read-txn `r`) feed a shared core via a
@@ -472,7 +545,7 @@ fn load(
     tx: &crate::store::WriteBatch<'_>,
     ns: &str,
     cache: &mut Cache,
-    quant: Quantization,
+    p: &DiskParams,
     id: u64,
 ) -> Result<Option<Node>> {
     if let Some(n) = cache.nodes.get(&id) {
@@ -480,7 +553,7 @@ fn load(
     }
     match tx.get(ns, &node_key(id))? {
         Some(b) => {
-            let node = decode_node(&b, quant);
+            let node = decode_node(&b, p);
             if let Some(n) = &node {
                 cache.nodes.insert(id, n.clone());
             }
@@ -494,7 +567,7 @@ fn load_r(
     r: &crate::store::ReadBatch<'_>,
     ns: &str,
     cache: &mut Cache,
-    quant: Quantization,
+    p: &DiskParams,
     id: u64,
 ) -> Result<Option<Node>> {
     if let Some(n) = cache.nodes.get(&id) {
@@ -502,7 +575,7 @@ fn load_r(
     }
     match r.get(ns, &node_key(id))? {
         Some(b) => {
-            let node = decode_node(&b, quant);
+            let node = decode_node(&b, p);
             if let Some(n) = &node {
                 cache.nodes.insert(id, n.clone());
             }
@@ -527,14 +600,14 @@ macro_rules! search_layer_impl {
         ) -> Result<Vec<Cand>> {
             use std::cmp::Reverse;
             use std::collections::{BinaryHeap, HashSet};
-            let probe = p.quant.probe(query);
+            let probe = p.make_probe(query);
             let mut visited: HashSet<u64> = HashSet::new();
             let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
             let mut results: BinaryHeap<Cand> = BinaryHeap::new();
 
             for &ep in entries {
-                if let Some(node) = $loader(src, ns, cache, p.quant, ep)? {
-                    let d = p.quant.dist(p.metric, &probe, &node.vector);
+                if let Some(node) = $loader(src, ns, cache, p, ep)? {
+                    let d = p.dist(&probe, &node.vector);
                     candidates.push(Reverse(Cand { dist: d, id: ep }));
                     results.push(Cand { dist: d, id: ep });
                     visited.insert(ep);
@@ -553,8 +626,8 @@ macro_rules! search_layer_impl {
                 };
                 for nb in neighbors {
                     if visited.insert(nb) {
-                        if let Some(node) = $loader(src, ns, cache, p.quant, nb)? {
-                            let d = p.quant.dist(p.metric, &probe, &node.vector);
+                        if let Some(node) = $loader(src, ns, cache, p, nb)? {
+                            let d = p.dist(&probe, &node.vector);
                             let worst = results.peek().map(|w| w.dist).unwrap_or(f32::INFINITY);
                             if results.len() < ef || d < worst {
                                 candidates.push(Reverse(Cand { dist: d, id: nb }));
@@ -592,7 +665,7 @@ fn prune(
         Some(n) => n.vector.clone(),
         None => return Ok(()),
     };
-    let probe = p.quant.probe_of(&base);
+    let probe = p.probe_of(&base);
     let ns_ids: Vec<u64> = cache
         .nodes
         .get(&node)
@@ -600,8 +673,8 @@ fn prune(
         .unwrap_or_default();
     let mut scored: Vec<(f32, u64)> = Vec::with_capacity(ns_ids.len());
     for nb in ns_ids {
-        if let Some(other) = load(tx, ns, cache, p.quant, nb)? {
-            scored.push((p.quant.dist(p.metric, &probe, &other.vector), nb));
+        if let Some(other) = load(tx, ns, cache, p, nb)? {
+            scored.push((p.dist(&probe, &other.vector), nb));
         }
     }
     scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -709,7 +782,7 @@ mod tests {
         for (i, v) in data.iter().enumerate() {
             insert(&store, "ix", &p, format!("k{i}").as_bytes(), v).unwrap();
         }
-        assert!(delete(&store, "ix", Quantization::None, b"k20").unwrap());
+        assert!(delete(&store, "ix", &p, b"k20").unwrap());
         let got = search(&store, "ix", &p, &data[20], 5, 80).unwrap();
         assert!(!got.iter().any(|(key, _)| key == b"k20"));
     }

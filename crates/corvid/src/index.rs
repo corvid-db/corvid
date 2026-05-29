@@ -36,19 +36,34 @@ pub(crate) enum IndexKind {
     InMemory,
     /// HNSW graph stored on disk (redb); bounded memory, persists across open.
     OnDisk,
+    /// On-disk HNSW storing product-quantized vectors (a codebook persists
+    /// alongside the graph).
+    OnDiskPq,
+}
+
+impl IndexKind {
+    fn is_on_disk(self) -> bool {
+        matches!(self, IndexKind::OnDisk | IndexKind::OnDiskPq)
+    }
 }
 
 /// A registered vector index definition.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct VectorDef {
     metric: Metric,
     quant: Quantization,
     kind: IndexKind,
+    /// PQ codebook for [`IndexKind::OnDiskPq`] (loaded from disk on open).
+    pq: Option<std::sync::Arc<crate::pq::Pq>>,
 }
 
 impl VectorDef {
     fn disk_params(&self) -> DiskParams {
-        DiskParams::with_quant(self.metric, self.quant, DEFAULT_M, DEFAULT_EF_CONSTRUCTION)
+        let p = DiskParams::with_quant(self.metric, self.quant, DEFAULT_M, DEFAULT_EF_CONSTRUCTION);
+        match &self.pq {
+            Some(pq) => p.with_pq(pq.clone()),
+            None => p,
+        }
     }
 }
 
@@ -135,12 +150,20 @@ impl Db {
                     .get(2)
                     .and_then(kind_from_byte)
                     .unwrap_or(IndexKind::InMemory);
+                // A PQ index carries a codebook persisted in its graph namespace.
+                let pq = if kind == IndexKind::OnDiskPq {
+                    let ns = disk_hnsw::namespace(&coll, &field);
+                    disk_hnsw::load_codebook(self.store(), &ns)?.map(std::sync::Arc::new)
+                } else {
+                    None
+                };
                 state.defs.insert(
                     (coll, field),
                     VectorDef {
                         metric,
                         quant,
                         kind,
+                        pq,
                     },
                 );
             }
@@ -159,11 +182,28 @@ impl Db {
         quant: Quantization,
         kind: IndexKind,
     ) -> Result<()> {
+        self.register_vector_index_inner(collection, field, metric, quant, kind, None)
+    }
+
+    fn register_vector_index_inner(
+        &self,
+        collection: &str,
+        field: &str,
+        metric: Metric,
+        quant: Quantization,
+        kind: IndexKind,
+        pq: Option<std::sync::Arc<crate::pq::Pq>>,
+    ) -> Result<()> {
         self.store().put(
             INDEX_DEFS,
             &def_key(collection, field),
             &[metric_byte(metric), quant_byte(quant), kind_byte(kind)],
         )?;
+        // The PQ codebook lives in the graph namespace (not the def bytes).
+        if let Some(pq) = &pq {
+            let ns = disk_hnsw::namespace(collection, field);
+            disk_hnsw::store_codebook(self.store(), &ns, pq)?;
+        }
         let mut state = self.indexes().lock().expect("index lock");
         let key = (collection.to_owned(), field.to_owned());
         state.defs.insert(
@@ -172,6 +212,7 @@ impl Db {
                 metric,
                 quant,
                 kind,
+                pq,
             },
         );
         // Drop any built in-memory graph so it rebuilds with the (possibly new) def.
@@ -189,19 +230,19 @@ impl Db {
                 .defs
                 .iter()
                 .filter(|((c, _), _)| c == collection)
-                .map(|((_, f), d)| (f.clone(), *d))
+                .map(|((_, f), d)| (f.clone(), d.clone()))
                 .collect()
         };
         for (field, def) in defs {
             match def.kind {
-                IndexKind::OnDisk => {
+                IndexKind::OnDisk | IndexKind::OnDiskPq => {
                     let ns = disk_hnsw::namespace(collection, &field);
                     match doc.get(&field).and_then(Value::as_vector) {
                         Some(v) => {
                             disk_hnsw::insert(self.store(), &ns, &def.disk_params(), key, v)?
                         }
                         None => {
-                            disk_hnsw::delete(self.store(), &ns, def.quant, key)?;
+                            disk_hnsw::delete(self.store(), &ns, &def.disk_params(), key)?;
                         }
                     }
                 }
@@ -230,14 +271,14 @@ impl Db {
                 .defs
                 .iter()
                 .filter(|((c, _), _)| c == collection)
-                .map(|((_, f), d)| (f.clone(), *d))
+                .map(|((_, f), d)| (f.clone(), d.clone()))
                 .collect()
         };
         for (field, def) in defs {
             match def.kind {
-                IndexKind::OnDisk => {
+                IndexKind::OnDisk | IndexKind::OnDiskPq => {
                     let ns = disk_hnsw::namespace(collection, &field);
-                    disk_hnsw::delete(self.store(), &ns, def.quant, key)?;
+                    disk_hnsw::delete(self.store(), &ns, &def.disk_params(), key)?;
                 }
                 IndexKind::InMemory => {
                     let map_key = (collection.to_owned(), field);
@@ -267,13 +308,13 @@ impl Db {
         let def = {
             let state = self.indexes().lock().expect("index lock");
             match state.defs.get(&map_key) {
-                Some(d) if d.metric == metric => *d,
+                Some(d) if d.metric == metric => d.clone(),
                 _ => return Ok(None), // no index, or metric mismatch → exact
             }
         };
 
         // On-disk indexes are served directly from the store (bounded memory).
-        if def.kind == IndexKind::OnDisk {
+        if def.kind.is_on_disk() {
             let ns = disk_hnsw::namespace(collection, field);
             let ef = (k * 4).max(64);
             return Ok(Some(disk_hnsw::search(
@@ -294,7 +335,7 @@ impl Db {
             .contains_key(&map_key);
 
         if needs_build {
-            let built = build_index(self.store(), collection, field, def)?;
+            let built = build_index(self.store(), collection, field, def.clone())?;
             let mut state = self.indexes().lock().expect("index lock");
             state.built.entry(map_key.clone()).or_insert(built);
         }
@@ -308,7 +349,7 @@ impl Db {
                 .is_some_and(|b| !b.node_to_key.is_empty() && b.dead() * 2 > b.node_to_key.len())
         };
         if needs_compact {
-            let built = build_index(self.store(), collection, field, def)?;
+            let built = build_index(self.store(), collection, field, def.clone())?;
             let mut state = self.indexes().lock().expect("index lock");
             state.built.insert(map_key.clone(), built);
         }
@@ -383,6 +424,7 @@ fn kind_byte(k: IndexKind) -> u8 {
     match k {
         IndexKind::InMemory => 0,
         IndexKind::OnDisk => 1,
+        IndexKind::OnDiskPq => 2,
     }
 }
 
@@ -390,6 +432,7 @@ fn kind_from_byte(b: &u8) -> Option<IndexKind> {
     match b {
         0 => Some(IndexKind::InMemory),
         1 => Some(IndexKind::OnDisk),
+        2 => Some(IndexKind::OnDiskPq),
         _ => None,
     }
 }
@@ -473,6 +516,89 @@ impl Collection<'_> {
         }
         Ok(())
     }
+
+    /// Create an on-disk HNSW index storing **product-quantized** vectors: a
+    /// codebook of `m` subspaces × `k` centroids is trained from up to a sample
+    /// of existing vectors, then each vector is stored as `m` code bytes — far
+    /// smaller than f32 (e.g. a 128-dim vector → `m` bytes). `field`'s
+    /// dimension must be divisible by `m`. The codebook persists with the index.
+    ///
+    /// Requires existing documents to train on (a codebook can't be learned
+    /// from nothing); returns [`Error::EmptyIndexTraining`] if none have a
+    /// usable vector at `field`.
+    pub fn create_vector_index_ondisk_pq(
+        &self,
+        field: &str,
+        metric: Metric,
+        m: usize,
+        k: usize,
+    ) -> Result<()> {
+        let store = self.db().store();
+        // Gather a training sample (bounded) from existing vectors.
+        const SAMPLE_CAP: usize = 50_000;
+        let mut sample: Vec<Vec<f32>> = Vec::new();
+        let mut cursor: Vec<u8> = Vec::new();
+        'outer: loop {
+            let page = store.scan_from(self.name(), &cursor, 2048)?;
+            let Some((last_key, _)) = page.last() else {
+                break;
+            };
+            let mut next = last_key.clone();
+            next.push(0);
+            for (_, bytes) in &page {
+                let doc = Value::decode(bytes)?;
+                if let Some(v) = doc.get(field).and_then(Value::as_vector) {
+                    sample.push(v.to_vec());
+                    if sample.len() >= SAMPLE_CAP {
+                        break 'outer;
+                    }
+                }
+            }
+            cursor = next;
+        }
+        let pq = crate::pq::Pq::train(&sample, m, k).ok_or(crate::Error::EmptyIndexTraining)?;
+        let pq = std::sync::Arc::new(pq);
+
+        self.db().register_vector_index_inner(
+            self.name(),
+            field,
+            metric,
+            Quantization::None,
+            IndexKind::OnDiskPq,
+            Some(pq.clone()),
+        )?;
+
+        // Backfill with the trained codebook.
+        let ns = disk_hnsw::namespace(self.name(), field);
+        let params = DiskParams::with_quant(
+            metric,
+            Quantization::None,
+            DEFAULT_M,
+            DEFAULT_EF_CONSTRUCTION,
+        )
+        .with_pq(pq);
+        let mut cursor: Vec<u8> = Vec::new();
+        loop {
+            let page = store.scan_from(self.name(), &cursor, 2048)?;
+            let Some((last_key, _)) = page.last() else {
+                break;
+            };
+            let mut next = last_key.clone();
+            next.push(0);
+            let mut batch: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
+            for (key, bytes) in &page {
+                let doc = Value::decode(bytes)?;
+                if let Some(v) = doc.get(field).and_then(Value::as_vector) {
+                    batch.push((key.clone(), v.to_vec()));
+                }
+            }
+            if !batch.is_empty() {
+                disk_hnsw::insert_many(store, &ns, &params, &batch)?;
+            }
+            cursor = next;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -484,6 +610,94 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("embedding".to_owned(), Value::Vector(v));
         Value::Map(m)
+    }
+
+    fn pq_corpus(n: usize, dim: usize) -> Vec<Vec<f32>> {
+        let mut state: u64 = 0xA5A5_1234_DEAD_0001;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let centers: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..dim).map(|_| next() * 10.0).collect())
+            .collect();
+        (0..n)
+            .map(|i| {
+                let c = &centers[i % centers.len()];
+                c.iter().map(|&x| x + (next() - 0.5)).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ondisk_pq_index_is_used_persists_and_recalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvid.db");
+        let data = pq_corpus(400, 16);
+        {
+            let db = Db::open(&path).unwrap();
+            let c = db.collection("docs");
+            for (i, v) in data.iter().enumerate() {
+                c.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                    .unwrap();
+            }
+            c.create_vector_index_ondisk_pq("embedding", Metric::L2, 8, 32)
+                .unwrap();
+        }
+        // Reopen: the codebook reloads from disk (no retrain) and serves search.
+        let db = Db::open(&path).unwrap();
+        let c = db.collection("docs");
+        let mut hits = 0;
+        for (i, v) in data.iter().enumerate().take(40) {
+            let got = c.vector_search("embedding", v, 5, Metric::L2).unwrap();
+            let want = format!("k{i}").into_bytes();
+            if got.iter().any(|h| h.key == want) {
+                hits += 1;
+            }
+        }
+        // The querying vector itself should usually be in its own top-5.
+        assert!(hits >= 30, "PQ self-recall {hits}/40 too low");
+    }
+
+    #[test]
+    fn ondisk_pq_reflects_incremental_writes_and_deletes() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        let data = pq_corpus(200, 8);
+        for (i, v) in data.iter().enumerate() {
+            c.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                .unwrap();
+        }
+        c.create_vector_index_ondisk_pq("embedding", Metric::L2, 4, 16)
+            .unwrap();
+        // Insert after creation → encoded with the existing codebook. An
+        // in-distribution duplicate of data[5] is retrievable near data[5]
+        // (generous k so quantization coarseness doesn't hide it).
+        c.insert(b"new", &doc(data[5].clone())).unwrap();
+        let got = c
+            .vector_search("embedding", &data[5], 50, Metric::L2)
+            .unwrap();
+        assert!(
+            got.iter().any(|h| h.key == b"new".to_vec()),
+            "freshly inserted vector must be retrievable"
+        );
+        // Delete is reflected (the tombstoned key never appears, exactly).
+        c.delete(b"new").unwrap();
+        let got = c
+            .vector_search("embedding", &data[5], 50, Metric::L2)
+            .unwrap();
+        assert!(!got.iter().any(|h| h.key == b"new".to_vec()));
+    }
+
+    #[test]
+    fn ondisk_pq_on_empty_collection_errors() {
+        let db = Db::open_in_memory().unwrap();
+        let err =
+            db.collection("docs")
+                .create_vector_index_ondisk_pq("embedding", Metric::L2, 4, 16);
+        assert!(matches!(err, Err(crate::Error::EmptyIndexTraining)));
     }
 
     fn seeded() -> Db {

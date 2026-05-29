@@ -149,7 +149,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "create_index",
-                "description": "Create an HNSW vector index on a field to accelerate search.",
+                "description": "Create an HNSW vector index on a field to accelerate search. Set on_disk for bounded memory; quant for binary/scalar compression; or pq:{m,k} for an on-disk product-quantized index (smallest footprint).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -157,7 +157,15 @@ fn tools_list() -> Json {
                         "field": { "type": "string" },
                         "metric": { "type": "string", "enum": ["cosine", "dot", "l2"] },
                         "quant": { "type": "string", "enum": ["none", "binary", "scalar"] },
-                        "on_disk": { "type": "boolean" }
+                        "on_disk": { "type": "boolean" },
+                        "pq": {
+                            "type": "object",
+                            "properties": {
+                                "m": { "type": "integer" },
+                                "k": { "type": "integer" }
+                            },
+                            "required": ["m", "k"]
+                        }
                     },
                     "required": ["collection", "field"]
                 }

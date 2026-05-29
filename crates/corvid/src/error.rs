@@ -50,4 +50,9 @@ pub enum Error {
         /// The version this engine writes.
         expected: u64,
     },
+
+    /// A product-quantized index was created with no vectors to train its
+    /// codebook on (or with parameters the sample can't satisfy).
+    #[error("cannot train a PQ codebook: no usable training vectors")]
+    EmptyIndexTraining,
 }

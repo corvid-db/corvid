@@ -222,8 +222,10 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 
 **WASM / mobile (engine ready, measured).** The engine compiles to `wasm32-unknown-unknown`; a `cdylib` harness (`corvid-wasm`) links it and the bundle is **≈0.2 MB gzipped** — well under the 2 MB budget — enforced in CI. The engine also cross-compiles for `aarch64` iOS/Android (CI builds android). The remaining browser-runtime piece is the OPFS-SAHPool `StorageBackend` + `wasm-bindgen` surface (Worker-only, needs a browser to validate); in-memory works on wasm today.
 
+**Product Quantization (DONE).** `create_vector_index_ondisk_pq(field, metric, m, k)` trains a deterministic per-subspace codebook (k-means) from a bounded sample of existing vectors, stores each vector as `m` code bytes, and persists the codebook in the index namespace (reloaded on open). Distance is by reconstruction (decode + metric, metric-agnostic) with an L2 asymmetric-distance table available. The `pq.rs` core is standalone and validated (recall ≥0.6 at 8× compression).
+
 **Deliberately deferred (large subsystems, with reasons):**
-- **Product Quantization (PQ) codebook** (#16 remainder): binary/scalar quantization is done for both indexes; codebook-based PQ (k-means + asymmetric distance tables) is a further compression-vs-recall option, a distinct subsystem.
+- **In-memory PQ + ADC in the HNSW hot path**: PQ is wired into the on-disk index (the footprint-critical path); using it for the in-memory index and switching distance to the table-based ADC are follow-ons on the same `pq.rs` core.
 - **Browser support (OPFS StorageBackend + wasm-bindgen)** — *deferred by decision (2026-05-29)*. The engine is wasm-ready and size-validated (≈0.2 MB gzipped, CI-enforced) and runs in-memory on wasm; the browser-persistence layer (OPFS-SAHPool VFS, Worker RPC, JS bindings) is explicitly out of scope for now. Desktop + server is the focus.
 - **Cursor/iterator result API** (#15 remainder): single-source ranked queries are now bounded (index fast paths + streaming top-k), and filter-only queries already stream; a public streaming *cursor* over arbitrary result sets (incremental pull) is still a larger API addition. Multi-source RRF fusion still materializes the candidate set.
 - **Declared schema/constraints** (#9): schema-on-read today; a strict-schema layer is a future addition.

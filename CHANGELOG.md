@@ -29,6 +29,9 @@ format and API may change without backward-compatibility guarantees.
   nearby grid cells.
 - Quantization extracted to a shared module used by both the in-memory and
   on-disk vector indexes.
+- Product Quantization: `create_vector_index_ondisk_pq(field, metric, m, k)`
+  (and MCP `create_index` with `pq:{m,k}`) stores vectors as m code bytes via a
+  trained, persisted codebook — the smallest vector footprint.
 - Online backup: `Db::backup(path)` / `Store::backup(path)` (and MCP `backup`)
   write a consistent point-in-time copy from one read snapshot, safe to run
   while writers are active.

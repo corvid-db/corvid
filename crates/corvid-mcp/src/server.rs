@@ -237,7 +237,13 @@ impl Server {
         let on_disk = p.get("on_disk").and_then(Json::as_bool).unwrap_or(false);
         let quant = parse_quant(p.get("quant"))?;
         let c = self.db.collection(collection);
-        if on_disk {
+        // `pq: {m, k}` builds an on-disk product-quantized index (overrides
+        // on_disk/quant).
+        if let Some(pq) = p.get("pq") {
+            let m = uint_param(pq, "m")?;
+            let k = uint_param(pq, "k")?;
+            c.create_vector_index_ondisk_pq(field, metric, m, k)?;
+        } else if on_disk {
             c.create_vector_index_ondisk_quantized(field, metric, quant)?;
         } else {
             c.create_vector_index_quantized(field, metric, quant)?;
