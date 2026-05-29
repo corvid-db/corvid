@@ -535,18 +535,74 @@ impl QueryBuilder<'_> {
             None
         };
 
-        let keys = match scalar_keys {
-            Some(keys) => keys,
-            None => match self.compound_candidate_keys()? {
-                Some(keys) => keys,
-                None => match self.geo_candidate_keys()? {
-                    Some(keys) => keys,
-                    None => return Ok(None),
-                },
-            },
+        let keys = if let Some(k) = scalar_keys {
+            k
+        } else if let Some(k) = self.range_set_prefix_candidate_keys()? {
+            k
+        } else if let Some(k) = self.compound_candidate_keys()? {
+            k
+        } else if let Some(k) = self.geo_candidate_keys()? {
+            k
+        } else {
+            return Ok(None);
         };
 
         self.verify_candidates(keys)
+    }
+
+    /// Candidate keys for the first index-serviceable `Between` / `In` /
+    /// `StartsWith` filter on an indexed field (a verified superset), else
+    /// `None`.
+    fn range_set_prefix_candidate_keys(&self) -> Result<Option<Vec<Vec<u8>>>> {
+        const CAP: usize = 100_000;
+        let db = self.collection.db();
+        let coll = self.collection.name();
+        for pred in &self.filters {
+            match pred {
+                Predicate::Between { path, low, high } if db.has_scalar_index(coll, path) => {
+                    let cons = [
+                        crate::scalar::Constraint {
+                            op: CmpOp::Ge,
+                            value: low,
+                        },
+                        crate::scalar::Constraint {
+                            op: CmpOp::Le,
+                            value: high,
+                        },
+                    ];
+                    return db.scalar_candidates(coll, path, &cons, CAP);
+                }
+                Predicate::In { path, values } if db.has_scalar_index(coll, path) => {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut out = Vec::new();
+                    for v in values {
+                        let cons = [crate::scalar::Constraint {
+                            op: CmpOp::Eq,
+                            value: v,
+                        }];
+                        match db.scalar_candidates(coll, path, &cons, CAP)? {
+                            Some(ks) => {
+                                for k in ks {
+                                    if seen.insert(k.clone()) {
+                                        out.push(k);
+                                    }
+                                }
+                                if out.len() > CAP {
+                                    return Ok(None);
+                                }
+                            }
+                            None => return Ok(None),
+                        }
+                    }
+                    return Ok(Some(out));
+                }
+                Predicate::StartsWith { path, prefix } if db.has_scalar_index(coll, path) => {
+                    return db.scalar_prefix_candidates(coll, path, prefix, CAP);
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
     }
 
     /// If a compound index's leading fields are pinned by equality filters

@@ -437,6 +437,36 @@ fn parse_predicate(j: &Json) -> Result<Predicate, ToolError> {
                 _ => unreachable!("op matched above"),
             })
         }
+        "in" => {
+            let f = field(field_param(obj)?);
+            let arr = obj
+                .get("values")
+                .and_then(Json::as_array)
+                .ok_or_else(|| ToolError::BadParams("'in' needs a 'values' array".into()))?;
+            Ok(f.is_in(arr.iter().map(json_to_value)))
+        }
+        "between" => {
+            let f = field(field_param(obj)?);
+            let low = obj
+                .get("low")
+                .ok_or_else(|| ToolError::BadParams("'between' needs 'low'".into()))?;
+            let high = obj
+                .get("high")
+                .ok_or_else(|| ToolError::BadParams("'between' needs 'high'".into()))?;
+            Ok(f.between(json_to_value(low), json_to_value(high)))
+        }
+        "starts_with" | "contains" => {
+            let f = field(field_param(obj)?);
+            let s = obj
+                .get("value")
+                .and_then(Json::as_str)
+                .ok_or_else(|| ToolError::BadParams("text match needs a string 'value'".into()))?;
+            Ok(if op == "starts_with" {
+                f.starts_with(s)
+            } else {
+                f.contains(s)
+            })
+        }
         other => Err(ToolError::BadParams(format!("unknown filter op: {other}"))),
     }
 }

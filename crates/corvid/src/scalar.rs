@@ -521,6 +521,50 @@ impl Db {
         window_candidates(self.store(), &ns, lane, &lower, upper.as_deref(), cap)
     }
 
+    /// Doc keys whose indexed text value at `field` starts with `prefix` (a
+    /// verified superset). `None` if not indexed or over `cap`.
+    pub(crate) fn scalar_prefix_candidates(
+        &self,
+        collection: &str,
+        field: &str,
+        prefix: &str,
+        cap: usize,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        if !self.has_scalar_index(collection, field) {
+            return Ok(None);
+        }
+        let mut pbytes = vec![LANE_TEXT];
+        escape_into(prefix.as_bytes(), &mut pbytes);
+        let ns = namespace(collection, field);
+        let mut out = Vec::new();
+        let mut cursor = pbytes.clone();
+        loop {
+            let page = self.store().scan_from(&ns, &cursor, PAGE)?;
+            if page.is_empty() {
+                break;
+            }
+            let mut advanced = false;
+            for (key, _) in &page {
+                if !key.starts_with(&pbytes) {
+                    advanced = false;
+                    break;
+                }
+                if let Some(dk) = doc_key_of(key) {
+                    out.push(dk);
+                    if out.len() > cap {
+                        return Ok(None);
+                    }
+                }
+                advanced = true;
+            }
+            if !advanced {
+                break;
+            }
+            cursor = next_after(&page.last().unwrap().0);
+        }
+        Ok(Some(out))
+    }
+
     /// Load persisted compound-index definitions. Called once on open.
     pub(crate) fn load_compound_defs(&self) -> Result<()> {
         let mut state = self.scalar().lock().expect("scalar lock");
@@ -733,6 +777,62 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("n".to_owned(), Value::Int(n));
         Value::Map(m)
+    }
+
+    #[test]
+    fn between_in_prefix_use_index_matching_scan() {
+        use crate::field;
+        fn fill(c: &crate::Collection) {
+            for i in 0..60i64 {
+                let mut m = BTreeMap::new();
+                m.insert("n".to_owned(), Value::Int(i));
+                m.insert("name".to_owned(), Value::Text(format!("item{:02}", i)));
+                c.insert(&[i as u8], &Value::Map(m)).unwrap();
+            }
+        }
+        let plain = Db::open_in_memory().unwrap();
+        fill(&plain.collection("docs"));
+        let indexed = Db::open_in_memory().unwrap();
+        let ic = indexed.collection("docs");
+        fill(&ic);
+        ic.create_scalar_index("n").unwrap();
+        ic.create_scalar_index("name").unwrap();
+
+        let keys = |rows: Vec<crate::ResultRow>| {
+            let mut k: Vec<_> = rows.into_iter().map(|r| r.key).collect();
+            k.sort();
+            k
+        };
+        // between
+        let q = |db: &Db| {
+            db.collection("docs")
+                .query()
+                .filter(field("n").between(Value::Int(10), Value::Int(15)))
+                .run()
+                .unwrap()
+        };
+        assert_eq!(keys(q(&plain)), keys(q(&indexed)));
+        // in
+        let q = |db: &Db| {
+            db.collection("docs")
+                .query()
+                .filter(field("n").is_in([Value::Int(3), Value::Int(50), Value::Int(59)]))
+                .run()
+                .unwrap()
+        };
+        assert_eq!(keys(q(&plain)), keys(q(&indexed)));
+        assert_eq!(keys(q(&indexed)).len(), 3);
+        // starts_with (text prefix)
+        let q = |db: &Db| {
+            db.collection("docs")
+                .query()
+                .filter(field("name").starts_with("item1"))
+                .run()
+                .unwrap()
+        };
+        assert_eq!(keys(q(&plain)), keys(q(&indexed)));
+        // item10..item19 → 10 docs
+        assert_eq!(keys(q(&indexed)).len(), 10);
     }
 
     #[test]

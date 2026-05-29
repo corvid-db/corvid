@@ -41,6 +41,36 @@ pub enum Predicate {
     },
     /// True when the path resolves to a present value.
     Exists(String),
+    /// True when the value at `path` equals any of `values`.
+    In {
+        /// Dotted field path.
+        path: String,
+        /// The accepted values.
+        values: Vec<Value>,
+    },
+    /// True when the value at `path` is within `[low, high]` (inclusive).
+    Between {
+        /// Dotted field path.
+        path: String,
+        /// Inclusive lower bound.
+        low: Value,
+        /// Inclusive upper bound.
+        high: Value,
+    },
+    /// True when the text at `path` starts with `prefix`.
+    StartsWith {
+        /// Dotted field path.
+        path: String,
+        /// The required prefix.
+        prefix: String,
+    },
+    /// True when the text at `path` contains `substr`.
+    Contains {
+        /// Dotted field path.
+        path: String,
+        /// The required substring.
+        substr: String,
+    },
     /// True when the path resolves to a point within `radius_km` of the given
     /// center. The point is a `[lat, lon]` array or a `lat`/`lon` map.
     GeoWithin {
@@ -84,6 +114,19 @@ impl Predicate {
                 Some(found) => compare(found, *op, value),
             },
             Predicate::Exists(path) => resolve(doc, path).is_some(),
+            Predicate::In { path, values } => {
+                matches!(resolve(doc, path), Some(found) if values.contains(found))
+            }
+            Predicate::Between { path, low, high } => match resolve(doc, path) {
+                Some(v) => compare(v, CmpOp::Ge, low) && compare(v, CmpOp::Le, high),
+                None => false,
+            },
+            Predicate::StartsWith { path, prefix } => {
+                matches!(resolve(doc, path), Some(Value::Text(s)) if s.starts_with(prefix))
+            }
+            Predicate::Contains { path, substr } => {
+                matches!(resolve(doc, path), Some(Value::Text(s)) if s.contains(substr))
+            }
             Predicate::GeoWithin {
                 path,
                 lat,
@@ -149,6 +192,39 @@ impl FieldRef {
     /// The path resolves to a present value.
     pub fn exists(self) -> Predicate {
         Predicate::Exists(self.path)
+    }
+
+    /// `path` equals any of `values` (set membership).
+    pub fn is_in(self, values: impl IntoIterator<Item = Value>) -> Predicate {
+        Predicate::In {
+            path: self.path,
+            values: values.into_iter().collect(),
+        }
+    }
+
+    /// `low <= path <= high` (inclusive range).
+    pub fn between(self, low: Value, high: Value) -> Predicate {
+        Predicate::Between {
+            path: self.path,
+            low,
+            high,
+        }
+    }
+
+    /// The text at `path` starts with `prefix`.
+    pub fn starts_with(self, prefix: impl Into<String>) -> Predicate {
+        Predicate::StartsWith {
+            path: self.path,
+            prefix: prefix.into(),
+        }
+    }
+
+    /// The text at `path` contains `substr`.
+    pub fn contains(self, substr: impl Into<String>) -> Predicate {
+        Predicate::Contains {
+            path: self.path,
+            substr: substr.into(),
+        }
     }
 
     /// The path holds a point within `radius_km` of `(lat, lon)`. The point is
@@ -338,6 +414,42 @@ mod tests {
     fn path_through_non_map_is_none() {
         // "score" is an int; descending further yields nothing.
         assert!(!field("score.deeper").exists().eval(&doc()));
+    }
+
+    #[test]
+    fn in_between_prefix_contains_predicates() {
+        let d = doc(); // category="blog", score=7, ratio=0.5, meta.author="rocky"
+        // in
+        assert!(
+            field("category")
+                .is_in([Value::Text("news".into()), Value::Text("blog".into())])
+                .eval(&d)
+        );
+        assert!(
+            !field("category")
+                .is_in([Value::Text("news".into())])
+                .eval(&d)
+        );
+        // between (inclusive)
+        assert!(
+            field("score")
+                .between(Value::Int(5), Value::Int(7))
+                .eval(&d)
+        );
+        assert!(
+            !field("score")
+                .between(Value::Int(1), Value::Int(6))
+                .eval(&d)
+        );
+        // starts_with / contains (text)
+        assert!(field("category").starts_with("bl").eval(&d));
+        assert!(!field("category").starts_with("xx").eval(&d));
+        assert!(field("category").contains("lo").eval(&d));
+        assert!(!field("category").contains("zz").eval(&d));
+        // non-text field: starts_with/contains are false
+        assert!(!field("score").starts_with("7").eval(&d));
+        // missing path → false
+        assert!(!field("nope").is_in([Value::Int(1)]).eval(&d));
     }
 
     #[test]

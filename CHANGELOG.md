@@ -49,6 +49,9 @@ format and API may change without backward-compatibility guarantees.
   rerank + projection + `order_by`/`offset` pagination + `count`/`group_count`.
 - Aggregations: sum/avg/min/max/count_distinct globally and group_sum/group_avg grouped, over the filtered set (respecting filters and indexes).
 - Filter predicates (`field().gt()`, and/or/not, dotted paths, `within_km` geo).
+- More predicates: `is_in` (set membership), `between` (inclusive range),
+  `starts_with`/`contains` (text); between/in/starts_with route through the
+  scalar index (text prefix scan), the rest verify on scan.
 - Optional per-collection declared schema (`set_schema`): field types,
   `required`, and `unique` enforced on write; schemaless collections unaffected.
 - Per-record TTL/expiry (`insert_with_ttl`/`set_ttl`/`purge_expired`): time is
