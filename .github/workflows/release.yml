@@ -1,6 +1,8 @@
 name: Release
 
-# Cut a release by pushing a tag like `v0.1.0`.
+# Cut a release by pushing a tag like `v0.1.0`. Builds the corvid-mcp binary
+# for Linux (x86_64 + arm64), macOS (Intel + Apple Silicon), and Windows, and
+# attaches them to a GitHub release with generated notes.
 on:
   push:
     tags:
@@ -10,28 +12,41 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: build & publish
+  create-release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Test
-        run: cargo test --workspace
-
-      - name: Build the MCP sidecar (release)
-        run: cargo build --release -p corvid-mcp
-
-      - name: Package the binary
+      - name: Create the release (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          tar -C target/release -czf "corvid-mcp-${GITHUB_REF_NAME}-x86_64-linux.tar.gz" corvid-mcp
+          gh release view "$GITHUB_REF_NAME" \
+            || gh release create "$GITHUB_REF_NAME" \
+                 --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
 
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+  upload-binaries:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build & upload corvid-mcp
+        uses: taiki-e/upload-rust-binary-action@v1
         with:
-          generate_release_notes: true
-          files: corvid-mcp-*-x86_64-linux.tar.gz
+          bin: corvid-mcp
+          target: ${{ matrix.target }}
+          archive: corvid-mcp-$tag-$target
+          token: ${{ secrets.GITHUB_TOKEN }}
