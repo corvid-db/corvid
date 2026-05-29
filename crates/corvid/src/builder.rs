@@ -243,7 +243,7 @@ impl QueryBuilder<'_> {
         let mut groups: BTreeMap<String, usize> = BTreeMap::new();
         self.collection.for_each_doc(|_, doc| {
             if self.filters.iter().all(|p| p.eval(&doc))
-                && let Some(key) = doc.get(field).and_then(group_key)
+                && let Some(key) = doc.get_path(field).and_then(group_key)
             {
                 *groups.entry(key).or_insert(0) += 1;
             }
@@ -352,7 +352,7 @@ impl QueryBuilder<'_> {
         let mut buf: Vec<(f32, Vec<u8>, Value)> = Vec::new();
         self.collection.for_each_doc(|key, doc| {
             if self.filters.iter().all(|p| p.eval(&doc))
-                && let Some(v) = doc.get(field).and_then(Value::as_vector)
+                && let Some(v) = doc.get_path(field).and_then(Value::as_vector)
                 && v.len() == query.len()
             {
                 let dist = metric.distance(query, v);
@@ -673,8 +673,8 @@ impl QueryBuilder<'_> {
         let mut ordered = ordered;
         if let Some((field, descending)) = &self.order_by {
             ordered.sort_by(|(ka, _), (kb, _)| {
-                let va = docs.get(ka).and_then(|d| d.get(field));
-                let vb = docs.get(kb).and_then(|d| d.get(field));
+                let va = docs.get(ka).and_then(|d| d.get_path(field));
+                let vb = docs.get(kb).and_then(|d| d.get_path(field));
                 match (va, vb) {
                     (Some(a), Some(b)) => {
                         let base = crate::filter::value_order(a, b).unwrap_or(Ordering::Equal);
@@ -828,16 +828,18 @@ fn group_key(v: &Value) -> Option<String> {
 /// Sort `(key, doc)` pairs by a scalar field, missing/incomparable last, ties
 /// by key. `descending` reverses the value comparison.
 fn sort_by_field(buf: &mut [(Vec<u8>, Value)], field: &str, descending: bool) {
-    buf.sort_by(|(ka, da), (kb, db)| match (da.get(field), db.get(field)) {
-        (Some(a), Some(b)) => {
-            let base = crate::filter::value_order(a, b).unwrap_or(Ordering::Equal);
-            let base = if descending { base.reverse() } else { base };
-            base.then_with(|| ka.cmp(kb))
-        }
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => ka.cmp(kb),
-    });
+    buf.sort_by(
+        |(ka, da), (kb, db)| match (da.get_path(field), db.get_path(field)) {
+            (Some(a), Some(b)) => {
+                let base = crate::filter::value_order(a, b).unwrap_or(Ordering::Equal);
+                let base = if descending { base.reverse() } else { base };
+                base.then_with(|| ka.cmp(kb))
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => ka.cmp(kb),
+        },
+    );
 }
 
 /// Narrow a document to the named field paths, which may be dotted
@@ -920,7 +922,7 @@ fn rerank_mmr(
     for (key, _) in fused {
         match docs
             .get(key)
-            .and_then(|d| d.get(field))
+            .and_then(|d| d.get_path(field))
             .and_then(Value::as_vector)
         {
             Some(v) if v.len() == query.len() => with_vec.push((key.clone(), v.to_vec())),

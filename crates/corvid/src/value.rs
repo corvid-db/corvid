@@ -64,6 +64,22 @@ impl Value {
         }
     }
 
+    /// Resolve a dotted `path` (e.g. `"meta.author"`) through nested maps. A
+    /// single segment is equivalent to [`Value::get`]; an empty path yields
+    /// `None`. This is the field accessor used uniformly by filters and index
+    /// maintenance, so an index declared on a nested field resolves the same
+    /// value a filter would.
+    pub fn get_path(&self, path: &str) -> Option<&Value> {
+        if path.is_empty() {
+            return None;
+        }
+        let mut current = self;
+        for segment in path.split('.') {
+            current = current.get(segment)?;
+        }
+        Some(current)
+    }
+
     /// Borrow the contents if this is a [`Value::Bool`].
     pub fn as_bool(&self) -> Option<bool> {
         match self {

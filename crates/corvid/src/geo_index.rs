@@ -241,7 +241,7 @@ impl Db {
     pub(crate) fn geo_on_insert(&self, collection: &str, key: &[u8], doc: &Value) -> Result<()> {
         for field in self.geo_fields(collection) {
             let ns = namespace(collection, &field);
-            match doc.get(&field) {
+            match doc.get_path(&field) {
                 Some(value) => insert(self.store(), &ns, key, value)?,
                 None => delete(self.store(), &ns, key)?,
             }
@@ -324,7 +324,7 @@ impl Collection<'_> {
             let mut batch: Vec<(Vec<u8>, Value)> = Vec::new();
             for (key, bytes) in &page {
                 let doc = Value::decode(bytes)?;
-                if let Some(value) = doc.get(field) {
+                if let Some(value) = doc.get_path(field) {
                     batch.push((key.clone(), value.clone()));
                 }
             }

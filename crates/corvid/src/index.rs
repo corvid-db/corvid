@@ -237,7 +237,7 @@ impl Db {
             match def.kind {
                 IndexKind::OnDisk | IndexKind::OnDiskPq => {
                     let ns = disk_hnsw::namespace(collection, &field);
-                    match doc.get(&field).and_then(Value::as_vector) {
+                    match doc.get_path(&field).and_then(Value::as_vector) {
                         Some(v) => {
                             disk_hnsw::insert(self.store(), &ns, &def.disk_params(), key, v)?
                         }
@@ -252,7 +252,7 @@ impl Db {
                     // Only maintain an already-built graph; an unbuilt one picks
                     // this up when it builds lazily.
                     if let Some(built) = state.built.get_mut(&map_key) {
-                        match doc.get(&field).and_then(Value::as_vector) {
+                        match doc.get_path(&field).and_then(Value::as_vector) {
                             Some(v) => built.add(key, v.to_vec()),
                             None => built.tombstone(key),
                         }
@@ -364,7 +364,7 @@ fn build_index(store: &Store, collection: &str, field: &str, def: VectorDef) -> 
     let mut built = BuiltIndex::new(def);
     for (key, bytes) in store.scan(collection)? {
         let doc = Value::decode(&bytes)?;
-        if let Some(v) = doc.get(field).and_then(Value::as_vector) {
+        if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
             built.add(&key, v.to_vec());
         }
     }
@@ -505,7 +505,7 @@ impl Collection<'_> {
             let mut batch: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
             for (key, bytes) in &page {
                 let doc = Value::decode(bytes)?;
-                if let Some(v) = doc.get(field).and_then(Value::as_vector) {
+                if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
                     batch.push((key.clone(), v.to_vec()));
                 }
             }
@@ -547,7 +547,7 @@ impl Collection<'_> {
             next.push(0);
             for (_, bytes) in &page {
                 let doc = Value::decode(bytes)?;
-                if let Some(v) = doc.get(field).and_then(Value::as_vector) {
+                if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
                     sample.push(v.to_vec());
                     if sample.len() >= SAMPLE_CAP {
                         break 'outer;
@@ -588,7 +588,7 @@ impl Collection<'_> {
             let mut batch: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
             for (key, bytes) in &page {
                 let doc = Value::decode(bytes)?;
-                if let Some(v) = doc.get(field).and_then(Value::as_vector) {
+                if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
                     batch.push((key.clone(), v.to_vec()));
                 }
             }

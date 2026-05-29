@@ -115,7 +115,7 @@ impl Collection<'_> {
         // the whole collection.
         let mut heap: BinaryHeap<NearCand> = BinaryHeap::new();
         self.for_each_doc(|key, doc| {
-            if let Some(v) = doc.get(field).and_then(Value::as_vector)
+            if let Some(v) = doc.get_path(field).and_then(Value::as_vector)
                 && v.len() == query.len()
             {
                 let cand = NearCand {
@@ -185,7 +185,7 @@ pub(crate) fn ranked_vector(
     let mut ranked: Vec<(Vec<u8>, f32)> = cands
         .iter()
         .filter_map(|(key, doc)| {
-            let v = doc.get(field).and_then(Value::as_vector)?;
+            let v = doc.get_path(field).and_then(Value::as_vector)?;
             (v.len() == query.len()).then(|| (key.clone(), metric.distance(query, v)))
         })
         .collect();
@@ -220,7 +220,7 @@ pub(crate) fn ranked_bm25(
     let mut doc_freq: HashMap<String, usize> = HashMap::new();
     let mut total_len = 0usize;
     for (key, doc) in cands {
-        let Some(text) = doc.get(field).and_then(Value::as_text) else {
+        let Some(text) = doc.get_path(field).and_then(Value::as_text) else {
             continue;
         };
         let mut term_freq: HashMap<String, u32> = HashMap::new();

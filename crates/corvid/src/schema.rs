@@ -214,7 +214,7 @@ impl Db {
             return Ok(());
         };
         for f in &schema.fields {
-            let found = doc.get(&f.name);
+            let found = doc.get_path(&f.name);
             match found {
                 None | Some(Value::Null) => {
                     if f.required {
@@ -263,7 +263,7 @@ impl Db {
                 for k in keys {
                     if k != exclude
                         && let Some(doc) = self.collection(collection).get(&k)?
-                        && doc.get(field) == Some(value)
+                        && doc.get_path(field) == Some(value)
                     {
                         return Ok(true);
                     }
@@ -274,7 +274,7 @@ impl Db {
         // Fallback: streaming scan with early stop.
         let mut conflict = false;
         self.collection(collection).for_each_doc(|k, doc| {
-            if k != exclude && doc.get(field) == Some(value) {
+            if k != exclude && doc.get_path(field) == Some(value) {
                 conflict = true;
                 return Ok(false); // stop
             }

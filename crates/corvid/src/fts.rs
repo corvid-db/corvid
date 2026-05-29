@@ -186,7 +186,7 @@ impl Db {
                 .collect()
         };
         for (field, kind) in fields {
-            let text = doc.get(&field).and_then(Value::as_text);
+            let text = doc.get_path(&field).and_then(Value::as_text);
             match kind {
                 TextKind::OnDisk => {
                     let ns = disk_fts::namespace(collection, &field);
@@ -280,7 +280,7 @@ fn build_inverted(store: &Store, collection: &str, field: &str) -> Result<Invert
     let mut inv = Inverted::default();
     for (key, bytes) in store.scan(collection)? {
         let doc = Value::decode(&bytes)?;
-        if let Some(text) = doc.get(field).and_then(Value::as_text) {
+        if let Some(text) = doc.get_path(field).and_then(Value::as_text) {
             inv.add(&key, text);
         }
     }
@@ -337,7 +337,7 @@ impl Collection<'_> {
             let mut batch: Vec<(Vec<u8>, String)> = Vec::new();
             for (key, bytes) in &page {
                 let doc = Value::decode(bytes)?;
-                if let Some(text) = doc.get(field).and_then(Value::as_text) {
+                if let Some(text) = doc.get_path(field).and_then(Value::as_text) {
                     batch.push((key.clone(), text.to_owned()));
                 }
             }

@@ -464,7 +464,7 @@ impl Db {
         let fields = self.scalar_fields(collection);
         for field in fields {
             let ns = namespace(collection, &field);
-            match doc.get(&field) {
+            match doc.get_path(&field) {
                 Some(value) => insert(self.store(), &ns, key, value)?,
                 None => delete(self.store(), &ns, key)?,
             }
@@ -568,7 +568,7 @@ impl Db {
     ) -> Result<()> {
         for fields in self.compound_indexes(collection) {
             let ns = compound_namespace(collection, &fields);
-            let values: Option<Vec<&Value>> = fields.iter().map(|f| doc.get(f)).collect();
+            let values: Option<Vec<&Value>> = fields.iter().map(|f| doc.get_path(f)).collect();
             self.store().transaction(|tx| match &values {
                 Some(vs) => compound_insert_in_txn(tx, &ns, key, vs),
                 None => compound_remove_in_txn(tx, &ns, key),
@@ -679,7 +679,7 @@ impl Collection<'_> {
             let mut batch: Vec<(Vec<u8>, Value)> = Vec::new();
             for (key, bytes) in &page {
                 let doc = Value::decode(bytes)?;
-                if let Some(value) = doc.get(field) {
+                if let Some(value) = doc.get_path(field) {
                     batch.push((key.clone(), value.clone()));
                 }
             }
@@ -709,7 +709,8 @@ impl Collection<'_> {
             self.db().store().transaction(|tx| {
                 for (key, bytes) in &page {
                     let doc = Value::decode(bytes)?;
-                    let values: Option<Vec<&Value>> = fields.iter().map(|f| doc.get(f)).collect();
+                    let values: Option<Vec<&Value>> =
+                        fields.iter().map(|f| doc.get_path(f)).collect();
                     if let Some(vs) = &values {
                         compound_insert_in_txn(tx, &ns, key, vs)?;
                     }
@@ -732,6 +733,36 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("n".to_owned(), Value::Int(n));
         Value::Map(m)
+    }
+
+    #[test]
+    fn scalar_index_on_nested_field() {
+        use crate::field;
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for i in 0..10i64 {
+            let mut meta = BTreeMap::new();
+            meta.insert("score".to_owned(), Value::Int(i));
+            let mut m = BTreeMap::new();
+            m.insert("meta".to_owned(), Value::Map(meta));
+            c.insert(&[i as u8], &Value::Map(m)).unwrap();
+        }
+        // Index a nested/dotted field; a filter on it uses the index and
+        // returns the right docs (parity with dotted-path filter semantics).
+        c.create_scalar_index("meta.score").unwrap();
+        let got = db
+            .scalar_candidates("docs", "meta.score", &one(CmpOp::Eq, &Value::Int(7)), 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, vec![vec![7u8]]);
+        let rows = c
+            .query()
+            .filter(field("meta.score").ge(Value::Int(8)))
+            .run()
+            .unwrap();
+        let mut keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+        keys.sort();
+        assert_eq!(keys, vec![vec![8u8], vec![9u8]]);
     }
 
     #[test]
