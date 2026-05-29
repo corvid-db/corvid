@@ -6,6 +6,15 @@
 //! `u64` id and all records live in one physical table keyed by
 //! `id.to_be_bytes() ++ user_key`. Big-endian ids keep collections
 //! contiguous and ordered, so a collection scan is a single prefix range.
+//!
+//! Writes go through [`Store::transaction`], which exposes a [`WriteBatch`]
+//! and commits once at the end — every operation in the closure lands
+//! atomically or not at all. This is the foundation the cross-modal
+//! consistency invariant is built on: a row and all of its derived index
+//! entries are written in a single transaction. Reads go through
+//! [`Store::read`], which exposes a [`ReadBatch`] over one consistent
+//! snapshot. The single-op helpers ([`Store::put`] etc.) are thin wrappers
+//! over these.
 
 use std::ops::Bound;
 use std::path::Path;
@@ -43,104 +52,190 @@ impl Store {
         })
     }
 
-    /// Insert or overwrite `value` at `key` within `collection`.
+    /// Run `f` inside a single write transaction and commit once.
     ///
-    /// The collection is created on first write. The catalog update and the
-    /// record write share one transaction, so a failure leaves neither behind.
-    pub fn put(&self, collection: &str, key: &[u8], value: &[u8]) -> Result<()> {
+    /// Every operation performed on the [`WriteBatch`] commits together. If
+    /// `f` returns an error the transaction is dropped without committing, so
+    /// no partial state is left behind.
+    pub fn transaction<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut WriteBatch<'_>) -> Result<T>,
+    {
         let txn = self.db.begin_write()?;
-        let id = {
-            let mut catalog = txn.open_table(CATALOG)?;
-            let existing = catalog.get(collection)?.map(|g| g.value());
-            match existing {
-                Some(id) => id,
-                None => {
-                    let next = {
-                        let mut meta = txn.open_table(META)?;
-                        let next = meta.get(NEXT_ID)?.map(|g| g.value()).unwrap_or(0);
-                        meta.insert(NEXT_ID, next + 1)?;
-                        next
-                    };
-                    catalog.insert(collection, next)?;
-                    next
-                }
-            }
+        let out = {
+            let mut batch = WriteBatch { txn: &txn };
+            f(&mut batch)?
         };
-        {
-            let mut records = txn.open_table(RECORDS)?;
-            records.insert(physical_key(id, key).as_slice(), value)?;
-        }
         txn.commit()?;
-        Ok(())
+        Ok(out)
+    }
+
+    /// Run `f` against one consistent read snapshot.
+    pub fn read<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&ReadBatch<'_>) -> Result<T>,
+    {
+        let txn = self.db.begin_read()?;
+        let batch = ReadBatch { txn: &txn };
+        f(&batch)
+    }
+
+    /// Insert or overwrite `value` at `key` within `collection`.
+    pub fn put(&self, collection: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        self.transaction(|tx| tx.put(collection, key, value))
     }
 
     /// Fetch the value at `key` within `collection`, if present.
     pub fn get(&self, collection: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let txn = self.db.begin_read()?;
-        let Some(id) = self.lookup_id(&txn, collection)? else {
+        self.read(|r| r.get(collection, key))
+    }
+
+    /// Remove `key` from `collection`. Returns whether a value was removed.
+    pub fn delete(&self, collection: &str, key: &[u8]) -> Result<bool> {
+        self.transaction(|tx| tx.delete(collection, key))
+    }
+
+    /// Return all `(key, value)` pairs in `collection`, in key order.
+    pub fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.read(|r| r.scan(collection))
+    }
+}
+
+/// A set of writes (and reads) executed inside one transaction.
+///
+/// Obtained via [`Store::transaction`]. Reads see this transaction's own
+/// uncommitted writes.
+pub struct WriteBatch<'txn> {
+    txn: &'txn redb::WriteTransaction,
+}
+
+impl WriteBatch<'_> {
+    /// Insert or overwrite `value` at `key` within `collection`, creating the
+    /// collection on first use.
+    pub fn put(&mut self, collection: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        let id = self.ensure_id(collection)?;
+        let mut records = self.txn.open_table(RECORDS)?;
+        records.insert(physical_key(id, key).as_slice(), value)?;
+        Ok(())
+    }
+
+    /// Fetch the value at `key` within `collection`, including writes made
+    /// earlier in this transaction.
+    pub fn get(&self, collection: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some(id) = self.lookup_id(collection)? else {
             return Ok(None);
         };
-        let records = txn.open_table(RECORDS)?;
+        let records = self.txn.open_table(RECORDS)?;
         Ok(records
             .get(physical_key(id, key).as_slice())?
             .map(|g| g.value().to_vec()))
     }
 
     /// Remove `key` from `collection`. Returns whether a value was removed.
-    pub fn delete(&self, collection: &str, key: &[u8]) -> Result<bool> {
-        let txn = self.db.begin_write()?;
+    pub fn delete(&mut self, collection: &str, key: &[u8]) -> Result<bool> {
         // Resolve without creating: deleting from an unknown collection is a no-op.
-        let id = {
-            let catalog = txn.open_table(CATALOG)?;
-            catalog.get(collection)?.map(|g| g.value())
+        let Some(id) = self.lookup_id(collection)? else {
+            return Ok(false);
         };
-        let removed = match id {
-            None => false,
-            Some(id) => {
-                let mut records = txn.open_table(RECORDS)?;
-                records.remove(physical_key(id, key).as_slice())?.is_some()
-            }
-        };
-        txn.commit()?;
-        Ok(removed)
+        let mut records = self.txn.open_table(RECORDS)?;
+        Ok(records.remove(physical_key(id, key).as_slice())?.is_some())
     }
 
     /// Return all `(key, value)` pairs in `collection`, in key order.
-    ///
-    /// An unknown collection yields an empty vector.
     pub fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let txn = self.db.begin_read()?;
-        let Some(id) = self.lookup_id(&txn, collection)? else {
+        let Some(id) = self.lookup_id(collection)? else {
             return Ok(Vec::new());
         };
-        let records = txn.open_table(RECORDS)?;
-
-        let lower = id.to_be_bytes().to_vec();
-        let upper = id.checked_add(1).map(|n| n.to_be_bytes().to_vec());
-        let lower_slice: &[u8] = &lower;
-        let bounds: (Bound<&[u8]>, Bound<&[u8]>) = match &upper {
-            Some(u) => (Bound::Included(lower_slice), Bound::Excluded(u.as_slice())),
-            None => (Bound::Included(lower_slice), Bound::Unbounded),
-        };
-
-        let mut out = Vec::new();
-        for entry in records.range::<&[u8]>(bounds)? {
-            let (k, v) = entry?;
-            out.push((user_key(k.value()), v.value().to_vec()));
-        }
-        Ok(out)
+        let records = self.txn.open_table(RECORDS)?;
+        collect_collection(&records, id)
     }
 
-    /// Resolve a collection id without creating the collection.
-    fn lookup_id(&self, txn: &redb::ReadTransaction, collection: &str) -> Result<Option<u64>> {
-        let catalog = match txn.open_table(CATALOG) {
+    /// Resolve a collection id, assigning a fresh one if the collection is new.
+    fn ensure_id(&self, collection: &str) -> Result<u64> {
+        let mut catalog = self.txn.open_table(CATALOG)?;
+        if let Some(id) = catalog.get(collection)?.map(|g| g.value()) {
+            return Ok(id);
+        }
+        let next = {
+            let mut meta = self.txn.open_table(META)?;
+            let next = meta.get(NEXT_ID)?.map(|g| g.value()).unwrap_or(0);
+            meta.insert(NEXT_ID, next + 1)?;
+            next
+        };
+        catalog.insert(collection, next)?;
+        Ok(next)
+    }
+
+    /// Resolve a collection id without creating it. In a write transaction
+    /// opening the catalog table always succeeds (it is created on demand),
+    /// so an unknown collection simply has no entry.
+    fn lookup_id(&self, collection: &str) -> Result<Option<u64>> {
+        let catalog = self.txn.open_table(CATALOG)?;
+        Ok(catalog.get(collection)?.map(|g| g.value()))
+    }
+}
+
+/// A set of reads executed against one consistent snapshot.
+///
+/// Obtained via [`Store::read`].
+pub struct ReadBatch<'txn> {
+    txn: &'txn redb::ReadTransaction,
+}
+
+impl ReadBatch<'_> {
+    /// Fetch the value at `key` within `collection`, if present.
+    pub fn get(&self, collection: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some(id) = self.lookup_id(collection)? else {
+            return Ok(None);
+        };
+        let records = self.txn.open_table(RECORDS)?;
+        Ok(records
+            .get(physical_key(id, key).as_slice())?
+            .map(|g| g.value().to_vec()))
+    }
+
+    /// Return all `(key, value)` pairs in `collection`, in key order.
+    pub fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let Some(id) = self.lookup_id(collection)? else {
+            return Ok(Vec::new());
+        };
+        let records = self.txn.open_table(RECORDS)?;
+        collect_collection(&records, id)
+    }
+
+    /// Resolve a collection id without creating the collection. A read
+    /// transaction never creates tables, so a missing catalog table means
+    /// nothing has ever been written.
+    fn lookup_id(&self, collection: &str) -> Result<Option<u64>> {
+        let catalog = match self.txn.open_table(CATALOG) {
             Ok(t) => t,
-            // No catalog table yet means no collection has ever been written.
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         Ok(catalog.get(collection)?.map(|g| g.value()))
     }
+}
+
+/// Collect every record belonging to collection `id` from an open records
+/// table, stripping the id prefix back to user keys.
+fn collect_collection<T>(records: &T, id: u64) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    let lower = id.to_be_bytes().to_vec();
+    let upper = id.checked_add(1).map(|n| n.to_be_bytes().to_vec());
+    let lower_slice: &[u8] = &lower;
+    let bounds: (Bound<&[u8]>, Bound<&[u8]>) = match &upper {
+        Some(u) => (Bound::Included(lower_slice), Bound::Excluded(u.as_slice())),
+        None => (Bound::Included(lower_slice), Bound::Unbounded),
+    };
+
+    let mut out = Vec::new();
+    for entry in records.range::<&[u8]>(bounds)? {
+        let (k, v) = entry?;
+        out.push((user_key(k.value()), v.value().to_vec()));
+    }
+    Ok(out)
 }
 
 /// Compose a physical record key: `collection_id (BE) ++ user_key`.
@@ -281,5 +376,101 @@ mod tests {
             vec![0, 0, 0, 0, 0, 0, 0, 1, b'x', b'y']
         );
         assert_eq!(user_key(&physical_key(7, b"abc")), b"abc".to_vec());
+    }
+
+    #[test]
+    fn transaction_commits_all_writes_atomically() {
+        let s = mem();
+        s.transaction(|tx| {
+            tx.put("docs", b"a", b"1")?;
+            tx.put("docs", b"b", b"2")?;
+            tx.put("notes", b"x", b"y")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.get("docs", b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(s.get("docs", b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(s.get("notes", b"x").unwrap(), Some(b"y".to_vec()));
+    }
+
+    #[test]
+    fn transaction_error_rolls_back_every_write() {
+        let s = mem();
+        let result: Result<()> = s.transaction(|tx| {
+            tx.put("docs", b"a", b"1")?;
+            tx.put("docs", b"b", b"2")?;
+            Err(crate::Error::Storage(redb::StorageError::Corrupted(
+                "intentional".into(),
+            )))
+        });
+        assert!(result.is_err());
+        // Nothing from the aborted transaction is visible, and the collection
+        // was never created.
+        assert_eq!(s.get("docs", b"a").unwrap(), None);
+        assert!(s.scan("docs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn transaction_sees_its_own_writes() {
+        let s = mem();
+        let seen = s
+            .transaction(|tx| {
+                tx.put("docs", b"a", b"1")?;
+                let mid = tx.get("docs", b"a")?;
+                tx.delete("docs", b"a")?;
+                let after = tx.get("docs", b"a")?;
+                Ok((mid, after))
+            })
+            .unwrap();
+        assert_eq!(seen, (Some(b"1".to_vec()), None));
+    }
+
+    #[test]
+    fn write_batch_scan_includes_uncommitted_writes() {
+        let s = mem();
+        let in_txn = s
+            .transaction(|tx| {
+                tx.put("docs", b"a", b"1")?;
+                tx.put("docs", b"b", b"2")?;
+                tx.scan("docs")
+            })
+            .unwrap();
+        assert_eq!(
+            in_txn,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn write_batch_delete_on_missing_collection_is_false() {
+        let s = mem();
+        let removed = s.transaction(|tx| tx.delete("ghost", b"a")).unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn read_snapshot_sees_consistent_view_across_ops() {
+        let s = mem();
+        s.put("docs", b"a", b"1").unwrap();
+        s.put("docs", b"b", b"2").unwrap();
+        let (a, all) = s
+            .read(|r| Ok((r.get("docs", b"a")?, r.scan("docs")?)))
+            .unwrap();
+        assert_eq!(a, Some(b"1".to_vec()));
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn read_batch_missing_collection_paths() {
+        let s = mem();
+        // Read transaction against a store with no tables at all.
+        let (g, sc) = s
+            .read(|r| Ok((r.get("ghost", b"k")?, r.scan("ghost")?)))
+            .unwrap();
+        assert_eq!(g, None);
+        assert!(sc.is_empty());
     }
 }
