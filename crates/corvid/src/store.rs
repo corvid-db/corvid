@@ -499,6 +499,43 @@ impl WriteBatch<'_> {
         collect_collection(&records, id)
     }
 
+    /// Return up to `limit` `(key, value)` pairs whose key is `>= start`,
+    /// in key order, seeing this transaction's own uncommitted writes.
+    /// Mirrors [`Store::scan_from`] for in-transaction consumers (e.g. the
+    /// unique-constraint check, which must observe the batch's earlier puts).
+    pub fn scan_from(
+        &self,
+        collection: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(id) = self.lookup_id(collection)? else {
+            return Ok(Vec::new());
+        };
+        let records = self.txn.open_table(RECORDS)?;
+        let lower = physical_key(id, start);
+        let upper = id.checked_add(1).map(|n| n.to_be_bytes().to_vec());
+        let bounds: (Bound<&[u8]>, Bound<&[u8]>) = match &upper {
+            Some(u) => (
+                Bound::Included(lower.as_slice()),
+                Bound::Excluded(u.as_slice()),
+            ),
+            None => (Bound::Included(lower.as_slice()), Bound::Unbounded),
+        };
+        let mut out = Vec::new();
+        for entry in records.range::<&[u8]>(bounds)? {
+            if out.len() >= limit {
+                break;
+            }
+            let (k, v) = entry?;
+            out.push((user_key(k.value()), v.value().to_vec()));
+        }
+        Ok(out)
+    }
+
     /// Resolve a collection id, assigning a fresh one if the collection is new.
     fn ensure_id(&self, collection: &str) -> Result<u64> {
         let mut catalog = self.txn.open_table(CATALOG)?;

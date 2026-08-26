@@ -141,14 +141,16 @@ fn decode_meta(b: &[u8]) -> Meta {
     }
 }
 
-/// Index (or re-index) `doc_key`'s `text` in a single transaction.
+/// Test seam: index one document in its own transaction.
+#[cfg(test)]
 pub(crate) fn insert(store: &Store, ns: &str, doc_key: &[u8], text: &str) -> Result<()> {
-    store.transaction(|tx| {
-        let mut meta = read_meta(tx, ns)?;
-        index_in_txn(tx, ns, &mut meta, doc_key, text)?;
-        tx.put(ns, &[TAG_META], &encode_meta(meta))?;
-        Ok(())
-    })
+    store.transaction(|tx| insert_in_txn(tx, ns, doc_key, text))
+}
+
+/// Test seam: remove one document in its own transaction.
+#[cfg(test)]
+pub(crate) fn delete(store: &Store, ns: &str, doc_key: &[u8]) -> Result<()> {
+    store.transaction(|tx| delete_in_txn(tx, ns, doc_key))
 }
 
 /// Index many documents in one transaction (bulk load).
@@ -163,14 +165,33 @@ pub(crate) fn insert_many(store: &Store, ns: &str, items: &[(Vec<u8>, String)]) 
     })
 }
 
-/// Remove `doc_key` from the index.
-pub(crate) fn delete(store: &Store, ns: &str, doc_key: &[u8]) -> Result<()> {
-    store.transaction(|tx| {
-        let mut meta = read_meta(tx, ns)?;
-        remove_in_txn(tx, ns, &mut meta, doc_key)?;
+/// Index (or re-index) `doc_key`'s `text` inside a caller's transaction, so
+/// postings and corpus stats commit atomically with the document.
+pub(crate) fn insert_in_txn(
+    tx: &mut crate::store::WriteBatch<'_>,
+    ns: &str,
+    doc_key: &[u8],
+    text: &str,
+) -> Result<()> {
+    let mut meta = read_meta(tx, ns)?;
+    index_in_txn(tx, ns, &mut meta, doc_key, text)?;
+    tx.put(ns, &[TAG_META], &encode_meta(meta))?;
+    Ok(())
+}
+
+/// Remove `doc_key` inside a caller's transaction. META is rewritten only
+/// when something was actually removed (a delete of a non-indexed key is a
+/// no-op rather than a stats rewrite).
+pub(crate) fn delete_in_txn(
+    tx: &mut crate::store::WriteBatch<'_>,
+    ns: &str,
+    doc_key: &[u8],
+) -> Result<()> {
+    let mut meta = read_meta(tx, ns)?;
+    if remove_in_txn(tx, ns, &mut meta, doc_key)? {
         tx.put(ns, &[TAG_META], &encode_meta(meta))?;
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 fn read_meta(tx: &crate::store::WriteBatch<'_>, ns: &str) -> Result<Meta> {
@@ -185,7 +206,7 @@ fn remove_in_txn(
     ns: &str,
     meta: &mut Meta,
     doc_key: &[u8],
-) -> Result<()> {
+) -> Result<bool> {
     if let Some(fwd) = tx.get(ns, &fwd_key(doc_key))?
         && let Some((old_len, terms)) = decode_fwd(&fwd)
     {
@@ -195,8 +216,9 @@ fn remove_in_txn(
         tx.delete(ns, &fwd_key(doc_key))?;
         meta.n = meta.n.saturating_sub(1);
         meta.total_len = meta.total_len.saturating_sub(old_len as u64);
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn index_in_txn(

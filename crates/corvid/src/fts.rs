@@ -251,8 +251,16 @@ impl Db {
         Ok(())
     }
 
-    /// Maintain every text index on `collection` after a document write.
-    pub(crate) fn fts_on_insert(&self, collection: &str, key: &[u8], doc: &Value) -> Result<()> {
+    /// Maintain every on-disk text index on `collection` inside the caller's
+    /// write transaction, so postings commit atomically with the document.
+    /// In-memory indexes are handled post-commit by [`Db::fts_on_insert_memory`].
+    pub(crate) fn fts_on_insert_in_txn(
+        &self,
+        tx: &mut crate::store::WriteBatch<'_>,
+        collection: &str,
+        key: &[u8],
+        doc: &Value,
+    ) -> Result<()> {
         let fields: Vec<(String, TextKind)> = {
             let state = self.fts().lock().expect("fts lock");
             state
@@ -264,31 +272,52 @@ impl Db {
         };
         for (field, kind) in fields {
             let text = doc.get_path(&field).and_then(Value::as_text);
-            match kind {
-                TextKind::OnDisk => {
-                    let ns = disk_fts::namespace(collection, &field);
-                    match text {
-                        Some(t) => disk_fts::insert(self.store(), &ns, key, t)?,
-                        None => disk_fts::delete(self.store(), &ns, key)?,
-                    }
-                }
-                TextKind::InMemory => {
-                    let map_key = (collection.to_owned(), field.clone());
-                    let mut state = self.fts().lock().expect("fts lock");
-                    if let Some(inv) = state.built.get_mut(&map_key) {
-                        match text {
-                            Some(t) => inv.add(key, t),
-                            None => inv.remove(key),
-                        }
-                    }
+            if kind == TextKind::OnDisk {
+                let ns = disk_fts::namespace(collection, &field);
+                match text {
+                    Some(t) => disk_fts::insert_in_txn(tx, &ns, key, t)?,
+                    None => disk_fts::delete_in_txn(tx, &ns, key)?,
                 }
             }
         }
         Ok(())
     }
 
-    /// Remove `key` from every text index on `collection` after a delete.
-    pub(crate) fn fts_on_delete(&self, collection: &str, key: &[u8]) -> Result<()> {
+    /// Maintain in-memory text indexes after a successful commit. An unbuilt
+    /// index picks this up when it builds lazily from the store.
+    pub(crate) fn fts_on_insert_memory(&self, collection: &str, key: &[u8], doc: &Value) {
+        let fields: Vec<(String, TextKind)> = {
+            let state = self.fts().lock().expect("fts lock");
+            state
+                .defs
+                .iter()
+                .filter(|((c, _), _)| c == collection)
+                .map(|((_, f), k)| (f.clone(), *k))
+                .collect()
+        };
+        for (field, kind) in fields {
+            let text = doc.get_path(&field).and_then(Value::as_text);
+            if kind == TextKind::InMemory {
+                let map_key = (collection.to_owned(), field);
+                let mut state = self.fts().lock().expect("fts lock");
+                if let Some(inv) = state.built.get_mut(&map_key) {
+                    match text {
+                        Some(t) => inv.add(key, t),
+                        None => inv.remove(key),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remove `key` from every on-disk text index inside the caller's write
+    /// transaction.
+    pub(crate) fn fts_on_delete_in_txn(
+        &self,
+        tx: &mut crate::store::WriteBatch<'_>,
+        collection: &str,
+        key: &[u8],
+    ) -> Result<()> {
         let defs: Vec<(String, TextKind)> = {
             let state = self.fts().lock().expect("fts lock");
             state
@@ -299,21 +328,34 @@ impl Db {
                 .collect()
         };
         for (field, kind) in defs {
-            match kind {
-                TextKind::OnDisk => {
-                    let ns = disk_fts::namespace(collection, &field);
-                    disk_fts::delete(self.store(), &ns, key)?;
-                }
-                TextKind::InMemory => {
-                    let map_key = (collection.to_owned(), field);
-                    let mut state = self.fts().lock().expect("fts lock");
-                    if let Some(inv) = state.built.get_mut(&map_key) {
-                        inv.remove(key);
-                    }
-                }
+            if kind == TextKind::OnDisk {
+                let ns = disk_fts::namespace(collection, &field);
+                disk_fts::delete_in_txn(tx, &ns, key)?;
             }
         }
         Ok(())
+    }
+
+    /// Remove `key` from every in-memory text index after a successful commit.
+    pub(crate) fn fts_on_delete_memory(&self, collection: &str, key: &[u8]) {
+        let defs: Vec<(String, TextKind)> = {
+            let state = self.fts().lock().expect("fts lock");
+            state
+                .defs
+                .iter()
+                .filter(|((c, _), _)| c == collection)
+                .map(|((_, f), k)| (f.clone(), *k))
+                .collect()
+        };
+        for (field, kind) in defs {
+            if kind == TextKind::InMemory {
+                let map_key = (collection.to_owned(), field);
+                let mut state = self.fts().lock().expect("fts lock");
+                if let Some(inv) = state.built.get_mut(&map_key) {
+                    inv.remove(key);
+                }
+            }
+        }
     }
 
     /// If a text index is registered, return the BM25-ranked top `k` keys;

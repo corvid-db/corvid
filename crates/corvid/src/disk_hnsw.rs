@@ -314,6 +314,25 @@ impl Cache {
 // ---- public operations ----
 
 /// Insert (or overwrite) `doc_key`'s `vector` into the on-disk index `ns`.
+/// Insert one vector inside a caller's transaction, so graph state commits
+/// atomically with the document that produced it.
+pub(crate) fn insert_one_in_txn(
+    tx: &mut crate::store::WriteBatch<'_>,
+    ns: &str,
+    p: &DiskParams,
+    doc_key: &[u8],
+    vector: &[f32],
+) -> Result<()> {
+    let mut meta = read_meta(tx, ns)?;
+    let mut cache = Cache::new();
+    insert_in_txn(tx, ns, p, &mut cache, &mut meta, doc_key, vector)?;
+    flush_dirty(tx, ns, &mut cache)?;
+    tx.put(ns, &[TAG_META], &encode_meta(meta))?;
+    Ok(())
+}
+
+/// Test seam: insert one vector in its own transaction.
+#[cfg(test)]
 pub(crate) fn insert(
     store: &Store,
     ns: &str,
@@ -321,14 +340,13 @@ pub(crate) fn insert(
     doc_key: &[u8],
     vector: &[f32],
 ) -> Result<()> {
-    store.transaction(|tx| {
-        let mut meta = read_meta(tx, ns)?;
-        let mut cache = Cache::new();
-        insert_in_txn(tx, ns, p, &mut cache, &mut meta, doc_key, vector)?;
-        flush_dirty(tx, ns, &mut cache)?;
-        tx.put(ns, &[TAG_META], &encode_meta(meta))?;
-        Ok(())
-    })
+    store.transaction(|tx| insert_one_in_txn(tx, ns, p, doc_key, vector))
+}
+
+/// Test seam: tombstone one key in its own transaction.
+#[cfg(test)]
+pub(crate) fn delete(store: &Store, ns: &str, p: &DiskParams, doc_key: &[u8]) -> Result<bool> {
+    store.transaction(|tx| delete_in_txn(tx, ns, p, doc_key))
 }
 
 /// Cap on the shared node cache during a bulk insert: keeps hot nodes (entry
@@ -482,22 +500,25 @@ fn flush_dirty(tx: &mut crate::store::WriteBatch<'_>, ns: &str, cache: &mut Cach
     Ok(())
 }
 
-/// Delete `doc_key` from the index (tombstone). Returns whether it existed.
-pub(crate) fn delete(store: &Store, ns: &str, p: &DiskParams, doc_key: &[u8]) -> Result<bool> {
-    store.transaction(|tx| {
-        let Some(id_bytes) = tx.get(ns, &keymap_key(doc_key))? else {
-            return Ok(false);
-        };
-        let id = u64::from_be_bytes(id_bytes.as_slice().try_into().unwrap_or([0; 8]));
-        if let Some(bytes) = tx.get(ns, &node_key(id))?
-            && let Some(mut node) = decode_node(&bytes, p)
-        {
-            node.deleted = true;
-            tx.put(ns, &node_key(id), &encode_node(&node))?;
-        }
-        tx.delete(ns, &keymap_key(doc_key))?;
-        Ok(true)
-    })
+/// Tombstone `doc_key` inside a caller's transaction.
+pub(crate) fn delete_in_txn(
+    tx: &mut crate::store::WriteBatch<'_>,
+    ns: &str,
+    p: &DiskParams,
+    doc_key: &[u8],
+) -> Result<bool> {
+    let Some(id_bytes) = tx.get(ns, &keymap_key(doc_key))? else {
+        return Ok(false);
+    };
+    let id = u64::from_be_bytes(id_bytes.as_slice().try_into().unwrap_or([0; 8]));
+    if let Some(bytes) = tx.get(ns, &node_key(id))?
+        && let Some(mut node) = decode_node(&bytes, p)
+    {
+        node.deleted = true;
+        tx.put(ns, &node_key(id), &encode_node(&node))?;
+    }
+    tx.delete(ns, &keymap_key(doc_key))?;
+    Ok(true)
 }
 
 /// Search for the `k` nearest live document keys to `query`.

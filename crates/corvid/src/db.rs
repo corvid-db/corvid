@@ -171,27 +171,96 @@ impl Db {
         &self.subscribers
     }
 
-    /// Maintain every index after `key`'s document was written (a plain write
-    /// clears any prior expiry).
-    fn maintain_insert(&self, collection: &str, key: &[u8], doc: &Value) -> Result<()> {
-        self.index_on_insert(collection, key, doc)?;
-        self.fts_on_insert(collection, key, doc)?;
-        self.scalar_on_insert(collection, key, doc)?;
-        self.compound_on_insert(collection, key, doc)?;
-        self.geo_on_insert(collection, key, doc)?;
-        self.ttl_clear(collection, key)?;
-        Ok(())
+    /// The shared write path. One transaction covers the row write, the
+    /// unique-constraint check (which observes this transaction's own earlier
+    /// puts), and every *persisted* index's maintenance — so a crash or error
+    /// can never leave an index disagreeing with committed documents.
+    /// In-memory index updates and change events run after a successful
+    /// commit (they are rebuilt lazily from documents, so they cannot go stale).
+    ///
+    /// `doc = Some` inserts/overwrites; `None` deletes. `expires_at = Some`
+    /// sets (or replaces) the record's expiry in the same commit.
+    /// Returns whether anything was applied.
+    pub(crate) fn write_document(
+        &self,
+        collection: &str,
+        key: &[u8],
+        doc: Option<&Value>,
+        expires_at: Option<i64>,
+    ) -> Result<bool> {
+        if let Some(doc) = doc {
+            self.validate_schema(collection, key, doc)?;
+        }
+        let ttl_on = self.ttl_enabled(collection);
+        let applied = self.store().transaction(|tx| {
+            match doc {
+                Some(doc) => {
+                    self.validate_unique_in_txn(tx, collection, key, doc)?;
+                    tx.put(collection, key, &doc.encode())?;
+                    self.index_on_insert_in_txn(tx, collection, key, doc)?;
+                    self.fts_on_insert_in_txn(tx, collection, key, doc)?;
+                    self.scalar_on_insert_in_txn(tx, collection, key, doc)?;
+                    self.compound_on_insert_in_txn(tx, collection, key, doc)?;
+                    self.geo_on_insert_in_txn(tx, collection, key, doc)?;
+                    match expires_at {
+                        Some(ts) => self.ttl_set_in_txn(tx, collection, key, ts)?,
+                        None => {
+                            if ttl_on {
+                                self.ttl_clear_in_txn(tx, collection, key)?
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let existed = tx.delete(collection, key)?;
+                    if !existed {
+                        return Ok(false);
+                    }
+                    self.index_on_delete_in_txn(tx, collection, key)?;
+                    self.fts_on_delete_in_txn(tx, collection, key)?;
+                    self.scalar_on_delete_in_txn(tx, collection, key)?;
+                    self.compound_on_delete_in_txn(tx, collection, key)?;
+                    self.geo_on_delete_in_txn(tx, collection, key)?;
+                    if ttl_on {
+                        self.ttl_clear_in_txn(tx, collection, key)?;
+                    }
+                }
+            }
+            Ok(true)
+        })?;
+        if applied {
+            if expires_at.is_some() {
+                self.mark_ttl_collection(collection);
+            }
+            self.finish_applied(collection, key, doc);
+        }
+        Ok(applied)
     }
 
-    /// Maintain every index after `key` was removed.
-    fn maintain_delete(&self, collection: &str, key: &[u8]) -> Result<()> {
-        self.index_on_delete(collection, key)?;
-        self.fts_on_delete(collection, key)?;
-        self.scalar_on_delete(collection, key)?;
-        self.compound_on_delete(collection, key)?;
-        self.geo_on_delete(collection, key)?;
-        self.ttl_clear(collection, key)?;
-        Ok(())
+    /// Post-commit work for an applied write: in-memory index maintenance
+    /// (rebuildable state only) and change events. Never affects durability —
+    /// by this point the data and all persisted indexes are committed.
+    fn finish_applied(&self, collection: &str, key: &[u8], doc: Option<&Value>) {
+        match doc {
+            Some(doc) => {
+                self.index_on_insert_memory(collection, key, doc);
+                self.fts_on_insert_memory(collection, key, doc);
+                self.notify(ChangeEvent {
+                    collection: collection.to_owned(),
+                    key: key.to_vec(),
+                    kind: ChangeKind::Insert,
+                });
+            }
+            None => {
+                self.index_on_delete_memory(collection, key);
+                self.fts_on_delete_memory(collection, key);
+                self.notify(ChangeEvent {
+                    collection: collection.to_owned(),
+                    key: key.to_vec(),
+                    kind: ChangeKind::Delete,
+                });
+            }
+        }
     }
 }
 
@@ -226,16 +295,13 @@ impl Collection<'_> {
     }
 
     /// Insert or overwrite the document stored at `key`.
+    ///
+    /// Atomic: the row, every persisted index's entry, and the unique-
+    /// constraint check commit in one transaction. In-memory index state and
+    /// change events follow a successful commit.
     pub fn insert(&self, key: &[u8], doc: &Value) -> Result<()> {
         self.ensure_writable()?;
-        self.db.validate_schema(self.name, key, doc)?;
-        self.db.store().put(self.name, key, &doc.encode())?;
-        self.db.maintain_insert(self.name, key, doc)?;
-        self.db.notify(ChangeEvent {
-            collection: self.name.to_owned(),
-            key: key.to_vec(),
-            kind: ChangeKind::Insert,
-        });
+        self.db.write_document(self.name, key, Some(doc), None)?;
         Ok(())
     }
 
@@ -276,8 +342,9 @@ impl Collection<'_> {
 
     /// Atomically write `new` (or delete, with `new = None`) only if the current
     /// value equals `expected` (`expected = None` means "must be absent").
-    /// Returns whether the write was applied. The compare-and-write is atomic at
-    /// the document level (one transaction); index maintenance follows.
+    /// Returns whether the write was applied. The compare, the row write, the
+    /// unique-constraint check, and every persisted index's maintenance all
+    /// happen in one transaction.
     pub fn compare_and_set(
         &self,
         key: &[u8],
@@ -289,38 +356,44 @@ impl Collection<'_> {
             self.db.validate_schema(self.name, key, doc)?;
         }
         let expected_bytes = expected.map(Value::encode);
+        let ttl_on = self.db.ttl_enabled(self.name);
         let applied = self.db.store().transaction(|tx| {
             let current = tx.get(self.name, key)?;
             if current != expected_bytes {
                 return Ok(false);
             }
             match &new {
-                Some(doc) => tx.put(self.name, key, &doc.encode())?,
+                Some(doc) => {
+                    self.db.validate_unique_in_txn(tx, self.name, key, doc)?;
+                    tx.put(self.name, key, &doc.encode())?;
+                    self.db.index_on_insert_in_txn(tx, self.name, key, doc)?;
+                    self.db.fts_on_insert_in_txn(tx, self.name, key, doc)?;
+                    self.db.scalar_on_insert_in_txn(tx, self.name, key, doc)?;
+                    self.db.compound_on_insert_in_txn(tx, self.name, key, doc)?;
+                    self.db.geo_on_insert_in_txn(tx, self.name, key, doc)?;
+                    if ttl_on {
+                        self.db.ttl_clear_in_txn(tx, self.name, key)?;
+                    }
+                }
                 None => {
-                    tx.delete(self.name, key)?;
+                    let existed = tx.delete(self.name, key)?;
+                    if !existed {
+                        return Ok(false);
+                    }
+                    self.db.index_on_delete_in_txn(tx, self.name, key)?;
+                    self.db.fts_on_delete_in_txn(tx, self.name, key)?;
+                    self.db.scalar_on_delete_in_txn(tx, self.name, key)?;
+                    self.db.compound_on_delete_in_txn(tx, self.name, key)?;
+                    self.db.geo_on_delete_in_txn(tx, self.name, key)?;
+                    if ttl_on {
+                        self.db.ttl_clear_in_txn(tx, self.name, key)?;
+                    }
                 }
             }
             Ok(true)
         })?;
         if applied {
-            match new {
-                Some(doc) => {
-                    self.db.maintain_insert(self.name, key, &doc)?;
-                    self.db.notify(ChangeEvent {
-                        collection: self.name.to_owned(),
-                        key: key.to_vec(),
-                        kind: ChangeKind::Insert,
-                    });
-                }
-                None => {
-                    self.db.maintain_delete(self.name, key)?;
-                    self.db.notify(ChangeEvent {
-                        collection: self.name.to_owned(),
-                        key: key.to_vec(),
-                        kind: ChangeKind::Delete,
-                    });
-                }
-            }
+            self.db.finish_applied(self.name, key, new.as_ref());
         }
         Ok(applied)
     }
@@ -349,27 +422,34 @@ impl Collection<'_> {
     }
 
     /// Insert many documents in a single transaction (bulk load). Far faster
-    /// than repeated [`Collection::insert`] (one commit instead of N). Indexes
-    /// and subscribers are updated after the commit.
+    /// than repeated [`Collection::insert`] (one commit instead of N). The
+    /// whole batch is atomic: schema and unique checks see earlier items in
+    /// the same batch, and every persisted index commits with the rows.
+    /// In-memory index updates and change events follow a successful commit.
     pub fn insert_batch(&self, items: &[(&[u8], &Value)]) -> Result<()> {
         self.ensure_writable()?;
-        // Validate the whole batch before committing any of it.
+        // Fail fast on pure schema violations before opening the transaction.
         for (key, doc) in items {
             self.db.validate_schema(self.name, key, doc)?;
         }
+        let ttl_on = self.db.ttl_enabled(self.name);
         self.db.store().transaction(|tx| {
             for (key, doc) in items {
+                self.db.validate_unique_in_txn(tx, self.name, key, doc)?;
                 tx.put(self.name, key, &doc.encode())?;
+                self.db.index_on_insert_in_txn(tx, self.name, key, doc)?;
+                self.db.fts_on_insert_in_txn(tx, self.name, key, doc)?;
+                self.db.scalar_on_insert_in_txn(tx, self.name, key, doc)?;
+                self.db.compound_on_insert_in_txn(tx, self.name, key, doc)?;
+                self.db.geo_on_insert_in_txn(tx, self.name, key, doc)?;
+                if ttl_on {
+                    self.db.ttl_clear_in_txn(tx, self.name, key)?;
+                }
             }
             Ok(())
         })?;
         for (key, doc) in items {
-            self.db.maintain_insert(self.name, key, doc)?;
-            self.db.notify(ChangeEvent {
-                collection: self.name.to_owned(),
-                key: key.to_vec(),
-                kind: ChangeKind::Insert,
-            });
+            self.db.finish_applied(self.name, key, Some(doc));
         }
         Ok(())
     }
@@ -396,21 +476,12 @@ impl Collection<'_> {
 
     /// Remove the document at `key`. Returns whether one was removed.
     ///
-    /// Like every other write path, this rejects engine-reserved collection
-    /// names — internal state (graph edges, index namespaces, TTL entries) can
-    /// only be modified through the APIs that own it.
+    /// Atomic: the row deletion and every persisted index's cleanup commit in
+    /// one transaction. In-memory index state and change events follow a
+    /// successful commit.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
         self.ensure_writable()?;
-        let removed = self.db.store().delete(self.name, key)?;
-        if removed {
-            self.db.maintain_delete(self.name, key)?;
-            self.db.notify(ChangeEvent {
-                collection: self.name.to_owned(),
-                key: key.to_vec(),
-                kind: ChangeKind::Delete,
-            });
-        }
-        Ok(removed)
+        self.db.write_document(self.name, key, None, None)
     }
 
     /// Delete every document matching `predicate`; returns the number removed.

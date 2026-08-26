@@ -223,8 +223,11 @@ impl Db {
     }
 
     /// Validate `doc` (to be stored at `key`) against `collection`'s schema, if
-    /// one is declared. Checks types, required presence, and uniqueness.
-    pub(crate) fn validate_schema(&self, collection: &str, key: &[u8], doc: &Value) -> Result<()> {
+    /// one is declared. Checks types and required presence — the pure checks
+    /// that need no storage access. Unique constraints are enforced by
+    /// [`Db::validate_unique_in_txn`] inside the write transaction itself, so
+    /// two writers contending for the same value serialize instead of racing.
+    pub(crate) fn validate_schema(&self, collection: &str, _key: &[u8], doc: &Value) -> Result<()> {
         let Some(schema) = self.schema_of(collection) else {
             return Ok(());
         };
@@ -246,56 +249,86 @@ impl Db {
                             f.name
                         )));
                     }
-                    if f.unique && self.unique_conflict(collection, &f.name, v, key)? {
-                        return Err(Error::SchemaViolation(format!(
-                            "field '{}' must be unique; value already exists",
-                            f.name
-                        )));
-                    }
                 }
             }
         }
         Ok(())
     }
 
-    /// Whether another document (key != `exclude`) already has `value` at
-    /// `field`. Uses a scalar index when present, else a streaming scan that
-    /// stops at the first conflict.
-    fn unique_conflict(
+    /// Enforce `unique` fields inside the caller's write transaction. The
+    /// check observes the transaction's own earlier puts, so a batch cannot
+    /// smuggle in duplicate unique values, and concurrent writers serialize
+    /// on redb's single-writer commit.
+    pub(crate) fn validate_unique_in_txn(
         &self,
+        tx: &mut crate::store::WriteBatch<'_>,
         collection: &str,
-        field: &str,
-        value: &Value,
-        exclude: &[u8],
-    ) -> Result<bool> {
-        use crate::filter::CmpOp;
-        if self.has_scalar_index(collection, field) {
-            let cons = [crate::scalar::Constraint {
-                op: CmpOp::Eq,
-                value,
-            }];
-            if let Some(keys) = self.scalar_candidates(collection, field, &cons, usize::MAX)? {
-                for k in keys {
-                    if k != exclude
-                        && let Some(doc) = self.collection(collection).get(&k)?
-                        && doc.get_path(field) == Some(value)
-                    {
-                        return Ok(true);
+        key: &[u8],
+        doc: &Value,
+    ) -> Result<()> {
+        let Some(schema) = self.schema_of(collection) else {
+            return Ok(());
+        };
+        for f in schema.fields.iter().filter(|f| f.unique) {
+            let Some(value) = doc.get_path(&f.name) else {
+                continue;
+            };
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            let conflict_msg = || {
+                Error::SchemaViolation(format!(
+                    "field '{}' must be unique; value already exists",
+                    f.name
+                ))
+            };
+            if self.has_scalar_index(collection, &f.name) {
+                // Walk exactly this value's bucket: index keys are
+                // `encoded_value ‖ doc_key`, so everything from `enc` until
+                // the first non-prefixed key shares the value.
+                let ns = crate::scalar::namespace(collection, &f.name);
+                let Some(enc) = crate::scalar::encode_value(value) else {
+                    continue;
+                };
+                let mut cursor = enc.clone();
+                'bucket: loop {
+                    let page = tx.scan_from(&ns, &cursor, 256)?;
+                    if page.is_empty() {
+                        break 'bucket;
+                    }
+                    let mut next = None;
+                    for (k, _) in &page {
+                        if !k.starts_with(&enc) {
+                            break 'bucket;
+                        }
+                        let doc_key = &k[enc.len()..];
+                        if doc_key != key {
+                            return Err(conflict_msg());
+                        }
+                        next = Some(k.clone());
+                    }
+                    match next {
+                        Some(mut c) => {
+                            c.push(0);
+                            cursor = c;
+                        }
+                        None => break 'bucket,
                     }
                 }
-                return Ok(false);
+            } else {
+                // No scalar index: scan the collection within the txn.
+                for (k, bytes) in tx.scan(collection)? {
+                    if k == key {
+                        continue;
+                    }
+                    let d = Value::decode(&bytes)?;
+                    if d.get_path(&f.name) == Some(value) {
+                        return Err(conflict_msg());
+                    }
+                }
             }
         }
-        // Fallback: streaming scan with early stop.
-        let mut conflict = false;
-        self.collection(collection).for_each_doc(|k, doc| {
-            if k != exclude && doc.get_path(field) == Some(value) {
-                conflict = true;
-                return Ok(false); // stop
-            }
-            Ok(true)
-        })?;
-        Ok(conflict)
+        Ok(())
     }
 }
 
@@ -398,6 +431,65 @@ mod tests {
             ]),
         )
         .unwrap();
+    }
+
+    /// Regression: a batch containing two items with the same unique value
+    /// used to commit both (validation ran against pre-batch state). Now the
+    /// check runs inside the transaction and sees earlier batch items — and
+    /// the whole batch rolls back atomically.
+    #[test]
+    fn batch_unique_violation_is_atomic() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("users");
+        c.set_schema(&schema()).unwrap();
+        let u1 = doc(&[("name", Value::Text("a".into())), ("email", Value::Text("x@x.com".into()))]);
+        let u2 = doc(&[("name", Value::Text("b".into())), ("email", Value::Text("y@x.com".into()))]);
+        let u3 = doc(&[("name", Value::Text("c".into())), ("email", Value::Text("x@x.com".into()))]);
+        let err = c.insert_batch(&[(b"u1", &u1), (b"u2", &u2), (b"u3", &u3)]);
+        assert!(matches!(err, Err(Error::SchemaViolation(_))));
+        // Nothing from the batch was committed.
+        assert_eq!(c.len().unwrap(), 0);
+    }
+
+    /// Concurrent writers contending for one unique value: at most one may
+    /// win. The check now lives inside the write transaction, so contenders
+    /// serialize instead of both observing "no conflict" pre-commit.
+    #[test]
+    fn concurrent_unique_inserts_allow_at_most_one_winner() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = Arc::new(Db::open(&path).unwrap());
+        {
+            let c = db.collection("users");
+            c.set_schema(&schema()).unwrap();
+        }
+        const THREADS: usize = 8;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let key = format!("k{t}");
+                db.collection("users")
+                    .insert(
+                        key.as_bytes(),
+                        &doc(&[
+                            ("name", Value::Text(format!("n{t}"))),
+                            ("email", Value::Text("contested@x.com".into())),
+                        ]),
+                    )
+                    .is_ok()
+            }));
+        }
+        let winners: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            winners.iter().filter(|w| **w).count(),
+            1,
+            "exactly one contender may win the unique value"
+        );
     }
 
     #[test]

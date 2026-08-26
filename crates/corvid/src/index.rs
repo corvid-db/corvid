@@ -263,76 +263,111 @@ impl Db {
         Ok(())
     }
 
-    /// Maintain every index on `collection` after a document write.
-    pub(crate) fn index_on_insert(&self, collection: &str, key: &[u8], doc: &Value) -> Result<()> {
-        // Snapshot the relevant defs, then work without holding the lock for
-        // on-disk I/O.
+    /// Maintain every on-disk vector index on `collection` inside the
+    /// caller's write transaction, so graph state commits atomically with the
+    /// document. In-memory graphs are handled post-commit by
+    /// [`Db::index_on_insert_memory`].
+    pub(crate) fn index_on_insert_in_txn(
+        &self,
+        tx: &mut crate::store::WriteBatch<'_>,
+        collection: &str,
+        key: &[u8],
+        doc: &Value,
+    ) -> Result<()> {
         let defs: Vec<(String, VectorDef)> = {
             let state = self.indexes().lock().expect("index lock");
             state
                 .defs
                 .iter()
                 .filter(|((c, _), _)| c == collection)
+                .filter(|(.., d)| d.kind.is_on_disk())
                 .map(|((_, f), d)| (f.clone(), d.clone()))
                 .collect()
         };
         for (field, def) in defs {
-            match def.kind {
-                IndexKind::OnDisk | IndexKind::OnDiskPq => {
-                    let ns = disk_hnsw::namespace(collection, &field);
-                    match doc.get_path(&field).and_then(Value::as_vector) {
-                        Some(v) => {
-                            disk_hnsw::insert(self.store(), &ns, &def.disk_params(), key, v)?
-                        }
-                        None => {
-                            disk_hnsw::delete(self.store(), &ns, &def.disk_params(), key)?;
-                        }
-                    }
-                }
-                IndexKind::InMemory => {
-                    let map_key = (collection.to_owned(), field.clone());
-                    let mut state = self.indexes().lock().expect("index lock");
-                    // Only maintain an already-built graph; an unbuilt one picks
-                    // this up when it builds lazily.
-                    if let Some(built) = state.built.get_mut(&map_key) {
-                        match doc.get_path(&field).and_then(Value::as_vector) {
-                            Some(v) => built.add(key, v.to_vec()),
-                            None => built.tombstone(key),
-                        }
-                    }
+            let ns = disk_hnsw::namespace(collection, &field);
+            match doc.get_path(&field).and_then(Value::as_vector) {
+                Some(v) => disk_hnsw::insert_one_in_txn(tx, &ns, &def.disk_params(), key, v)?,
+                None => {
+                    disk_hnsw::delete_in_txn(tx, &ns, &def.disk_params(), key)?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Remove `key` from every index on `collection` after a delete.
-    pub(crate) fn index_on_delete(&self, collection: &str, key: &[u8]) -> Result<()> {
+    /// Maintain already-built in-memory graphs after a successful commit. An
+    /// unbuilt graph picks this up when it builds lazily from the store.
+    pub(crate) fn index_on_insert_memory(&self, collection: &str, key: &[u8], doc: &Value) {
         let defs: Vec<(String, VectorDef)> = {
             let state = self.indexes().lock().expect("index lock");
             state
                 .defs
                 .iter()
                 .filter(|((c, _), _)| c == collection)
+                .filter(|(.., d)| d.kind == IndexKind::InMemory)
+                .map(|((_, f), d)| (f.clone(), d.clone()))
+                .collect()
+        };
+        for (field, _def) in defs {
+            let map_key = (collection.to_owned(), field);
+            let mut state = self.indexes().lock().expect("index lock");
+            // Only maintain an already-built graph; an unbuilt one picks
+            // this up when it builds lazily.
+            if let Some(built) = state.built.get_mut(&map_key) {
+                match doc.get_path(&map_key.1).and_then(Value::as_vector) {
+                    Some(v) => built.add(key, v.to_vec()),
+                    None => built.tombstone(key),
+                }
+            }
+        }
+    }
+
+    /// Remove `key` from every on-disk vector index inside the caller's
+    /// write transaction.
+    pub(crate) fn index_on_delete_in_txn(
+        &self,
+        tx: &mut crate::store::WriteBatch<'_>,
+        collection: &str,
+        key: &[u8],
+    ) -> Result<()> {
+        let defs: Vec<(String, VectorDef)> = {
+            let state = self.indexes().lock().expect("index lock");
+            state
+                .defs
+                .iter()
+                .filter(|((c, _), _)| c == collection)
+                .filter(|(.., d)| d.kind.is_on_disk())
                 .map(|((_, f), d)| (f.clone(), d.clone()))
                 .collect()
         };
         for (field, def) in defs {
-            match def.kind {
-                IndexKind::OnDisk | IndexKind::OnDiskPq => {
-                    let ns = disk_hnsw::namespace(collection, &field);
-                    disk_hnsw::delete(self.store(), &ns, &def.disk_params(), key)?;
-                }
-                IndexKind::InMemory => {
-                    let map_key = (collection.to_owned(), field);
-                    let mut state = self.indexes().lock().expect("index lock");
-                    if let Some(built) = state.built.get_mut(&map_key) {
-                        built.tombstone(key);
-                    }
-                }
-            }
+            let ns = disk_hnsw::namespace(collection, &field);
+            disk_hnsw::delete_in_txn(tx, &ns, &def.disk_params(), key)?;
         }
         Ok(())
+    }
+
+    /// Tombstone `key` from every already-built in-memory graph after a
+    /// successful commit.
+    pub(crate) fn index_on_delete_memory(&self, collection: &str, key: &[u8]) {
+        let fields: Vec<String> = {
+            let state = self.indexes().lock().expect("index lock");
+            state
+                .defs
+                .iter()
+                .filter(|((c, _), _)| c == collection)
+                .filter(|(.., d)| d.kind == IndexKind::InMemory)
+                .map(|((_, f), _)| f.clone())
+                .collect()
+        };
+        for field in fields {
+            let map_key = (collection.to_owned(), field);
+            let mut state = self.indexes().lock().expect("index lock");
+            if let Some(built) = state.built.get_mut(&map_key) {
+                built.tombstone(key);
+            }
+        }
     }
 
     /// If a matching index is registered, return the approximate nearest `k`

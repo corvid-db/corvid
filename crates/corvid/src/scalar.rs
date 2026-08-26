@@ -68,7 +68,7 @@ pub(crate) fn compound_namespace(collection: &str, fields: &[String]) -> String 
 /// Encode a scalar value into an order-preserving, self-delimiting key payload.
 /// Returns `None` for values that are not indexable scalars (null, containers,
 /// vectors, bytes).
-fn encode_value(v: &Value) -> Option<Vec<u8>> {
+pub(crate) fn encode_value(v: &Value) -> Option<Vec<u8>> {
     let (lane, payload): (u8, Vec<u8>) = match v {
         Value::Bool(b) => (LANE_BOOL, vec![*b as u8]),
         Value::Int(i) => (LANE_NUM, num_payload(*i as f64)),
@@ -133,18 +133,22 @@ fn fwd_key(doc_key: &[u8]) -> Vec<u8> {
 
 // ---- maintenance ----
 
-/// Index (or re-index) `doc_key`'s `value` in one transaction.
-pub(crate) fn insert(store: &Store, ns: &str, doc_key: &[u8], value: &Value) -> Result<()> {
-    store.transaction(|tx| {
-        remove_in_txn(tx, ns, doc_key)?;
-        if let Some(enc) = encode_value(value) {
-            let mut idx_key = enc.clone();
-            idx_key.extend_from_slice(doc_key);
-            tx.put(ns, &idx_key, &[])?;
-            tx.put(ns, &fwd_key(doc_key), &enc)?;
-        }
-        Ok(())
-    })
+/// Index (or re-index) `doc_key`'s `value` inside a caller's transaction, so
+/// the index entry commits atomically with the document that produced it.
+pub(crate) fn insert_in_txn(
+    tx: &mut crate::store::WriteBatch<'_>,
+    ns: &str,
+    doc_key: &[u8],
+    value: &Value,
+) -> Result<()> {
+    remove_in_txn(tx, ns, doc_key)?;
+    if let Some(enc) = encode_value(value) {
+        let mut idx_key = enc.clone();
+        idx_key.extend_from_slice(doc_key);
+        tx.put(ns, &idx_key, &[])?;
+        tx.put(ns, &fwd_key(doc_key), &enc)?;
+    }
+    Ok(())
 }
 
 /// Index many `(doc_key, value)` pairs in one transaction (bulk load).
@@ -161,11 +165,6 @@ pub(crate) fn insert_many(store: &Store, ns: &str, items: &[(Vec<u8>, Value)]) -
         }
         Ok(())
     })
-}
-
-/// Remove `doc_key` from the index.
-pub(crate) fn delete(store: &Store, ns: &str, doc_key: &[u8]) -> Result<()> {
-    store.transaction(|tx| remove_in_txn(tx, ns, doc_key))
 }
 
 fn remove_in_txn(tx: &mut crate::store::WriteBatch<'_>, ns: &str, doc_key: &[u8]) -> Result<()> {
@@ -466,22 +465,36 @@ impl Db {
     }
 
     /// Maintain every scalar index on `collection` after a document write.
-    pub(crate) fn scalar_on_insert(&self, collection: &str, key: &[u8], doc: &Value) -> Result<()> {
+    /// Maintain every scalar index on `collection` inside the caller's write
+    /// transaction, so index entries commit atomically with the document.
+    pub(crate) fn scalar_on_insert_in_txn(
+        &self,
+        tx: &mut crate::store::WriteBatch<'_>,
+        collection: &str,
+        key: &[u8],
+        doc: &Value,
+    ) -> Result<()> {
         let fields = self.scalar_fields(collection);
         for field in fields {
             let ns = namespace(collection, &field);
             match doc.get_path(&field) {
-                Some(value) => insert(self.store(), &ns, key, value)?,
-                None => delete(self.store(), &ns, key)?,
+                Some(value) => insert_in_txn(tx, &ns, key, value)?,
+                None => remove_in_txn(tx, &ns, key)?,
             }
         }
         Ok(())
     }
 
-    /// Remove `key` from every scalar index on `collection` after a delete.
-    pub(crate) fn scalar_on_delete(&self, collection: &str, key: &[u8]) -> Result<()> {
+    /// Remove `key` from every scalar index on `collection` inside the
+    /// caller's write transaction.
+    pub(crate) fn scalar_on_delete_in_txn(
+        &self,
+        tx: &mut crate::store::WriteBatch<'_>,
+        collection: &str,
+        key: &[u8],
+    ) -> Result<()> {
         for field in self.scalar_fields(collection) {
-            delete(self.store(), &namespace(collection, &field), key)?;
+            remove_in_txn(tx, &namespace(collection, &field), key)?;
         }
         Ok(())
     }
@@ -622,8 +635,11 @@ impl Db {
     }
 
     /// Maintain every compound index on `collection` after a document write.
-    pub(crate) fn compound_on_insert(
+    /// Maintain every compound index on `collection` inside the caller's
+    /// write transaction.
+    pub(crate) fn compound_on_insert_in_txn(
         &self,
+        tx: &mut crate::store::WriteBatch<'_>,
         collection: &str,
         key: &[u8],
         doc: &Value,
@@ -631,20 +647,24 @@ impl Db {
         for fields in self.compound_indexes(collection) {
             let ns = compound_namespace(collection, &fields);
             let values: Option<Vec<&Value>> = fields.iter().map(|f| doc.get_path(f)).collect();
-            self.store().transaction(|tx| match &values {
-                Some(vs) => compound_insert_in_txn(tx, &ns, key, vs),
-                None => compound_remove_in_txn(tx, &ns, key),
-            })?;
+            match &values {
+                Some(vs) => compound_insert_in_txn(tx, &ns, key, vs)?,
+                None => compound_remove_in_txn(tx, &ns, key)?,
+            }
         }
         Ok(())
     }
 
-    /// Remove `key` from every compound index on `collection` after a delete.
-    pub(crate) fn compound_on_delete(&self, collection: &str, key: &[u8]) -> Result<()> {
+    /// Remove `key` from every compound index on `collection` inside the
+    /// caller's write transaction.
+    pub(crate) fn compound_on_delete_in_txn(
+        &self,
+        tx: &mut crate::store::WriteBatch<'_>,
+        collection: &str,
+        key: &[u8],
+    ) -> Result<()> {
         for fields in self.compound_indexes(collection) {
-            let ns = compound_namespace(collection, &fields);
-            self.store()
-                .transaction(|tx| compound_remove_in_txn(tx, &ns, key))?;
+            compound_remove_in_txn(tx, &compound_namespace(collection, &fields), key)?;
         }
         Ok(())
     }
@@ -1039,7 +1059,9 @@ mod tests {
         // A value containing 0x00 must not break the terminator/doc-key split.
         let store = Store::open_in_memory().unwrap();
         let v = Value::Text("a\u{0}b".into());
-        insert(&store, "ix", b"doc1", &v).unwrap();
+        store
+            .transaction(|tx| insert_in_txn(tx, "ix", b"doc1", &v))
+            .unwrap();
         let (lane, lower, upper) = window(&[Constraint {
             op: CmpOp::Eq,
             value: &v,

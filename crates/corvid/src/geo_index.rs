@@ -88,18 +88,22 @@ fn fwd_key(doc_key: &[u8]) -> Vec<u8> {
 
 // ---- maintenance ----
 
-pub(crate) fn insert(store: &Store, ns: &str, doc_key: &[u8], value: &Value) -> Result<()> {
-    store.transaction(|tx| {
-        remove_in_txn(tx, ns, doc_key)?;
-        if let Some((lat, lon)) = extract_point(value) {
-            let cell = cell_prefix(lat, lon);
-            let mut idx_key = cell.to_vec();
-            idx_key.extend_from_slice(doc_key);
-            tx.put(ns, &idx_key, &[])?;
-            tx.put(ns, &fwd_key(doc_key), &cell)?;
-        }
-        Ok(())
-    })
+/// Index (or re-index) `doc_key`'s point inside a caller's transaction.
+pub(crate) fn insert_in_txn(
+    tx: &mut crate::store::WriteBatch<'_>,
+    ns: &str,
+    doc_key: &[u8],
+    value: &Value,
+) -> Result<()> {
+    remove_in_txn(tx, ns, doc_key)?;
+    if let Some((lat, lon)) = extract_point(value) {
+        let cell = cell_prefix(lat, lon);
+        let mut idx_key = cell.to_vec();
+        idx_key.extend_from_slice(doc_key);
+        tx.put(ns, &idx_key, &[])?;
+        tx.put(ns, &fwd_key(doc_key), &cell)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn insert_many(store: &Store, ns: &str, items: &[(Vec<u8>, Value)]) -> Result<()> {
@@ -116,10 +120,6 @@ pub(crate) fn insert_many(store: &Store, ns: &str, items: &[(Vec<u8>, Value)]) -
         }
         Ok(())
     })
-}
-
-pub(crate) fn delete(store: &Store, ns: &str, doc_key: &[u8]) -> Result<()> {
-    store.transaction(|tx| remove_in_txn(tx, ns, doc_key))
 }
 
 fn remove_in_txn(tx: &mut crate::store::WriteBatch<'_>, ns: &str, doc_key: &[u8]) -> Result<()> {
@@ -253,20 +253,35 @@ impl Db {
         Ok(())
     }
 
-    pub(crate) fn geo_on_insert(&self, collection: &str, key: &[u8], doc: &Value) -> Result<()> {
+    /// Maintain every geo index on `collection` inside the caller's write
+    /// transaction.
+    pub(crate) fn geo_on_insert_in_txn(
+        &self,
+        tx: &mut crate::store::WriteBatch<'_>,
+        collection: &str,
+        key: &[u8],
+        doc: &Value,
+    ) -> Result<()> {
         for field in self.geo_fields(collection) {
             let ns = namespace(collection, &field);
             match doc.get_path(&field) {
-                Some(value) => insert(self.store(), &ns, key, value)?,
-                None => delete(self.store(), &ns, key)?,
+                Some(value) => insert_in_txn(tx, &ns, key, value)?,
+                None => remove_in_txn(tx, &ns, key)?,
             }
         }
         Ok(())
     }
 
-    pub(crate) fn geo_on_delete(&self, collection: &str, key: &[u8]) -> Result<()> {
+    /// Remove `key` from every geo index on `collection` inside the caller's
+    /// write transaction.
+    pub(crate) fn geo_on_delete_in_txn(
+        &self,
+        tx: &mut crate::store::WriteBatch<'_>,
+        collection: &str,
+        key: &[u8],
+    ) -> Result<()> {
         for field in self.geo_fields(collection) {
-            delete(self.store(), &namespace(collection, &field), key)?;
+            remove_in_txn(tx, &namespace(collection, &field), key)?;
         }
         Ok(())
     }
