@@ -369,24 +369,26 @@ impl Db {
     ) -> Result<Option<RankedKeys>> {
         let map_key = (collection.to_owned(), field.to_owned());
 
-        let needs_build = {
-            let state = self.fts().lock().expect("fts lock");
+        // Build while holding the registry lock: a concurrent writer's
+        // maintenance blocks here and then applies to the fresh index, so no
+        // committed document can fall between the build snapshot and install.
+        {
+            let mut state = self.fts().lock().expect("fts lock");
             match state.defs.get(&map_key) {
                 None => return Ok(None),
-                // On-disk postings are maintained on every write; no build,
-                // no lock held during the scan.
+                // On-disk postings are maintained on every write; no build.
                 Some(TextKind::OnDisk) => {
                     let ns = disk_fts::namespace(collection, field);
                     drop(state);
                     return Ok(Some(disk_fts::search(self.store(), &ns, query, k)?));
                 }
-                Some(TextKind::InMemory) => !state.built.contains_key(&map_key),
+                Some(TextKind::InMemory) => {
+                    if !state.built.contains_key(&map_key) {
+                        let inv = build_inverted(self.store(), collection, field)?;
+                        state.built.entry(map_key.clone()).or_insert(inv);
+                    }
+                }
             }
-        };
-        if needs_build {
-            let inv = build_inverted(self.store(), collection, field)?;
-            let mut state = self.fts().lock().expect("fts lock");
-            state.built.entry(map_key.clone()).or_insert(inv);
         }
 
         let state = self.fts().lock().expect("fts lock");
@@ -403,8 +405,9 @@ impl Db {
         k: usize,
     ) -> Result<Option<RankedKeys>> {
         let map_key = (collection.to_owned(), field.to_owned());
-        let needs_build = {
-            let state = self.fts().lock().expect("fts lock");
+        // Same build-under-lock contract as [`Db::fts_search`].
+        {
+            let mut state = self.fts().lock().expect("fts lock");
             match state.defs.get(&map_key) {
                 None => return Ok(None),
                 Some(TextKind::OnDisk) => {
@@ -412,13 +415,13 @@ impl Db {
                     drop(state);
                     return Ok(Some(disk_fts::phrase_search(self.store(), &ns, phrase, k)?));
                 }
-                Some(TextKind::InMemory) => !state.built.contains_key(&map_key),
+                Some(TextKind::InMemory) => {
+                    if !state.built.contains_key(&map_key) {
+                        let inv = build_inverted(self.store(), collection, field)?;
+                        state.built.entry(map_key.clone()).or_insert(inv);
+                    }
+                }
             }
-        };
-        if needs_build {
-            let inv = build_inverted(self.store(), collection, field)?;
-            let mut state = self.fts().lock().expect("fts lock");
-            state.built.entry(map_key.clone()).or_insert(inv);
         }
         let state = self.fts().lock().expect("fts lock");
         Ok(state

@@ -152,6 +152,10 @@ struct Node {
 struct Meta {
     entry: Option<u64>,
     count: u64,
+    /// Dimension of indexed vectors, fixed by the first inserted vector.
+    /// Inserts and queries of any other dimension are rejected/skipped so a
+    /// mismatch can never silently produce truncated-distance garbage.
+    dim: Option<u32>,
 }
 
 // ---- key encoding ----
@@ -216,10 +220,18 @@ fn decode_node(b: &[u8], p: &DiskParams) -> Option<Node> {
 }
 
 fn encode_meta(m: Meta) -> Vec<u8> {
-    let mut out = Vec::with_capacity(9);
+    let mut out = Vec::with_capacity(22);
     out.push(m.entry.is_some() as u8);
     out.extend_from_slice(&m.entry.unwrap_or(0).to_be_bytes());
     out.extend_from_slice(&m.count.to_be_bytes());
+    // dim: 0x00 = unset, 0x01 + u32 = set.
+    match m.dim {
+        None => out.push(0),
+        Some(d) => {
+            out.push(1);
+            out.extend_from_slice(&d.to_be_bytes());
+        }
+    }
     out
 }
 
@@ -228,14 +240,22 @@ fn decode_meta(b: &[u8]) -> Meta {
         return Meta {
             entry: None,
             count: 0,
+            dim: None,
         };
     }
     let has = b[0] != 0;
     let entry = u64::from_be_bytes(b[1..9].try_into().unwrap());
     let count = u64::from_be_bytes(b[9..17].try_into().unwrap());
+    // Older namespaces (pre-dim) decode as unset, which preserves their
+    // accept-all behavior until the first fresh write pins the dimension.
+    let dim = match b.get(17) {
+        Some(1) if b.len() >= 22 => Some(u32::from_be_bytes(b[18..22].try_into().unwrap())),
+        _ => None,
+    };
     Meta {
         entry: has.then_some(entry),
         count,
+        dim,
     }
 }
 
@@ -389,6 +409,7 @@ fn read_meta(tx: &crate::store::WriteBatch<'_>, ns: &str) -> Result<Meta> {
         None => Meta {
             entry: None,
             count: 0,
+            dim: None,
         },
     })
 }
@@ -405,6 +426,18 @@ fn insert_in_txn(
     doc_key: &[u8],
     vector: &[f32],
 ) -> Result<()> {
+    // Dimension gate: the first vector pins the index's dimension; any other
+    // dimension is not indexed (matching the exact-search paths, which skip
+    // mismatched documents). If an existing key's vector changes shape, its
+    // old node is tombstoned so nothing stale competes in searches.
+    match meta.dim {
+        None => meta.dim = Some(vector.len() as u32),
+        Some(d) if d as usize != vector.len() => {
+            delete_in_txn(tx, ns, p, doc_key)?;
+            return Ok(());
+        }
+        _ => {}
+    }
     {
         // Overwrite: tombstone the previous node for this key.
         if let Some(old_bytes) = tx.get(ns, &keymap_key(doc_key))? {
@@ -521,7 +554,9 @@ pub(crate) fn delete_in_txn(
     Ok(true)
 }
 
-/// Search for the `k` nearest live document keys to `query`.
+/// Search for the `k` nearest live document keys to `query`. Returns `None`
+/// when the index cannot honestly serve the query — a dimension mismatch —
+/// so the caller falls back to an exact scan instead of getting garbage.
 pub(crate) fn search(
     store: &Store,
     ns: &str,
@@ -529,17 +564,23 @@ pub(crate) fn search(
     query: &[f32],
     k: usize,
     ef_search: usize,
-) -> Result<Vec<(Vec<u8>, f32)>> {
+) -> Result<Option<DiskRanked>> {
     if k == 0 {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     store.read(|r| {
         let meta = match r.get(ns, &[TAG_META])? {
             Some(b) => decode_meta(&b),
-            None => return Ok(Vec::new()),
+            None => return Ok(Some(Vec::new())),
         };
+        // Dimension gate (unset on legacy namespaces → accept-all).
+        if let Some(d) = meta.dim
+            && d as usize != query.len()
+        {
+            return Ok(None);
+        }
         let Some(entry) = meta.entry else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
         let mut cache = Cache::new();
         let top = load_r(r, ns, &mut cache, p, entry)?
@@ -568,9 +609,12 @@ pub(crate) fn search(
                 }
             }
         }
-        Ok(out)
+        Ok(Some(out))
     })
 }
+
+/// Ranked `(doc_key, distance)` results, nearest first.
+pub(crate) type DiskRanked = Vec<(Vec<u8>, f32)>;
 
 /// The reserved collection name holding an on-disk index's graph.
 pub(crate) fn namespace(collection: &str, field: &str) -> String {
@@ -771,6 +815,7 @@ mod tests {
         assert!(
             search(&store, "ix", &p, &[1.0, 2.0], 5, 50)
                 .unwrap()
+                .unwrap()
                 .is_empty()
         );
     }
@@ -780,7 +825,9 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let p = DiskParams::with_quant(Metric::L2, Quantization::None, 16, 128);
         insert(&store, "ix", &p, b"a", &[1.0, 2.0, 3.0]).unwrap();
-        let got = search(&store, "ix", &p, &[1.0, 2.0, 3.0], 1, 50).unwrap();
+        let got = search(&store, "ix", &p, &[1.0, 2.0, 3.0], 1, 50)
+            .unwrap()
+            .unwrap();
         assert_eq!(got[0].0, b"a".to_vec());
         assert_eq!(got[0].1, 0.0);
     }
@@ -798,6 +845,7 @@ mod tests {
         let queries = corpus(15, 16);
         for q in &queries {
             let approx: HashSet<usize> = search(&store, "ix", &p, q, k, 100)
+                .unwrap()
                 .unwrap()
                 .into_iter()
                 .map(|(key, _)| String::from_utf8(key).unwrap()[1..].parse().unwrap())
@@ -823,7 +871,7 @@ mod tests {
         }
         // Reopen: no rebuild, search uses the persisted graph.
         let store = Store::open(&path).unwrap();
-        let got = search(&store, "ix", &p, &data[20], 1, 50).unwrap();
+        let got = search(&store, "ix", &p, &data[20], 1, 50).unwrap().unwrap();
         assert_eq!(got[0].0, b"k20".to_vec());
     }
 
@@ -836,7 +884,7 @@ mod tests {
             insert(&store, "ix", &p, format!("k{i}").as_bytes(), v).unwrap();
         }
         assert!(delete(&store, "ix", &p, b"k20").unwrap());
-        let got = search(&store, "ix", &p, &data[20], 5, 80).unwrap();
+        let got = search(&store, "ix", &p, &data[20], 5, 80).unwrap().unwrap();
         assert!(!got.iter().any(|(key, _)| key == b"k20"));
     }
 
@@ -867,6 +915,7 @@ mod tests {
         let mut total = 0.0;
         for q in &queries {
             let approx: HashSet<usize> = search(&store, "ix", &p, q, k, 100)
+                .unwrap()
                 .unwrap()
                 .into_iter()
                 .map(|(key, _)| String::from_utf8(key).unwrap()[1..].parse().unwrap())
@@ -908,7 +957,7 @@ mod tests {
         }
         // Reopen: the quantized graph decodes with the same mode, no rebuild.
         let store = Store::open(&path).unwrap();
-        let got = search(&store, "ix", &p, &data[20], 1, 50).unwrap();
+        let got = search(&store, "ix", &p, &data[20], 1, 50).unwrap().unwrap();
         assert_eq!(got[0].0, b"k20".to_vec());
     }
 
@@ -920,7 +969,7 @@ mod tests {
         insert(&store, "ix", &p, b"far", &[10.0, 10.0]).unwrap();
         // Move x next to far; querying near far should surface both.
         insert(&store, "ix", &p, b"x", &[10.0, 10.0]).unwrap();
-        let got = search(&store, "ix", &p, &[10.0, 10.0], 2, 50).unwrap();
+        let got = search(&store, "ix", &p, &[10.0, 10.0], 2, 50).unwrap().unwrap();
         let keys: HashSet<Vec<u8>> = got.into_iter().map(|(k, _)| k).collect();
         assert!(keys.contains(b"x".as_slice()));
         assert!(keys.contains(b"far".as_slice()));

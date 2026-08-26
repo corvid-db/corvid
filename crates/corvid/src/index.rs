@@ -83,6 +83,8 @@ struct BuiltIndex {
     node_to_key: Vec<Option<Vec<u8>>>,
     /// live key -> current node id.
     key_to_node: HashMap<Vec<u8>, usize>,
+    /// Dimension of the indexed vectors (fixed by the first accepted vector).
+    dim: Option<usize>,
 }
 
 impl BuiltIndex {
@@ -91,6 +93,7 @@ impl BuiltIndex {
             hnsw: Hnsw::with_quant(def.metric, def.quant, DEFAULT_M, DEFAULT_EF_CONSTRUCTION),
             node_to_key: Vec::new(),
             key_to_node: HashMap::new(),
+            dim: None,
         }
     }
 
@@ -98,8 +101,16 @@ impl BuiltIndex {
         self.node_to_key.len() - self.key_to_node.len()
     }
 
-    /// Add (or replace) `key`'s vector. An existing node for `key` is tombstoned.
+    /// Add (or replace) `key`'s vector. An existing node for `key` is
+    /// tombstoned. Vectors whose dimension differs from the index's fixed
+    /// dimension are skipped, matching the exact-search paths (which skip
+    /// them too) — the document stays queryable by everything else.
     fn add(&mut self, key: &[u8], vector: Vec<f32>) {
+        match self.dim {
+            Some(d) if d != vector.len() => return,
+            None => self.dim = Some(vector.len()),
+            _ => {}
+        }
         self.tombstone(key);
         let id = self.hnsw.insert(vector);
         debug_assert_eq!(id, self.node_to_key.len(), "hnsw ids are dense");
@@ -114,11 +125,20 @@ impl BuiltIndex {
         }
     }
 
+    /// Whether `query` matches the graph's fixed dimension. `None`-dim means
+    /// an empty graph, which serves any query (returning nothing).
+    fn accepts(&self, query: &[f32]) -> bool {
+        match self.dim {
+            Some(d) => d == query.len(),
+            None => true,
+        }
+    }
+
     /// Search for the nearest `k` live keys. Over-fetches by the tombstone
     /// count so that, even if every dead node ranks ahead, `k` live nodes
     /// remain.
     fn search(&self, query: &[f32], k: usize) -> RankedKeys {
-        if k == 0 {
+        if k == 0 || !self.accepts(query) {
             return Vec::new();
         }
         let want = k + self.dead();
@@ -392,48 +412,49 @@ impl Db {
         };
 
         // On-disk indexes are served directly from the store (bounded memory).
+        // A `None` from the search means "cannot serve this query" (dimension
+        // mismatch) — fall back to exact like every other unserveable case.
         if def.kind.is_on_disk() {
             let ns = disk_hnsw::namespace(collection, field);
             let ef = (k * 4).max(64);
-            return Ok(Some(disk_hnsw::search(
-                self.store(),
-                &ns,
-                &def.disk_params(),
-                query,
-                k,
-                ef,
-            )?));
+            return match disk_hnsw::search(self.store(), &ns, &def.disk_params(), query, k, ef)? {
+                Some(ranked) => Ok(Some(ranked)),
+                None => Ok(None),
+            };
         }
 
-        let needs_build = !self
-            .indexes()
-            .lock()
-            .expect("index lock")
-            .built
-            .contains_key(&map_key);
-
-        if needs_build {
-            let built = build_index(self.store(), collection, field, def.clone())?;
+        // Build (or compact) while holding the registry lock. A concurrent
+        // writer's maintenance blocks on this lock and then applies to the
+        // freshly installed graph, so no committed document can fall between
+        // the build's store snapshot and the install — the race that
+        // otherwise permanently hid such documents from ANN search.
+        {
             let mut state = self.indexes().lock().expect("index lock");
-            state.built.entry(map_key.clone()).or_insert(built);
-        }
+            if !state.built.contains_key(&map_key) {
+                let built = build_index(self.store(), collection, field, def.clone())?;
+                state.built.entry(map_key.clone()).or_insert(built);
+            }
 
-        // Compact if more than half the graph is tombstoned.
-        let needs_compact = {
-            let state = self.indexes().lock().expect("index lock");
-            state
+            // Compact if more than half the graph is tombstoned.
+            let needs_compact = state
                 .built
                 .get(&map_key)
-                .is_some_and(|b| !b.node_to_key.is_empty() && b.dead() * 2 > b.node_to_key.len())
-        };
-        if needs_compact {
-            let built = build_index(self.store(), collection, field, def.clone())?;
-            let mut state = self.indexes().lock().expect("index lock");
-            state.built.insert(map_key.clone(), built);
+                .is_some_and(|b| !b.node_to_key.is_empty() && b.dead() * 2 > b.node_to_key.len());
+            if needs_compact {
+                let built = build_index(self.store(), collection, field, def.clone())?;
+                state.built.insert(map_key.clone(), built);
+            }
         }
 
         let state = self.indexes().lock().expect("index lock");
-        Ok(state.built.get(&map_key).map(|b| b.search(query, k)))
+        match state.built.get(&map_key) {
+            // Dimension mismatch: the graph cannot serve this query honestly.
+            // Return None so the caller falls back to an exact scan (which
+            // skips mismatched documents), keeping results identical whether
+            // or not an index exists.
+            Some(b) if !b.accepts(query) => Ok(None),
+            other => Ok(other.map(|b| b.search(query, k))),
+        }
     }
 }
 
@@ -1022,5 +1043,94 @@ mod tests {
             .vector_search("embedding", &[0.0, 1.0], 1, Metric::L2)
             .unwrap();
         assert_eq!(hits[0].key, b"b".to_vec());
+    }
+
+    /// Regression: a query whose dimension differs from the indexed vectors
+    /// used to panic in debug builds and compute truncated-distance garbage in
+    /// release. It must behave exactly like the unindexed path instead.
+    #[test]
+    fn wrong_dimension_query_falls_back_to_exact_semantics() {
+        let db = seeded(); // docs have 2-dimensional embeddings
+        let c = db.collection("docs");
+        c.create_vector_index("embedding", Metric::L2).unwrap();
+        // Force the graph to build so the ANN branch is live.
+        let _ = c.vector_search("embedding", &[1.0, 0.0], 3, Metric::L2).unwrap();
+
+        let wrong_dim = c.vector_search("embedding", &[1.0], 3, Metric::L2);
+        assert!(wrong_dim.unwrap().is_empty(), "no doc has a 1-dim embedding");
+
+        let on_disk = Db::open_in_memory().unwrap();
+        let oc = on_disk.collection("docs");
+        oc.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
+        oc.create_vector_index_ondisk("embedding", Metric::L2).unwrap();
+        let got = oc.vector_search("embedding", &[1.0], 3, Metric::L2).unwrap();
+        assert!(got.is_empty());
+        // Matching dims still work through both index kinds.
+        assert_eq!(
+            c.vector_search("embedding", &[1.0, 0.0], 1, Metric::L2).unwrap()[0].key,
+            b"a".to_vec()
+        );
+        assert_eq!(
+            oc.vector_search("embedding", &[1.0, 0.0], 1, Metric::L2).unwrap()[0].key,
+            b"a".to_vec()
+        );
+    }
+
+    /// Stress the lazy build against concurrent writes: a reader triggers the
+    /// first (full-scan) build while a writer commits documents. Every
+    /// committed document must be findable afterwards — before the
+    /// build-under-lock fix, a write landing during the scan was skipped by
+    /// maintenance *and* missed by the snapshot, permanently.
+    #[test]
+    fn concurrent_writes_are_never_lost_from_the_lazy_built_index() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        db.collection("docs")
+            .create_vector_index("embedding", Metric::L2)
+            .unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+
+        let writer = {
+            let db = Arc::clone(&db);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                for i in 0..300u32 {
+                    let v = vec![i as f32, 0.0];
+                    db.collection("docs")
+                        .insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                        .unwrap();
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+        let reader = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || loop {
+                if done.load(Ordering::Acquire) {
+                    break;
+                }
+                // Triggers the first lazy build while writes are in flight.
+                let _ = db
+                    .collection("docs")
+                    .vector_search("embedding", &[0.0], 10, Metric::L2);
+            })
+        };
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        // One final search per document: every committed key is its own exact
+        // nearest neighbour, so it must come back in the top hit.
+        let c = db.collection("docs");
+        for i in 0..300u32 {
+            let hits = c
+                .vector_search("embedding", &[i as f32, 0.0], 1, Metric::L2)
+                .unwrap();
+            assert_eq!(
+                hits[0].key,
+                format!("k{i}").into_bytes(),
+                "document k{i} was lost from the index"
+            );
+        }
     }
 }
