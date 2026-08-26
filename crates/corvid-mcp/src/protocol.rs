@@ -21,6 +21,10 @@ use crate::server::Server;
 /// The MCP protocol revision this server reports.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Largest accepted request frame, in bytes. A longer line is answered with a
+/// parse error and skipped: the transport never buffers unboundedly.
+pub const MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
+
 /// Build a server from an optional database path (in-memory when `None`).
 pub fn open_server(path: Option<&str>) -> Result<Server, corvid::Error> {
     match path {
@@ -32,22 +36,98 @@ pub fn open_server(path: Option<&str>) -> Result<Server, corvid::Error> {
 /// Run the stdio JSON-RPC loop: read newline-delimited requests, dispatch, and
 /// write newline-delimited responses. Blank lines are ignored; unparseable
 /// lines get a JSON-RPC parse-error response.
-pub fn run<R: BufRead, W: Write>(server: &Server, reader: R, mut writer: W) -> std::io::Result<()> {
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+///
+/// The loop is resilient to a faulty peer: a frame that is not valid UTF-8 or
+/// exceeds [`MAX_FRAME_SIZE`] is answered with a `-32700` error and skipped —
+/// one bad byte never terminates the server, and memory per frame is bounded
+/// regardless of what the client sends.
+pub fn run<R: BufRead, W: Write>(server: &Server, reader: R, writer: W) -> std::io::Result<()> {
+    run_with_limit(server, reader, writer, MAX_FRAME_SIZE)
+}
+
+/// Like [`run`], with an explicit frame-size limit (tests use a small one).
+pub fn run_with_limit<R: BufRead, W: Write>(
+    server: &Server,
+    mut reader: R,
+    mut writer: W,
+    max_frame_size: usize,
+) -> std::io::Result<()> {
+    let mut frame: Vec<u8> = Vec::with_capacity(4096);
+    'frames: loop {
+        frame.clear();
+        let mut overflow = false;
+        let mut eof = false;
+        // Read one line incrementally so an oversized frame is discarded as it
+        // streams in rather than buffered whole.
+        loop {
+            let available = match reader.fill_buf() {
+                Ok(b) => b,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if available.is_empty() {
+                eof = true;
+                break;
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    if !overflow {
+                        if frame.len() + i > max_frame_size {
+                            overflow = true;
+                            frame.clear();
+                        } else {
+                            frame.extend_from_slice(&available[..i]);
+                        }
+                    }
+                    reader.consume(i + 1);
+                    break;
+                }
+                None => {
+                    if !overflow && frame.len() + available.len() > max_frame_size {
+                        overflow = true;
+                        frame.clear();
+                    }
+                    if !overflow {
+                        frame.extend_from_slice(available);
+                    }
+                    let n = available.len();
+                    reader.consume(n);
+                }
+            }
+        }
+        if eof && frame.is_empty() && !overflow {
+            return Ok(());
+        }
+
+        let respond = |writer: &mut W, resp: Json| -> std::io::Result<()> {
+            writeln!(writer, "{resp}")?;
+            writer.flush()
+        };
+
+        if overflow {
+            respond(
+                &mut writer,
+                error_response(Json::Null, -32700, "frame exceeds maximum size"),
+            )?;
+            continue 'frames;
+        }
+        while matches!(frame.last(), Some(b'\n') | Some(b'\r')) {
+            frame.pop();
+        }
+        if frame.iter().all(|b| b.is_ascii_whitespace()) {
             continue;
         }
-        let response = match serde_json::from_str::<Json>(&line) {
-            Ok(req) => handle_request(server, &req),
-            Err(_) => Some(error_response(Json::Null, -32700, "parse error")),
+        let response = match std::str::from_utf8(&frame) {
+            Ok(text) => match serde_json::from_str::<Json>(text) {
+                Ok(req) => handle_request(server, &req),
+                Err(_) => Some(error_response(Json::Null, -32700, "parse error")),
+            },
+            Err(_) => Some(error_response(Json::Null, -32700, "frame is not valid utf-8")),
         };
         if let Some(resp) = response {
-            writeln!(writer, "{resp}")?;
-            writer.flush()?;
+            respond(&mut writer, resp)?;
         }
     }
-    Ok(())
 }
 
 /// Handle one parsed JSON-RPC request, returning its response, or `None` for
@@ -170,7 +250,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "search",
-                "description": "Hybrid search: filter + vector + text, fused, optionally MMR-reranked.",
+                "description": "Hybrid search: filter + vector + text, fused, optionally MMR-reranked. Result cap: 100 rows by default; explicit 'limit' accepted up to 10000."
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -308,7 +388,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "page",
-                "description": "Keyset pagination in key order: up to 'limit' rows with key after the 'after' cursor (optional 'filter'). Returns {rows, next} where next is the cursor for the following page (null at end).",
+                "description": "Keyset pagination in key order: up to 'limit' rows with key after the 'after' cursor (optional 'filter'). Returns {rows, next} where next is the cursor for the following page (null at end). 'limit' is capped at 10000 (default 1000)."
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -322,7 +402,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "phrase_search",
-                "description": "Find documents whose field text contains an exact phrase (consecutive in-order tokens). Returns ranked {key, score, document}.",
+                "description": "Find documents whose field text contains an exact phrase (consecutive in-order tokens). Returns ranked {key, score, document}. 'k' is capped at 10000."
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -668,6 +748,50 @@ mod tests {
         let mut out = Vec::new();
         run(&s, Cursor::new(input.into_bytes()), &mut out).unwrap();
         assert!(out.is_empty());
+    }
+
+    /// A frame of invalid UTF-8 must produce a parse error and *not* kill the
+    /// loop — the next (valid) request still gets served.
+    #[test]
+    fn run_loop_survives_invalid_utf8_frames() {
+        let s = server();
+        let mut input = b"\xff\xfe\xf9 bad bytes\n".to_vec();
+        input.extend_from_slice(
+            format!("{}\n", json!({"jsonrpc":"2.0","id":1,"method":"ping"})).as_bytes(),
+        );
+        let mut out = Vec::new();
+        run(&s, Cursor::new(input), &mut out).unwrap();
+        let lines: Vec<Json> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["error"]["code"], -32700);
+        assert_eq!(lines[1]["id"], 1); // the ping was answered
+    }
+
+    /// A frame larger than the limit is refused and skipped; memory stays
+    /// bounded and the connection continues.
+    #[test]
+    fn run_loop_rejects_oversized_frames() {
+        let s = server();
+        let giant = vec![b'a'; 4096]; // over a deliberately tiny limit
+        let mut input = giant;
+        input.push(b'\n');
+        input.extend_from_slice(
+            format!("{}\n", json!({"jsonrpc":"2.0","id":7,"method":"ping"})).as_bytes(),
+        );
+        let mut out = Vec::new();
+        run_with_limit(&s, Cursor::new(input), &mut out, 1024).unwrap();
+        let lines: Vec<Json> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["error"]["code"], -32700);
+        assert_eq!(lines[1]["id"], 7);
     }
 
     #[test]

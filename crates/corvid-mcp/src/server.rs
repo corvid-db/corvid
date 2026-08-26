@@ -123,7 +123,7 @@ impl Server {
 
     fn page(&self, p: &Json) -> Result<Json, ToolError> {
         let collection = str_param(p, "collection")?;
-        let limit = uint_param(p, "limit")?;
+        let limit = search_or_page_limit(p, DEFAULT_LIST_LIMIT)?;
         let after = p.get("after").and_then(Json::as_str);
         let after_bytes = after.map(str::as_bytes);
         let handle = self.db.collection(collection);
@@ -151,7 +151,7 @@ impl Server {
         let collection = str_param(p, "collection")?;
         let field = str_param(p, "field")?;
         let phrase = str_param(p, "phrase")?;
-        let k = uint_param(p, "k")?;
+        let k = bounded_limit(p, "k")?;
         let hits = self
             .db
             .collection(collection)
@@ -206,14 +206,14 @@ impl Server {
         if let Some(v) = p.get("vector") {
             let vfield = str_param(v, "field")?;
             let query = f32_array(v.get("query"))?;
-            let k = uint_param(v, "k")?;
+            let k = bounded_limit(v, "k")?;
             let metric = parse_metric(v.get("metric"))?;
             q = q.vector(vfield, query, k, metric);
         }
         if let Some(t) = p.get("text") {
             let tfield = str_param(t, "field")?;
             let query = str_param(t, "query")?;
-            let k = uint_param(t, "k")?;
+            let k = bounded_limit(t, "k")?;
             q = q.text(tfield, query, k);
         }
         if let Some(m) = p.get("mmr") {
@@ -245,12 +245,10 @@ impl Server {
             }
             q = q.select(fields);
         }
-        if let Some(l) = p.get("limit") {
-            let n = l.as_u64().ok_or_else(|| {
-                ToolError::BadParams("'limit' must be a non-negative integer".into())
-            })?;
-            q = q.limit(n as usize);
-        }
+        // Default result cap: an absent `limit` must not serialize the whole
+        // collection into one response.
+        let limit = search_or_page_limit(p, DEFAULT_SEARCH_LIMIT)?;
+        q = q.limit(limit);
 
         let rows = q.run()?;
         let results: Vec<Json> = rows
@@ -602,12 +600,52 @@ fn str_param<'a>(p: &'a Json, key: &str) -> Result<&'a str, ToolError> {
 /// unbounded payload. Overridable per call via a `limit` param.
 const DEFAULT_LIST_LIMIT: usize = 1000;
 
-/// The result cap for a list-returning tool: the `limit` param, or the default.
+/// Default row cap for `search` when the call supplies no `limit` — the tool
+/// surface promises default result caps, and an uncapped search would
+/// serialize an entire collection into one response.
+const DEFAULT_SEARCH_LIMIT: usize = 100;
+
+/// Hard ceiling for any caller-supplied result count (`limit`/`k`), so a
+/// single tool call can never demand unbounded work or memory.
+const MAX_RESULT_LIMIT: usize = 10_000;
+
+/// The result cap for a list-returning tool: the `limit` param (clamped to
+/// [`MAX_RESULT_LIMIT`]), or the default.
 fn result_limit(p: &Json) -> usize {
     p.get("limit")
         .and_then(Json::as_u64)
-        .map(|n| n as usize)
+        .map(|n| (n as usize).min(MAX_RESULT_LIMIT))
         .unwrap_or(DEFAULT_LIST_LIMIT)
+}
+
+/// A caller-supplied result count that must be present and within bounds.
+fn bounded_limit(p: &Json, key: &str) -> Result<usize, ToolError> {
+    let n = uint_param(p, key)?;
+    if n > MAX_RESULT_LIMIT {
+        return Err(ToolError::BadParams(format!(
+            "'{key}' exceeds the maximum of {MAX_RESULT_LIMIT}"
+        )));
+    }
+    Ok(n)
+}
+
+/// The `limit` param for a row-returning tool: explicit and bounded, or the
+/// given default when absent.
+fn search_or_page_limit(p: &Json, default: usize) -> Result<usize, ToolError> {
+    match p.get("limit") {
+        Some(l) => {
+            let n = l.as_u64().ok_or_else(|| {
+                ToolError::BadParams("'limit' must be a non-negative integer".into())
+            })?;
+            if n > MAX_RESULT_LIMIT as u64 {
+                return Err(ToolError::BadParams(format!(
+                    "'limit' exceeds the maximum of {MAX_RESULT_LIMIT}"
+                )));
+            }
+            Ok(n as usize)
+        }
+        None => Ok(default),
+    }
 }
 
 fn uint_param(p: &Json, key: &str) -> Result<usize, ToolError> {
@@ -1223,6 +1261,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out["results"][0]["key"], "a");
+    }
+
+    #[test]
+    /// Regression: `search` previously had *no* default cap — one call would
+    /// serialize an entire collection into a single response.
+    #[test]
+    fn search_has_a_default_result_cap() {
+        let s = server();
+        for i in 0..250u32 {
+            s.handle(
+                "store",
+                &json!({"collection": "big", "key": format!("k{i:04}"), "document": {"n": i}}),
+            )
+            .unwrap();
+        }
+        let out = s.handle("search", &json!({"collection": "big"})).unwrap();
+        assert_eq!(
+            out["results"].as_array().unwrap().len(),
+            DEFAULT_SEARCH_LIMIT
+        );
+        // An explicit limit is still honored.
+        let out = s
+            .handle("search", &json!({"collection": "big", "limit": 10}))
+            .unwrap();
+        assert_eq!(out["results"].as_array().unwrap().len(), 10);
+    }
+
+    /// Caller-supplied counts are capped: oversized limits are rejected
+    /// instead of demanding unbounded work.
+    #[test]
+    fn oversized_result_counts_are_rejected() {
+        let s = server();
+        let over = MAX_RESULT_LIMIT as u64 + 1;
+        let err = s
+            .handle(
+                "search",
+                &json!({"collection": "c", "limit": over}),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("maximum"));
+        let err = s
+            .handle(
+                "phrase_search",
+                &json!({"collection": "c", "field": "body", "phrase": "x", "k": over}),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("maximum"));
+        let err = s
+            .handle(
+                "page",
+                &json!({"collection": "c", "limit": over}),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("maximum"));
+        let err = s
+            .handle(
+                "search",
+                &json!({"collection": "c", "vector": {"field": "v", "query": [1.0], "k": over}}),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("maximum"));
     }
 
     #[test]
