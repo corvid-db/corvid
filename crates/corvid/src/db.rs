@@ -395,7 +395,12 @@ impl Collection<'_> {
     }
 
     /// Remove the document at `key`. Returns whether one was removed.
+    ///
+    /// Like every other write path, this rejects engine-reserved collection
+    /// names — internal state (graph edges, index namespaces, TTL entries) can
+    /// only be modified through the APIs that own it.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
+        self.ensure_writable()?;
         let removed = self.db.store().delete(self.name, key)?;
         if removed {
             self.db.maintain_delete(self.name, key)?;
@@ -910,6 +915,20 @@ mod tests {
         assert!(matches!(err, Err(crate::Error::ReservedCollection(_))));
         // A normal collection is fine.
         assert!(db.collection("docs").insert(b"k", &Value::Int(1)).is_ok());
+    }
+
+    #[test]
+    fn reserved_collection_names_are_rejected_on_delete() {
+        let db = Db::open_in_memory().unwrap();
+        // Seed a real internal namespace, then try to bypass its owner.
+        db.collection("docs").link(b"a", "r", b"b").unwrap();
+        let err = db.collection("__edges__docs").delete(b"whatever");
+        assert!(matches!(err, Err(crate::Error::ReservedCollection(_))));
+        // The edge itself is untouched.
+        assert_eq!(
+            db.collection("docs").neighbors(b"a", "r").unwrap(),
+            vec![b"b".to_vec()]
+        );
     }
 
     #[test]

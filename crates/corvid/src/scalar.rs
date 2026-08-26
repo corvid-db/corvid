@@ -84,7 +84,13 @@ fn encode_value(v: &Value) -> Option<Vec<u8>> {
 }
 
 /// IEEE-754 total-order encoding of an `f64` as 8 big-endian bytes.
+///
+/// `-0.0` is canonicalized to `+0.0`: the predicate layer treats the two as
+/// equal (`-0.0 == 0.0`, and `partial_cmp` says `Equal`), so they must share
+/// one index key — otherwise an equality/range window anchored at either
+/// zero would silently exclude documents storing the other.
 fn num_payload(f: f64) -> Vec<u8> {
+    let f = if f == 0.0 { 0.0 } else { f };
     let bits = f.to_bits();
     // Flip all bits for negatives, just the sign bit for non-negatives, so the
     // unsigned big-endian order matches numeric order.
@@ -789,6 +795,47 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("n".to_owned(), Value::Int(n));
         Value::Map(m)
+    }
+
+    fn float_doc(x: f64) -> Value {
+        let mut m = BTreeMap::new();
+        m.insert("x".to_owned(), Value::Float(x));
+        Value::Map(m)
+    }
+
+    /// Regression: `-0.0` and `+0.0` are equal to the predicate layer, so the
+    /// index must not split them into two keys (a window anchored at either
+    /// zero used to exclude documents storing the other).
+    #[test]
+    fn negative_zero_is_visible_to_zero_anchored_windows() {
+        use crate::field;
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"neg", &float_doc(-0.0)).unwrap();
+        c.insert(b"pos", &float_doc(0.0)).unwrap();
+        c.create_scalar_index("x").unwrap();
+
+        let count = |p: crate::Predicate| {
+            c.query().filter(p).run().unwrap().len()
+        };
+        assert_eq!(count(field("x").eq(Value::Float(0.0))), 2);
+        assert_eq!(count(field("x").eq(Value::Float(-0.0))), 2);
+        assert_eq!(count(field("x").ge(Value::Int(0))), 2);
+        assert_eq!(count(field("x").ge(Value::Float(-0.0))), 2);
+        assert_eq!(count(field("x").le(Value::Float(-0.0))), 2);
+        // And a scan-only database agrees.
+        let plain = Db::open_in_memory().unwrap();
+        let pc = plain.collection("docs");
+        pc.insert(b"neg", &float_doc(-0.0)).unwrap();
+        pc.insert(b"pos", &float_doc(0.0)).unwrap();
+        assert_eq!(
+            pc.query()
+                .filter(field("x").eq(Value::Float(0.0)))
+                .run()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

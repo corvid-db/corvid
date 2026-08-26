@@ -72,6 +72,12 @@ pub enum Error {
     #[error("invalid dump: {0}")]
     InvalidDump(String),
 
+    /// The backup target path already exists. Backing up would silently
+    /// merge into the old file (redb opens-or-creates), so an existing target
+    /// is refused instead.
+    #[error("backup target already exists: {0}")]
+    BackupTargetExists(String),
+
     /// An I/O error reading or writing a dump stream.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

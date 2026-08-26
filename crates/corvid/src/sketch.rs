@@ -139,7 +139,7 @@ impl Collection<'_> {
     pub fn approx_distinct(&self, field: &str) -> Result<u64> {
         let mut hll = HyperLogLog::new();
         self.for_each_doc(|_, doc| {
-            if let Some(v) = doc.get(field) {
+            if let Some(v) = doc.get_path(field) {
                 hll.add_bytes(&v.encode());
             }
             Ok(true)

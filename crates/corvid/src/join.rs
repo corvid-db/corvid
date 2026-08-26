@@ -35,7 +35,7 @@ impl Collection<'_> {
         self.db().store().read(|reader| {
             let mut rows = Vec::with_capacity(left.len());
             for (key, left_doc) in left {
-                let foreign_key = match left_doc.get(foreign_key_field) {
+                let foreign_key = match left_doc.get_path(foreign_key_field) {
                     Some(Value::Text(s)) => Some(s.clone().into_bytes()),
                     Some(Value::Bytes(b)) => Some(b.clone()),
                     Some(Value::Int(i)) => Some(i.to_string().into_bytes()),

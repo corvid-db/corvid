@@ -188,7 +188,10 @@ impl Collection<'_> {
     }
 
     /// Set or replace `key`'s expiry without rewriting the document.
+    ///
+    /// Rejects engine-reserved collection names, like every write path.
     pub fn set_ttl(&self, key: &[u8], expires_at: i64) -> Result<()> {
+        self.ensure_writable()?;
         self.db().set_ttl(self.name(), key, expires_at)
     }
 
@@ -200,6 +203,7 @@ impl Collection<'_> {
     /// Delete every record whose expiry is `<= now`; returns the count purged.
     /// `now` is supplied by the caller (the engine keeps no clock).
     pub fn purge_expired(&self, now: i64) -> Result<usize> {
+        self.ensure_writable()?;
         self.db().purge_expired(self.name(), now)
     }
 }
@@ -308,5 +312,19 @@ mod tests {
         assert_eq!(c.purge_expired(0).unwrap(), 1);
         assert_eq!(c.get(b"neg").unwrap(), None);
         assert_eq!(c.get(b"big").unwrap(), Some(rec(2)));
+    }
+
+    #[test]
+    fn reserved_collection_names_are_rejected() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("__ttl__docs");
+        assert!(matches!(
+            c.set_ttl(b"a", 100),
+            Err(crate::Error::ReservedCollection(_))
+        ));
+        assert!(matches!(
+            c.purge_expired(100),
+            Err(crate::Error::ReservedCollection(_))
+        ));
     }
 }

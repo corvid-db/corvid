@@ -108,6 +108,11 @@ impl Predicate {
     /// A comparison whose path is missing is `false`. Ordered comparisons
     /// between values that are not order-comparable (different or unordered
     /// types) are also `false`. Use [`Predicate::Exists`] for presence.
+    ///
+    /// Equality (`eq`/`ne`/`is_in`) compares numbers across `Int`/`Float`
+    /// numerically — matching the ordered comparisons, the scalar index's
+    /// shared numeric lane, and JSON clients for which "2" and "2.0" are the
+    /// same value. Non-numeric kinds use structural equality.
     pub fn eval(&self, doc: &Value) -> bool {
         match self {
             Predicate::Compare { path, op, value } => match resolve(doc, path) {
@@ -116,7 +121,10 @@ impl Predicate {
             },
             Predicate::Exists(path) => resolve(doc, path).is_some(),
             Predicate::In { path, values } => {
-                matches!(resolve(doc, path), Some(found) if values.contains(found))
+                matches!(
+                    resolve(doc, path),
+                    Some(found) if values.iter().any(|v| values_equal(found, v))
+                )
             }
             Predicate::Between { path, low, high } => match resolve(doc, path) {
                 Some(v) => compare(v, CmpOp::Ge, low) && compare(v, CmpOp::Le, high),
@@ -260,8 +268,8 @@ fn resolve<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
 /// Apply a comparison operator between a found value and a constant.
 fn compare(found: &Value, op: CmpOp, rhs: &Value) -> bool {
     match op {
-        CmpOp::Eq => found == rhs,
-        CmpOp::Ne => found != rhs,
+        CmpOp::Eq => values_equal(found, rhs),
+        CmpOp::Ne => !values_equal(found, rhs),
         CmpOp::Lt => value_order(found, rhs) == Some(Ordering::Less),
         CmpOp::Le => matches!(
             value_order(found, rhs),
@@ -272,6 +280,19 @@ fn compare(found: &Value, op: CmpOp, rhs: &Value) -> bool {
             value_order(found, rhs),
             Some(Ordering::Greater | Ordering::Equal)
         ),
+    }
+}
+
+/// Equality with numeric interop: `Int(2)` equals `Float(2.0)` (matching
+/// `value_order` and the scalar index's numeric lane); everything else is
+/// structural. NaN never equals anything.
+fn values_equal(a: &Value, b: &Value) -> bool {
+    if matches!(a, Value::Int(_) | Value::Float(_))
+        && matches!(b, Value::Int(_) | Value::Float(_))
+    {
+        value_order(a, b) == Some(Ordering::Equal)
+    } else {
+        a == b
     }
 }
 
@@ -338,6 +359,26 @@ mod tests {
     fn numeric_int_float_interop() {
         assert!(field("score").gt(Value::Float(6.5)).eval(&doc()));
         assert!(field("ratio").lt(Value::Int(1)).eval(&doc()));
+    }
+
+    /// Regression: equality must interoperate across Int/Float like the
+    /// ordered comparisons and the scalar index's shared numeric lane —
+    /// `eq(Float(7.0))` used to miss a stored `Int(7)`.
+    #[test]
+    fn equality_interops_int_and_float() {
+        // doc() has score = Int(7), ratio = Float(0.5).
+        assert!(field("score").eq(Value::Float(7.0)).eval(&doc()));
+        assert!(field("ratio").eq(Value::Float(0.5)).eval(&doc()));
+        assert!(field("ratio").ne(Value::Int(1)).eval(&doc()));
+        assert!(field("score").is_in([Value::Float(7.0)]).eval(&doc()));
+        // Non-numerics stay structural.
+        assert!(!field("category").eq(Value::Int(0)).eval(&doc()));
+        // NaN never equals anything.
+        let mut m = BTreeMap::new();
+        m.insert("x".to_owned(), Value::Float(f64::NAN));
+        let nan_doc = Value::Map(m);
+        assert!(!field("x").eq(Value::Float(f64::NAN)).eval(&nan_doc));
+        assert!(field("x").ne(Value::Int(0)).eval(&nan_doc));
     }
 
     #[test]

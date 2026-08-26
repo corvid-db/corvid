@@ -63,6 +63,7 @@ impl Collection<'_> {
     /// Remove the edge `from --relation--> to` (and its reverse), atomically.
     /// Returns whether the forward edge existed.
     pub fn unlink(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<bool> {
+        self.ensure_writable()?;
         let (forward, reverse) = (self.edges_name(), self.redges_name());
         let (fwd_key, rev_key) = (edge_key(relation, from, to), edge_key(relation, to, from));
         self.db().store().transaction(|tx| {
@@ -193,6 +194,16 @@ mod tests {
         c.link(b"a", "r", b"b").unwrap();
         c.link(b"a", "r", b"b").unwrap();
         assert_eq!(c.neighbors(b"a", "r").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unlink_on_reserved_collection_is_rejected() {
+        let db = Db::open_in_memory().unwrap();
+        // The edge namespace itself must not be writable through the public API.
+        let err = db
+            .collection("__edges__nodes")
+            .unlink(b"a", "r", b"b");
+        assert!(matches!(err, Err(crate::Error::ReservedCollection(_))));
     }
 
     #[test]

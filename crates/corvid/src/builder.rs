@@ -1031,12 +1031,18 @@ impl QueryBuilder<'_> {
 }
 
 /// A canonical group key for a scalar value, or `None` for containers/null.
+///
+/// Keys are tagged by kind (`s:`, `i:`, `f:`, `b:`) so distinct types never
+/// collapse into one group — without the tag, `Text("1")`, `Int(1)`, and
+/// `Float(1.0)` all serialized to `"1"` and undercounted `count_distinct`.
+/// `-0.0` and `+0.0` share a group (they are numerically equal); NaN groups
+/// separately as `f:NaN`.
 fn group_key(v: &Value) -> Option<String> {
     match v {
-        Value::Text(s) => Some(s.clone()),
-        Value::Int(i) => Some(i.to_string()),
-        Value::Float(f) => Some(f.to_string()),
-        Value::Bool(b) => Some(b.to_string()),
+        Value::Text(s) => Some(format!("s:{s}")),
+        Value::Int(i) => Some(format!("i:{i}")),
+        Value::Float(f) => Some(format!("f:{}", if *f == 0.0 { 0.0 } else { *f })),
+        Value::Bool(b) => Some(format!("b:{b}")),
         _ => None,
     }
 }
@@ -1757,12 +1763,12 @@ mod tests {
 
         // Grouped.
         let gs = c.query().group_sum("cat", "n").unwrap();
-        assert_eq!(gs.get("a"), Some(&30.0));
-        assert_eq!(gs.get("b"), Some(&70.0));
-        assert_eq!(gs.get("c"), Some(&5.0));
+        assert_eq!(gs.get("s:a"), Some(&30.0));
+        assert_eq!(gs.get("s:b"), Some(&70.0));
+        assert_eq!(gs.get("s:c"), Some(&5.0));
         let ga = c.query().group_avg("cat", "n").unwrap();
-        assert_eq!(ga.get("a"), Some(&15.0));
-        assert_eq!(ga.get("b"), Some(&35.0));
+        assert_eq!(ga.get("s:a"), Some(&15.0));
+        assert_eq!(ga.get("s:b"), Some(&35.0));
     }
 
     #[test]
@@ -1810,8 +1816,8 @@ mod tests {
             .query()
             .group_count("category")
             .unwrap();
-        assert_eq!(groups.get("blog"), Some(&2));
-        assert_eq!(groups.get("news"), Some(&1));
+        assert_eq!(groups.get("s:blog"), Some(&2));
+        assert_eq!(groups.get("s:news"), Some(&1));
     }
 
     #[test]
@@ -1822,7 +1828,7 @@ mod tests {
         c.insert(b"b", &Value::Int(5)).unwrap(); // no "category" field
         let groups = c.query().group_count("category").unwrap();
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups.get("blog"), Some(&1));
+        assert_eq!(groups.get("s:blog"), Some(&1));
     }
 
     #[test]
@@ -1835,7 +1841,39 @@ mod tests {
             .group_count("category")
             .unwrap();
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups.get("blog"), Some(&2));
+        assert_eq!(groups.get("s:blog"), Some(&2));
+    }
+
+    /// Regression: distinct types must not collapse into one group
+    /// (`Text("1")` / `Int(1)` / `Float(1.0)` used to all serialize to "1"),
+    /// and `-0.0` shares a group with `+0.0`.
+    #[test]
+    fn group_keys_are_typed_so_distinct_types_stay_distinct() {
+        use crate::Value;
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for (i, v) in [
+            Value::Text("1".into()),
+            Value::Int(1),
+            Value::Float(1.0),
+            Value::Float(-0.0),
+            Value::Float(0.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut m = BTreeMap::new();
+            m.insert("v".to_owned(), v);
+            c.insert(&[i as u8], &Value::Map(m)).unwrap();
+        }
+        let groups = c.query().group_count("v").unwrap();
+        assert_eq!(groups.get("s:1"), Some(&1));
+        assert_eq!(groups.get("i:1"), Some(&1));
+        assert_eq!(groups.get("f:1"), Some(&1));
+        assert_eq!(groups.get("f:0"), Some(&2)); // -0.0 == 0.0 for grouping
+        assert_eq!(groups.len(), 4);
+        // count_distinct agrees.
+        assert_eq!(c.query().count_distinct("v").unwrap(), 4);
     }
 
     #[test]

@@ -72,7 +72,7 @@ impl Collection<'_> {
 
         let mut hits: Vec<GeoHit> = Vec::new();
         for (key, document) in scanned {
-            if let Some((plat, plon)) = document.get(field).and_then(extract_point) {
+            if let Some((plat, plon)) = document.get_path(field).and_then(extract_point) {
                 let distance_km = haversine_km(lat, lon, plat, plon);
                 if distance_km <= radius_km {
                     hits.push(GeoHit {
@@ -154,7 +154,7 @@ impl Collection<'_> {
         let scanned = self.geo_scan_set(field, Some((min_lat, min_lon, max_lat, max_lon)))?;
         let mut out = Vec::new();
         for (key, document) in scanned {
-            if let Some((lat, lon)) = document.get(field).and_then(extract_point)
+            if let Some((lat, lon)) = document.get_path(field).and_then(extract_point)
                 && (min_lat..=max_lat).contains(&lat)
                 && (min_lon..=max_lon).contains(&lon)
             {
@@ -243,6 +243,57 @@ mod tests {
         let keys: Vec<_> = hits.iter().map(|h| h.key.clone()).collect();
         assert_eq!(keys, vec![b"london".to_vec(), b"greenwich".to_vec()]);
         assert!(hits[0].distance_km <= hits[1].distance_km);
+    }
+
+    /// Regression: with a geo index present, a match poleward of the center
+    /// (where the circle's longitude extent is widest) must still be found.
+    /// The old bbox used `δ / cos(center_lat)` and silently dropped it.
+    #[test]
+    fn indexed_within_radius_finds_poleward_match() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("places");
+        c.insert(b"poleish", &place("poleish", 62.0, 78.0)).unwrap();
+        c.create_geo_index("loc").unwrap();
+        let hits = c.geo_within_radius("loc", 60.0, 60.0, 1000.0).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.key.clone()).collect::<Vec<_>>(),
+            vec![b"poleish".to_vec()]
+        );
+    }
+
+    /// Nested fields must behave identically whether or not an index exists
+    /// (index maintenance resolves dotted paths, so verification must too).
+    #[test]
+    fn nested_field_geo_matches_indexed_and_not() {
+        fn nested(lat: f64, lon: f64) -> Value {
+            let mut loc = BTreeMap::new();
+            loc.insert("lat".to_owned(), Value::Float(lat));
+            loc.insert("lon".to_owned(), Value::Float(lon));
+            let mut meta = BTreeMap::new();
+            meta.insert("loc".to_owned(), Value::Map(loc));
+            let mut m = BTreeMap::new();
+            m.insert("meta".to_owned(), Value::Map(meta));
+            Value::Map(m)
+        }
+        let plain = Db::open_in_memory().unwrap();
+        let pc = plain.collection("places");
+        pc.insert(b"a", &nested(51.5, -0.1)).unwrap();
+        let indexed = Db::open_in_memory().unwrap();
+        let ic = indexed.collection("places");
+        ic.insert(b"a", &nested(51.5, -0.1)).unwrap();
+        ic.create_geo_index("meta.loc").unwrap();
+        for (label, db) in [("plain", &plain), ("indexed", &indexed)] {
+            let hits = db
+                .collection("places")
+                .geo_within_radius("meta.loc", 51.5, -0.1, 10.0)
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{label}: db-level geo must resolve nested paths");
+            let rows = db
+                .collection("places")
+                .geo_within_bbox("meta.loc", 51.0, -1.0, 52.0, 1.0)
+                .unwrap();
+            assert_eq!(rows.len(), 1, "{label}: bbox must resolve nested paths");
+        }
     }
 
     #[test]

@@ -154,10 +154,19 @@ impl Store {
     ///
     /// The copy is taken from one read snapshot, so it is point-in-time
     /// consistent and safe to call while writers are active (a concurrent
-    /// commit simply isn't included). `path` must not already exist as a redb
-    /// file you care about — it is created/overwritten. The result is a
-    /// complete, independent database openable with [`Store::open`].
+    /// commit simply isn't included). The target must not already exist:
+    /// redb opens-or-creates, so writing over a previous backup would
+    /// *merge* into it (resurrecting deleted records) rather than replace
+    /// it — an existing path is refused with
+    /// [`crate::Error::BackupTargetExists`]. The result is a complete,
+    /// independent database openable with [`Store::open`].
     pub fn backup(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if path.exists() {
+            return Err(crate::Error::BackupTargetExists(
+                path.display().to_string(),
+            ));
+        }
         let src = self.db.begin_read()?;
         let dst = Database::create(path)?;
         let wtx = dst.begin_write()?;
@@ -617,6 +626,29 @@ mod tests {
         mem().backup(&bak).unwrap();
         let b = Store::open(&bak).unwrap();
         assert_eq!(b.get("docs", b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn backup_refuses_existing_target_instead_of_merging() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("src.db");
+        let bak = dir.path().join("bak.db");
+        {
+            let s = Store::open(&src_path).unwrap();
+            s.put("docs", b"a", b"v1").unwrap();
+            s.backup(&bak).unwrap();
+            // Delete after the first backup; a merged second copy would
+            // resurrect the record.
+            s.delete("docs", b"a").unwrap();
+        }
+        let s = Store::open(&src_path).unwrap();
+        assert!(matches!(
+            s.backup(&bak),
+            Err(crate::Error::BackupTargetExists(_))
+        ));
+        // The old backup is untouched by the refused attempt.
+        let b = Store::open(&bak).unwrap();
+        assert_eq!(b.get("docs", b"a").unwrap(), Some(b"v1".to_vec()));
     }
 
     #[test]

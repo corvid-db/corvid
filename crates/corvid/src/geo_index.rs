@@ -200,18 +200,33 @@ fn next_after(key: &[u8]) -> Vec<u8> {
 /// Bounding box (degrees) of a `radius_km` circle around `(lat, lon)`.
 /// Returns `None` if the box would wrap the antimeridian or cover all
 /// longitudes (caller falls back to a scan — still correct).
+///
+/// The longitude half-width uses the exact spherical bound
+/// `Δλ = asin(sin δ / cos φ)` (δ = angular radius): a circle's maximal
+/// longitude excursion is reached poleward of the center, where parallels
+/// shorten, so the naive `δ / cos φ` linear form underestimates the box and
+/// silently drops matching documents.
 pub(crate) fn radius_bbox(lat: f64, lon: f64, radius_km: f64) -> Option<(f64, f64, f64, f64)> {
     const KM_PER_DEG_LAT: f64 = 110.574;
-    const KM_PER_DEG_LON_EQ: f64 = 111.320;
     let dlat = radius_km / KM_PER_DEG_LAT;
-    let cos = lat.to_radians().cos();
-    if cos.abs() < 1e-6 {
-        return None; // near a pole: longitude band is unbounded
+    // A circle a quarter-circumference or more in radius reaches every
+    // longitude (and wraps the globe); the asin bound below is only valid
+    // for smaller radii.
+    if dlat >= 90.0 {
+        return None;
     }
-    let dlon = radius_km / (KM_PER_DEG_LON_EQ * cos);
-    if dlon >= 180.0 {
-        return None; // spans all longitudes
+    let ang_rad = dlat.to_radians();
+    let lat_rad = lat.to_radians();
+    let cos_lat = lat_rad.cos();
+    // Near-pole centers (or |lat| = 90) have an unbounded longitude band.
+    if !cos_lat.is_finite() || cos_lat.abs() < 1e-12 {
+        return None;
     }
+    let s = ang_rad.sin() / cos_lat;
+    if !s.is_finite() || s.abs() >= 1.0 {
+        return None; // circle reaches every longitude
+    }
+    let dlon = s.asin().to_degrees();
     let (min_lon, max_lon) = (lon - dlon, lon + dlon);
     if min_lon < -180.0 || max_lon > 180.0 {
         return None; // antimeridian wrap
@@ -379,6 +394,26 @@ mod tests {
     fn radius_bbox_falls_back_near_pole_and_large() {
         assert!(radius_bbox(89.9999, 0.0, 50.0).is_none());
         assert!(radius_bbox(0.0, 0.0, 50_000.0).is_none());
+    }
+
+    /// Regression: the longitude extent must be governed by the poleward
+    /// reach of the circle, not the center parallel. Center (60°, 60°),
+    /// r = 1000 km — the point (62°, 78°) is 992 km away (a match), but its
+    /// longitude exceeds the naive `δ / cos(center)` box.
+    #[test]
+    fn radius_bbox_covers_poleward_longitude_extent() {
+        let (mn_lat, mn_lon, mx_lat, mx_lon) = radius_bbox(60.0, 60.0, 1000.0).unwrap();
+        // Exact bound: asin(sin δ / cos φ).
+        let dlat: f64 = 1000.0 / 110.574;
+        let expected_dlon =
+            (dlat.to_radians().sin() / 60.0f64.to_radians().cos()).asin().to_degrees();
+        assert!((mx_lon - (60.0 + expected_dlon)).abs() < 1e-9);
+        assert!((mn_lon - (60.0 - expected_dlon)).abs() < 1e-9);
+        // The previously-dropped match now lies inside the box...
+        assert!(mn_lat <= 62.0 && 62.0 <= mx_lat);
+        assert!(mn_lon <= 78.0 && 78.0 <= mx_lon);
+        // ...and is genuinely within the radius.
+        assert!(crate::geo::haversine_km(60.0, 60.0, 62.0, 78.0) <= 1000.0);
     }
 
     #[test]
