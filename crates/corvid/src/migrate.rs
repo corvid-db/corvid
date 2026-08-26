@@ -2,14 +2,15 @@
 //!
 //! The on-disk storage format may break before v1.0 (per project policy: no
 //! backward-compat shims). [`Db::dump`] writes a *logical*, version-stamped
-//! export — every user collection's documents plus all index, schema, and TTL
-//! definitions — and [`Db::load`] replays it into a fresh database. A format
-//! break is migrated by `dump` from the old binary and `load` into the new one.
+//! export — every user collection's documents, all index/schema/TTL
+//! definitions, the graph edges, and the auto-key counters — and [`Db::load`]
+//! replays it into a fresh database. A format break is migrated by `dump`
+//! from the old binary and `load` into the new one.
 //!
 //! The dump is independent of the redb layout and the reserved-collection
-//! encodings (which are what change); document *values* use the [`Value`] codec,
-//! and indexes are *recreated* (rebuilt from the loaded documents) rather than
-//! copying their derived internal state.
+//! encodings (which are what change); document *values* use the [`Value`]
+//! codec, and indexes are *recreated* (rebuilt from the loaded documents)
+//! rather than copying their derived internal state.
 
 use std::io::{Read, Write};
 
@@ -32,6 +33,9 @@ fn put_u64(out: &mut Vec<u8>, n: usize) {
 }
 fn put_i64(out: &mut Vec<u8>, n: i64) {
     out.extend_from_slice(&n.to_le_bytes());
+}
+fn put_f64(out: &mut Vec<u8>, n: f64) {
+    out.extend_from_slice(&n.to_bits().to_le_bytes());
 }
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_u32(out, b.len());
@@ -69,6 +73,14 @@ impl<'a> Reader<'a> {
     }
     fn i64(&mut self) -> Result<i64> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn f64(&mut self) -> Result<f64> {
+        Ok(f64::from_bits(u64::from_le_bytes(
+            self.take(8)?.try_into().unwrap(),
+        )))
+    }
+    fn u64_raw(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
     fn bytes(&mut self) -> Result<Vec<u8>> {
         let n = self.u32()?;
@@ -212,6 +224,26 @@ impl Db {
             put_i64(&mut buf, *expiry);
         }
 
+        // Auto-id counters, so `insert_auto` never re-issues a used key after
+        // a dump→load cycle.
+        let autos = self.store().auto_id_snapshot()?;
+        put_u64(&mut buf, autos.len());
+        for (coll, next) in &autos {
+            put_str(&mut buf, coll);
+            buf.extend_from_slice(&next.to_le_bytes());
+        }
+
+        // Graph edges (forward+reverse are rebuilt by `load` via `link`).
+        let edges = self.all_edges()?;
+        put_u64(&mut buf, edges.len());
+        for e in &edges {
+            put_str(&mut buf, &e.collection);
+            put_str(&mut buf, &e.relation);
+            put_bytes(&mut buf, &e.from);
+            put_bytes(&mut buf, &e.to);
+            put_f64(&mut buf, e.weight);
+        }
+
         w.write_all(&buf)?;
         Ok(())
     }
@@ -230,10 +262,17 @@ impl Db {
             ));
         }
 
-        // Records → store directly (indexes are recreated afterwards).
+        // Records → store directly (indexes are recreated afterwards). The
+        // `__`-prefixed namespaces are engine-internal; a dump that names one
+        // is malformed (or hostile), since no legitimate dump can contain it.
         let n_records = rd.u64()?;
         for _ in 0..n_records {
             let coll = rd.string()?;
+            if coll.starts_with("__") {
+                return Err(Error::InvalidDump(format!(
+                    "dump contains records for engine-reserved collection '{coll}'"
+                )));
+            }
             let key = rd.bytes()?;
             let value = rd.bytes()?;
             // Validate the value decodes under the current codec.
@@ -287,8 +326,14 @@ impl Db {
         let n_compound = rd.u64()?;
         for _ in 0..n_compound {
             let coll = rd.string()?;
+            if coll.starts_with("__") {
+                return Err(Error::InvalidDump(format!(
+                    "dump contains index for engine-reserved collection '{coll}'"
+                )));
+            }
             let nf = rd.u32()?;
-            let mut fields = Vec::with_capacity(nf);
+            // The count is untrusted input; allocate conservatively and grow.
+            let mut fields = Vec::with_capacity(nf.min(4096));
             for _ in 0..nf {
                 fields.push(rd.string()?);
             }
@@ -332,9 +377,42 @@ impl Db {
         let n_ttl = rd.u64()?;
         for _ in 0..n_ttl {
             let coll = rd.string()?;
+            if coll.starts_with("__") {
+                return Err(Error::InvalidDump(format!(
+                    "dump contains TTL for engine-reserved collection '{coll}'"
+                )));
+            }
             let key = rd.bytes()?;
             let expiry = rd.i64()?;
             self.collection(&coll).set_ttl(&key, expiry)?;
+        }
+
+        // Auto-id counters (counters never move backwards on restore).
+        let n_auto = rd.u64()?;
+        let mut autos = Vec::with_capacity(n_auto.min(4096));
+        for _ in 0..n_auto {
+            let coll = rd.string()?;
+            let next = rd.u64_raw()?;
+            autos.push((coll, next));
+        }
+        self.store().restore_auto_ids(&autos)?;
+
+        // Graph edges: replayed through `link_weighted` so each edge's
+        // forward+reverse pair is rebuilt atomically.
+        let n_edges = rd.u64()?;
+        for _ in 0..n_edges {
+            let coll = rd.string()?;
+            if coll.starts_with("__") {
+                return Err(Error::InvalidDump(format!(
+                    "dump contains edges for engine-reserved collection '{coll}'"
+                )));
+            }
+            let rel = rd.string()?;
+            let from = rd.bytes()?;
+            let to = rd.bytes()?;
+            let weight = rd.f64()?;
+            self.collection(&coll)
+                .link_weighted(&from, &rel, &to, weight)?;
         }
 
         Ok(())
@@ -435,5 +513,85 @@ mod tests {
         let dst = Db::open_in_memory().unwrap();
         dst.load(&bytes[..]).unwrap();
         assert!(dst.collections().unwrap().is_empty());
+    }
+
+    /// Regression: the dump previously dropped every graph edge (they live in
+    /// engine-reserved `__edges__*` collections, invisible to
+    /// `Db::collections`) and the auto-key counters (so `insert_auto` would
+    /// re-issue used keys and silently overwrite documents).
+    #[test]
+    fn dump_load_preserves_graph_edges_and_auto_ids() {
+        let src = Db::open_in_memory().unwrap();
+        {
+            let c = src.collection("nodes");
+            c.insert_auto(&Value::Int(1)).unwrap();
+            c.insert_auto(&Value::Int(2)).unwrap();
+            c.link_weighted(b"a", "knows", b"b", 0.75).unwrap();
+            c.link(b"b", "knows", b"c").unwrap();
+        }
+        let mut bytes = Vec::new();
+        src.dump(&mut bytes).unwrap();
+
+        let dst = Db::open_in_memory().unwrap();
+        dst.load(&bytes[..]).unwrap();
+        let c = dst.collection("nodes");
+        // Edges survive, both directions, with weights.
+        assert_eq!(
+            c.neighbors(b"a", "knows").unwrap(),
+            vec![b"b".to_vec()]
+        );
+        assert_eq!(
+            c.in_neighbors(b"b", "knows").unwrap(),
+            vec![b"a".to_vec()]
+        );
+        assert_eq!(
+            c.neighbors_weighted(b"a", "knows").unwrap(),
+            vec![(b"b".to_vec(), 0.75)]
+        );
+        // Unweighted edges read back as 1.0.
+        assert_eq!(
+            c.neighbors_weighted(b"b", "knows").unwrap(),
+            vec![(b"c".to_vec(), 1.0)]
+        );
+        // The auto-id counter continues past the pre-dump keys.
+        let next = c.insert_auto(&Value::Int(3)).unwrap();
+        assert_eq!(next, b"00000000000000000002".to_vec());
+        // And it did not overwrite an existing document.
+        assert_eq!(
+            c.get(&b"00000000000000000001"[..]).unwrap(),
+            Some(Value::Int(2))
+        );
+    }
+
+    /// A dump naming an engine-reserved collection is rejected instead of
+    /// forging internal state.
+    #[test]
+    fn load_rejects_reserved_collection_names() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        put_u64(&mut bytes, 1); // one record
+        put_str(&mut bytes, "__schemas__"); // reserved name
+        put_bytes(&mut bytes, b"users");
+        put_bytes(&mut bytes, &Vec::new()); // empty value
+        let dst = Db::open_in_memory().unwrap();
+        let err = dst.load(&bytes[..]);
+        assert!(matches!(err, Err(Error::InvalidDump(msg)) if msg.contains("reserved")));
+    }
+
+    /// An absurd field count must not drive a huge allocation.
+    #[test]
+    fn load_rejects_absurd_compound_field_counts() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        put_u64(&mut bytes, 0); // no records
+        put_u64(&mut bytes, 0); // vector indexes
+        put_u64(&mut bytes, 0); // text indexes
+        put_u64(&mut bytes, 0); // scalar indexes
+        put_u64(&mut bytes, 1); // compound indexes
+        put_str(&mut bytes, "docs");
+        put_u32(&mut bytes, u32::MAX as usize); // absurd field count
+        let dst = Db::open_in_memory().unwrap();
+        // Must fail cleanly on truncated input, not abort on allocation.
+        assert!(matches!(dst.load(&bytes[..]), Err(Error::InvalidDump(_))));
     }
 }

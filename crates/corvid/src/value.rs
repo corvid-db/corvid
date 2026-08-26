@@ -48,6 +48,12 @@ const TAG_ARRAY: u8 = 6;
 const TAG_MAP: u8 = 7;
 const TAG_VECTOR: u8 = 8;
 
+/// Maximum container nesting accepted by [`Value::decode`]. Decoded bytes are
+/// untrusted input (database files, dump streams); this bounds recursion so a
+/// crafted payload errors instead of overflowing the stack. Matches
+/// serde_json's default depth guard on the JSON ingress path.
+pub const MAX_NESTING: usize = 128;
+
 impl Value {
     /// Encode the value into its deterministic byte representation.
     pub fn encode(&self) -> Vec<u8> {
@@ -130,10 +136,13 @@ impl Value {
 
     /// Decode a value previously produced by [`Value::encode`].
     ///
-    /// Fails if the bytes are malformed or have trailing content.
+    /// Fails if the bytes are malformed, have trailing content, or nest
+    /// deeper than [`MAX_NESTING`] — decoded bytes may come from files
+    /// (dumps, databases), so unbounded recursion is treated as malformed
+    /// input rather than allowed to exhaust the stack.
     pub fn decode(bytes: &[u8]) -> Result<Value> {
         let mut dec = Decoder { buf: bytes, pos: 0 };
-        let value = dec.value()?;
+        let value = dec.value_at_depth(0)?;
         if dec.pos != dec.buf.len() {
             return Err(Error::Decode(format!(
                 "{} trailing byte(s) after value",
@@ -213,7 +222,12 @@ struct Decoder<'a> {
 }
 
 impl Decoder<'_> {
-    fn value(&mut self) -> Result<Value> {
+    fn value_at_depth(&mut self, depth: usize) -> Result<Value> {
+        if depth > MAX_NESTING {
+            return Err(Error::Decode(format!(
+                "value nests deeper than {MAX_NESTING}"
+            )));
+        }
         let tag = self.byte()?;
         match tag {
             TAG_NULL => Ok(Value::Null),
@@ -237,7 +251,7 @@ impl Decoder<'_> {
                 let n = self.len()?;
                 let mut items = Vec::with_capacity(n.min(1024));
                 for _ in 0..n {
-                    items.push(self.value()?);
+                    items.push(self.value_at_depth(depth + 1)?);
                 }
                 Ok(Value::Array(items))
             }
@@ -250,7 +264,7 @@ impl Decoder<'_> {
                     let key = std::str::from_utf8(kbytes)
                         .map_err(|e| Error::Decode(format!("invalid utf-8 map key: {e}")))?
                         .to_owned();
-                    let val = self.value()?;
+                    let val = self.value_at_depth(depth + 1)?;
                     map.insert(key, val);
                 }
                 Ok(Value::Map(map))
@@ -429,6 +443,20 @@ mod tests {
         bytes.push(0);
         let err = Value::decode(&bytes).unwrap_err();
         assert!(format!("{err}").contains("trailing"));
+    }
+
+    /// Decoded bytes are untrusted input (database files, dumps); nesting
+    /// beyond the limit must be a clean error, never a stack overflow.
+    #[test]
+    fn decode_rejects_excessive_nesting() {
+        let mut bytes = Vec::new();
+        for _ in 0..(MAX_NESTING + 64) {
+            bytes.push(TAG_ARRAY);
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+        }
+        bytes.push(TAG_NULL);
+        let err = Value::decode(&bytes).unwrap_err();
+        assert!(format!("{err}").contains("deeper than"));
     }
 
     #[test]

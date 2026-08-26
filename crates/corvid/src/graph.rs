@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use crate::db::Collection;
+use crate::db::{Collection, Db};
 use crate::error::Result;
 
 impl Collection<'_> {
@@ -159,6 +159,61 @@ fn neighbor_prefix(relation: &str, from: &[u8]) -> Vec<u8> {
     k.extend_from_slice(&(from.len() as u32).to_be_bytes());
     k.extend_from_slice(from);
     k
+}
+
+/// Parse an edge key back into `(relation, from, to)`. Inverse of
+/// [`edge_key`]; the `to` field is length-delimited by the key's end.
+pub(crate) fn decode_edge_key(key: &[u8]) -> Option<(String, Vec<u8>, Vec<u8>)> {
+    let mut pos = 0usize;
+    let read_len = |pos: &mut usize| -> Option<u32> {
+        let b = key.get(*pos..*pos + 4)?;
+        *pos += 4;
+        Some(u32::from_be_bytes(b.try_into().unwrap()))
+    };
+    let rel_len = read_len(&mut pos)? as usize;
+    let rel = std::str::from_utf8(key.get(pos..pos + rel_len)?)
+        .ok()?
+        .to_owned();
+    pos += rel_len;
+    let from_len = read_len(&mut pos)? as usize;
+    let from = key.get(pos..pos + from_len)?.to_vec();
+    pos += from_len;
+    let to = key.get(pos..)?.to_vec();
+    Some((rel, from, to))
+}
+
+impl Db {
+    /// Every edge in the database as
+    /// `(collection, relation, from, to, weight)`, for dump/migrate. Edges of
+    /// reserved collections are engine-internal and excluded.
+    pub(crate) fn all_edges(&self) -> Result<Vec<EdgeRecord>> {
+        let collections = self.collections()?;
+        let mut out = Vec::new();
+        for coll in collections {
+            let c = self.collection(&coll);
+            for (key, value) in self.store().scan_prefix(&c.edges_name(), &[])? {
+                if let Some((rel, from, to)) = decode_edge_key(&key) {
+                    out.push(EdgeRecord {
+                        collection: coll.clone(),
+                        relation: rel,
+                        from,
+                        to,
+                        weight: decode_weight(&value),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// One graph edge in portable form (dump/migrate).
+pub(crate) struct EdgeRecord {
+    pub collection: String,
+    pub relation: String,
+    pub from: Vec<u8>,
+    pub to: Vec<u8>,
+    pub weight: f64,
 }
 
 #[cfg(test)]

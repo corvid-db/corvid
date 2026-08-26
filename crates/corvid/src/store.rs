@@ -150,6 +150,44 @@ impl Store {
         Ok(id)
     }
 
+    /// Every collection's auto-id counter as `(collection, next_id)`, for
+    /// dump/migrate. Without this, a dump→load cycle would re-issue used ids.
+    pub(crate) fn auto_id_snapshot(&self) -> Result<Vec<(String, u64)>> {
+        let txn = self.db.begin_read()?;
+        let meta = match txn.open_table(META) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in meta.iter()? {
+            let (k, v) = entry?;
+            if let Some(coll) = k.value().strip_prefix("auto:") {
+                out.push((coll.to_owned(), v.value()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Restore auto-id counters from a snapshot. Each counter becomes the max
+    /// of its old value and the snapshot's (counters never go backwards).
+    pub(crate) fn restore_auto_ids(&self, ids: &[(String, u64)]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut meta = txn.open_table(META)?;
+            for (coll, next) in ids {
+                let key = format!("auto:{coll}");
+                let current = meta.get(key.as_str())?.map(|g| g.value()).unwrap_or(0);
+                meta.insert(key.as_str(), (*next).max(current))?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Write a consistent copy of the store to a fresh database file at `path`.
     ///
     /// The copy is taken from one read snapshot, so it is point-in-time
