@@ -23,18 +23,22 @@ pub struct JoinRow {
 
 impl Collection<'_> {
     /// Left-outer join every document in this collection to `other`, using the
-    /// value at `foreign_key_field` as the key into `other`.
+    /// value at `foreign_key_field` as the key into `other`. The field may be
+    /// a dotted path (`"meta.author_id"`).
     ///
-    /// The foreign key must be [`Value::Text`] or [`Value::Bytes`]; any other
-    /// shape (or a missing field, or no matching document) yields `right:
-    /// None`. Rows are returned in this collection's key order.
+    /// The foreign key must be [`Value::Text`], [`Value::Bytes`], or
+    /// [`Value::Int`]; any other shape (or a missing field, or no matching
+    /// document) yields `right: None`. Rows are returned in this collection's
+    /// key order. Both legs read from one consistent snapshot — the joined
+    /// pair reflects a single point in time even under concurrent writes.
     pub fn join(&self, other: &str, foreign_key_field: &str) -> Result<Vec<JoinRow>> {
-        let left = self.scan()?;
-        // Resolve every right-hand reference within one read snapshot, rather
-        // than opening a fresh transaction per row.
+        // One read transaction serves both the left scan and every right-hand
+        // lookup, so a concurrent commit cannot produce torn pairs (old-left
+        // joined to new-right).
         self.db().store().read(|reader| {
-            let mut rows = Vec::with_capacity(left.len());
-            for (key, left_doc) in left {
+            let mut rows = Vec::new();
+            for (key, bytes) in reader.scan(self.name())? {
+                let left_doc = Value::decode(&bytes)?;
                 let foreign_key = match left_doc.get_path(foreign_key_field) {
                     Some(Value::Text(s)) => Some(s.clone().into_bytes()),
                     Some(Value::Bytes(b)) => Some(b.clone()),
@@ -69,6 +73,29 @@ mod tests {
         m.insert("title".to_owned(), Value::Text(title.to_owned()));
         m.insert("author_id".to_owned(), Value::Text(author_id.to_owned()));
         Value::Map(m)
+    }
+
+    /// Foreign keys may live on nested paths, consistent with every other
+    /// field-reference surface.
+    #[test]
+    fn join_resolves_nested_foreign_key_paths() {
+        let db = Db::open_in_memory().unwrap();
+        db.collection("authors")
+            .insert(b"u1", &Value::Text("Ada".into()))
+            .unwrap();
+        let mut inner = BTreeMap::new();
+        inner.insert("author_id".to_owned(), Value::Text("u1".into()));
+        let mut doc = BTreeMap::new();
+        doc.insert("meta".to_owned(), Value::Map(inner));
+        db.collection("posts")
+            .insert(b"p1", &Value::Map(doc))
+            .unwrap();
+        let rows = db
+            .collection("posts")
+            .join("authors", "meta.author_id")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].right, Some(Value::Text("Ada".into())));
     }
 
     fn author(name: &str) -> Value {
