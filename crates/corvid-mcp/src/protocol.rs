@@ -250,7 +250,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "search",
-                "description": "Hybrid search: filter + vector + text, fused, optionally MMR-reranked. Result cap: 100 rows by default; explicit 'limit' accepted up to 10000."
+                "description": "Hybrid search: filter + vector + text, fused, optionally MMR-reranked. Result cap: 100 rows by default; explicit 'limit' accepted up to 10000.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -388,7 +388,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "page",
-                "description": "Keyset pagination in key order: up to 'limit' rows with key after the 'after' cursor (optional 'filter'). Returns {rows, next} where next is the cursor for the following page (null at end). 'limit' is capped at 10000 (default 1000)."
+                "description": "Keyset pagination in key order: up to 'limit' rows with key after the 'after' cursor (optional 'filter'). Returns {rows, next} where next is the cursor for the following page (null at end). 'limit' is capped at 10000 (default 1000).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -402,7 +402,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "phrase_search",
-                "description": "Find documents whose field text contains an exact phrase (consecutive in-order tokens). Returns ranked {key, score, document}. 'k' is capped at 10000."
+                "description": "Find documents whose field text contains an exact phrase (consecutive in-order tokens). Returns ranked {key, score, document}. 'k' is capped at 10000.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

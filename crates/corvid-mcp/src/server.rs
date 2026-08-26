@@ -1263,7 +1263,6 @@ mod tests {
         assert_eq!(out["results"][0]["key"], "a");
     }
 
-    #[test]
     /// Regression: `search` previously had *no* default cap — one call would
     /// serialize an entire collection into a single response.
     #[test]
