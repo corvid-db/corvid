@@ -52,8 +52,12 @@ fn kind_from(b: Option<&u8>) -> TextKind {
 /// Per-database full-text index state.
 #[derive(Default)]
 pub(crate) struct FtsState {
-    /// Registered `(collection, field)` text indexes and where each lives.
-    defs: HashMap<(String, String), TextKind>,
+    /// Registered `(collection, field)` text indexes: where each lives and
+    /// whether it is still **building** (an interrupted on-disk creation).
+    /// Maintenance iterates all defs; serving an on-disk index requires
+    /// `building == false`. In-memory indexes rebuild lazily, so they are
+    /// never building.
+    defs: HashMap<(String, String), (TextKind, bool)>,
     /// Built in-memory inverted indexes, populated lazily.
     built: HashMap<(String, String), Inverted>,
 }
@@ -214,46 +218,85 @@ fn phrase_aligned(per_term: &[&Vec<u32>]) -> bool {
 }
 
 impl Db {
-    /// Load persisted text-index definitions. Called once on open.
+    /// Load persisted text-index definitions. Called once on open. Legacy
+    /// rows without state bytes decode as `Complete`; a `Building` row marks
+    /// an on-disk index for lazy resume on first use.
     pub(crate) fn load_text_defs(&self) -> Result<()> {
         let mut state = self.fts().lock().expect("fts lock");
         for (key, value) in self.store().scan(TEXT_DEFS)? {
             if let Some(def) = split_def_key(&key) {
-                state.defs.insert(def, kind_from(value.first()));
+                let (kind_bytes, st) = crate::index_build::decode_def(&value);
+                let kind = kind_from(kind_bytes.first());
+                let building = matches!(st, crate::index_build::DefState::Building { .. });
+                state.defs.insert(def, (kind, building));
             }
         }
         Ok(())
     }
 
-    /// All text index definitions as `(collection, field, on_disk)` (for dump).
+    /// All text index definitions as `(collection, field, on_disk)` (for
+    /// dump). State is intentionally dropped: dump/load replays creation.
     pub(crate) fn text_specs(&self) -> Vec<(String, String, bool)> {
         let state = self.fts().lock().expect("fts lock");
         state
             .defs
             .iter()
-            .map(|((c, f), kind)| (c.clone(), f.clone(), *kind == TextKind::OnDisk))
+            .map(|((c, f), (kind, _))| (c.clone(), f.clone(), *kind == TextKind::OnDisk))
             .collect()
     }
 
     /// Register (or replace) a text index on `field` for `collection`.
+    ///
+    /// Only the on-disk kind has a durable backfill, so only it carries
+    /// creation state: it registers `Building` (empty cursor) — a crash
+    /// between registration and backfill completion leaves a never-served,
+    /// resumable def, and an in-flight `Building` row keeps its cursor so a
+    /// re-registration resumes instead of rescanning. An in-memory index
+    /// rebuilds lazily from documents on first query, so its def is born
+    /// `Complete`.
     pub(crate) fn register_text_index(
         &self,
         collection: &str,
         field: &str,
         kind: TextKind,
     ) -> Result<()> {
-        self.store()
-            .put(TEXT_DEFS, &def_key(collection, field), &[kind_byte(kind)])?;
+        let key = def_key(collection, field);
+        let building = kind == TextKind::OnDisk;
+        if building {
+            let in_flight =
+                crate::index_build::read_building_cursor(self.store(), TEXT_DEFS, &key)?.is_some();
+            if !in_flight {
+                self.store().put(
+                    TEXT_DEFS,
+                    &key,
+                    &crate::index_build::encode_def(
+                        &[kind_byte(kind)],
+                        &crate::index_build::DefState::Building { cursor: vec![] },
+                    ),
+                )?;
+            }
+        } else {
+            self.store().put(
+                TEXT_DEFS,
+                &key,
+                &crate::index_build::encode_def(
+                    &[kind_byte(kind)],
+                    &crate::index_build::DefState::Complete,
+                ),
+            )?;
+        }
         let mut state = self.fts().lock().expect("fts lock");
-        let key = (collection.to_owned(), field.to_owned());
-        state.defs.insert(key.clone(), kind);
-        state.built.remove(&key);
+        let map_key = (collection.to_owned(), field.to_owned());
+        state.defs.insert(map_key.clone(), (kind, building));
+        state.built.remove(&map_key);
         Ok(())
     }
 
     /// Maintain every on-disk text index on `collection` inside the caller's
     /// write transaction, so postings commit atomically with the document.
     /// In-memory indexes are handled post-commit by [`Db::fts_on_insert_memory`].
+    /// Building indexes are maintained too: their backfill resumes from a
+    /// cursor and re-indexing is an idempotent upsert, so the two overlap safely.
     pub(crate) fn fts_on_insert_in_txn(
         &self,
         tx: &mut crate::store::WriteBatch<'_>,
@@ -267,7 +310,7 @@ impl Db {
                 .defs
                 .iter()
                 .filter(|((c, _), _)| c == collection)
-                .map(|((_, f), k)| (f.clone(), *k))
+                .map(|((_, f), (k, _))| (f.clone(), *k))
                 .collect()
         };
         for (field, kind) in fields {
@@ -292,7 +335,7 @@ impl Db {
                 .defs
                 .iter()
                 .filter(|((c, _), _)| c == collection)
-                .map(|((_, f), k)| (f.clone(), *k))
+                .map(|((_, f), (k, _))| (f.clone(), *k))
                 .collect()
         };
         for (field, kind) in fields {
@@ -324,7 +367,7 @@ impl Db {
                 .defs
                 .iter()
                 .filter(|((c, _), _)| c == collection)
-                .map(|((_, f), k)| (f.clone(), *k))
+                .map(|((_, f), (k, _))| (f.clone(), *k))
                 .collect()
         };
         for (field, kind) in defs {
@@ -344,7 +387,7 @@ impl Db {
                 .defs
                 .iter()
                 .filter(|((c, _), _)| c == collection)
-                .map(|((_, f), k)| (f.clone(), *k))
+                .map(|((_, f), (k, _))| (f.clone(), *k))
                 .collect()
         };
         for (field, kind) in defs {
@@ -367,6 +410,10 @@ impl Db {
         query: &str,
         k: usize,
     ) -> Result<Option<RankedKeys>> {
+        // Before consulting any index: resume interrupted builds (a Building
+        // def is never served, so without this nothing would ever flip it
+        // Complete). Must run before the fts lock: a resume takes it.
+        self.try_resume_index_builds(collection)?;
         let map_key = (collection.to_owned(), field.to_owned());
 
         // Build while holding the registry lock: a concurrent writer's
@@ -377,12 +424,15 @@ impl Db {
             match state.defs.get(&map_key) {
                 None => return Ok(None),
                 // On-disk postings are maintained on every write; no build.
-                Some(TextKind::OnDisk) => {
+                // A building one is never served — the caller falls back to
+                // an exact scan while the resume above finishes it.
+                Some((TextKind::OnDisk, false)) => {
                     let ns = disk_fts::namespace(collection, field);
                     drop(state);
                     return Ok(Some(disk_fts::search(self.store(), &ns, query, k)?));
                 }
-                Some(TextKind::InMemory) => {
+                Some((TextKind::OnDisk, true)) => return Ok(None),
+                Some((TextKind::InMemory, _)) => {
                     if !state.built.contains_key(&map_key) {
                         let inv = build_inverted(self.store(), collection, field)?;
                         state.built.entry(map_key.clone()).or_insert(inv);
@@ -404,18 +454,21 @@ impl Db {
         phrase: &str,
         k: usize,
     ) -> Result<Option<RankedKeys>> {
+        // Same resume-before-serve contract as [`Db::fts_search`].
+        self.try_resume_index_builds(collection)?;
         let map_key = (collection.to_owned(), field.to_owned());
         // Same build-under-lock contract as [`Db::fts_search`].
         {
             let mut state = self.fts().lock().expect("fts lock");
             match state.defs.get(&map_key) {
                 None => return Ok(None),
-                Some(TextKind::OnDisk) => {
+                Some((TextKind::OnDisk, false)) => {
                     let ns = disk_fts::namespace(collection, field);
                     drop(state);
                     return Ok(Some(disk_fts::phrase_search(self.store(), &ns, phrase, k)?));
                 }
-                Some(TextKind::InMemory) => {
+                Some((TextKind::OnDisk, true)) => return Ok(None),
+                Some((TextKind::InMemory, _)) => {
                     if !state.built.contains_key(&map_key) {
                         let inv = build_inverted(self.store(), collection, field)?;
                         state.built.entry(map_key.clone()).or_insert(inv);
@@ -428,6 +481,67 @@ impl Db {
             .built
             .get(&map_key)
             .map(|inv| inv.phrase_search(phrase, k)))
+    }
+
+    /// Flip a text index's in-memory def to complete after its backfill
+    /// committed `Complete` on disk.
+    pub(crate) fn mark_text_complete(&self, collection: &str, field: &str) {
+        let mut state = self.fts().lock().expect("fts lock");
+        let key = (collection.to_owned(), field.to_owned());
+        let kind = state.defs.get(&key).map_or(TextKind::OnDisk, |(k, _)| *k);
+        state.defs.insert(key, (kind, false));
+    }
+
+    /// Building text defs of `collection` as `(field, cursor)` jobs, read from
+    /// the def rows (disk is the resume truth after a crash). Only on-disk
+    /// defs carry a durable backfill, so only they can be Building.
+    pub(crate) fn collect_building_text(&self, collection: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut jobs = Vec::new();
+        for (key, value) in self.store().scan(TEXT_DEFS)? {
+            let Some((coll, field)) = split_def_key(&key) else {
+                continue;
+            };
+            if coll != collection {
+                continue;
+            }
+            let (kind_bytes, st) = crate::index_build::decode_def(&value);
+            if kind_from(kind_bytes.first()) != TextKind::OnDisk {
+                continue;
+            }
+            if let crate::index_build::DefState::Building { cursor } = st {
+                jobs.push((field, cursor));
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// (Re-)run the atomic backfill for one on-disk text index from `cursor`,
+    /// then mark it complete — the exact driver invocation
+    /// `create_text_index_ondisk` uses, shared with lazy resumes. Documents
+    /// without a text value on `field` are skipped, matching maintenance's
+    /// corpus rules.
+    pub(crate) fn resume_text(&self, collection: &str, field: &str, cursor: &[u8]) -> Result<()> {
+        let ns = disk_fts::namespace(collection, field);
+        let kb = [kind_byte(TextKind::OnDisk)];
+        crate::index_build::run_atomic_backfill(
+            self.store(),
+            collection,
+            TEXT_DEFS,
+            &def_key(collection, field),
+            &kb,
+            cursor,
+            &mut |tx, page| {
+                for (key, bytes) in page {
+                    let doc = Value::decode(bytes)?;
+                    if let Some(text) = doc.get_path(field).and_then(Value::as_text) {
+                        disk_fts::insert_in_txn(tx, &ns, key, text)?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        self.mark_text_complete(collection, field);
+        Ok(())
     }
 }
 
@@ -480,41 +594,30 @@ impl Collection<'_> {
     /// query terms (not the corpus) and the index persists across reopen with
     /// no rebuild. Existing documents are backfilled now; later writes maintain
     /// it incrementally.
+    ///
+    /// Atomic and crash-safe (audit A2): the def is registered `Building`
+    /// before any backfill work; every page's postings and cursor advance
+    /// commit in one transaction; completion is its own final transaction. A
+    /// crash or error leaves a resumable `Building` def that queries never
+    /// serve — the first text query (or a re-creation) resumes it.
     pub fn create_text_index_ondisk(&self, field: &str) -> Result<()> {
         self.db()
             .register_text_index(self.name(), field, TextKind::OnDisk)?;
-        let ns = disk_fts::namespace(self.name(), field);
-        let mut cursor: Vec<u8> = Vec::new();
-        loop {
-            let page = self.db().store().scan_from(self.name(), &cursor, 2048)?;
-            if page.is_empty() {
-                break;
-            }
-            let mut batch: Vec<(Vec<u8>, String)> = Vec::new();
-            for (key, bytes) in &page {
-                let doc = Value::decode(bytes)?;
-                if let Some(text) = doc.get_path(field).and_then(Value::as_text) {
-                    batch.push((key.clone(), text.to_owned()));
-                }
-            }
-            if !batch.is_empty() {
-                disk_fts::insert_many(self.db().store(), &ns, &batch)?;
-            }
-            cursor = next_key(&page.last().unwrap().0);
-        }
-        Ok(())
+        // A def still Building from an interrupted creation resumes from its
+        // saved cursor; a Complete (or fresh) def backfills from the start.
+        let cursor = crate::index_build::read_building_cursor(
+            self.db().store(),
+            TEXT_DEFS,
+            &def_key(self.name(), field),
+        )?;
+        self.db()
+            .resume_text(self.name(), field, &cursor.unwrap_or_default())
     }
-}
-
-/// The smallest key strictly greater than `key` (append a zero byte).
-fn next_key(key: &[u8]) -> Vec<u8> {
-    let mut k = key.to_vec();
-    k.push(0);
-    k
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{TEXT_DEFS, TextKind, def_key, kind_byte};
     use crate::Db;
     use std::collections::BTreeMap;
 
@@ -723,5 +826,119 @@ mod tests {
         assert!(c.text_search("body", "  ", 10).unwrap().is_empty());
         // A field with no index still works via the exact path.
         assert!(c.text_search("title", "fox", 10).unwrap().is_empty());
+    }
+
+    /// A building on-disk text index is never served: text queries fall back
+    /// to an exact scan and stay correct; the first unobstructed query
+    /// resumes the backfill.
+    #[test]
+    fn building_ondisk_text_def_falls_back_then_resumes() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db);
+        let c = db.collection("docs");
+        // Forge a Building def exactly as an interrupted creation would
+        // leave it, then reload the registry from that row.
+        db.store()
+            .put(
+                TEXT_DEFS,
+                &def_key("docs", "body"),
+                &crate::index_build::encode_def(
+                    &[kind_byte(TextKind::OnDisk)],
+                    &crate::index_build::DefState::Building { cursor: vec![] },
+                ),
+            )
+            .unwrap();
+        db.load_text_defs().unwrap();
+        assert_eq!(text_def_building(&db, "docs", "body"), Some(true));
+        // With the resume lock held (another thread resuming), the building
+        // def must not be served: fts_search reports "no usable index"...
+        let _guard = db.index_resume().lock().unwrap();
+        assert!(
+            db.fts_search("docs", "body", "fox dog", 10)
+                .unwrap()
+                .is_none(),
+            "a building on-disk index must not be served"
+        );
+        // ...so text_search falls back to an exact scan and stays correct.
+        let hits = c.text_search("body", "fox dog", 10).unwrap();
+        assert_eq!(hits[0].key, b"c".to_vec()); // matches both terms
+        drop(_guard);
+        // Once the resume lock is free, the next query resumes the backfill
+        // and serves from the on-disk postings.
+        let hits = c.text_search("body", "fox dog", 10).unwrap();
+        assert_eq!(hits[0].key, b"c".to_vec());
+        assert_eq!(text_def_building(&db, "docs", "body"), Some(false));
+        assert!(
+            db.fts_search("docs", "body", "fox dog", 10)
+                .unwrap()
+                .is_some(),
+            "a completed on-disk index must serve"
+        );
+    }
+
+    /// A text def row in the legacy kind-byte-only format (pre-state rows
+    /// written by earlier versions) decodes as `Complete`: the index stays
+    /// serviceable across the upgrade with no re-backfill.
+    #[test]
+    fn legacy_stateless_ondisk_def_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvid.db");
+        {
+            let db = Db::open(&path).unwrap();
+            seed(&db);
+            db.collection("docs")
+                .create_text_index_ondisk("body")
+                .unwrap();
+            // Overwrite the def row with the legacy kind-byte-only form.
+            db.store()
+                .put(
+                    TEXT_DEFS,
+                    &def_key("docs", "body"),
+                    &[kind_byte(TextKind::OnDisk)],
+                )
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(text_def_building(&db, "docs", "body"), Some(false));
+        assert!(db.collect_building_text("docs").unwrap().is_empty());
+        let hits = db
+            .collection("docs")
+            .text_search("body", "fox dog", 10)
+            .unwrap();
+        assert_eq!(hits[0].key, b"c".to_vec()); // served from the on-disk postings
+    }
+
+    /// An in-memory registration has no durable backfill: its def is born
+    /// `Complete` and `create_text_index` behavior is unchanged.
+    #[test]
+    fn inmemory_registration_is_born_complete() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db);
+        let c = db.collection("docs");
+        c.create_text_index("body").unwrap();
+        assert_eq!(text_def_building(&db, "docs", "body"), Some(false));
+        assert!(db.collect_building_text("docs").unwrap().is_empty());
+        // Lazily built on first query, correct results (unchanged behavior).
+        let hits = c.text_search("body", "fox dog", 10).unwrap();
+        assert_eq!(hits[0].key, b"c".to_vec());
+        // The def row is the new-format Complete encoding of the InMemory kind.
+        let row = db
+            .store()
+            .get(TEXT_DEFS, &def_key("docs", "body"))
+            .unwrap()
+            .unwrap();
+        let (kb, st) = crate::index_build::decode_def(&row);
+        assert_eq!(kb, vec![kind_byte(TextKind::InMemory)]);
+        assert!(matches!(st, crate::index_build::DefState::Complete));
+    }
+
+    /// Whether `field` of `coll` is registered and still building (test probe
+    /// into the registry; `None` when unregistered).
+    fn text_def_building(db: &Db, coll: &str, field: &str) -> Option<bool> {
+        let state = db.fts().lock().unwrap();
+        state
+            .defs
+            .get(&(coll.to_owned(), field.to_owned()))
+            .map(|(_, building)| *building)
     }
 }

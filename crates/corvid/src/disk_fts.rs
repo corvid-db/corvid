@@ -153,18 +153,6 @@ pub(crate) fn delete(store: &Store, ns: &str, doc_key: &[u8]) -> Result<()> {
     store.transaction(|tx| delete_in_txn(tx, ns, doc_key))
 }
 
-/// Index many documents in one transaction (bulk load).
-pub(crate) fn insert_many(store: &Store, ns: &str, items: &[(Vec<u8>, String)]) -> Result<()> {
-    store.transaction(|tx| {
-        let mut meta = read_meta(tx, ns)?;
-        for (doc_key, text) in items {
-            index_in_txn(tx, ns, &mut meta, doc_key, text)?;
-        }
-        tx.put(ns, &[TAG_META], &encode_meta(meta))?;
-        Ok(())
-    })
-}
-
 /// Index (or re-index) `doc_key`'s `text` inside a caller's transaction, so
 /// postings and corpus stats commit atomically with the document.
 pub(crate) fn insert_in_txn(
@@ -466,22 +454,5 @@ mod tests {
         let store = Store::open(&path).unwrap();
         let hits = search(&store, "ix", "fox", 10).unwrap();
         assert_eq!(hits.len(), 2);
-    }
-
-    #[test]
-    fn bulk_matches_incremental() {
-        let store = Store::open_in_memory().unwrap();
-        insert_many(
-            &store,
-            "ix",
-            &[
-                (b"a".to_vec(), "the quick brown fox".to_owned()),
-                (b"b".to_vec(), "the lazy dog sleeps".to_owned()),
-                (b"c".to_vec(), "a fox and a dog play".to_owned()),
-            ],
-        )
-        .unwrap();
-        let hits = search(&store, "ix", "fox dog", 10).unwrap();
-        assert_eq!(hits[0].0, b"c".to_vec());
     }
 }

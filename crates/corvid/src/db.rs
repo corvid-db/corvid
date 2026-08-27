@@ -192,7 +192,12 @@ impl Db {
         let scalar_jobs = self.collect_building_scalar(collection)?;
         let compound_jobs = self.collect_building_compound(collection)?;
         let geo_jobs = self.collect_building_geo(collection)?;
-        if scalar_jobs.is_empty() && compound_jobs.is_empty() && geo_jobs.is_empty() {
+        let text_jobs = self.collect_building_text(collection)?;
+        if scalar_jobs.is_empty()
+            && compound_jobs.is_empty()
+            && geo_jobs.is_empty()
+            && text_jobs.is_empty()
+        {
             return Ok(());
         }
         // Bound to this call: a concurrent caller's try_lock fails and it
@@ -209,6 +214,9 @@ impl Db {
         }
         for (field, cursor) in geo_jobs {
             self.resume_geo(collection, &field, &cursor)?;
+        }
+        for (field, cursor) in text_jobs {
+            self.resume_text(collection, &field, &cursor)?;
         }
         Ok(())
     }
