@@ -193,10 +193,12 @@ impl Db {
         let compound_jobs = self.collect_building_compound(collection)?;
         let geo_jobs = self.collect_building_geo(collection)?;
         let text_jobs = self.collect_building_text(collection)?;
+        let vector_jobs = self.collect_building_vector(collection)?;
         if scalar_jobs.is_empty()
             && compound_jobs.is_empty()
             && geo_jobs.is_empty()
             && text_jobs.is_empty()
+            && vector_jobs.is_empty()
         {
             return Ok(());
         }
@@ -217,6 +219,9 @@ impl Db {
         }
         for (field, cursor) in text_jobs {
             self.resume_text(collection, &field, &cursor)?;
+        }
+        for (field, cursor) in vector_jobs {
+            self.resume_vector(collection, &field, &cursor)?;
         }
         Ok(())
     }

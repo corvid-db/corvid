@@ -340,10 +340,11 @@ impl Cache {
 
 // ---- public operations ----
 
-/// Insert (or overwrite) `doc_key`'s `vector` into the on-disk index `ns`.
-/// Insert one vector inside a caller's transaction, so graph state commits
-/// atomically with the document that produced it.
-pub(crate) fn insert_one_in_txn(
+/// Insert (or overwrite) `doc_key`'s `vector` into the on-disk index `ns`
+/// inside the caller's transaction, so graph state commits atomically with
+/// the document that produced it (or with the backfill page's cursor
+/// advance, when the atomic-creation driver calls it).
+pub(crate) fn insert_in_txn(
     tx: &mut crate::store::WriteBatch<'_>,
     ns: &str,
     p: &DiskParams,
@@ -352,7 +353,7 @@ pub(crate) fn insert_one_in_txn(
 ) -> Result<()> {
     let mut meta = read_meta(tx, ns)?;
     let mut cache = Cache::new();
-    insert_in_txn(tx, ns, p, &mut cache, &mut meta, doc_key, vector)?;
+    insert_node_in_txn(tx, ns, p, &mut cache, &mut meta, doc_key, vector)?;
     flush_dirty(tx, ns, &mut cache)?;
     tx.put(ns, &[TAG_META], &encode_meta(meta))?;
     Ok(())
@@ -367,47 +368,13 @@ pub(crate) fn insert(
     doc_key: &[u8],
     vector: &[f32],
 ) -> Result<()> {
-    store.transaction(|tx| insert_one_in_txn(tx, ns, p, doc_key, vector))
+    store.transaction(|tx| insert_in_txn(tx, ns, p, doc_key, vector))
 }
 
 /// Test seam: tombstone one key in its own transaction.
 #[cfg(test)]
 pub(crate) fn delete(store: &Store, ns: &str, p: &DiskParams, doc_key: &[u8]) -> Result<bool> {
     store.transaction(|tx| delete_in_txn(tx, ns, p, doc_key))
-}
-
-/// Cap on the shared node cache during a bulk insert: keeps hot nodes (entry
-/// point, upper layers) cached across inserts without unbounded growth. Dirty
-/// nodes are already flushed, so clearing is safe (reloads from the txn).
-const BULK_CACHE_CAP: usize = 50_000;
-
-/// Insert many vectors in a single transaction (one commit, one fsync). Each
-/// insert uses a fresh per-node cache and flushes its touched nodes before the
-/// next, so within-batch graph connectivity works via read-your-writes while
-/// memory stays bounded per insert. Far faster than repeated [`insert`] for
-/// bulk loads.
-pub(crate) fn insert_many(
-    store: &Store,
-    ns: &str,
-    p: &DiskParams,
-    items: &[(Vec<u8>, Vec<f32>)],
-) -> Result<()> {
-    store.transaction(|tx| {
-        let mut meta = read_meta(tx, ns)?;
-        let mut cache = Cache::new();
-        for (doc_key, vector) in items {
-            insert_in_txn(tx, ns, p, &mut cache, &mut meta, doc_key, vector)?;
-            if cache.nodes.len() > BULK_CACHE_CAP {
-                // Persist dirty nodes before evicting, then drop the resident
-                // set (it reloads on demand).
-                flush_dirty(tx, ns, &mut cache)?;
-                cache.nodes.clear();
-            }
-        }
-        flush_dirty(tx, ns, &mut cache)?;
-        tx.put(ns, &[TAG_META], &encode_meta(meta))?;
-        Ok(())
-    })
 }
 
 fn read_meta(tx: &crate::store::WriteBatch<'_>, ns: &str) -> Result<Meta> {
@@ -424,7 +391,7 @@ fn read_meta(tx: &crate::store::WriteBatch<'_>, ns: &str) -> Result<Meta> {
 /// Insert one vector within an open transaction, flushing its touched nodes
 /// (so a following insert in the same transaction sees them) and updating
 /// `meta` in place. The caller persists `meta` and commits.
-fn insert_in_txn(
+fn insert_node_in_txn(
     tx: &mut crate::store::WriteBatch<'_>,
     ns: &str,
     p: &DiskParams,

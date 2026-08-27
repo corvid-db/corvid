@@ -55,6 +55,12 @@ struct VectorDef {
     kind: IndexKind,
     /// PQ codebook for [`IndexKind::OnDiskPq`] (loaded from disk on open).
     pq: Option<std::sync::Arc<crate::pq::Pq>>,
+    /// Whether an on-disk creation backfill is still **building** (an
+    /// interrupted creation). A building index is maintained on every write
+    /// but never served — queries fall back to exact scans until a resume
+    /// flips it complete. In-memory indexes rebuild lazily, so they are
+    /// never building.
+    pub(crate) building: bool,
 }
 
 impl VectorDef {
@@ -198,47 +204,54 @@ impl Db {
             .collect()
     }
 
-    /// Load persisted index definitions. Called once on open.
+    /// Load persisted index definitions. Called once on open. Legacy rows
+    /// without state bytes decode as `Complete`; a `Building` row marks an
+    /// on-disk index for lazy resume on first use.
     pub(crate) fn load_index_defs(&self) -> Result<()> {
         let mut state = self.indexes().lock().expect("index lock");
         for (key, value) in self.store().scan(INDEX_DEFS)? {
-            if let (Some((coll, field)), Some(metric)) = (
-                split_def_key(&key),
-                value.first().and_then(metric_from_byte),
-            ) {
-                // Quantization and kind bytes are optional (older defs lack them).
-                let quant = value
-                    .get(1)
-                    .and_then(quant_from_byte)
-                    .unwrap_or(Quantization::None);
-                let kind = value
-                    .get(2)
-                    .and_then(kind_from_byte)
-                    .unwrap_or(IndexKind::InMemory);
-                // A PQ index carries a codebook persisted in its graph namespace.
-                let pq = if kind == IndexKind::OnDiskPq {
-                    let ns = disk_hnsw::namespace(&coll, &field);
-                    disk_hnsw::load_codebook(self.store(), &ns)?.map(std::sync::Arc::new)
-                } else {
-                    None
-                };
-                state.defs.insert(
-                    (coll, field),
-                    VectorDef {
-                        metric,
-                        quant,
-                        kind,
-                        pq,
-                    },
-                );
-            }
+            let Some((coll, field)) = split_def_key(&key) else {
+                continue;
+            };
+            // Kind bytes are the def payload; the creation state follows them
+            // (new format) or is absent (legacy rows → Complete).
+            let (kb, st) = crate::index_build::decode_def(&value);
+            let Some(metric) = kb.first().and_then(metric_from_byte) else {
+                continue;
+            };
+            // Quantization and kind bytes are optional (older defs lack them).
+            let quant = kb
+                .get(1)
+                .and_then(quant_from_byte)
+                .unwrap_or(Quantization::None);
+            let kind = kb
+                .get(2)
+                .and_then(kind_from_byte)
+                .unwrap_or(IndexKind::InMemory);
+            let building = matches!(st, crate::index_build::DefState::Building { .. });
+            // A PQ index carries a codebook persisted in its graph namespace.
+            let pq = if kind == IndexKind::OnDiskPq {
+                let ns = disk_hnsw::namespace(&coll, &field);
+                disk_hnsw::load_codebook(self.store(), &ns)?.map(std::sync::Arc::new)
+            } else {
+                None
+            };
+            state.defs.insert(
+                (coll, field),
+                VectorDef {
+                    metric,
+                    quant,
+                    kind,
+                    pq,
+                    building,
+                },
+            );
         }
         Ok(())
     }
 
-    /// Register (or replace) an HNSW index on `field` for `collection`, with a
-    /// storage quantization mode. The definition is persisted; the graph builds
-    /// lazily on first use.
+    /// Register (or replace) an HNSW index on `field` for `collection`, with
+    /// a storage quantization mode.
     pub(crate) fn register_vector_index(
         &self,
         collection: &str,
@@ -250,6 +263,16 @@ impl Db {
         self.register_vector_index_inner(collection, field, metric, quant, kind, None)
     }
 
+    /// Register (or replace) an HNSW index definition.
+    ///
+    /// Only the on-disk kinds have a durable backfill, so only they carry
+    /// creation state: they register `Building` — a crash between
+    /// registration and backfill completion leaves a never-served, resumable
+    /// def. Re-registering the *same* def (identical kind bytes) preserves an
+    /// in-flight `Building` row's cursor, so a re-created creation resumes
+    /// instead of rescanning; any kind/quant/metric change is a replace and
+    /// starts fresh. In-memory indexes rebuild lazily from documents, so
+    /// their defs are born `Complete`.
     fn register_vector_index_inner(
         &self,
         collection: &str,
@@ -259,10 +282,29 @@ impl Db {
         kind: IndexKind,
         pq: Option<std::sync::Arc<crate::pq::Pq>>,
     ) -> Result<()> {
+        let key = def_key(collection, field);
+        let kb = [metric_byte(metric), quant_byte(quant), kind_byte(kind)];
+        let state = if kind.is_on_disk() {
+            // Same def again → resume an in-flight backfill from its cursor;
+            // a changed def → fresh Building (backfill from the start).
+            let same = self
+                .store()
+                .get(INDEX_DEFS, &key)?
+                .is_some_and(|v| crate::index_build::decode_def(&v).0 == kb);
+            let cursor = if same {
+                crate::index_build::read_building_cursor(self.store(), INDEX_DEFS, &key)?
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            crate::index_build::DefState::Building { cursor }
+        } else {
+            crate::index_build::DefState::Complete
+        };
         self.store().put(
             INDEX_DEFS,
-            &def_key(collection, field),
-            &[metric_byte(metric), quant_byte(quant), kind_byte(kind)],
+            &key,
+            &crate::index_build::encode_def(&kb, &state),
         )?;
         // The PQ codebook lives in the graph namespace (not the def bytes).
         if let Some(pq) = &pq {
@@ -270,18 +312,19 @@ impl Db {
             disk_hnsw::store_codebook(self.store(), &ns, pq)?;
         }
         let mut state = self.indexes().lock().expect("index lock");
-        let key = (collection.to_owned(), field.to_owned());
+        let map_key = (collection.to_owned(), field.to_owned());
         state.defs.insert(
-            key.clone(),
+            map_key.clone(),
             VectorDef {
                 metric,
                 quant,
                 kind,
                 pq,
+                building: kind.is_on_disk(),
             },
         );
         // Drop any built in-memory graph so it rebuilds with the (possibly new) def.
-        state.built.remove(&key);
+        state.built.remove(&map_key);
         Ok(())
     }
 
@@ -309,7 +352,7 @@ impl Db {
         for (field, def) in defs {
             let ns = disk_hnsw::namespace(collection, &field);
             match doc.get_path(&field).and_then(Value::as_vector) {
-                Some(v) => disk_hnsw::insert_one_in_txn(tx, &ns, &def.disk_params(), key, v)?,
+                Some(v) => disk_hnsw::insert_in_txn(tx, &ns, &def.disk_params(), key, v)?,
                 None => {
                     disk_hnsw::delete_in_txn(tx, &ns, &def.disk_params(), key)?;
                 }
@@ -402,6 +445,10 @@ impl Db {
         k: usize,
         metric: Metric,
     ) -> Result<Option<RankedKeys>> {
+        // Before consulting any index: resume interrupted builds (a Building
+        // def is never served, so without this nothing would ever flip it
+        // Complete). Must run before the index lock: a resume takes it.
+        self.try_resume_index_builds(collection)?;
         let map_key = (collection.to_owned(), field.to_owned());
 
         // Decide what work to do under a short lock; build/scan unlocked.
@@ -414,9 +461,16 @@ impl Db {
         };
 
         // On-disk indexes are served directly from the store (bounded memory).
-        // A `None` from the search means "cannot serve this query" (dimension
-        // mismatch) — fall back to exact like every other unserveable case.
+        // A building one is never served — the caller falls back to an exact
+        // scan while the resume above finishes it (this also covers a crash
+        // before the first backfill chunk: a Building def with an empty
+        // namespace never serves silently-empty results). A `None` from the
+        // search means "cannot serve this query" (dimension mismatch) — fall
+        // back to exact like every other unserveable case.
         if def.kind.is_on_disk() {
+            if def.building {
+                return Ok(None);
+            }
             let ns = disk_hnsw::namespace(collection, field);
             let ef = (k * 4).max(64);
             return match disk_hnsw::search(self.store(), &ns, &def.disk_params(), query, k, ef)? {
@@ -457,6 +511,96 @@ impl Db {
             Some(b) if !b.accepts(query) => Ok(None),
             other => Ok(other.map(|b| b.search(query, k))),
         }
+    }
+
+    /// Flip a vector index's in-memory def to complete after its backfill
+    /// committed `Complete` on disk.
+    pub(crate) fn mark_vector_complete(&self, collection: &str, field: &str) {
+        let mut state = self.indexes().lock().expect("index lock");
+        if let Some(def) = state
+            .defs
+            .get_mut(&(collection.to_owned(), field.to_owned()))
+        {
+            def.building = false;
+        }
+    }
+
+    /// Building on-disk vector defs of `collection` as `(field, cursor)`
+    /// jobs, read from the def rows (disk is the resume truth after a crash).
+    /// Only on-disk kinds carry a durable backfill, so only they can be
+    /// Building; rows whose kind bytes don't decode to a serveable on-disk
+    /// def are inert (no resume, never served).
+    pub(crate) fn collect_building_vector(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut jobs = Vec::new();
+        for (key, value) in self.store().scan(INDEX_DEFS)? {
+            let Some((coll, field)) = split_def_key(&key) else {
+                continue;
+            };
+            if coll != collection {
+                continue;
+            }
+            let (kb, st) = crate::index_build::decode_def(&value);
+            if !kb
+                .get(2)
+                .and_then(kind_from_byte)
+                .is_some_and(|k| k.is_on_disk())
+            {
+                continue;
+            }
+            if let crate::index_build::DefState::Building { cursor } = st {
+                jobs.push((field, cursor));
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// (Re-)run the atomic backfill for one on-disk vector index from
+    /// `cursor`, then mark it complete — the exact driver invocation the
+    /// `create_vector_index_ondisk*` fns use, shared with lazy resumes.
+    /// Build/search params (metric, quantization, PQ codebook) come from the
+    /// registered def, mirroring the create fns' construction;
+    /// `load_index_defs` reloads the codebook for PQ indexes on open.
+    pub(crate) fn resume_vector(&self, collection: &str, field: &str, cursor: &[u8]) -> Result<()> {
+        let def = {
+            let state = self.indexes().lock().expect("index lock");
+            state
+                .defs
+                .get(&(collection.to_owned(), field.to_owned()))
+                .cloned()
+        };
+        // No registered def → nothing to resume (and nothing to serve).
+        let Some(def) = def else {
+            return Ok(());
+        };
+        let ns = disk_hnsw::namespace(collection, field);
+        let kb = [
+            metric_byte(def.metric),
+            quant_byte(def.quant),
+            kind_byte(def.kind),
+        ];
+        let params = def.disk_params();
+        crate::index_build::run_atomic_backfill(
+            self.store(),
+            collection,
+            INDEX_DEFS,
+            &def_key(collection, field),
+            &kb,
+            cursor,
+            &mut |tx, page| {
+                for (key, bytes) in page {
+                    let doc = Value::decode(bytes)?;
+                    if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
+                        disk_hnsw::insert_in_txn(tx, &ns, &params, key, v)?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        self.mark_vector_complete(collection, field);
+        Ok(())
     }
 }
 
@@ -571,6 +715,12 @@ impl Collection<'_> {
     /// database (not RAM) and persists across reopen, so search memory is
     /// bounded by nodes touched per query rather than by collection size —
     /// suitable for very large collections. Existing documents are backfilled.
+    ///
+    /// Atomic and crash-safe (audit A2): the def is registered `Building`
+    /// before any backfill work; every page's graph writes and cursor advance
+    /// commit in one transaction; completion is its own final transaction. A
+    /// crash or error leaves a resumable `Building` def that queries never
+    /// serve — the first vector query (or a re-creation) resumes it.
     pub fn create_vector_index_ondisk(&self, field: &str, metric: Metric) -> Result<()> {
         self.create_vector_index_ondisk_quantized(field, metric, Quantization::None)
     }
@@ -587,35 +737,15 @@ impl Collection<'_> {
     ) -> Result<()> {
         self.db()
             .register_vector_index(self.name(), field, metric, quant, IndexKind::OnDisk)?;
-        // Backfill existing documents in chunks: read a page (read txn, which
-        // closes), then bulk-insert it (one write txn). Bounded memory, and far
-        // fewer commits than one-insert-per-transaction.
-        let ns = disk_hnsw::namespace(self.name(), field);
-        let params = DiskParams::with_quant(metric, quant, DEFAULT_M, DEFAULT_EF_CONSTRUCTION);
-        let store = self.db().store();
-        const CHUNK: usize = 2048;
-        let mut cursor: Vec<u8> = Vec::new();
-        loop {
-            let page = store.scan_from(self.name(), &cursor, CHUNK)?;
-            let Some((last_key, _)) = page.last() else {
-                break;
-            };
-            let mut next_cursor = last_key.clone();
-            next_cursor.push(0);
-
-            let mut batch: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
-            for (key, bytes) in &page {
-                let doc = Value::decode(bytes)?;
-                if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
-                    batch.push((key.clone(), v.to_vec()));
-                }
-            }
-            if !batch.is_empty() {
-                disk_hnsw::insert_many(store, &ns, &params, &batch)?;
-            }
-            cursor = next_cursor;
-        }
-        Ok(())
+        // A def still Building from an interrupted creation resumes from its
+        // saved cursor; a Complete (or fresh) def backfills from the start.
+        let cursor = crate::index_build::read_building_cursor(
+            self.db().store(),
+            INDEX_DEFS,
+            &def_key(self.name(), field),
+        )?;
+        self.db()
+            .resume_vector(self.name(), field, &cursor.unwrap_or_default())
     }
 
     /// Create an on-disk HNSW index storing **product-quantized** vectors: a
@@ -627,6 +757,10 @@ impl Collection<'_> {
     /// Requires existing documents to train on (a codebook can't be learned
     /// from nothing); returns [`Error::EmptyIndexTraining`](crate::Error::EmptyIndexTraining) if none have a
     /// usable vector at `field`.
+    ///
+    /// The backfill is atomic and crash-safe (audit A2), exactly like
+    /// [`Collection::create_vector_index_ondisk_quantized`]; only the
+    /// pre-registration training scan (bounded, read-only) precedes it.
     pub fn create_vector_index_ondisk_pq(
         &self,
         field: &str,
@@ -660,45 +794,23 @@ impl Collection<'_> {
         let pq = crate::pq::Pq::train(&sample, m, k).ok_or(crate::Error::EmptyIndexTraining)?;
         let pq = std::sync::Arc::new(pq);
 
+        // Register Building with the trained codebook, then run the atomic
+        // backfill through the shared driver (resuming an interrupted one).
         self.db().register_vector_index_inner(
             self.name(),
             field,
             metric,
             Quantization::None,
             IndexKind::OnDiskPq,
-            Some(pq.clone()),
+            Some(pq),
         )?;
-
-        // Backfill with the trained codebook.
-        let ns = disk_hnsw::namespace(self.name(), field);
-        let params = DiskParams::with_quant(
-            metric,
-            Quantization::None,
-            DEFAULT_M,
-            DEFAULT_EF_CONSTRUCTION,
-        )
-        .with_pq(pq);
-        let mut cursor: Vec<u8> = Vec::new();
-        loop {
-            let page = store.scan_from(self.name(), &cursor, 2048)?;
-            let Some((last_key, _)) = page.last() else {
-                break;
-            };
-            let mut next = last_key.clone();
-            next.push(0);
-            let mut batch: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
-            for (key, bytes) in &page {
-                let doc = Value::decode(bytes)?;
-                if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
-                    batch.push((key.clone(), v.to_vec()));
-                }
-            }
-            if !batch.is_empty() {
-                disk_hnsw::insert_many(store, &ns, &params, &batch)?;
-            }
-            cursor = next;
-        }
-        Ok(())
+        let cursor = crate::index_build::read_building_cursor(
+            self.db().store(),
+            INDEX_DEFS,
+            &def_key(self.name(), field),
+        )?;
+        self.db()
+            .resume_vector(self.name(), field, &cursor.unwrap_or_default())
     }
 }
 
@@ -831,6 +943,181 @@ mod tests {
         c.insert(b"b", &doc(vec![0.0, 1.0])).unwrap();
         c.insert(b"c", &doc(vec![-1.0, 0.0])).unwrap();
         db
+    }
+
+    /// A building on-disk vector index is never served: vector queries fall
+    /// back to an exact scan and stay correct; the first unobstructed query
+    /// resumes the backfill.
+    #[test]
+    fn building_ondisk_vector_def_falls_back_then_resumes() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
+        c.insert(b"b", &doc(vec![0.0, 1.0])).unwrap();
+        c.insert(b"c", &doc(vec![0.9, 0.1])).unwrap();
+        // Forge a Building def exactly as an interrupted creation would
+        // leave it, then reload the registry from that row.
+        db.store()
+            .put(
+                INDEX_DEFS,
+                &def_key("docs", "embedding"),
+                &crate::index_build::encode_def(
+                    &[
+                        metric_byte(Metric::L2),
+                        quant_byte(Quantization::None),
+                        kind_byte(IndexKind::OnDisk),
+                    ],
+                    &crate::index_build::DefState::Building { cursor: vec![] },
+                ),
+            )
+            .unwrap();
+        db.load_index_defs().unwrap();
+        assert_eq!(vector_def_building(&db, "docs", "embedding"), Some(true));
+        // With the resume lock held (another thread resuming), the building
+        // def must not be served: ann_search reports "no usable index"...
+        let _guard = db.index_resume().lock().unwrap();
+        assert!(
+            db.ann_search("docs", "embedding", &[1.0, 0.0], 3, Metric::L2)
+                .unwrap()
+                .is_none(),
+            "a building on-disk index must not be served"
+        );
+        // ...so vector_search falls back to an exact scan and stays correct.
+        let hits = c
+            .vector_search("embedding", &[1.0, 0.0], 3, Metric::L2)
+            .unwrap();
+        assert_eq!(hits[0].key, b"a".to_vec());
+        drop(_guard);
+        // Once the resume lock is free, the next query resumes the backfill
+        // and serves from the on-disk graph.
+        let hits = c
+            .vector_search("embedding", &[1.0, 0.0], 3, Metric::L2)
+            .unwrap();
+        assert_eq!(hits[0].key, b"a".to_vec());
+        assert_eq!(vector_def_building(&db, "docs", "embedding"), Some(false));
+        assert!(
+            db.ann_search("docs", "embedding", &[1.0, 0.0], 3, Metric::L2)
+                .unwrap()
+                .is_some(),
+            "a completed on-disk index must serve"
+        );
+    }
+
+    /// A vector def row in the legacy kind-bytes-only format (pre-state rows
+    /// written by earlier versions) decodes as `Complete`: the index stays
+    /// serviceable across the upgrade with no re-backfill.
+    #[test]
+    fn legacy_stateless_ondisk_def_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvid.db");
+        {
+            let db = Db::open(&path).unwrap();
+            let c = db.collection("docs");
+            c.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
+            c.insert(b"b", &doc(vec![0.0, 1.0])).unwrap();
+            c.create_vector_index_ondisk("embedding", Metric::L2)
+                .unwrap();
+            // Overwrite the def row with the legacy kind-bytes-only form.
+            db.store()
+                .put(
+                    INDEX_DEFS,
+                    &def_key("docs", "embedding"),
+                    &[
+                        metric_byte(Metric::L2),
+                        quant_byte(Quantization::None),
+                        kind_byte(IndexKind::OnDisk),
+                    ],
+                )
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(vector_def_building(&db, "docs", "embedding"), Some(false));
+        assert!(db.collect_building_vector("docs").unwrap().is_empty());
+        let hits = db
+            .collection("docs")
+            .vector_search("embedding", &[1.0, 0.0], 1, Metric::L2)
+            .unwrap();
+        assert_eq!(hits[0].key, b"a".to_vec()); // served from the on-disk graph
+    }
+
+    /// An in-memory registration has no durable backfill: its def is born
+    /// `Complete` and `create_vector_index` behavior is unchanged.
+    #[test]
+    fn inmemory_registration_is_born_complete() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
+        c.create_vector_index("embedding", Metric::L2).unwrap();
+        assert_eq!(vector_def_building(&db, "docs", "embedding"), Some(false));
+        assert!(db.collect_building_vector("docs").unwrap().is_empty());
+        // Lazily built on first query, correct results (unchanged behavior).
+        let hits = c
+            .vector_search("embedding", &[1.0, 0.0], 1, Metric::L2)
+            .unwrap();
+        assert_eq!(hits[0].key, b"a".to_vec());
+        // The def row is the new-format Complete encoding of the InMemory kind.
+        let row = db
+            .store()
+            .get(INDEX_DEFS, &def_key("docs", "embedding"))
+            .unwrap()
+            .unwrap();
+        let (kb, st) = crate::index_build::decode_def(&row);
+        assert_eq!(
+            kb,
+            vec![
+                metric_byte(Metric::L2),
+                quant_byte(Quantization::None),
+                kind_byte(IndexKind::InMemory)
+            ]
+        );
+        assert!(matches!(st, crate::index_build::DefState::Complete));
+    }
+
+    /// PQ smoke (audit A2): a completed PQ creation leaves a `Complete` def
+    /// on disk whose quantized on-disk graph serves search.
+    #[test]
+    fn pq_create_completes_and_serves() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        let data = pq_corpus(60, 8);
+        for (i, v) in data.iter().enumerate() {
+            c.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                .unwrap();
+        }
+        c.create_vector_index_ondisk_pq("embedding", Metric::L2, 4, 16)
+            .unwrap();
+        assert_eq!(vector_def_building(&db, "docs", "embedding"), Some(false));
+        // The def row is Complete on disk...
+        let row = db
+            .store()
+            .get(INDEX_DEFS, &def_key("docs", "embedding"))
+            .unwrap()
+            .unwrap();
+        let (kb, st) = crate::index_build::decode_def(&row);
+        assert_eq!(
+            kb,
+            vec![
+                metric_byte(Metric::L2),
+                quant_byte(Quantization::None),
+                kind_byte(IndexKind::OnDiskPq)
+            ]
+        );
+        assert!(matches!(st, crate::index_build::DefState::Complete));
+        // ...and the quantized graph serves.
+        let got = c
+            .vector_search("embedding", &data[0], 5, Metric::L2)
+            .unwrap();
+        assert!(!got.is_empty());
+    }
+
+    /// Whether `field` of `coll` is registered and still building (test probe
+    /// into the registry; `None` when unregistered).
+    fn vector_def_building(db: &Db, coll: &str, field: &str) -> Option<bool> {
+        let state = db.indexes().lock().unwrap();
+        state
+            .defs
+            .get(&(coll.to_owned(), field.to_owned()))
+            .map(|d| d.building)
     }
 
     #[test]
