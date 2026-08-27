@@ -102,16 +102,18 @@ impl BuiltIndex {
     }
 
     /// Add (or replace) `key`'s vector. An existing node for `key` is
-    /// tombstoned. Vectors whose dimension differs from the index's fixed
-    /// dimension are skipped, matching the exact-search paths (which skip
-    /// them too) — the document stays queryable by everything else.
+    /// tombstoned first — even when the new vector is skipped below, the old
+    /// node must not stay live (a live stale node is exactly what the exact
+    /// paths never show). Vectors whose dimension differs from the index's
+    /// fixed dimension are skipped, matching the exact-search paths (which
+    /// skip them too) — the document stays queryable by everything else.
     fn add(&mut self, key: &[u8], vector: Vec<f32>) {
+        self.tombstone(key);
         match self.dim {
             Some(d) if d != vector.len() => return,
             None => self.dim = Some(vector.len()),
             _ => {}
         }
-        self.tombstone(key);
         let id = self.hnsw.insert(vector);
         debug_assert_eq!(id, self.node_to_key.len(), "hnsw ids are dense");
         self.node_to_key.push(Some(key.to_vec()));
@@ -873,6 +875,34 @@ mod tests {
         assert_ne!(hits[0].key, b"a".to_vec());
     }
 
+    /// Regression (audit A1): overwriting an indexed document with a
+    /// different-dimension vector used to leave the old node live, so ANN
+    /// results diverged from exact search. The old node must be tombstoned.
+    #[test]
+    fn overwrite_with_different_dimension_tombstones_old_node() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
+        c.insert(b"b", &doc(vec![0.0, 1.0])).unwrap();
+        c.create_vector_index("embedding", Metric::Cosine).unwrap();
+        // Force the lazy build to run.
+        let _ = c
+            .vector_search("embedding", &[1.0, 0.0], 1, Metric::Cosine)
+            .unwrap();
+        // Overwrite "a" with a 3-dim vector (plain overwrite; no schema).
+        c.insert(b"a", &doc(vec![1.0, 0.0, 0.0])).unwrap();
+        // A 2-dim query must not return "a" — parity with the exact path,
+        // which skips dimension-mismatched documents.
+        let hits = c
+            .vector_search("embedding", &[1.0, 0.0], 2, Metric::Cosine)
+            .unwrap();
+        assert!(
+            hits.iter().all(|h| h.key != b"a".to_vec()),
+            "stale node for 'a' still served: {hits:?}"
+        );
+        assert_eq!(hits.len(), 1, "only 'b' should remain");
+    }
+
     #[test]
     fn many_overwrites_then_query_stays_correct_after_compaction() {
         let db = Db::open_in_memory().unwrap();
@@ -1054,24 +1084,36 @@ mod tests {
         let c = db.collection("docs");
         c.create_vector_index("embedding", Metric::L2).unwrap();
         // Force the graph to build so the ANN branch is live.
-        let _ = c.vector_search("embedding", &[1.0, 0.0], 3, Metric::L2).unwrap();
+        let _ = c
+            .vector_search("embedding", &[1.0, 0.0], 3, Metric::L2)
+            .unwrap();
 
         let wrong_dim = c.vector_search("embedding", &[1.0], 3, Metric::L2);
-        assert!(wrong_dim.unwrap().is_empty(), "no doc has a 1-dim embedding");
+        assert!(
+            wrong_dim.unwrap().is_empty(),
+            "no doc has a 1-dim embedding"
+        );
 
         let on_disk = Db::open_in_memory().unwrap();
         let oc = on_disk.collection("docs");
         oc.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
-        oc.create_vector_index_ondisk("embedding", Metric::L2).unwrap();
-        let got = oc.vector_search("embedding", &[1.0], 3, Metric::L2).unwrap();
+        oc.create_vector_index_ondisk("embedding", Metric::L2)
+            .unwrap();
+        let got = oc
+            .vector_search("embedding", &[1.0], 3, Metric::L2)
+            .unwrap();
         assert!(got.is_empty());
         // Matching dims still work through both index kinds.
         assert_eq!(
-            c.vector_search("embedding", &[1.0, 0.0], 1, Metric::L2).unwrap()[0].key,
+            c.vector_search("embedding", &[1.0, 0.0], 1, Metric::L2)
+                .unwrap()[0]
+                .key,
             b"a".to_vec()
         );
         assert_eq!(
-            oc.vector_search("embedding", &[1.0, 0.0], 1, Metric::L2).unwrap()[0].key,
+            oc.vector_search("embedding", &[1.0, 0.0], 1, Metric::L2)
+                .unwrap()[0]
+                .key,
             b"a".to_vec()
         );
     }
@@ -1083,8 +1125,8 @@ mod tests {
     /// maintenance *and* missed by the snapshot, permanently.
     #[test]
     fn concurrent_writes_are_never_lost_from_the_lazy_built_index() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         let db = Arc::new(Db::open_in_memory().unwrap());
         db.collection("docs")
             .create_vector_index("embedding", Metric::L2)
@@ -1106,14 +1148,16 @@ mod tests {
         };
         let reader = {
             let db = Arc::clone(&db);
-            std::thread::spawn(move || loop {
-                if done.load(Ordering::Acquire) {
-                    break;
+            std::thread::spawn(move || {
+                loop {
+                    if done.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // Triggers the first lazy build while writes are in flight.
+                    let _ =
+                        db.collection("docs")
+                            .vector_search("embedding", &[0.0], 10, Metric::L2);
                 }
-                // Triggers the first lazy build while writes are in flight.
-                let _ = db
-                    .collection("docs")
-                    .vector_search("embedding", &[0.0], 10, Metric::L2);
             })
         };
         writer.join().unwrap();
