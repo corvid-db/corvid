@@ -32,6 +32,7 @@ pub mod geo_index;
 pub mod graph;
 pub mod hnsw;
 pub mod index;
+pub mod index_build;
 pub mod join;
 pub mod migrate;
 pub mod plan;

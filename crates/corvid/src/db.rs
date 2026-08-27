@@ -29,6 +29,10 @@ pub struct Db {
     schemas: Mutex<crate::schema::SchemaState>,
     ttl: Mutex<crate::ttl::TtlState>,
     subscribers: Mutex<Subscribers>,
+    // Produced for wave-2 tasks 2-7 (lazy index-build resumes); nothing
+    // consumes it yet — remove this allow when they land.
+    #[allow(dead_code)]
+    index_resume: Mutex<()>,
 }
 
 impl Db {
@@ -43,6 +47,7 @@ impl Db {
             schemas: crate::schema::new_state(),
             ttl: crate::ttl::new_state(),
             subscribers: Mutex::new(Subscribers::default()),
+            index_resume: Mutex::new(()),
         };
         db.load_index_defs()?;
         db.load_text_defs()?;
@@ -65,6 +70,7 @@ impl Db {
             schemas: crate::schema::new_state(),
             ttl: crate::ttl::new_state(),
             subscribers: Mutex::new(Subscribers::default()),
+            index_resume: Mutex::new(()),
         };
         db.load_index_defs()?;
         db.load_text_defs()?;
@@ -172,6 +178,14 @@ impl Db {
     /// The change-feed subscriber registry.
     pub(crate) fn subscribers(&self) -> &Mutex<Subscribers> {
         &self.subscribers
+    }
+
+    /// Serialization point for lazy index-build resumes (try-lock only: a
+    /// query arriving while another thread resumes proceeds on fallbacks).
+    // Consumed by wave-2 tasks 2-7; nothing calls it yet.
+    #[allow(dead_code)]
+    pub(crate) fn index_resume(&self) -> &Mutex<()> {
+        &self.index_resume
     }
 
     /// The shared write path. One transaction covers the row write, the
