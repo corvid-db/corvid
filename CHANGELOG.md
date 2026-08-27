@@ -40,6 +40,17 @@ format and API may change without backward-compatibility guarantees.
   remaining backfill. The index-definition row format changed: binaries from
   before this change misread new-format rows — re-create indexes when
   downgrading. (audit A2)
+- `Error::CorruptIndex { context }` is a new public variant (breaking for
+  exhaustive matches on `Error`): corrupt on-disk index state that previously
+  decoded as empty and served silently wrong (empty) results now errors
+  loudly. (audit C1/C13)
+- On-disk vector indexes now compact automatically once tombstones exceed a
+  third of the index (`dead * 2 > live`), checked on the write path after the
+  commit: expect a synchronous rebuild burst (write amplification) when a
+  write crosses the threshold. (audit B5)
+- Re-registering an on-disk vector index — for any parameter change or none —
+  now always rebuilds from scratch in one transactional reset; same-parameter
+  re-creation no longer resumes a partial backfill. (audit A5)
 
 ## [0.1.1] - 2026-05-29
 

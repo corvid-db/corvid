@@ -465,6 +465,30 @@ impl Db {
             let ns = disk_hnsw::namespace(collection, field);
             let ef = (k * 4).max(64);
             return match disk_hnsw::search(self.store(), &ns, &def.disk_params(), query, k, ef)? {
+                Some(ranked) if ranked.is_empty() => {
+                    // Registry-lag window: a concurrent registration or
+                    // compaction may have committed between this reader's
+                    // registry snapshot (Complete, taken above) and the disk
+                    // search just performed — its transaction cleared the
+                    // namespace and flipped the def row to `Building`, and an
+                    // absent meta row searches as empty. Serving that empty
+                    // vector would be a silent wrong answer; re-read the def
+                    // row (one point-get) and if it now says `Building`,
+                    // declare the index unserviceable (`Ok(None)` → the
+                    // caller's exact fallback). A row that still says
+                    // `Complete` means a genuinely empty index — serve the
+                    // empty result as before.
+                    if crate::index_build::read_building_cursor(
+                        self.store(),
+                        INDEX_DEFS,
+                        &def_key(collection, field),
+                    )?
+                    .is_some()
+                    {
+                        return Ok(None);
+                    }
+                    Ok(Some(ranked))
+                }
                 Some(ranked) => Ok(Some(ranked)),
                 None => Ok(None),
             };
@@ -643,8 +667,12 @@ impl Db {
     /// On-disk HNSW never rewrites graph topology on delete — nodes are
     /// tombstoned and search merely filters them, with a fixed 2× over-fetch
     /// — so a large dead fraction progressively crowds live results out of
-    /// the search frontier (recall degrades; results stay *correct*). When
-    /// `dead * 2 > live`, run the compaction cycle: the Task-2 registration
+    /// the search frontier (recall degrades; results stay *correct*). The
+    /// trigger is `dead * 2 > live` with `live = count − dead` — i.e. dead
+    /// exceeds one third of total nodes — deliberately EARLIER than the
+    /// in-memory graph's dead-majority (>50%) rule, because the disk search's
+    /// over-fetch is fixed (not dead-scaled) and recall decays long before
+    /// tombstones reach a majority. Crossing it runs the compaction cycle: the Task-2 registration
     /// shape on the same def (one transaction: clear the namespace, re-persist
     /// the PQ codebook, install `Building { cursor: [] }`) followed by the
     /// atomic-backfill driver re-reading the documents, then completion.
@@ -897,6 +925,15 @@ impl Collection<'_> {
         metric: Metric,
         quant: Quantization,
     ) -> Result<()> {
+        // Serialize register + backfill against concurrent lazy resumes and
+        // dead-fraction compactions with a BLOCKING lock — not try_lock:
+        // creation is user-initiated and should wait out an in-flight
+        // resume/compaction rather than race it (a racing register+resume
+        // could interleave with a compaction's own reset+re-backfill over
+        // the same namespace). Lock order is index_resume → indexes()
+        // (register/resume take the registry briefly inside); the inverse
+        // never occurs.
+        let _guard = self.db().index_resume().lock().expect("index resume lock");
         self.db()
             .register_vector_index(self.name(), field, metric, quant, IndexKind::OnDisk)?;
         // Registration always installs a fresh Building cursor over a reset
@@ -957,6 +994,11 @@ impl Collection<'_> {
         let pq = crate::pq::Pq::train(&sample, m, k).ok_or(crate::Error::EmptyIndexTraining)?;
         let pq = std::sync::Arc::new(pq);
 
+        // Same blocking serialization as the quantized create above (the
+        // bounded training scan stays outside the lock): registration and
+        // backfill must not race a concurrent lazy resume or compaction.
+        // Lock order index_resume → indexes() holds here too.
+        let _guard = self.db().index_resume().lock().expect("index resume lock");
         // Register Building with the trained codebook, then run the atomic
         // backfill through the shared driver from the fresh cursor the
         // registration just installed (over a reset namespace, audit A5).
@@ -1164,6 +1206,96 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "a completed on-disk index must serve"
+        );
+    }
+
+    /// Registry-lag regression (review wave 3): a reader whose registry
+    /// snapshot says `Complete` can reach the disk search AFTER a concurrent
+    /// registration/compaction committed its namespace clear + `Building`
+    /// flip — the absent meta row searches as empty, which used to be served
+    /// as a silent wrong answer. The empty-result re-check must re-read the
+    /// def row: `Building` → `Ok(None)` (exact fallback), `Complete` → a
+    /// genuinely empty index still serves empty.
+    #[test]
+    fn registry_lag_empty_disk_result_falls_back_when_row_says_building() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        let data = pq_corpus(30, 8);
+        for (i, v) in data.iter().enumerate() {
+            c.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                .unwrap();
+        }
+        // Register an on-disk index: def row → Building over an EMPTY
+        // namespace (no backfill has run — exactly the post-registration /
+        // mid-compaction disk state).
+        db.register_vector_index(
+            "docs",
+            "embedding",
+            Metric::L2,
+            Quantization::None,
+            IndexKind::OnDisk,
+        )
+        .unwrap();
+        // Pin the interleaving: with the resume lock held, the query's own
+        // lazy-resume attempt cannot run (try-lock fails), so the forged
+        // state below is what the reader actually observes.
+        let _guard = db.index_resume().lock().unwrap();
+        // Forge the in-memory def to Complete — the reader's stale registry
+        // snapshot after a concurrent registration flipped the row beneath it.
+        {
+            let mut state = db.indexes().lock().unwrap();
+            state
+                .defs
+                .get_mut(&("docs".to_owned(), "embedding".to_owned()))
+                .unwrap()
+                .building = false;
+        }
+        // ann_search must NOT serve the silent empty result: the def row
+        // says Building → Ok(None) (cannot serve → exact fallback).
+        assert!(
+            db.ann_search("docs", "embedding", &data[0], 5, Metric::L2)
+                .unwrap()
+                .is_none(),
+            "a disk search over a just-cleared namespace must fall back, not serve empty"
+        );
+        // So vector_search takes the exact fallback and returns the right
+        // docs — at parity with an unindexed twin.
+        let twin = Db::open_in_memory().unwrap();
+        let tc = twin.collection("docs");
+        for (i, v) in data.iter().enumerate() {
+            tc.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                .unwrap();
+        }
+        for (i, v) in data.iter().enumerate().take(10) {
+            let exact = tc.vector_search("embedding", v, 3, Metric::L2).unwrap();
+            let got = c.vector_search("embedding", v, 3, Metric::L2).unwrap();
+            assert_eq!(
+                got.iter().map(|h| h.key.clone()).collect::<Vec<_>>(),
+                exact.iter().map(|h| h.key.clone()).collect::<Vec<_>>(),
+                "fallback results for k{i} must equal the unindexed twin"
+            );
+        }
+        // Negative control: flip the ROW to Complete as well — a genuinely
+        // empty index keeps serving the empty result as before.
+        db.store()
+            .put(
+                INDEX_DEFS,
+                &def_key("docs", "embedding"),
+                &crate::index_build::encode_def(
+                    &[
+                        metric_byte(Metric::L2),
+                        quant_byte(Quantization::None),
+                        kind_byte(IndexKind::OnDisk),
+                    ],
+                    &crate::index_build::DefState::Complete,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            db.ann_search("docs", "embedding", &data[0], 5, Metric::L2)
+                .unwrap(),
+            Some(Vec::new()),
+            "a Complete def over an empty namespace is a genuinely empty index"
         );
     }
 
@@ -1472,7 +1604,9 @@ mod tests {
     /// registration resets the namespace and installs a fresh Building
     /// cursor in one transaction, so the backfill rebuilds every document —
     /// no stale cursor skips a committed prefix, and post-replace queries
-    /// sit at parity with exact search.
+    /// sit at parity with exact search. Since create now BLOCKS on the
+    /// resume lock (wave-3 fix), the lock is held on a helper thread — a
+    /// same-thread hold would self-deadlock — and create waits it out.
     #[test]
     fn replace_during_resume_is_consistent() {
         use std::sync::mpsc::channel;
@@ -1504,35 +1638,45 @@ mod tests {
         db.load_index_defs().unwrap();
         assert_eq!(vector_def_building(&db, "docs", "embedding"), Some(true));
 
-        // Hold the resume lock so the query thread's lazy resume stalls; it
-        // must fall back to an exact scan (correct results either way).
-        let guard = db.index_resume().lock().unwrap();
-        let (done_tx, done_rx) = channel();
-        let querier = {
+        // A helper thread holds the resume lock so the query's lazy resume
+        // stalls; the query must fall back to an exact scan (correct results
+        // either way).
+        let (held_tx, held_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let staller = {
             let db = std::sync::Arc::clone(&db);
-            let q = data[0].clone();
             std::thread::spawn(move || {
-                let got = db
-                    .collection("docs")
-                    .vector_search("embedding", &q, 5, Metric::L2)
-                    .unwrap();
-                done_tx.send(()).unwrap();
-                got
+                let _guard = db.index_resume().lock().unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv(); // hold the lock until released
             })
         };
-        done_rx.recv().unwrap(); // the fallback query finished mid-race
-        // Re-register on the main thread while the resume stays stalled:
-        // fresh Building + cleared namespace, then the full backfill.
-        db.collection("docs")
-            .create_vector_index_ondisk("embedding", Metric::L2)
+        held_rx.recv().unwrap(); // the lock is held
+
+        // The stalled query's fallback is already correct: exact parity.
+        let fallback = db
+            .collection("docs")
+            .vector_search("embedding", &data[0], 5, Metric::L2)
             .unwrap();
-        drop(guard);
-        let fallback = querier.join().unwrap();
-        // The stalled query's fallback was already correct: exact parity.
         assert!(
             fallback.iter().any(|h| h.key == b"k0".to_vec()),
             "fallback query must return the exact nearest doc"
         );
+
+        // Re-register while the resume stays stalled: create BLOCKS on the
+        // resume lock (waiting out the in-flight resume rather than racing
+        // it), then resets the namespace and rebuilds in full.
+        let creator = {
+            let db = std::sync::Arc::clone(&db);
+            std::thread::spawn(move || {
+                db.collection("docs")
+                    .create_vector_index_ondisk("embedding", Metric::L2)
+                    .unwrap();
+            })
+        };
+        release_tx.send(()).unwrap();
+        staller.join().unwrap();
+        creator.join().unwrap();
 
         // The def ended Complete and the namespace holds the full rebuild.
         assert_eq!(vector_def_building(&db, "docs", "embedding"), Some(false));
