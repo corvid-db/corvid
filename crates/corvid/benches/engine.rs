@@ -102,5 +102,68 @@ fn bench_distance(c: &mut Criterion) {
     c.bench_function("cosine_768d", |bn| bn.iter(|| cosine_distance(&a, &b)));
 }
 
-criterion_group!(benches, bench_codec, bench_hnsw, bench_text, bench_distance);
+/// On-disk index-creation baselines (audit wave-2 perf rule). Each iteration
+/// seeds a fresh in-memory Db and then creates the index — creation is
+/// once-per-db, so the per-iteration seeding cost is deliberately inside the
+/// measured routine (fine for a relative before/after baseline; absolute
+/// numbers overstate creation cost). Sample size is kept low to bound wall
+/// time given multi-second iterations.
+fn bench_creation_ondisk(c: &mut Criterion) {
+    const N_TEXT: usize = 5_000; // 3 backfill pages (PAGE = 2048)
+    // One doc past the 2048-page boundary: exercises the multi-page cursor
+    // path of the atomic driver while keeping the bench around ~30 s.
+    const N_VEC: usize = 2_049;
+    let words = [
+        "rust", "embedded", "database", "vector", "search", "graph", "fox", "dog",
+    ];
+    let bodies: Vec<String> = (0..N_TEXT)
+        .map(|i| {
+            (0..20)
+                .map(|j| words[(i + j) % words.len()])
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    let vecs = corpus(N_VEC, 8);
+
+    let mut g = c.benchmark_group("index_creation_ondisk");
+    g.sample_size(10);
+    g.bench_function("create_text_index_ondisk_5k", |b| {
+        b.iter(|| {
+            let db = Db::open_in_memory().unwrap();
+            let coll = db.collection("docs");
+            for (i, body) in bodies.iter().enumerate() {
+                let mut m = BTreeMap::new();
+                m.insert("body".to_owned(), Value::Text(body.clone()));
+                coll.insert(format!("k{i}").as_bytes(), &Value::Map(m))
+                    .unwrap();
+            }
+            coll.create_text_index_ondisk("body").unwrap();
+        })
+    });
+    g.bench_function("create_vector_index_ondisk_2k_8d", |b| {
+        b.iter(|| {
+            let db = Db::open_in_memory().unwrap();
+            let coll = db.collection("docs");
+            for (i, v) in vecs.iter().enumerate() {
+                let mut m = BTreeMap::new();
+                m.insert("embedding".to_owned(), Value::Vector(v.clone()));
+                coll.insert(format!("k{i}").as_bytes(), &Value::Map(m))
+                    .unwrap();
+            }
+            coll.create_vector_index_ondisk("embedding", Metric::L2)
+                .unwrap();
+        })
+    });
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_codec,
+    bench_hnsw,
+    bench_text,
+    bench_distance,
+    bench_creation_ondisk
+);
 criterion_main!(benches);
