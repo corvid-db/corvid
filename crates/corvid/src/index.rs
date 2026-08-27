@@ -271,8 +271,10 @@ impl Db {
     /// def. Re-registering the *same* def (identical kind bytes) preserves an
     /// in-flight `Building` row's cursor, so a re-created creation resumes
     /// instead of rescanning; any kind/quant/metric change is a replace and
-    /// starts fresh. In-memory indexes rebuild lazily from documents, so
-    /// their defs are born `Complete`.
+    /// starts fresh. `OnDiskPq` never preserves a cursor: its kind bytes
+    /// don't capture m/k and every registration retrains, so a retrain
+    /// always implies a full re-backfill. In-memory indexes rebuild lazily
+    /// from documents, so their defs are born `Complete`.
     fn register_vector_index_inner(
         &self,
         collection: &str,
@@ -286,11 +288,17 @@ impl Db {
         let kb = [metric_byte(metric), quant_byte(quant), kind_byte(kind)];
         let state = if kind.is_on_disk() {
             // Same def again → resume an in-flight backfill from its cursor;
-            // a changed def → fresh Building (backfill from the start).
-            let same = self
-                .store()
-                .get(INDEX_DEFS, &key)?
-                .is_some_and(|v| crate::index_build::decode_def(&v).0 == kb);
+            // a changed def → fresh Building (backfill from the start). PQ is
+            // exempt: its kind bytes don't capture the m/k hyperparameters
+            // and every registration retrains a fresh codebook, so a
+            // preserved cursor would leave a committed prefix encoded with
+            // the previous codebook while the new one decodes every node —
+            // a retrain always re-backfills from the start.
+            let same = kind != IndexKind::OnDiskPq
+                && self
+                    .store()
+                    .get(INDEX_DEFS, &key)?
+                    .is_some_and(|v| crate::index_build::decode_def(&v).0 == kb);
             let cursor = if same {
                 crate::index_build::read_building_cursor(self.store(), INDEX_DEFS, &key)?
                     .unwrap_or_default()
@@ -1108,6 +1116,92 @@ mod tests {
             .vector_search("embedding", &data[0], 5, Metric::L2)
             .unwrap();
         assert!(!got.is_empty());
+    }
+
+    /// Regression (review round 1): re-creating a PQ index with different m/k
+    /// over an interrupted build must NOT resume the old cursor. PQ kind
+    /// bytes don't capture the hyperparameters, and every registration
+    /// retrains a fresh codebook — resuming would leave the committed prefix
+    /// encoded with the previous codebook while the completed index decodes
+    /// every node with the new one (silently wrong vectors). A retrain
+    /// implies a full re-backfill.
+    #[test]
+    fn pq_recreate_with_new_params_rebackfills_under_new_codebook() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        let data = pq_corpus(60, 8);
+        for (i, v) in data.iter().enumerate() {
+            c.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                .unwrap();
+        }
+        // First creation completes under (m=4, k=16).
+        c.create_vector_index_ondisk_pq("embedding", Metric::L2, 4, 16)
+            .unwrap();
+        // Forge an interrupted re-create: Building with a mid-corpus cursor,
+        // exactly as a crash mid-backfill leaves it (prefix committed).
+        db.store()
+            .put(
+                INDEX_DEFS,
+                &def_key("docs", "embedding"),
+                &crate::index_build::encode_def(
+                    &[
+                        metric_byte(Metric::L2),
+                        quant_byte(Quantization::None),
+                        kind_byte(IndexKind::OnDiskPq),
+                    ],
+                    &crate::index_build::DefState::Building {
+                        cursor: b"k29\0".to_vec(),
+                    },
+                ),
+            )
+            .unwrap();
+        db.load_index_defs().unwrap();
+        assert_eq!(vector_def_building(&db, "docs", "embedding"), Some(true));
+        // Re-create with different hyperparameters: the retrain must
+        // re-backfill the WHOLE corpus under the new codebook (fresh
+        // cursor), never resume the stale one.
+        c.create_vector_index_ondisk_pq("embedding", Metric::L2, 2, 8)
+            .unwrap();
+        assert_eq!(vector_def_building(&db, "docs", "embedding"), Some(false));
+        let row = db
+            .store()
+            .get(INDEX_DEFS, &def_key("docs", "embedding"))
+            .unwrap()
+            .unwrap();
+        let (kb, st) = crate::index_build::decode_def(&row);
+        assert_eq!(
+            kb,
+            vec![
+                metric_byte(Metric::L2),
+                quant_byte(Quantization::None),
+                kind_byte(IndexKind::OnDiskPq)
+            ]
+        );
+        assert!(matches!(st, crate::index_build::DefState::Complete));
+        // Prefix docs (committed before the forged cursor) must serve with
+        // new-codebook accuracy, at parity with the exact path: an
+        // unindexed collection's top-1 (the doc itself) comes back in the
+        // indexed top-5. A mixed-codebook prefix decodes as garbage and
+        // collapses this recall to chance.
+        let plain = Db::open_in_memory().unwrap();
+        let pc = plain.collection("docs");
+        for (i, v) in data.iter().enumerate() {
+            pc.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                .unwrap();
+        }
+        let mut hits = 0;
+        for (i, v) in data.iter().enumerate().take(20) {
+            let exact = pc.vector_search("embedding", v, 1, Metric::L2).unwrap();
+            assert_eq!(exact[0].key, format!("k{i}").into_bytes()); // sanity
+            let got = c.vector_search("embedding", v, 5, Metric::L2).unwrap();
+            if got.iter().any(|h| h.key == exact[0].key) {
+                hits += 1;
+            }
+        }
+        assert!(
+            hits >= 15,
+            "prefix self-recall {hits}/20 too low (mixed codebooks?)"
+        );
     }
 
     /// Whether `field` of `coll` is registered and still building (test probe
