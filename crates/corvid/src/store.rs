@@ -50,6 +50,25 @@ pub struct Store {
     relaxed: std::sync::atomic::AtomicBool,
 }
 
+thread_local! {
+    /// Depth of bulk-load scopes on *this* thread. Write transactions relax
+    /// durability only when the issuing thread is inside a bulk scope (plus
+    /// the explicit whole-store opt-in), so a bulk load on one thread never
+    /// silently degrades concurrent writers' durability.
+    static BULK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Guard marking the current thread as inside a bulk load (relaxed
+/// durability for write transactions started here). Dropping it — normally
+/// or on unwind — restores durable commits. Created by [`Store::begin_bulk`].
+pub struct BulkScope;
+
+impl Drop for BulkScope {
+    fn drop(&mut self) {
+        BULK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 impl Store {
     /// Open (creating if absent) a store backed by a file at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -74,6 +93,20 @@ impl Store {
     /// Enter or leave relaxed (eventual) durability for write transactions.
     pub fn set_relaxed_durability(&self, on: bool) {
         self.relaxed.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Enter a bulk-load scope on the current thread. Write transactions
+    /// started on this thread skip the per-commit fsync until the returned
+    /// guard drops; make them durable with [`Store::flush`].
+    pub fn begin_bulk(&self) -> BulkScope {
+        BULK_DEPTH.with(|d| d.set(d.get() + 1));
+        BulkScope
+    }
+
+    /// Whether write transactions on the current thread would relax
+    /// durability (bulk scope active or explicit opt-in).
+    fn bulk_active_on_this_thread(&self) -> bool {
+        self.relaxed.load(std::sync::atomic::Ordering::Relaxed) || BULK_DEPTH.with(|d| d.get() > 0)
     }
 
     /// Force a durable (fsync) commit, making all prior eventual writes durable.
@@ -201,9 +234,7 @@ impl Store {
     pub fn backup(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         if path.exists() {
-            return Err(crate::Error::BackupTargetExists(
-                path.display().to_string(),
-            ));
+            return Err(crate::Error::BackupTargetExists(path.display().to_string()));
         }
         let src = self.db.begin_read()?;
         let dst = Database::create(path)?;
@@ -244,7 +275,7 @@ impl Store {
         F: FnOnce(&mut WriteBatch<'_>) -> Result<T>,
     {
         let mut txn = self.db.begin_write()?;
-        if self.relaxed.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.bulk_active_on_this_thread() {
             // `None` skips the fsync; a later `Immediate` commit (flush) persists.
             txn.set_durability(redb::Durability::None)?;
         }
@@ -1026,5 +1057,37 @@ mod tests {
             .unwrap();
         assert_eq!(g, None);
         assert!(sc.is_empty());
+    }
+
+    /// Regression (audit B1): relaxed durability leaked to threads not
+    /// inside the bulk scope, and a panicking bulk closure left it on
+    /// forever. Bulk scope is thread-local and panic-safe (RAII).
+    #[test]
+    fn bulk_scope_relaxes_only_the_bulk_thread() {
+        use std::sync::Arc;
+        let s = Arc::new(mem());
+        let _scope = s.begin_bulk();
+        assert!(s.bulk_active_on_this_thread());
+        let other = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || s.bulk_active_on_this_thread())
+                .join()
+                .unwrap()
+        };
+        assert!(!other, "concurrent writer must keep durable commits");
+    }
+
+    #[test]
+    fn panicking_bulk_closure_restores_durability() {
+        let s = mem();
+        let boomed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope = s.begin_bulk();
+            panic!("bulk closure failed mid-load");
+        }));
+        assert!(boomed.is_err());
+        assert!(!s.bulk_active_on_this_thread());
+        // And a subsequent ordinary transaction is durable again (flag-wise).
+        s.put("docs", b"k", b"v").unwrap();
+        assert!(!s.bulk_active_on_this_thread());
     }
 }

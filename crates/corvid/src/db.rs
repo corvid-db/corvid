@@ -95,15 +95,18 @@ impl Db {
     /// flush at the end makes everything durable. A crash *during* the load can
     /// lose the in-flight writes (the database stays consistent), so use this
     /// only for rebuildable bulk ingestion, not for writes you must not lose.
+    /// Relaxed durability applies only to write transactions on the calling
+    /// thread; concurrent writers are unaffected. The scope is panic-safe.
     ///
     /// Turns an N-document load from ~N fsyncs into ~1.
     pub fn bulk<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce() -> Result<T>,
     {
-        self.store.set_relaxed_durability(true);
+        // Relaxed durability applies only to transactions begun on this
+        // thread, and the scope is panic-safe (RAII).
+        let _scope = self.store.begin_bulk();
         let result = f();
-        self.store.set_relaxed_durability(false);
         // Make the bulk writes durable even if `f` failed partway.
         let flush = self.store.flush();
         let out = result?;
