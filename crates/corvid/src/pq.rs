@@ -119,11 +119,14 @@ impl Pq {
     /// Precompute the L2 asymmetric-distance table for `query`:
     /// `table[s * k + c]` is the squared-L2 distance from `query`'s subvector
     /// `s` to centroid `c`. Use with [`Pq::adc_l2`] for fast L2 scoring.
-    pub fn l2_table(&self, query: &[f32]) -> Vec<f32> {
-        let mut table = vec![0.0f32; self.m * self.k];
+    /// Returns `None` when the query dimension does not match the codebook —
+    /// a mismatched query has no meaningful table, and an all-zero one would
+    /// score every node at distance 0.
+    pub fn l2_table(&self, query: &[f32]) -> Option<Vec<f32>> {
         if query.len() != self.dim {
-            return table;
+            return None;
         }
+        let mut table = vec![0.0f32; self.m * self.k];
         for s in 0..self.m {
             let off = s * self.sub_dim;
             let qsub = &query[off..off + self.sub_dim];
@@ -138,15 +141,21 @@ impl Pq {
                 table[s * self.k + c] = d;
             }
         }
-        table
+        Some(table)
     }
 
-    /// Squared-L2 distance from a coded vector to the query whose `table` was
-    /// built with [`Pq::l2_table`] — a sum of `m` table lookups.
+    /// Squared-L2 distance from a coded vector to the query whose `table`
+    /// was built with [`Pq::l2_table`] — a sum of `m` table lookups. A code
+    /// byte outside `[0, k)` (corrupt or foreign-format state) scores
+    /// `INFINITY`: the node never ranks and nothing panics.
     pub fn adc_l2(&self, table: &[f32], code: &[u8]) -> f32 {
         let mut sum = 0.0f32;
         for (s, &c) in code.iter().enumerate().take(self.m) {
-            sum += table[s * self.k + c as usize];
+            let c = c as usize;
+            if c >= self.k {
+                return f32::INFINITY;
+            }
+            sum += table[s * self.k + c];
         }
         sum
     }
@@ -349,7 +358,7 @@ mod tests {
         let data = clustered(100, 8, 5);
         let pq = Pq::train(&data, 4, 16).unwrap();
         let q = &data[10];
-        let table = pq.l2_table(q);
+        let table = pq.l2_table(q).unwrap();
         for v in data.iter().take(20) {
             let code = pq.encode(v);
             let adc = pq.adc_l2(&table, &code);
@@ -379,7 +388,7 @@ mod tests {
             let want: std::collections::HashSet<usize> =
                 exact.iter().take(k).map(|(i, _)| *i).collect();
             // PQ top-k via ADC.
-            let table = pq.l2_table(q);
+            let table = pq.l2_table(q).unwrap();
             let mut approx: Vec<(usize, f32)> = codes
                 .iter()
                 .enumerate()
@@ -395,6 +404,32 @@ mod tests {
         // neighbours; exact thresholds depend on params, so assert a solid
         // majority rather than a brittle high bar.
         assert!(recall >= 0.6, "PQ recall {recall} too low");
+    }
+
+    /// Regression (audit A4): a code byte outside [0, k) used to index the ADC
+    /// table out of bounds (panic from the query path). Such a node must score
+    /// INFINITY — never rank, never panic.
+    #[test]
+    fn adc_l2_rejects_out_of_range_codes() {
+        let data = clustered(100, 8, 5);
+        let pq = Pq::train(&data, 4, 16).unwrap();
+        let table = pq.l2_table(&data[0]).unwrap();
+        assert_eq!(pq.adc_l2(&table, &[255, 255, 255, 255]), f32::INFINITY);
+        // In-range codes still score finitely.
+        let code = pq.encode(&data[1]);
+        assert!(pq.adc_l2(&table, &code).is_finite());
+    }
+
+    /// Regression (audit A4): a dimension-mismatched query used to get an
+    /// all-zero table (every node distance 0). It must get `None` so callers
+    /// can decline to serve or fall back.
+    #[test]
+    fn l2_table_returns_none_on_dimension_mismatch() {
+        let data = clustered(50, 8, 4);
+        let pq = Pq::train(&data, 4, 16).unwrap();
+        let wrong: Vec<f32> = (0..pq.dim() + 1).map(|i| i as f32).collect();
+        assert!(pq.l2_table(&wrong).is_none());
+        assert!(pq.l2_table(&data[0]).is_some());
     }
 
     #[test]

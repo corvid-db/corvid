@@ -76,9 +76,15 @@ impl DiskParams {
     /// Build the PQ probe for a query: under L2, precompute the asymmetric-
     /// distance table once (so each node is O(m) table lookups instead of an
     /// O(dim) reconstruct + distance); other metrics keep the query vector.
+    /// If the table cannot be built (dimension mismatch), fall back to the
+    /// reconstruction probe — slower, but correct; `search` declines
+    /// mismatched queries up front, so this is defense in depth.
     fn pq_probe(pq: &Pq, metric: Metric, query: Vec<f32>) -> DProbe {
         match metric {
-            Metric::L2 => DProbe::PqAdc(pq.l2_table(&query)),
+            Metric::L2 => match pq.l2_table(&query) {
+                Some(table) => DProbe::PqAdc(table),
+                None => DProbe::Pq(query),
+            },
             _ => DProbe::Pq(query),
         }
     }
@@ -576,6 +582,13 @@ pub(crate) fn search(
         // Dimension gate (unset on legacy namespaces → accept-all).
         if let Some(d) = meta.dim
             && d as usize != query.len()
+        {
+            return Ok(None);
+        }
+        // A PQ index can only serve queries matching its codebook dimension
+        // (covers legacy namespaces whose meta.dim is unset).
+        if let Some(pq) = &p.pq
+            && pq.dim() != query.len()
         {
             return Ok(None);
         }

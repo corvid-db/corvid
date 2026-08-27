@@ -801,6 +801,29 @@ mod tests {
         assert!(matches!(err, Err(crate::Error::EmptyIndexTraining)));
     }
 
+    /// A query whose dimension mismatches an on-disk PQ index falls back to the
+    /// exact path — same results as an unindexed collection (audit A4 pin).
+    #[test]
+    fn pq_index_dimension_mismatch_falls_back_to_exact() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        let corpus = pq_corpus(40, 8);
+        for (i, v) in corpus.iter().enumerate() {
+            c.insert(&(i as u32).to_le_bytes(), &doc(v.clone()))
+                .unwrap();
+        }
+        c.create_vector_index_ondisk_pq("embedding", Metric::L2, 4, 16)
+            .unwrap();
+        let wrong = vec![0.5f32; 7];
+        let hits = c.vector_search("embedding", &wrong, 5, Metric::L2).unwrap();
+        assert!(hits.is_empty(), "no 7-dim vectors exist");
+        // The correct dimension still serves via the index.
+        let hits = c
+            .vector_search("embedding", &corpus[0], 5, Metric::L2)
+            .unwrap();
+        assert!(!hits.is_empty());
+    }
+
     fn seeded() -> Db {
         let db = Db::open_in_memory().unwrap();
         let c = db.collection("docs");
