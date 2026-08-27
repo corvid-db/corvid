@@ -191,7 +191,8 @@ impl Db {
     pub(crate) fn try_resume_index_builds(&self, collection: &str) -> Result<()> {
         let scalar_jobs = self.collect_building_scalar(collection)?;
         let compound_jobs = self.collect_building_compound(collection)?;
-        if scalar_jobs.is_empty() && compound_jobs.is_empty() {
+        let geo_jobs = self.collect_building_geo(collection)?;
+        if scalar_jobs.is_empty() && compound_jobs.is_empty() && geo_jobs.is_empty() {
             return Ok(());
         }
         // Bound to this call: a concurrent caller's try_lock fails and it
@@ -205,6 +206,9 @@ impl Db {
         }
         for (fields, cursor) in compound_jobs {
             self.resume_compound(collection, &fields, &cursor)?;
+        }
+        for (field, cursor) in geo_jobs {
+            self.resume_geo(collection, &field, &cursor)?;
         }
         Ok(())
     }

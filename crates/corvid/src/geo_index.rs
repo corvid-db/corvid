@@ -42,7 +42,10 @@ const FWD_TAG: u8 = 0x00;
 /// Per-database geo-index registry.
 #[derive(Default)]
 pub(crate) struct GeoState {
-    defs: std::collections::HashSet<(String, String)>,
+    /// Geo indexes: `(collection, field)` → whether the index is still
+    /// **building** (an interrupted creation). Maintenance iterates all defs;
+    /// serviceability requires `building == false`.
+    defs: std::collections::HashMap<(String, String), bool>,
 }
 
 pub(crate) fn new_state() -> std::sync::Mutex<GeoState> {
@@ -104,22 +107,6 @@ pub(crate) fn insert_in_txn(
         tx.put(ns, &fwd_key(doc_key), &cell)?;
     }
     Ok(())
-}
-
-pub(crate) fn insert_many(store: &Store, ns: &str, items: &[(Vec<u8>, Value)]) -> Result<()> {
-    store.transaction(|tx| {
-        for (doc_key, value) in items {
-            remove_in_txn(tx, ns, doc_key)?;
-            if let Some((lat, lon)) = extract_point(value) {
-                let cell = cell_prefix(lat, lon);
-                let mut idx_key = cell.to_vec();
-                idx_key.extend_from_slice(doc_key);
-                tx.put(ns, &idx_key, &[])?;
-                tx.put(ns, &fwd_key(doc_key), &cell)?;
-            }
-        }
-        Ok(())
-    })
 }
 
 fn remove_in_txn(tx: &mut crate::store::WriteBatch<'_>, ns: &str, doc_key: &[u8]) -> Result<()> {
@@ -235,21 +222,47 @@ pub(crate) fn radius_bbox(lat: f64, lon: f64, radius_km: f64) -> Option<(f64, f6
 }
 
 impl Db {
+    /// Load persisted geo-index definitions. Called once on open. Legacy rows
+    /// without state bytes decode as `Complete`; a `Building` row marks the
+    /// index for lazy resume on first use.
     pub(crate) fn load_geo_defs(&self) -> Result<()> {
         let mut state = self.geo().lock().expect("geo lock");
-        for (key, _) in self.store().scan(GEO_DEFS)? {
+        for (key, value) in self.store().scan(GEO_DEFS)? {
             if let Some(def) = split_def_key(&key) {
-                state.defs.insert(def);
+                // Kind bytes are unused for geo defs (empty).
+                let (_, st) = crate::index_build::decode_def(&value);
+                state.defs.insert(
+                    def,
+                    matches!(st, crate::index_build::DefState::Building { .. }),
+                );
             }
         }
         Ok(())
     }
 
+    /// Register (or replace) a geo index on `field` for `collection`: the
+    /// def row becomes `Building` (empty cursor) so a crash between
+    /// registration and backfill completion leaves a never-served, resumable
+    /// state. An in-flight `Building` row keeps its cursor, so a
+    /// re-registration resumes the interrupted backfill instead of rescanning.
     pub(crate) fn register_geo_index(&self, collection: &str, field: &str) -> Result<()> {
-        self.store()
-            .put(GEO_DEFS, &def_key(collection, field), b"")?;
+        let key = def_key(collection, field);
+        let in_flight =
+            crate::index_build::read_building_cursor(self.store(), GEO_DEFS, &key)?.is_some();
+        if !in_flight {
+            self.store().put(
+                GEO_DEFS,
+                &key,
+                &crate::index_build::encode_def(
+                    &[],
+                    &crate::index_build::DefState::Building { cursor: vec![] },
+                ),
+            )?;
+        }
         let mut state = self.geo().lock().expect("geo lock");
-        state.defs.insert((collection.to_owned(), field.to_owned()));
+        state
+            .defs
+            .insert((collection.to_owned(), field.to_owned()), true);
         Ok(())
     }
 
@@ -286,27 +299,92 @@ impl Db {
         Ok(())
     }
 
+    /// Every field of `collection` with a geo index, building or complete —
+    /// maintenance must keep all of them current so a resumed backfill and
+    /// concurrent writes overlap safely (idempotent upserts).
     fn geo_fields(&self, collection: &str) -> Vec<String> {
         let state = self.geo().lock().expect("geo lock");
         state
             .defs
-            .iter()
+            .keys()
             .filter(|(c, _)| c == collection)
             .map(|(_, f)| f.clone())
             .collect()
     }
 
-    /// All geo index definitions (for dump/migrate).
+    /// All geo index definitions (for dump/migrate). State is intentionally
+    /// dropped: dump/load replays creation, materializing each def as
+    /// `Complete`.
     pub(crate) fn geo_specs(&self) -> Vec<(String, String)> {
         let state = self.geo().lock().expect("geo lock");
-        state.defs.iter().cloned().collect()
+        state.defs.keys().cloned().collect()
     }
 
+    /// Whether `field` of `collection` has a **complete** geo index. A
+    /// building index is never serviceable: geo queries conservatively fall
+    /// back (the first probe resumes the build).
     pub(crate) fn has_geo_index(&self, collection: &str, field: &str) -> bool {
         let state = self.geo().lock().expect("geo lock");
         state
             .defs
-            .contains(&(collection.to_owned(), field.to_owned()))
+            .get(&(collection.to_owned(), field.to_owned()))
+            .is_some_and(|building| !*building)
+    }
+
+    /// Flip a geo index's in-memory def to complete after its backfill
+    /// committed `Complete` on disk.
+    pub(crate) fn mark_geo_complete(&self, collection: &str, field: &str) {
+        let mut state = self.geo().lock().expect("geo lock");
+        state
+            .defs
+            .insert((collection.to_owned(), field.to_owned()), false);
+    }
+
+    /// Building geo defs of `collection` as `(field, cursor)` jobs, read from
+    /// the def rows (disk is the resume truth after a crash).
+    pub(crate) fn collect_building_geo(&self, collection: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut jobs = Vec::new();
+        for (key, value) in self.store().scan(GEO_DEFS)? {
+            let Some((coll, field)) = split_def_key(&key) else {
+                continue;
+            };
+            if coll != collection {
+                continue;
+            }
+            if let crate::index_build::DefState::Building { cursor } =
+                crate::index_build::decode_def(&value).1
+            {
+                jobs.push((field, cursor));
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// (Re-)run the atomic backfill for one geo index from `cursor`, then mark
+    /// it complete — the exact driver invocation `create_geo_index` uses,
+    /// shared with lazy resumes.
+    pub(crate) fn resume_geo(&self, collection: &str, field: &str, cursor: &[u8]) -> Result<()> {
+        let ns = namespace(collection, field);
+        let kb: Vec<u8> = Vec::new();
+        crate::index_build::run_atomic_backfill(
+            self.store(),
+            collection,
+            GEO_DEFS,
+            &def_key(collection, field),
+            &kb,
+            cursor,
+            &mut |tx, page| {
+                for (key, bytes) in page {
+                    let doc = Value::decode(bytes)?;
+                    if let Some(value) = doc.get_path(field) {
+                        insert_in_txn(tx, &ns, key, value)?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        self.mark_geo_complete(collection, field);
+        Ok(())
     }
 
     /// If `field` has a geo index, a verified superset of doc keys whose point
@@ -320,6 +398,7 @@ impl Db {
         max_lat: f64,
         max_lon: f64,
     ) -> Result<Option<Vec<Vec<u8>>>> {
+        self.try_resume_index_builds(collection)?;
         if !self.has_geo_index(collection, field) || min_lon > max_lon {
             return Ok(None);
         }
@@ -348,28 +427,23 @@ impl Collection<'_> {
     /// documents. Radius and bbox queries on `field` then scan only the cells
     /// their bounding box overlaps instead of the whole collection. The index
     /// is on disk and persists.
+    ///
+    /// Atomic and crash-safe (audit A2): the def is registered `Building`
+    /// before any backfill work; every page's index writes and cursor advance
+    /// commit in one transaction; completion is its own final transaction. A
+    /// crash or error leaves a resumable `Building` def that queries never
+    /// serve — the first geo query (or a re-creation) resumes it.
     pub fn create_geo_index(&self, field: &str) -> Result<()> {
         self.db().register_geo_index(self.name(), field)?;
-        let ns = namespace(self.name(), field);
-        let mut cursor: Vec<u8> = Vec::new();
-        loop {
-            let page = self.db().store().scan_from(self.name(), &cursor, 2048)?;
-            if page.is_empty() {
-                break;
-            }
-            let mut batch: Vec<(Vec<u8>, Value)> = Vec::new();
-            for (key, bytes) in &page {
-                let doc = Value::decode(bytes)?;
-                if let Some(value) = doc.get_path(field) {
-                    batch.push((key.clone(), value.clone()));
-                }
-            }
-            if !batch.is_empty() {
-                insert_many(self.db().store(), &ns, &batch)?;
-            }
-            cursor = next_after(&page.last().unwrap().0);
-        }
-        Ok(())
+        // A def still Building from an interrupted creation resumes from its
+        // saved cursor; a Complete (or fresh) def backfills from the start.
+        let cursor = crate::index_build::read_building_cursor(
+            self.db().store(),
+            GEO_DEFS,
+            &def_key(self.name(), field),
+        )?;
+        self.db()
+            .resume_geo(self.name(), field, &cursor.unwrap_or_default())
     }
 }
 
@@ -497,6 +571,62 @@ mod tests {
             c.create_geo_index("loc").unwrap();
         }
         let db = Db::open(&path).unwrap();
+        let got = db
+            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, vec![b"london".to_vec()]);
+    }
+
+    /// A building geo index is never served: geo queries fall back to a scan
+    /// and stay correct; the first such query resumes the build.
+    #[test]
+    fn building_geo_index_falls_back_then_resumes() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("places");
+        c.insert(b"london", &place(51.5074, -0.1278)).unwrap();
+        c.insert(b"greenwich", &place(51.4779, 0.0015)).unwrap();
+        c.insert(b"paris", &place(48.8566, 2.3522)).unwrap();
+        // Forge a Building def exactly as an interrupted creation would leave it.
+        db.register_geo_index("places", "loc").unwrap(); // registers Building
+        assert!(
+            !db.has_geo_index("places", "loc"),
+            "building def must not be serviceable"
+        );
+        // Before resume: a radius query must still be correct (scan fallback;
+        // the query itself resumes the build).
+        let hits = c.geo_within_radius("loc", 51.5, -0.13, 50.0).unwrap();
+        let mut keys: Vec<Vec<u8>> = hits.iter().map(|h| h.key.clone()).collect();
+        keys.sort();
+        assert_eq!(keys, vec![b"greenwich".to_vec(), b"london".to_vec()]);
+        // After the resume the def is complete and serviceable.
+        assert!(db.has_geo_index("places", "loc"));
+        // And the builder's geo filter drives off the resumed index.
+        let rows = c
+            .query()
+            .filter(crate::field("loc").within_km(51.5, -0.13, 50.0))
+            .run()
+            .unwrap();
+        let mut keys: Vec<Vec<u8>> = rows.iter().map(|r| r.key.clone()).collect();
+        keys.sort();
+        assert_eq!(keys, vec![b"greenwich".to_vec(), b"london".to_vec()]);
+    }
+
+    #[test]
+    fn legacy_stateless_geo_def_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = Db::open(&path).unwrap();
+            let c = db.collection("places");
+            c.insert(b"london", &place(51.5074, -0.1278)).unwrap();
+            c.create_geo_index("loc").unwrap();
+            // Overwrite the def row with the legacy empty form.
+            db.store().put(GEO_DEFS, b"places\x00loc", b"").unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert!(db.has_geo_index("places", "loc")); // legacy → Complete → serviceable
+        assert!(db.collect_building_geo("places").unwrap().is_empty());
         let got = db
             .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0)
             .unwrap()
