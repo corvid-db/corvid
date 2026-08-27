@@ -1563,10 +1563,12 @@ mod tests {
         {
             let db = Db::open(&path).unwrap();
             let c = db.collection("docs");
-            let mut m = BTreeMap::new();
-            m.insert("a".to_owned(), Value::Int(1));
-            m.insert("b".to_owned(), Value::Int(2));
-            c.insert(b"k", &Value::Map(m)).unwrap();
+            for i in 0..20i64 {
+                let mut m = BTreeMap::new();
+                m.insert("a".to_owned(), Value::Text(format!("g{}", i % 2)));
+                m.insert("b".to_owned(), Value::Int(i));
+                c.insert(&[i as u8], &Value::Map(m)).unwrap();
+            }
             c.create_compound_index(&["a", "b"]).unwrap();
             // Overwrite the def row with the legacy empty form.
             db.store()
@@ -1577,31 +1579,56 @@ mod tests {
         let fields = vec!["a".to_owned(), "b".to_owned()];
         assert!(db.has_compound_index("docs", &fields)); // legacy → Complete → serviceable
         assert!(db.collect_building_compound("docs").unwrap().is_empty());
+        // End-to-end (mirrors the fts/vector legacy tests): a real prefix+
+        // range query served through the legacy def returns exactly the
+        // right rows.
+        let rows = db
+            .collection("docs")
+            .query()
+            .filter(field("a").eq(Value::Text("g1".into())))
+            .filter(field("b").ge(Value::Int(10)))
+            .run()
+            .unwrap();
+        let mut keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![vec![11u8], vec![13u8], vec![15u8], vec![17u8], vec![19u8]]
+        );
     }
 
     #[test]
     fn legacy_stateless_scalar_def_is_complete() {
-        let db = Db::open_in_memory().unwrap();
-        let c = db.collection("docs");
-        c.insert(b"k", &rec(1)).unwrap();
-        db.register_scalar_index("docs", "n").unwrap();
-        // Overwrite the def row with the legacy empty form.
-        db.store()
-            .put(crate::scalar::SCALAR_DEFS, b"docs\x00n", b"")
-            .unwrap();
-        let fresh = Db::open_in_memory().unwrap(); // loaders on a fresh db
-        let _ = fresh; // state decode is covered below via reopen of a file db
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         {
             let db = Db::open(&path).unwrap();
-            db.collection("docs").insert(b"k", &rec(1)).unwrap();
-            db.register_scalar_index("docs", "n").unwrap();
+            let c = db.collection("docs");
+            for i in 0..20i64 {
+                c.insert(&[i as u8], &rec(i)).unwrap();
+            }
+            c.create_scalar_index("n").unwrap();
+            // Overwrite the def row with the legacy empty form.
             db.store()
                 .put(crate::scalar::SCALAR_DEFS, b"docs\x00n", b"")
                 .unwrap();
         }
         let db = Db::open(&path).unwrap();
         assert!(db.has_scalar_index("docs", "n")); // legacy → Complete → serviceable
+        assert!(db.collect_building_scalar("docs").unwrap().is_empty());
+        // End-to-end (mirrors the fts/vector legacy tests): a real filtered
+        // query served through the legacy def returns exactly the right rows.
+        let rows = db
+            .collection("docs")
+            .query()
+            .filter(field("n").ge(Value::Int(15)))
+            .run()
+            .unwrap();
+        let mut keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![vec![15u8], vec![16u8], vec![17u8], vec![18u8], vec![19u8]]
+        );
     }
 }

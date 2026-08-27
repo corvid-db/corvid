@@ -193,12 +193,28 @@ mod tests {
 
     #[test]
     fn malformed_state_decodes_as_building_from_scratch() {
-        // Truncated 0xFF form: tag says Building but cursor length overruns.
-        let bad = [0xFFu8, 1, 0, 0, 0, 9, 1, 2];
-        let (_, st) = decode_def(&bad);
-        match st {
-            DefState::Building { cursor } => assert!(cursor.is_empty()),
-            DefState::Complete => panic!("malformed must not decode Complete"),
+        // Every malformed input must decode as Building with an empty cursor:
+        // the backfill restarts from scratch, so the worst case is wasted
+        // work, never a trusted partial index.
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            // Truncated 0xFF form: tag says Building but cursor length overruns.
+            (vec![0xFFu8, 1, 0, 0, 0, 9, 1, 2], "cursor length overrun"),
+            // Bare marker: no tag byte at all.
+            (vec![0xFFu8], "bare marker"),
+            // Garbage tag: neither Complete (0) nor Building (1).
+            (vec![0xFFu8, 2, 1, 2, 3], "garbage tag"),
+            // Truncated length prefix: fewer than 4 bytes after the tag.
+            (vec![0xFFu8, 1, 0, 0], "truncated length prefix"),
+        ];
+        for (bad, what) in cases {
+            let (kb, st) = decode_def(&bad);
+            assert!(kb.is_empty(), "{what}: kind bytes must be empty");
+            match st {
+                DefState::Building { cursor } => {
+                    assert!(cursor.is_empty(), "{what}: cursor must be empty")
+                }
+                DefState::Complete => panic!("{what}: malformed must not decode Complete"),
+            }
         }
     }
 

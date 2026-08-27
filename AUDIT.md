@@ -17,7 +17,7 @@ Wave 1 exit gates green: fmt, clippy `-D warnings`, tests, coverage ≥ 90%.
 
 ## Status 2026-08-27 — remediation wave 2 landed
 
-- A2 — fixed in b4982fd..b9cbdf1 (+ exit 1b17de9): all five index kinds (scalar, compound,
+- A2 — fixed in b4982fd..=b9cbdf1 (+ exit 1b17de9): all five index kinds (scalar, compound,
   geo, FTS, vector) create via a persisted Building{cursor}→Complete watermark; queries never
   serve Building defs (exact/bounded fallbacks); lazy first-use resume; dump/load materializes
   Complete via create_* replay.

@@ -23,6 +23,15 @@ format and API may change without backward-compatibility guarantees.
 - New public API: `Store::begin_bulk` / `Store::BulkScope` — a thread-local,
   panic-safe relaxed-durability scope; `Db::bulk` now uses it (concurrent
   writers on other threads are no longer affected). (audit B1)
+- Index creation is now crash- and error-safe: a creation interrupted between
+  registration and backfill completion no longer leaves a permanently partial
+  index that queries silently trust. Creation state is persisted
+  (`Building{cursor}` → `Complete`); queries never serve a building index
+  (exact or bounded fallbacks); the first query after a reopen resumes an
+  interrupted build synchronously, so first-query latency can include the
+  remaining backfill. The index-definition row format changed: binaries from
+  before this change misread new-format rows — re-create indexes when
+  downgrading. (audit A2)
 
 ## [0.1.1] - 2026-05-29
 
