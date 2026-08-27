@@ -612,6 +612,49 @@ mod tests {
         assert_eq!(keys, vec![b"greenwich".to_vec(), b"london".to_vec()]);
     }
 
+    /// Contention: while another thread holds the resume lock mid-backfill, a
+    /// geo query must not serve the building index — it falls back to an
+    /// exact scan and stays correct, and the def stays building; once the
+    /// lock is free, the next query resumes the build and serves.
+    #[test]
+    fn building_geo_index_with_resume_lock_held_falls_back() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("places");
+        c.insert(b"london", &place(51.5074, -0.1278)).unwrap();
+        c.insert(b"greenwich", &place(51.4779, 0.0015)).unwrap();
+        c.insert(b"paris", &place(48.8566, 2.3522)).unwrap();
+        // Forge a Building def exactly as an interrupted creation would leave it.
+        db.register_geo_index("places", "loc").unwrap();
+        // With the resume lock held (another thread resuming), the building
+        // def must not be served: geo_candidates reports "no usable index"...
+        let _guard = db.index_resume().lock().unwrap();
+        assert!(
+            db.geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0)
+                .unwrap()
+                .is_none(),
+            "a building geo index must not be served"
+        );
+        // ...so the radius query falls back to an exact scan and stays
+        // correct, while the contended resume never runs (def still building).
+        let hits = c.geo_within_radius("loc", 51.5, -0.13, 50.0).unwrap();
+        let mut keys: Vec<Vec<u8>> = hits.iter().map(|h| h.key.clone()).collect();
+        keys.sort();
+        assert_eq!(keys, vec![b"greenwich".to_vec(), b"london".to_vec()]);
+        assert!(!db.has_geo_index("places", "loc"));
+        assert_eq!(db.collect_building_geo("places").unwrap().len(), 1);
+        drop(_guard);
+        // Once the resume lock is free, the next query resumes the backfill
+        // and the completed index serves.
+        let got = db
+            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0)
+            .unwrap()
+            .unwrap();
+        assert!(got.iter().any(|k| k == b"london"));
+        assert!(got.iter().any(|k| k == b"greenwich"));
+        assert!(!got.iter().any(|k| k == b"paris"));
+        assert!(db.has_geo_index("places", "loc"));
+    }
+
     #[test]
     fn legacy_stateless_geo_def_is_complete() {
         let dir = tempfile::tempdir().unwrap();

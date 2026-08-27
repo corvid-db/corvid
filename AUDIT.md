@@ -25,6 +25,17 @@ Wave 1 exit gates green: fmt, clippy `-D warnings`, tests, coverage ≥ 90%.
 Wave 2 exit gates green: fmt, clippy `-D warnings`, 445 tests, 95.13% line coverage.
 Full plan (5 waves): docs/superpowers/specs/2026-08-27-audit-remediation-design.md.
 
+## Status 2026-08-27 — remediation wave 3 landed
+
+- A5 — c6d4635; B5 — 25d7d3f; B6 — 7712729; C1/C13 — 19a8a74 (fix range 6eaddfc..=19a8a74,
+  closed by this exit commit's contention tests).
+- Perf restored in 6eaddfc: page-level batch insert in the atomic driver — creation bench
+  396ms vs the 545ms pre-driver bulk baseline (3.36s at wave-2 exit), atomicity unchanged.
+- B5 trigger: dead*2 > live, checked on the write path post-commit (every tombstone follows
+  an applied write); synchronous reset + re-backfill under the index_resume try-lock.
+
+Wave 3 exit gates green: fmt, clippy `-D warnings`, 470 tests, 95.34% line coverage.
+
 Severity legend: **CRITICAL** breaks the project's own central contract. **MAJOR** wrong results,
 data loss, crash, or DoS reachable through normal/intended use. **MINOR** edge-case wrongness,
 behavioral inconsistency, or doc claims with behavioral impact. **NIT** hygiene.

@@ -1510,6 +1510,56 @@ mod tests {
         assert!(db.has_scalar_index("docs", "n"));
     }
 
+    /// Contention: while another thread holds the resume lock mid-backfill, a
+    /// filtered query must not serve the building scalar index — it falls
+    /// back to an exact scan and stays correct, and the def stays building;
+    /// once the lock is free, the next query resumes the build and serves.
+    #[test]
+    fn building_scalar_index_with_resume_lock_held_falls_back() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for i in 0..50i64 {
+            c.insert(&[i as u8], &rec(i)).unwrap();
+        }
+        // Forge a Building def exactly as an interrupted creation would leave it.
+        db.register_scalar_index("docs", "n").unwrap();
+        // With the resume lock held (another thread resuming), the building
+        // def must not be served: scalar_candidates reports "no usable
+        // index"...
+        let _guard = db.index_resume().lock().unwrap();
+        assert!(
+            db.scalar_candidates("docs", "n", &one(CmpOp::Eq, &Value::Int(3)), 1000)
+                .unwrap()
+                .is_none(),
+            "a building scalar index must not be served"
+        );
+        // ...so the filtered query falls back to an exact scan and stays
+        // correct, while the contended resume never runs (def still building).
+        let rows = c
+            .query()
+            .filter(crate::field("n").ge(Value::Int(40)))
+            .run()
+            .unwrap();
+        assert_eq!(rows.len(), 10);
+        assert!(!db.has_scalar_index("docs", "n"));
+        assert_eq!(db.collect_building_scalar("docs").unwrap().len(), 1);
+        drop(_guard);
+        // Once the resume lock is free, the next query resumes the backfill
+        // and the completed index serves.
+        let rows = c
+            .query()
+            .filter(crate::field("n").ge(Value::Int(40)))
+            .run()
+            .unwrap();
+        assert_eq!(rows.len(), 10);
+        assert!(db.has_scalar_index("docs", "n"));
+        let got = db
+            .scalar_candidates("docs", "n", &one(CmpOp::Eq, &Value::Int(3)), 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, vec![vec![3u8]], "a completed scalar index must serve");
+    }
+
     /// A building compound index is never served: filtered queries fall back
     /// to a scan and stay correct; the first such query resumes the build.
     #[test]
@@ -1554,6 +1604,69 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.len(), 5);
+    }
+
+    /// Contention: while another thread holds the resume lock mid-backfill, a
+    /// compound query must not serve the building index — it falls back to an
+    /// exact scan and stays correct, and the def stays building; once the
+    /// lock is free, the next query resumes the build and serves.
+    #[test]
+    fn building_compound_index_with_resume_lock_held_falls_back() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for i in 0..50i64 {
+            let mut m = BTreeMap::new();
+            m.insert("a".to_owned(), Value::Text(format!("g{}", i % 2)));
+            m.insert("b".to_owned(), Value::Int(i));
+            c.insert(&[i as u8], &Value::Map(m)).unwrap();
+        }
+        // Forge a Building def exactly as an interrupted creation would leave it.
+        let fields = vec!["a".to_owned(), "b".to_owned()];
+        db.register_compound_index("docs", &fields).unwrap();
+        // With the resume lock held (another thread resuming), the building
+        // def must not be served: compound_candidates reports "no usable
+        // index"...
+        let _guard = db.index_resume().lock().unwrap();
+        let g1 = Value::Text("g1".into());
+        let tail = one(CmpOp::Ge, &Value::Int(40));
+        assert!(
+            db.compound_candidates("docs", &fields, &[&g1], &tail, 1000)
+                .unwrap()
+                .is_none(),
+            "a building compound index must not be served"
+        );
+        // ...so the prefix+range query falls back to an exact scan and stays
+        // correct, while the contended resume never runs (def still building).
+        let rows = c
+            .query()
+            .filter(crate::field("a").eq(g1.clone()))
+            .filter(crate::field("b").ge(Value::Int(40)))
+            .run()
+            .unwrap();
+        assert_eq!(rows.len(), 5); // i in {41,43,45,47,49}
+        assert!(!db.has_compound_index("docs", &fields));
+        assert_eq!(db.collect_building_compound("docs").unwrap().len(), 1);
+        drop(_guard);
+        // Once the resume lock is free, the next query resumes the backfill
+        // and the completed index serves.
+        let rows = c
+            .query()
+            .filter(crate::field("a").eq(g1.clone()))
+            .filter(crate::field("b").ge(Value::Int(40)))
+            .run()
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(db.has_compound_index("docs", &fields));
+        let mut got = db
+            .compound_candidates("docs", &fields, &[&g1], &tail, 1000)
+            .unwrap()
+            .unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![vec![41u8], vec![43u8], vec![45u8], vec![47u8], vec![49u8]],
+            "a completed compound index must serve"
+        );
     }
 
     #[test]
