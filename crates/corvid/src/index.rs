@@ -265,16 +265,22 @@ impl Db {
 
     /// Register (or replace) an HNSW index definition.
     ///
-    /// Only the on-disk kinds have a durable backfill, so only they carry
-    /// creation state: they register `Building` — a crash between
-    /// registration and backfill completion leaves a never-served, resumable
-    /// def. Re-registering the *same* def (identical kind bytes) preserves an
-    /// in-flight `Building` row's cursor, so a re-created creation resumes
-    /// instead of rescanning; any kind/quant/metric change is a replace and
-    /// starts fresh. `OnDiskPq` never preserves a cursor: its kind bytes
-    /// don't capture m/k and every registration retrains, so a retrain
-    /// always implies a full re-backfill. In-memory indexes rebuild lazily
-    /// from documents, so their defs are born `Complete`.
+    /// One transaction installs the whole replacement: the target namespace
+    /// is cleared, the def row lands, and a PQ codebook (when present)
+    /// persists with it. Every re-registration — same or different
+    /// kind/quant/metric — therefore starts from an empty namespace with a
+    /// fresh `Building` cursor (spec decision: "re-register clears the target
+    /// namespace in the same transaction that installs the new Building
+    /// def"). This closes the audit's mixed-encoding window (A5: stale nodes
+    /// from a previous encoding decoding under the new params), the register
+    /// get→put interleave (W2T9: a stale cursor skipping committed prefix
+    /// docs), and the PQ def/codebook two-transaction window (W2T8) at once.
+    ///
+    /// Only the on-disk kinds have a durable backfill, so only they register
+    /// `Building` — a crash between registration and backfill completion
+    /// leaves a never-served, resumable def; an interrupted creation is
+    /// simply replaced by the next registration. In-memory indexes rebuild
+    /// lazily from documents, so their defs are born `Complete`.
     fn register_vector_index_inner(
         &self,
         collection: &str,
@@ -287,38 +293,29 @@ impl Db {
         let key = def_key(collection, field);
         let kb = [metric_byte(metric), quant_byte(quant), kind_byte(kind)];
         let state = if kind.is_on_disk() {
-            // Same def again → resume an in-flight backfill from its cursor;
-            // a changed def → fresh Building (backfill from the start). PQ is
-            // exempt: its kind bytes don't capture the m/k hyperparameters
-            // and every registration retrains a fresh codebook, so a
-            // preserved cursor would leave a committed prefix encoded with
-            // the previous codebook while the new one decodes every node —
-            // a retrain always re-backfills from the start.
-            let same = kind != IndexKind::OnDiskPq
-                && self
-                    .store()
-                    .get(INDEX_DEFS, &key)?
-                    .is_some_and(|v| crate::index_build::decode_def(&v).0 == kb);
-            let cursor = if same {
-                crate::index_build::read_building_cursor(self.store(), INDEX_DEFS, &key)?
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            crate::index_build::DefState::Building { cursor }
+            // Always a fresh cursor: the namespace below was just reset in
+            // this same transaction, so any preserved cursor would address a
+            // build that no longer exists.
+            crate::index_build::DefState::Building { cursor: Vec::new() }
         } else {
             crate::index_build::DefState::Complete
         };
-        self.store().put(
-            INDEX_DEFS,
-            &key,
-            &crate::index_build::encode_def(&kb, &state),
-        )?;
-        // The PQ codebook lives in the graph namespace (not the def bytes).
-        if let Some(pq) = &pq {
-            let ns = disk_hnsw::namespace(collection, field);
-            disk_hnsw::store_codebook(self.store(), &ns, pq)?;
-        }
+        let ns = disk_hnsw::namespace(collection, field);
+        self.store().transaction(|tx| {
+            // Reset first: the codebook put below must survive the clear.
+            crate::store::clear_in_txn(tx, &ns)?;
+            // The PQ codebook lives in the graph namespace (not the def
+            // bytes), committed atomically with the reset and the def row.
+            if let Some(pq) = &pq {
+                disk_hnsw::store_codebook_in_txn(tx, &ns, pq)?;
+            }
+            tx.put(
+                INDEX_DEFS,
+                &key,
+                &crate::index_build::encode_def(&kb, &state),
+            )?;
+            Ok(())
+        })?;
         let mut state = self.indexes().lock().expect("index lock");
         let map_key = (collection.to_owned(), field.to_owned());
         state.defs.insert(
@@ -732,7 +729,10 @@ impl Collection<'_> {
     /// before any backfill work; every page's graph writes and cursor advance
     /// commit in one transaction; completion is its own final transaction. A
     /// crash or error leaves a resumable `Building` def that queries never
-    /// serve — the first vector query (or a re-creation) resumes it.
+    /// serve — the first vector query resumes it. Re-creating the index
+    /// replaces it wholesale: the namespace resets in the same transaction
+    /// that installs the fresh `Building` def (audit A5), so the backfill
+    /// always rebuilds from scratch.
     pub fn create_vector_index_ondisk(&self, field: &str, metric: Metric) -> Result<()> {
         self.create_vector_index_ondisk_quantized(field, metric, Quantization::None)
     }
@@ -749,8 +749,9 @@ impl Collection<'_> {
     ) -> Result<()> {
         self.db()
             .register_vector_index(self.name(), field, metric, quant, IndexKind::OnDisk)?;
-        // A def still Building from an interrupted creation resumes from its
-        // saved cursor; a Complete (or fresh) def backfills from the start.
+        // Registration always installs a fresh Building cursor over a reset
+        // namespace (audit A5), so the backfill below always starts at the
+        // beginning; read_building_cursor simply recovers that fresh cursor.
         let cursor = crate::index_build::read_building_cursor(
             self.db().store(),
             INDEX_DEFS,
@@ -807,7 +808,8 @@ impl Collection<'_> {
         let pq = std::sync::Arc::new(pq);
 
         // Register Building with the trained codebook, then run the atomic
-        // backfill through the shared driver (resuming an interrupted one).
+        // backfill through the shared driver from the fresh cursor the
+        // registration just installed (over a reset namespace, audit A5).
         self.db().register_vector_index_inner(
             self.name(),
             field,
@@ -1206,6 +1208,214 @@ mod tests {
             hits >= 15,
             "prefix self-recall {hits}/20 too low (mixed codebooks?)"
         );
+    }
+
+    /// Audit A5: re-registering an index with a different quantization must
+    /// reset the graph namespace in the SAME transaction that installs the
+    /// new def. Previously the first build's differently-encoded nodes
+    /// survived the switch as tombstoned garbage (the node counter never
+    /// reset either), so every re-registration leaked a full stale graph.
+    #[test]
+    fn recreate_with_different_quantization_is_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvid.db");
+        let data = pq_corpus(120, 8);
+        {
+            let db = Db::open(&path).unwrap();
+            let c = db.collection("docs");
+            for (i, v) in data.iter().enumerate() {
+                c.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                    .unwrap();
+            }
+            c.create_vector_index_ondisk_quantized("embedding", Metric::L2, Quantization::Scalar)
+                .unwrap();
+            let hits = c
+                .vector_search("embedding", &data[0], 5, Metric::L2)
+                .unwrap();
+            assert!(!hits.is_empty());
+            // Re-register over the scalar build with plain (None) storage.
+            c.create_vector_index_ondisk("embedding", Metric::L2)
+                .unwrap();
+
+            // (a) Parity with an unindexed twin collection: every doc is its
+            // own exact top-1 and appears in the indexed top-5.
+            let plain = Db::open_in_memory().unwrap();
+            let pc = plain.collection("docs");
+            for (i, v) in data.iter().enumerate() {
+                pc.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                    .unwrap();
+            }
+            let mut parity = 0;
+            for (i, v) in data.iter().enumerate().take(20) {
+                let exact = pc.vector_search("embedding", v, 1, Metric::L2).unwrap();
+                assert_eq!(exact[0].key, format!("k{i}").into_bytes()); // sanity
+                let got = c.vector_search("embedding", v, 5, Metric::L2).unwrap();
+                if got.iter().any(|h| h.key == exact[0].key) {
+                    parity += 1;
+                }
+            }
+            assert!(parity >= 18, "quant-switch parity {parity}/20 too low");
+
+            // (b) The namespace holds exactly the second build: one node and
+            // one keymap per live doc plus one meta row — nothing leaked
+            // from the scalar-encoded first build.
+            let ns = disk_hnsw::namespace("docs", "embedding");
+            let rows = db.store().scan(&ns).unwrap();
+            let nodes = rows
+                .iter()
+                .filter(|(k, _)| k.first() == Some(&b'n'))
+                .count();
+            let keymaps = rows
+                .iter()
+                .filter(|(k, _)| k.first() == Some(&b'k'))
+                .count();
+            let metas = rows
+                .iter()
+                .filter(|(k, _)| k.first() == Some(&b'm'))
+                .count();
+            assert_eq!(keymaps, data.len(), "live keymaps must match live docs");
+            assert_eq!(nodes, data.len(), "leaked nodes from the first build");
+            assert_eq!(metas, 1);
+            assert_eq!(rows.len(), 2 * data.len() + 1);
+        }
+        // Reopen: the re-created (full-precision) graph still serves at
+        // parity — the doc itself is its own top-1 under L2.
+        let db = Db::open(&path).unwrap();
+        let hits = db
+            .collection("docs")
+            .vector_search("embedding", &data[0], 1, Metric::L2)
+            .unwrap();
+        assert_eq!(hits[0].key, b"k0".to_vec());
+    }
+
+    /// Audit A5: switching an indexed field from an on-disk kind to InMemory
+    /// must remove the disk graph (the namespace resets with the def), not
+    /// leak a dead graph that a later re-switch would resurrect.
+    #[test]
+    fn kind_switch_to_inmemory_removes_disk_namespace() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
+        c.insert(b"b", &doc(vec![0.0, 1.0])).unwrap();
+        c.create_vector_index_ondisk("embedding", Metric::L2)
+            .unwrap();
+        let ns = disk_hnsw::namespace("docs", "embedding");
+        assert!(
+            !db.store().scan(&ns).unwrap().is_empty(),
+            "sanity: the on-disk build wrote graph rows"
+        );
+        // Replace with the in-memory kind.
+        c.create_vector_index("embedding", Metric::L2).unwrap();
+        assert!(
+            db.store().scan(&ns).unwrap().is_empty(),
+            "the disk graph must be removed when the kind switches to InMemory"
+        );
+        // And the in-memory index serves correctly.
+        let hits = c
+            .vector_search("embedding", &[1.0, 0.0], 1, Metric::L2)
+            .unwrap();
+        assert_eq!(hits[0].key, b"a".to_vec());
+    }
+
+    /// The deferred W2T5/W2T9 race: a re-registration landing while a lazy
+    /// resume is stalled must fully replace the interrupted build. The
+    /// registration resets the namespace and installs a fresh Building
+    /// cursor in one transaction, so the backfill rebuilds every document —
+    /// no stale cursor skips a committed prefix, and post-replace queries
+    /// sit at parity with exact search.
+    #[test]
+    fn replace_during_resume_is_consistent() {
+        use std::sync::mpsc::channel;
+        let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
+        let c = db.collection("docs");
+        let data = pq_corpus(80, 8);
+        for (i, v) in data.iter().enumerate() {
+            c.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                .unwrap();
+        }
+        // Forge a mid-cursor Building def exactly as an interrupted creation
+        // would leave it (prefix k0..=k39 notionally committed).
+        db.store()
+            .put(
+                INDEX_DEFS,
+                &def_key("docs", "embedding"),
+                &crate::index_build::encode_def(
+                    &[
+                        metric_byte(Metric::L2),
+                        quant_byte(Quantization::None),
+                        kind_byte(IndexKind::OnDisk),
+                    ],
+                    &crate::index_build::DefState::Building {
+                        cursor: b"k39\0".to_vec(),
+                    },
+                ),
+            )
+            .unwrap();
+        db.load_index_defs().unwrap();
+        assert_eq!(vector_def_building(&db, "docs", "embedding"), Some(true));
+
+        // Hold the resume lock so the query thread's lazy resume stalls; it
+        // must fall back to an exact scan (correct results either way).
+        let guard = db.index_resume().lock().unwrap();
+        let (done_tx, done_rx) = channel();
+        let querier = {
+            let db = std::sync::Arc::clone(&db);
+            let q = data[0].clone();
+            std::thread::spawn(move || {
+                let got = db
+                    .collection("docs")
+                    .vector_search("embedding", &q, 5, Metric::L2)
+                    .unwrap();
+                done_tx.send(()).unwrap();
+                got
+            })
+        };
+        done_rx.recv().unwrap(); // the fallback query finished mid-race
+        // Re-register on the main thread while the resume stays stalled:
+        // fresh Building + cleared namespace, then the full backfill.
+        db.collection("docs")
+            .create_vector_index_ondisk("embedding", Metric::L2)
+            .unwrap();
+        drop(guard);
+        let fallback = querier.join().unwrap();
+        // The stalled query's fallback was already correct: exact parity.
+        assert!(
+            fallback.iter().any(|h| h.key == b"k0".to_vec()),
+            "fallback query must return the exact nearest doc"
+        );
+
+        // The def ended Complete and the namespace holds the full rebuild.
+        assert_eq!(vector_def_building(&db, "docs", "embedding"), Some(false));
+        let ns = disk_hnsw::namespace("docs", "embedding");
+        let keymaps = db
+            .store()
+            .scan(&ns)
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| k.first() == Some(&b'k'))
+            .count();
+        assert_eq!(keymaps, data.len(), "the rebuild must cover every doc");
+
+        // Post-replace queries serve from the rebuilt graph at exact parity.
+        let plain = Db::open_in_memory().unwrap();
+        let pc = plain.collection("docs");
+        for (i, v) in data.iter().enumerate() {
+            pc.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                .unwrap();
+        }
+        let mut parity = 0;
+        for (i, v) in data.iter().enumerate().take(20) {
+            let exact = pc.vector_search("embedding", v, 1, Metric::L2).unwrap();
+            assert_eq!(exact[0].key, format!("k{i}").into_bytes()); // sanity
+            let got = db
+                .collection("docs")
+                .vector_search("embedding", v, 5, Metric::L2)
+                .unwrap();
+            if got.iter().any(|h| h.key == exact[0].key) {
+                parity += 1;
+            }
+        }
+        assert!(parity >= 18, "post-replace parity {parity}/20 too low");
     }
 
     /// Whether `field` of `coll` is registered and still building (test probe

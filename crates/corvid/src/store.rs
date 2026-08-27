@@ -465,6 +465,30 @@ impl Store {
     }
 }
 
+/// Delete every key in `collection` inside the caller's transaction (audit
+/// A5: namespace reset). Paged via [`WriteBatch::scan_from`] — the batch sees
+/// its own deletes, and each page's resume point sits strictly past the keys
+/// just removed, so nothing is materialized and no key survives. An unknown
+/// or already-empty collection is a no-op.
+pub(crate) fn clear_in_txn(tx: &mut WriteBatch<'_>, collection: &str) -> Result<()> {
+    const PAGE: usize = 2048;
+    let mut start: Vec<u8> = Vec::new();
+    loop {
+        let page = tx.scan_from(collection, &start, PAGE)?;
+        let Some((last, _)) = page.last().cloned() else {
+            break;
+        };
+        for (key, _) in &page {
+            tx.delete(collection, key)?;
+        }
+        // Resume strictly past everything deleted above (the documented
+        // cursor-pagination convention: `last_key` + trailing `0` byte).
+        start = last;
+        start.push(0);
+    }
+    Ok(())
+}
+
 /// A set of writes (and reads) executed inside one transaction.
 ///
 /// Obtained via [`Store::transaction`]. Reads see this transaction's own
@@ -1096,5 +1120,54 @@ mod tests {
         // And a subsequent ordinary transaction is durable again (flag-wise).
         s.put("docs", b"k", b"v").unwrap();
         assert!(!s.bulk_active_on_this_thread());
+    }
+
+    /// clear_in_txn empties a collection inside the caller's transaction, so
+    /// the removal commits atomically with whatever else the batch writes.
+    #[test]
+    fn clear_in_txn_empties_collection_atomically() {
+        let s = mem();
+        s.put("docs", b"a", b"1").unwrap();
+        s.put("docs", b"b", b"2").unwrap();
+        s.put("other", b"x", b"keep").unwrap();
+        s.transaction(|tx| {
+            clear_in_txn(tx, "docs")?;
+            tx.put("docs", b"fresh", b"v")
+        })
+        .unwrap();
+        assert_eq!(
+            s.scan("docs").unwrap(),
+            vec![(b"fresh".to_vec(), b"v".to_vec())]
+        );
+        assert_eq!(s.count("docs").unwrap(), 1);
+        // A sibling collection is untouched.
+        assert_eq!(s.get("other", b"x").unwrap(), Some(b"keep".to_vec()));
+    }
+
+    /// The clear pages through large collections (more than one page) and
+    /// leaves nothing behind, including keys sorting past the page boundary.
+    #[test]
+    fn clear_in_txn_pages_large_collections() {
+        let s = mem();
+        s.transaction(|tx| {
+            for i in 0..5000u32 {
+                tx.put("docs", &i.to_be_bytes(), &[i as u8])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.count("docs").unwrap(), 5000);
+        s.transaction(|tx| clear_in_txn(tx, "docs")).unwrap();
+        assert!(s.scan("docs").unwrap().is_empty());
+        assert_eq!(s.count("docs").unwrap(), 0);
+    }
+
+    /// Clearing an unknown or empty collection is a no-op, so registering an
+    /// index over a fresh namespace costs one empty scan.
+    #[test]
+    fn clear_in_txn_missing_collection_is_noop() {
+        let s = mem();
+        s.transaction(|tx| clear_in_txn(tx, "ghost")).unwrap();
+        assert_eq!(s.count("ghost").unwrap(), 0);
     }
 }

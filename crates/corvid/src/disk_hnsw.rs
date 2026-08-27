@@ -621,9 +621,15 @@ pub(crate) fn namespace(collection: &str, field: &str) -> String {
     format!("__dann__{collection}__{field}")
 }
 
-/// Persist a PQ codebook in the index namespace.
-pub(crate) fn store_codebook(store: &Store, ns: &str, pq: &Pq) -> Result<()> {
-    store.put(ns, &[TAG_PQ], &pq.to_bytes())
+/// Persist a PQ codebook in the index namespace inside the caller's
+/// transaction (audit A5: it must commit atomically with the def row and the
+/// namespace reset that precedes it).
+pub(crate) fn store_codebook_in_txn(
+    tx: &mut crate::store::WriteBatch<'_>,
+    ns: &str,
+    pq: &Pq,
+) -> Result<()> {
+    tx.put(ns, &[TAG_PQ], &pq.to_bytes())
 }
 
 /// Load a persisted PQ codebook from the index namespace, if present.
