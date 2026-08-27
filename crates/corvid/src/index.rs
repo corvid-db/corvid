@@ -519,18 +519,32 @@ impl Db {
     /// Building on-disk vector defs of `collection` as `(field, cursor)`
     /// jobs, read from the def rows (disk is the resume truth after a crash).
     /// Only on-disk kinds carry a durable backfill, so only they can be
-    /// Building; rows whose kind bytes don't decode to a serveable on-disk
-    /// def are inert (no resume, never served).
+    /// Building. A row only becomes a job when its kind bytes decode to an
+    /// on-disk def the registry actually holds — a row `load_index_defs`
+    /// refused (e.g. a corrupt metric byte) has no def to resume, so
+    /// emitting a job for it would no-op forever and re-churn on every
+    /// future query (W2T10); such rows are inert.
     pub(crate) fn collect_building_vector(
         &self,
         collection: &str,
     ) -> Result<Vec<(String, Vec<u8>)>> {
+        // Registry snapshot: `resume_vector` no-ops without a registered
+        // def, so only registered on-disk fields may produce jobs.
+        let ondisk: std::collections::HashSet<String> = {
+            let state = self.indexes().lock().expect("index lock");
+            state
+                .defs
+                .iter()
+                .filter(|((c, _), d)| c == collection && d.kind.is_on_disk())
+                .map(|((_, f), _)| f.clone())
+                .collect()
+        };
         let mut jobs = Vec::new();
         for (key, value) in self.store().scan(INDEX_DEFS)? {
             let Some((coll, field)) = split_def_key(&key) else {
                 continue;
             };
-            if coll != collection {
+            if coll != collection || !ondisk.contains(&field) {
                 continue;
             }
             let (kb, st) = crate::index_build::decode_def(&value);
@@ -1562,6 +1576,103 @@ mod tests {
             .defs
             .get(&(coll.to_owned(), field.to_owned()))
             .map(|d| d.building)
+    }
+
+    /// Audit C1 (end-to-end): a truncated node row in an on-disk index's
+    /// namespace makes `vector_search` return `Error::CorruptIndex` — never
+    /// silently empty results.
+    #[test]
+    fn corrupt_ondisk_node_row_errors_vector_search() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
+        c.create_vector_index_ondisk("embedding", Metric::L2)
+            .unwrap();
+        let ns = disk_hnsw::namespace("docs", "embedding");
+        let mut node0 = vec![b'n'];
+        node0.extend_from_slice(&0u64.to_be_bytes());
+        db.store().put(&ns, &node0, &[0u8, 0xFF, 0xFF]).unwrap();
+        let err = c.vector_search("embedding", &[1.0, 0.0], 1, Metric::L2);
+        assert!(
+            matches!(&err, Err(crate::Error::CorruptIndex { .. })),
+            "corrupt index state must error loudly, got {err:?}"
+        );
+    }
+
+    /// Audit C1 (end-to-end): a truncated meta row — which used to decode as
+    /// an empty index and serve empty results forever — errors the search.
+    #[test]
+    fn corrupt_ondisk_meta_row_errors_vector_search() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
+        c.create_vector_index_ondisk("embedding", Metric::L2)
+            .unwrap();
+        let ns = disk_hnsw::namespace("docs", "embedding");
+        db.store().put(&ns, b"m", &[1u8, 2, 3]).unwrap();
+        let err = c.vector_search("embedding", &[1.0, 0.0], 1, Metric::L2);
+        assert!(
+            matches!(&err, Err(crate::Error::CorruptIndex { .. })),
+            "corrupt index meta must error loudly, got {err:?}"
+        );
+    }
+
+    /// W2T10: a Building def row whose kind bytes don't decode to a def the
+    /// registry holds (here: a corrupt metric byte `load_index_defs`
+    /// refuses) must not produce a resume job — the row is inert, so it
+    /// can't churn every future query with a no-op resume that never flips
+    /// it Complete.
+    #[test]
+    fn building_def_with_corrupt_metric_byte_is_inert() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &doc(vec![1.0, 0.0])).unwrap();
+        // 7 is not a metric byte: load_index_defs refuses the row, so no
+        // registered def exists to resume.
+        db.store()
+            .put(
+                INDEX_DEFS,
+                &def_key("docs", "embedding"),
+                &crate::index_build::encode_def(
+                    &[
+                        7,
+                        quant_byte(Quantization::None),
+                        kind_byte(IndexKind::OnDisk),
+                    ],
+                    &crate::index_build::DefState::Building { cursor: vec![] },
+                ),
+            )
+            .unwrap();
+        db.load_index_defs().unwrap();
+        assert!(
+            db.collect_building_vector("docs").unwrap().is_empty(),
+            "no resume job for a def the registry doesn't hold"
+        );
+        // Queries neither resume nor serve the corrupt def: exact fallback,
+        // correct results.
+        let hits = c
+            .vector_search("embedding", &[1.0, 0.0], 1, Metric::L2)
+            .unwrap();
+        assert_eq!(hits[0].key, b"a".to_vec());
+        // Negative control: a well-formed Building def still yields its job.
+        db.store()
+            .put(
+                INDEX_DEFS,
+                &def_key("docs", "embedding"),
+                &crate::index_build::encode_def(
+                    &[
+                        metric_byte(Metric::L2),
+                        quant_byte(Quantization::None),
+                        kind_byte(IndexKind::OnDisk),
+                    ],
+                    &crate::index_build::DefState::Building { cursor: vec![] },
+                ),
+            )
+            .unwrap();
+        db.load_index_defs().unwrap();
+        let jobs = db.collect_building_vector("docs").unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].0, "embedding");
     }
 
     #[test]

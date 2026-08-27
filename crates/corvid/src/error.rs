@@ -45,6 +45,13 @@ pub enum Error {
     #[error("decode: {0}")]
     Decode(String),
 
+    /// Persisted index state is corrupt (truncated or malformed bytes).
+    /// Surfaced loudly rather than silently degrading to empty results or
+    /// decoded-as-zero ids (audit C1/C13): a corrupt index must error so it
+    /// can be rebuilt, never be trusted.
+    #[error("corrupt index state: {context}")]
+    CorruptIndex { context: String },
+
     /// A collection name used the engine-reserved `__` prefix.
     #[error("reserved collection name: {0}")]
     ReservedCollection(String),

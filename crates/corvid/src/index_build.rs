@@ -62,13 +62,22 @@ pub(crate) fn decode_def(value: &[u8]) -> (Vec<u8>, DefState) {
                     .and_then(|b| b.try_into().ok())
                     .unwrap_or([0u8; 4]),
             ) as usize;
-            match body.get(4..4 + len) {
-                Some(cursor) => (
-                    body.get(4 + len..).unwrap_or(&[]).to_vec(),
-                    DefState::Building {
-                        cursor: cursor.to_vec(),
-                    },
-                ),
+            // The length is untrusted (audit C1): slice without a `4 + len`
+            // addition — which a near-`u32::MAX` len can overflow on 32-bit
+            // targets — while keeping the exact old semantics of "cursor
+            // must fit in the remaining bytes". (A plain `len.min(len-4)`
+            // clamp would instead trust the whole body as a cursor and skip
+            // the backfill; the filter keeps overruns on the restart arm.)
+            match body.get(4..).filter(|tail| tail.len() >= len) {
+                Some(tail) => {
+                    let (cursor, kind) = tail.split_at(len);
+                    (
+                        kind.to_vec(),
+                        DefState::Building {
+                            cursor: cursor.to_vec(),
+                        },
+                    )
+                }
                 // Truncated cursor: restart the backfill from the beginning.
                 None => (Vec::new(), DefState::Building { cursor: Vec::new() }),
             }
@@ -205,6 +214,12 @@ mod tests {
             (vec![0xFFu8, 2, 1, 2, 3], "garbage tag"),
             // Truncated length prefix: fewer than 4 bytes after the tag.
             (vec![0xFFu8, 1, 0, 0], "truncated length prefix"),
+            // Cursor length near u32::MAX: the range computation must not
+            // overflow (32-bit targets) and the overrun still restarts.
+            (
+                vec![0xFFu8, 1, 0xFF, 0xFF, 0xFF, 0xFF, 1, 2, 3],
+                "cursor length near u32::MAX",
+            ),
         ];
         for (bad, what) in cases {
             let (kb, st) = decode_def(&bad);

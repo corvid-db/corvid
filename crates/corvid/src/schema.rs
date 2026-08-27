@@ -155,7 +155,10 @@ impl Schema {
     fn decode(b: &[u8]) -> Option<Schema> {
         let n = u32::from_le_bytes(b.get(0..4)?.try_into().ok()?) as usize;
         let mut pos = 4;
-        let mut fields = Vec::with_capacity(n);
+        // The count is untrusted input; allocate conservatively and grow
+        // (migrate.rs precedent; audit C1 — a forged huge count must fail
+        // the decode below, not reserve gigabytes first).
+        let mut fields = Vec::with_capacity(n.min(4096));
         for _ in 0..n {
             let ty = FieldType::from_byte(*b.get(pos)?)?;
             let required = *b.get(pos + 1)? != 0;
@@ -703,5 +706,15 @@ mod tests {
     fn schema_round_trips_through_bytes() {
         let s = schema();
         assert_eq!(Schema::decode(&s.encode()).unwrap(), s);
+    }
+
+    /// Audit C1: a forged huge field count must not drive a huge allocation
+    /// — capacity is clamped (migrate.rs precedent) and the decode fails
+    /// cleanly on the truncated input instead of reserving gigabytes first.
+    #[test]
+    fn decode_clamps_forged_huge_field_count() {
+        let mut b = u32::MAX.to_le_bytes().to_vec();
+        b.push(0); // one field type byte, then nothing
+        assert!(Schema::decode(&b).is_none());
     }
 }

@@ -19,7 +19,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::distance::Metric;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::pq::Pq;
 use crate::quant::{Probe, Quantization, StoredVec};
 use crate::store::Store;
@@ -191,6 +191,23 @@ fn keymap_key(doc_key: &[u8]) -> Vec<u8> {
 
 // ---- node/meta codec ----
 
+/// A `CorruptIndex` error naming the namespace and what was wrong with it
+/// (audit C1: corrupt state errors loudly instead of silently degrading).
+fn corrupt(ns: &str, what: &str) -> Error {
+    Error::CorruptIndex {
+        context: format!("{what} in index namespace '{ns}'"),
+    }
+}
+
+/// Decode a keymap value into its node id. Only full 8-byte values were
+/// ever written; anything else is corrupt and returns `None` so callers
+/// skip the entry instead of decoding zeros and tombstoning node 0 —
+/// whoever owns it (audit C13).
+fn decode_keymap(b: &[u8]) -> Option<u64> {
+    let arr: [u8; 8] = b.try_into().ok()?;
+    Some(u64::from_be_bytes(arr))
+}
+
 fn encode_node(node: &Node) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(node.deleted as u8);
@@ -217,10 +234,16 @@ fn decode_node(b: &[u8], p: &DiskParams) -> Option<Node> {
     let vec_len = c.u32()?;
     let vector = p.decode_stored(c.take(vec_len)?);
     let n_layers = c.u32()?;
-    let mut layers = Vec::with_capacity(n_layers);
+    // Capacity clamps (audit C1): the counts are untrusted input, so each
+    // reserve is bounded by the bytes actually remaining (a layer costs at
+    // least its 4-byte count, a neighbour id exactly 8). A corrupt huge
+    // count then fails the `take` below fast, instead of attempting a giant
+    // allocation first; valid input never exceeds these bounds, so the
+    // clamp only ever under-reserves for bytes that can't be there.
+    let mut layers = Vec::with_capacity(n_layers.min(c.remaining() / 4));
     for _ in 0..n_layers {
         let cnt = c.u32()?;
-        let mut layer = Vec::with_capacity(cnt);
+        let mut layer = Vec::with_capacity(cnt.min(c.remaining() / 8));
         for _ in 0..cnt {
             layer.push(u64::from_be_bytes(c.take(8)?.try_into().ok()?));
         }
@@ -252,22 +275,26 @@ fn encode_meta(m: Meta) -> Vec<u8> {
     out
 }
 
-fn decode_meta(b: &[u8]) -> Meta {
+/// Decode a meta row. `None` iff the row is a shape no writer version ever
+/// produced (audit C1: a present-but-malformed row must error loudly at the
+/// callers, not decode as an empty index and silently serve no results
+/// forever). Every documented legacy shape — 17 (pre-dim), 18 (dim unset),
+/// 22 (legacy dim-set, or new dim-unset + dead) and 26 (dim-set + dead)
+/// bytes — still decodes exactly as before.
+fn decode_meta(b: &[u8]) -> Option<Meta> {
+    // Every version wrote at least the 17-byte legacy section (flag +
+    // entry + count); a present row shorter than that is corrupt, not
+    // legacy.
     if b.len() < 17 {
-        return Meta {
-            entry: None,
-            count: 0,
-            dead: 0,
-            dim: None,
-        };
+        return None;
     }
     let has = b[0] != 0;
-    let entry = u64::from_be_bytes(b[1..9].try_into().unwrap());
-    let count = u64::from_be_bytes(b[9..17].try_into().unwrap());
+    let entry = u64::from_be_bytes(b[1..9].try_into().ok()?);
+    let count = u64::from_be_bytes(b[9..17].try_into().ok()?);
     // Older namespaces (pre-dim) decode as unset, which preserves their
     // accept-all behavior until the first fresh write pins the dimension.
     let dim = match b.get(17) {
-        Some(1) if b.len() >= 22 => Some(u32::from_be_bytes(b[18..22].try_into().unwrap())),
+        Some(1) if b.len() >= 22 => Some(u32::from_be_bytes(b[18..22].try_into().ok()?)),
         _ => None,
     };
     // dead (audit B5) is length-disambiguated: legacy rows are exactly 17
@@ -278,20 +305,28 @@ fn decode_meta(b: &[u8]) -> Meta {
     // flag) with dead at 18..22.
     let dim_end = match b.get(17) {
         Some(1) if b.len() >= 22 => 22,
+        // The flag promises a 4-byte dim that isn't there: never written.
+        Some(&1) => return None,
         Some(_) => 18,
         None => 17,
     };
+    // The only lengths any encoder ever produced are `dim_end` (legacy, no
+    // dead) and `dim_end + 4` (current, with dead). Anything else was never
+    // written — corrupt, not a legacy shape.
+    if b.len() != dim_end && b.len() != dim_end + 4 {
+        return None;
+    }
     let dead = if b.len() == dim_end + 4 {
-        u32::from_be_bytes(b[dim_end..dim_end + 4].try_into().unwrap())
+        u32::from_be_bytes(b[dim_end..dim_end + 4].try_into().ok()?)
     } else {
         0
     };
-    Meta {
+    Some(Meta {
         entry: has.then_some(entry),
         count,
         dead,
         dim,
-    }
+    })
 }
 
 fn put_u32(out: &mut Vec<u8>, n: usize) {
@@ -316,6 +351,10 @@ impl<'a> Cursor<'a> {
     }
     fn u32(&mut self) -> Option<usize> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?) as usize)
+    }
+    /// Bytes not yet consumed (capacity clamps bound reserves against this).
+    fn remaining(&self) -> usize {
+        self.b.len() - self.pos
     }
 }
 
@@ -426,7 +465,7 @@ pub(crate) fn delete(store: &Store, ns: &str, p: &DiskParams, doc_key: &[u8]) ->
 
 fn read_meta(tx: &crate::store::WriteBatch<'_>, ns: &str) -> Result<Meta> {
     Ok(match tx.get(ns, &[TAG_META])? {
-        Some(b) => decode_meta(&b),
+        Some(b) => decode_meta(&b).ok_or_else(|| corrupt(ns, "malformed meta row"))?,
         None => Meta {
             entry: None,
             count: 0,
@@ -465,9 +504,14 @@ fn insert_node_in_txn(
         _ => {}
     }
     {
-        // Overwrite: tombstone the previous node for this key.
-        if let Some(old_bytes) = tx.get(ns, &keymap_key(doc_key))? {
-            let old_id = u64::from_be_bytes(old_bytes.as_slice().try_into().unwrap_or([0; 8]));
+        // Overwrite: tombstone the previous node for this key. A keymap
+        // value that isn't a full node id is corrupt (never written): skip
+        // it entirely — decoding it as id 0 would tombstone whoever owns
+        // node 0 (audit C13). The fresh keymap put below overwrites the
+        // garbage row.
+        if let Some(old_bytes) = tx.get(ns, &keymap_key(doc_key))?
+            && let Some(old_id) = decode_keymap(&old_bytes)
+        {
             if load(tx, ns, cache, p, old_id)?.is_some()
                 && let Some(node) = cache.nodes.get_mut(&old_id)
             {
@@ -577,7 +621,13 @@ pub(crate) fn delete_in_txn(
     let Some(id_bytes) = tx.get(ns, &keymap_key(doc_key))? else {
         return Ok(false);
     };
-    let id = u64::from_be_bytes(id_bytes.as_slice().try_into().unwrap_or([0; 8]));
+    // A keymap value that isn't a full node id is corrupt (never written):
+    // drop the garbage row, touch no node — decoding it as id 0 would
+    // tombstone whoever owns node 0 (audit C13) — and count nothing dead.
+    let Some(id) = decode_keymap(&id_bytes) else {
+        tx.delete(ns, &keymap_key(doc_key))?;
+        return Ok(false);
+    };
     if let Some(bytes) = tx.get(ns, &node_key(id))?
         && let Some(mut node) = decode_node(&bytes, p)
     {
@@ -612,7 +662,7 @@ pub(crate) fn search(
     }
     store.read(|r| {
         let meta = match r.get(ns, &[TAG_META])? {
-            Some(b) => decode_meta(&b),
+            Some(b) => decode_meta(&b).ok_or_else(|| corrupt(ns, "malformed meta row"))?,
             None => return Ok(Some(Vec::new())),
         };
         // Dimension gate (unset on legacy namespaces → accept-all).
@@ -670,10 +720,13 @@ pub(crate) type DiskRanked = Vec<(Vec<u8>, f32)>;
 /// has no meta (never built, or freshly reset by a registration/compaction).
 /// One point-get — cheap enough to call after every applied write.
 pub(crate) fn dead_fraction(store: &Store, ns: &str) -> Result<Option<(u32, u64)>> {
-    Ok(store.get(ns, &[TAG_META])?.map(|b| {
-        let m = decode_meta(&b);
-        (m.dead, m.count.saturating_sub(m.dead as u64))
-    }))
+    match store.get(ns, &[TAG_META])? {
+        Some(b) => {
+            let m = decode_meta(&b).ok_or_else(|| corrupt(ns, "malformed meta row"))?;
+            Ok(Some((m.dead, m.count.saturating_sub(m.dead as u64))))
+        }
+        None => Ok(None),
+    }
 }
 
 /// The reserved collection name holding an on-disk index's graph.
@@ -719,7 +772,10 @@ fn load(
                 cache.nodes.insert(id, rc.clone());
                 Ok(Some(rc))
             }
-            None => Ok(None),
+            // Present but undecodable: corrupt state errors loudly (audit
+            // C1) — treating it as an absent node silently hollowed
+            // searches out (empty results forever).
+            None => Err(corrupt(ns, &format!("malformed node row for id {id}"))),
         },
         None => Ok(None),
     }
@@ -742,7 +798,8 @@ fn load_r(
                 cache.nodes.insert(id, rc.clone());
                 Ok(Some(rc))
             }
-            None => Ok(None),
+            // See `load`: corrupt state errors, never reads as absent.
+            None => Err(corrupt(ns, &format!("malformed node row for id {id}"))),
         },
         None => Ok(None),
     }
@@ -1066,14 +1123,14 @@ mod tests {
                 dim: None,
             },
         ] {
-            assert_eq!(decode_meta(&encode_meta(m)), m);
+            assert_eq!(decode_meta(&encode_meta(m)), Some(m));
         }
         // Legacy rows (pre-dead) decode dead = 0 with their fields intact.
         let mut legacy = Vec::new();
         legacy.push(1u8);
         legacy.extend_from_slice(&7u64.to_be_bytes());
         legacy.extend_from_slice(&9u64.to_be_bytes());
-        let pre_dim = decode_meta(&legacy); // 17 bytes: no dim flag at all
+        let pre_dim = decode_meta(&legacy).unwrap(); // 17 bytes: no dim flag at all
         assert_eq!(
             pre_dim,
             Meta {
@@ -1085,7 +1142,7 @@ mod tests {
         );
         legacy.push(1u8); // dim set
         legacy.extend_from_slice(&3u32.to_be_bytes());
-        let dim_set = decode_meta(&legacy); // 22 bytes: legacy dim-set
+        let dim_set = decode_meta(&legacy).unwrap(); // 22 bytes: legacy dim-set
         assert_eq!(dim_set.dim, Some(3));
         assert_eq!(dim_set.dead, 0);
         assert_eq!(dim_set.count, 9);
@@ -1097,10 +1154,53 @@ mod tests {
         new_unset.extend_from_slice(&6u64.to_be_bytes());
         new_unset.push(0u8); // dim unset flag
         new_unset.extend_from_slice(&5u32.to_be_bytes()); // dead
-        let m = decode_meta(&new_unset);
+        let m = decode_meta(&new_unset).unwrap();
         assert_eq!(m.dim, None);
         assert_eq!(m.dead, 5);
         assert_eq!(m.count, 6);
+    }
+
+    /// Audit C1: `decode_meta` refuses rows no writer version ever produced;
+    /// every form any encoder did write still decodes.
+    #[test]
+    fn decode_meta_rejects_never_written_shapes() {
+        // Corrupt lengths (audit C1 targets these erroring, not degrading).
+        assert!(decode_meta(&[0u8; 16]).is_none()); // truncated header
+        assert!(decode_meta(&[1u8, 2, 3]).is_none());
+        assert!(decode_meta(&[0u8; 19]).is_none()); // 18 + one stray byte
+        assert!(decode_meta(&[0u8; 20]).is_none());
+        assert!(decode_meta(&[0u8; 21]).is_none()); // dead without a dim flag
+        assert!(decode_meta(&[0u8; 23]).is_none());
+        assert!(decode_meta(&[0u8; 25]).is_none());
+        assert!(decode_meta(&[0u8; 27]).is_none());
+        // Flag byte promises a dim that isn't there.
+        let mut dangling = vec![1u8];
+        dangling.extend_from_slice(&7u64.to_be_bytes());
+        dangling.extend_from_slice(&9u64.to_be_bytes());
+        dangling.push(1);
+        assert!(decode_meta(&dangling).is_none()); // 18 bytes, flag = 1
+        // Every written form decodes: 17 (pre-dim), 18 (dim unset),
+        // 22 (legacy dim-set or new dim-unset + dead), 26 (dim-set + dead).
+        let base = |flag: Option<u8>| {
+            let mut v = vec![1u8];
+            v.extend_from_slice(&7u64.to_be_bytes());
+            v.extend_from_slice(&9u64.to_be_bytes());
+            if let Some(f) = flag {
+                v.push(f);
+            }
+            v
+        };
+        assert!(decode_meta(&base(None)).is_some()); // 17
+        assert!(decode_meta(&base(Some(0))).is_some()); // 18
+        assert!(decode_meta(&base(Some(1))).is_none()); // 18 + flag 1: corrupt
+        let mut v = base(Some(0));
+        v.extend_from_slice(&5u32.to_be_bytes()); // dead → 22, new dim-unset
+        assert!(decode_meta(&v).is_some());
+        let mut v = base(Some(1));
+        v.extend_from_slice(&3u32.to_be_bytes()); // dim → 22, legacy dim-set
+        assert!(decode_meta(&v).is_some());
+        v.extend_from_slice(&5u32.to_be_bytes()); // dead → 26, dim-set + dead
+        assert!(decode_meta(&v).is_some());
     }
 
     /// A page insert produces the same graph state as per-doc inserts: build the
@@ -1133,5 +1233,86 @@ mod tests {
             .unwrap();
         let keys = |r: &[(Vec<u8>, f32)]| r.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
         assert_eq!(keys(&a), keys(&b));
+    }
+
+    /// Audit C1: a present-but-malformed node row must make `search` error
+    /// loudly — previously the loader read the failed decode as an absent
+    /// node and the search silently returned empty results forever.
+    #[test]
+    fn corrupt_node_row_errors_search() {
+        let store = Store::open_in_memory().unwrap();
+        let p = DiskParams::with_quant(Metric::L2, Quantization::None, 16, 128);
+        insert(&store, "ix", &p, b"a", &[1.0, 2.0, 3.0]).unwrap();
+        // Forge a truncated node row for id 0 (the first insert's node and
+        // the graph's entry point).
+        store.put("ix", &node_key(0), &[0u8, 0xFF, 0xFF]).unwrap();
+        let res = search(&store, "ix", &p, &[1.0, 2.0, 3.0], 1, 50);
+        assert!(
+            matches!(res, Err(crate::Error::CorruptIndex { .. })),
+            "corrupt node row must error loudly, got {res:?}"
+        );
+    }
+
+    /// Audit C1: a present-but-malformed meta row must error the search
+    /// instead of decoding as an empty index — the silent-empty failure
+    /// mode. No writer version ever produced rows of these shapes.
+    #[test]
+    fn corrupt_meta_row_errors_search() {
+        let store = Store::open_in_memory().unwrap();
+        let p = DiskParams::with_quant(Metric::L2, Quantization::None, 16, 128);
+        insert(&store, "ix", &p, b"a", &[1.0, 2.0, 3.0]).unwrap();
+        // Truncated header (3 bytes).
+        store.put("ix", &[TAG_META], &[1u8, 2, 3]).unwrap();
+        let res = search(&store, "ix", &p, &[1.0, 2.0, 3.0], 1, 50);
+        assert!(
+            matches!(res, Err(crate::Error::CorruptIndex { .. })),
+            "truncated meta row must error loudly, got {res:?}"
+        );
+        // 18 valid bytes plus one stray byte: never written by any encoder.
+        store.put("ix", &[TAG_META], &[0u8; 19]).unwrap();
+        let res = search(&store, "ix", &p, &[1.0, 2.0, 3.0], 1, 50);
+        assert!(
+            matches!(res, Err(crate::Error::CorruptIndex { .. })),
+            "never-written meta length must error loudly, got {res:?}"
+        );
+    }
+
+    /// Audit C1: forged huge counts in a node row must not drive a huge
+    /// allocation — capacity is clamped against the bytes remaining, so the
+    /// decode fails fast (and the loader reports corrupt state) instead of
+    /// attempting a multi-gigabyte reserve first.
+    #[test]
+    fn decode_node_clamps_forged_huge_counts() {
+        let p = DiskParams::with_quant(Metric::L2, Quantization::None, 16, 128);
+        let forged = |layers: u32, cnt: u32| {
+            let mut b = vec![0u8, 1, 0, 0, 0, b'k']; // deleted, dk_len=1, "k"
+            b.extend_from_slice(&0u32.to_le_bytes()); // vec_len = 0
+            b.extend_from_slice(&layers.to_le_bytes()); // n_layers
+            b.extend_from_slice(&cnt.to_le_bytes()); // first layer cnt
+            b
+        };
+        assert!(decode_node(&forged(u32::MAX, u32::MAX), &p).is_none());
+        assert!(decode_node(&forged(1, u32::MAX), &p).is_none());
+    }
+
+    /// Audit C13: a keymap value shorter than a node id is corrupt (never
+    /// written). Deleting its key must no-op on the graph — not decode the
+    /// short value as id 0 and tombstone whoever owns node 0.
+    #[test]
+    fn short_keymap_value_delete_does_not_tombstone_node_zero() {
+        let store = Store::open_in_memory().unwrap();
+        let p = DiskParams::with_quant(Metric::L2, Quantization::None, 16, 128);
+        insert(&store, "ix", &p, b"a", &[1.0, 0.0]).unwrap(); // node 0
+        insert(&store, "ix", &p, b"b", &[0.0, 1.0]).unwrap();
+        // Forge a corrupt short keymap for a key that owns no node.
+        store.put("ix", &keymap_key(b"zzz"), &[9, 9, 9]).unwrap();
+        assert!(!delete(&store, "ix", &p, b"zzz").unwrap());
+        // Node 0 ("a") was not tombstoned: still live and searchable.
+        let got = search(&store, "ix", &p, &[1.0, 0.0], 1, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got[0].0, b"a".to_vec());
+        // The garbage keymap row itself is gone.
+        assert!(store.get("ix", &keymap_key(b"zzz")).unwrap().is_none());
     }
 }
