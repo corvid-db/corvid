@@ -293,8 +293,10 @@ impl Db {
     }
 
     /// Post-commit work for an applied write: in-memory index maintenance
-    /// (rebuildable state only) and change events. Never affects durability —
-    /// by this point the data and all persisted indexes are committed.
+    /// (rebuildable state only), on-disk dead-fraction compaction checks
+    /// (audit B5), and change events. Never affects durability — by this
+    /// point the data and all persisted indexes are committed, and no locks
+    /// are held, so the compaction's `index_resume` try-lock is safe.
     fn finish_applied(&self, collection: &str, key: &[u8], doc: Option<&Value>) {
         match doc {
             Some(doc) => {
@@ -316,6 +318,12 @@ impl Db {
                 });
             }
         }
+        // Audit B5: dead only grows through applied writes (deletes AND
+        // overwrites tombstone the old node), so checking here — once per
+        // applied write, one meta point-get per on-disk index — observes
+        // every threshold crossing without putting maintenance on the read
+        // path. Skips collections with no on-disk vector index for free.
+        self.compact_ondisk_vector_indexes(collection);
     }
 }
 

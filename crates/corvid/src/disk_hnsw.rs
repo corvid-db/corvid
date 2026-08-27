@@ -155,10 +155,18 @@ struct Node {
 }
 
 /// Index metadata.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct Meta {
     entry: Option<u64>,
     count: u64,
+    /// Tombstoned node count (audit B5): drives dead-fraction compaction
+    /// (`dead * 2 > live`, checked on the write path in `index.rs`). Invariant:
+    /// `live = count - dead` is the number of live nodes, because every path
+    /// that tombstones an already-live node (delete, overwrite, dimension-
+    /// mismatch re-insert) increments `dead`, and every path that assigns a
+    /// node id also grows `count` (an overwrite does both, leaving `live`
+    /// unchanged). Reset to 0 with the namespace (a fresh build).
+    dead: u32,
     /// Dimension of indexed vectors, fixed by the first inserted vector.
     /// Inserts and queries of any other dimension are rejected/skipped so a
     /// mismatch can never silently produce truncated-distance garbage.
@@ -227,7 +235,7 @@ fn decode_node(b: &[u8], p: &DiskParams) -> Option<Node> {
 }
 
 fn encode_meta(m: Meta) -> Vec<u8> {
-    let mut out = Vec::with_capacity(22);
+    let mut out = Vec::with_capacity(26);
     out.push(m.entry.is_some() as u8);
     out.extend_from_slice(&m.entry.unwrap_or(0).to_be_bytes());
     out.extend_from_slice(&m.count.to_be_bytes());
@@ -239,6 +247,8 @@ fn encode_meta(m: Meta) -> Vec<u8> {
             out.extend_from_slice(&d.to_be_bytes());
         }
     }
+    // dead (audit B5): 4 BE bytes appended after the legacy section.
+    out.extend_from_slice(&m.dead.to_be_bytes());
     out
 }
 
@@ -247,6 +257,7 @@ fn decode_meta(b: &[u8]) -> Meta {
         return Meta {
             entry: None,
             count: 0,
+            dead: 0,
             dim: None,
         };
     }
@@ -259,9 +270,26 @@ fn decode_meta(b: &[u8]) -> Meta {
         Some(1) if b.len() >= 22 => Some(u32::from_be_bytes(b[18..22].try_into().unwrap())),
         _ => None,
     };
+    // dead (audit B5) is length-disambiguated: legacy rows are exactly 17
+    // (pre-dim), 18 (dim unset) or 22 (dim set) bytes and never carry it;
+    // new rows append exactly 4 bytes after the dim section. The one length
+    // collision — 22 — splits cleanly on byte 17: legacy dim-set rows hold
+    // the dim flag `0x01` there, new dim-unset rows hold `0x00` (the unset
+    // flag) with dead at 18..22.
+    let dim_end = match b.get(17) {
+        Some(1) if b.len() >= 22 => 22,
+        Some(_) => 18,
+        None => 17,
+    };
+    let dead = if b.len() == dim_end + 4 {
+        u32::from_be_bytes(b[dim_end..dim_end + 4].try_into().unwrap())
+    } else {
+        0
+    };
     Meta {
         entry: has.then_some(entry),
         count,
+        dead,
         dim,
     }
 }
@@ -402,6 +430,7 @@ fn read_meta(tx: &crate::store::WriteBatch<'_>, ns: &str) -> Result<Meta> {
         None => Meta {
             entry: None,
             count: 0,
+            dead: 0,
             dim: None,
         },
     })
@@ -427,6 +456,10 @@ fn insert_node_in_txn(
         None => meta.dim = Some(vector.len() as u32),
         Some(d) if d as usize != vector.len() => {
             delete_in_txn(tx, ns, p, doc_key)?;
+            // delete_in_txn just did its own meta read-modify-write (dead
+            // increment); re-sync so the caller's final meta put doesn't
+            // clobber it with this stale copy.
+            *meta = read_meta(tx, ns)?;
             return Ok(());
         }
         _ => {}
@@ -441,6 +474,11 @@ fn insert_node_in_txn(
                 Rc::make_mut(node).deleted = true;
                 cache.dirty.insert(old_id);
             }
+            // Audit B5: the old id stops being live (tombstoned above, or
+            // its node row is already absent) — count it dead. The insert
+            // below also grows `count`, so `live = count - dead` is
+            // unchanged by the overwrite, as it must be.
+            meta.dead = meta.dead.saturating_add(1);
         }
 
         let id = meta.count;
@@ -526,7 +564,10 @@ fn flush_dirty(tx: &mut crate::store::WriteBatch<'_>, ns: &str, cache: &mut Cach
     Ok(())
 }
 
-/// Tombstone `doc_key` inside a caller's transaction.
+/// Tombstone `doc_key` inside a caller's transaction. Increments the meta
+/// dead counter (audit B5) so the write-path compaction trigger observes the
+/// tombstone; callers that hold their own `Meta` copy across this call must
+/// re-read it (see `insert_node_in_txn`'s dimension-mismatch arm).
 pub(crate) fn delete_in_txn(
     tx: &mut crate::store::WriteBatch<'_>,
     ns: &str,
@@ -544,6 +585,14 @@ pub(crate) fn delete_in_txn(
         tx.put(ns, &node_key(id), &encode_node(&node))?;
     }
     tx.delete(ns, &keymap_key(doc_key))?;
+    // The id stops being live whether or not its node row was readable, so
+    // `dead` increments on every keymap hit (keeping `live = count - dead`
+    // honest even against corrupt node rows). Saturating: `dead` can never
+    // legitimately exceed `count` (u64), so a saturated counter only
+    // over-triggers compaction, never under-reports.
+    let mut meta = read_meta(tx, ns)?;
+    meta.dead = meta.dead.saturating_add(1);
+    tx.put(ns, &[TAG_META], &encode_meta(meta))?;
     Ok(true)
 }
 
@@ -615,6 +664,17 @@ pub(crate) fn search(
 
 /// Ranked `(doc_key, distance)` results, nearest first.
 pub(crate) type DiskRanked = Vec<(Vec<u8>, f32)>;
+
+/// `(dead, live)` node counts for the on-disk index at `ns`, read from its
+/// meta row (audit B5 compaction trigger input); `None` when the namespace
+/// has no meta (never built, or freshly reset by a registration/compaction).
+/// One point-get — cheap enough to call after every applied write.
+pub(crate) fn dead_fraction(store: &Store, ns: &str) -> Result<Option<(u32, u64)>> {
+    Ok(store.get(ns, &[TAG_META])?.map(|b| {
+        let m = decode_meta(&b);
+        (m.dead, m.count.saturating_sub(m.dead as u64))
+    }))
+}
 
 /// The reserved collection name holding an on-disk index's graph.
 pub(crate) fn namespace(collection: &str, field: &str) -> String {
@@ -981,6 +1041,66 @@ mod tests {
         let keys: HashSet<Vec<u8>> = got.into_iter().map(|(k, _)| k).collect();
         assert!(keys.contains(b"x".as_slice()));
         assert!(keys.contains(b"far".as_slice()));
+    }
+
+    #[test]
+    fn meta_dead_round_trips_and_legacy_decodes_zero() {
+        // New-format rows round-trip dead with and without a pinned dim.
+        for m in [
+            Meta {
+                entry: Some(7),
+                count: 9,
+                dead: 4,
+                dim: Some(3),
+            },
+            Meta {
+                entry: Some(1),
+                count: 5,
+                dead: 2,
+                dim: None,
+            },
+            Meta {
+                entry: None,
+                count: 0,
+                dead: 0,
+                dim: None,
+            },
+        ] {
+            assert_eq!(decode_meta(&encode_meta(m)), m);
+        }
+        // Legacy rows (pre-dead) decode dead = 0 with their fields intact.
+        let mut legacy = Vec::new();
+        legacy.push(1u8);
+        legacy.extend_from_slice(&7u64.to_be_bytes());
+        legacy.extend_from_slice(&9u64.to_be_bytes());
+        let pre_dim = decode_meta(&legacy); // 17 bytes: no dim flag at all
+        assert_eq!(
+            pre_dim,
+            Meta {
+                entry: Some(7),
+                count: 9,
+                dead: 0,
+                dim: None,
+            }
+        );
+        legacy.push(1u8); // dim set
+        legacy.extend_from_slice(&3u32.to_be_bytes());
+        let dim_set = decode_meta(&legacy); // 22 bytes: legacy dim-set
+        assert_eq!(dim_set.dim, Some(3));
+        assert_eq!(dim_set.dead, 0);
+        assert_eq!(dim_set.count, 9);
+        // The 22-byte collision: a new dim-unset + dead row must not be
+        // mistaken for a legacy dim-set row (byte 17 splits them).
+        let mut new_unset = Vec::new();
+        new_unset.push(1u8);
+        new_unset.extend_from_slice(&1u64.to_be_bytes());
+        new_unset.extend_from_slice(&6u64.to_be_bytes());
+        new_unset.push(0u8); // dim unset flag
+        new_unset.extend_from_slice(&5u32.to_be_bytes()); // dead
+        let m = decode_meta(&new_unset);
+        assert_eq!(m.dim, None);
+        assert_eq!(m.dead, 5);
+        assert_eq!(m.count, 6);
     }
 
     /// A page insert produces the same graph state as per-doc inserts: build the
