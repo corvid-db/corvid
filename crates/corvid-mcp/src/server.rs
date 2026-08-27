@@ -1294,10 +1294,7 @@ mod tests {
         let s = server();
         let over = MAX_RESULT_LIMIT as u64 + 1;
         let err = s
-            .handle(
-                "search",
-                &json!({"collection": "c", "limit": over}),
-            )
+            .handle("search", &json!({"collection": "c", "limit": over}))
             .unwrap_err();
         assert!(format!("{err}").contains("maximum"));
         let err = s
@@ -1308,10 +1305,7 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err}").contains("maximum"));
         let err = s
-            .handle(
-                "page",
-                &json!({"collection": "c", "limit": over}),
-            )
+            .handle("page", &json!({"collection": "c", "limit": over}))
             .unwrap_err();
         assert!(format!("{err}").contains("maximum"));
         let err = s

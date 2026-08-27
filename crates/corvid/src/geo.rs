@@ -287,7 +287,11 @@ mod tests {
                 .collection("places")
                 .geo_within_radius("meta.loc", 51.5, -0.1, 10.0)
                 .unwrap();
-            assert_eq!(hits.len(), 1, "{label}: db-level geo must resolve nested paths");
+            assert_eq!(
+                hits.len(),
+                1,
+                "{label}: db-level geo must resolve nested paths"
+            );
             let rows = db
                 .collection("places")
                 .geo_within_bbox("meta.loc", 51.0, -1.0, 52.0, 1.0)

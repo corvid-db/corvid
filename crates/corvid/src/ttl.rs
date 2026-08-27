@@ -202,7 +202,8 @@ impl Db {
                 // Expiry entry without a document (e.g. the expiry was set
                 // before any write landed). Drop it so future purges stop
                 // rescanning it.
-                self.store().transaction(|tx| remove_in_txn(tx, &ns, &key))?;
+                self.store()
+                    .transaction(|tx| remove_in_txn(tx, &ns, &key))?;
             }
         }
         Ok(purged)
@@ -224,7 +225,8 @@ impl Collection<'_> {
     /// its expiry commit atomically — a crash can never leave an immortal
     /// record that was asked to expire.
     pub fn insert_with_ttl(&self, key: &[u8], doc: &crate::Value, expires_at: i64) -> Result<()> {
-        self.db().write_document(self.name(), key, Some(doc), Some(expires_at))?;
+        self.db()
+            .write_document(self.name(), key, Some(doc), Some(expires_at))?;
         Ok(())
     }
 

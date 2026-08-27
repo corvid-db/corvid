@@ -420,8 +420,9 @@ mod tests {
         let (mn_lat, mn_lon, mx_lat, mx_lon) = radius_bbox(60.0, 60.0, 1000.0).unwrap();
         // Exact bound: asin(sin δ / cos φ).
         let dlat: f64 = 1000.0 / 110.574;
-        let expected_dlon =
-            (dlat.to_radians().sin() / 60.0f64.to_radians().cos()).asin().to_degrees();
+        let expected_dlon = (dlat.to_radians().sin() / 60.0f64.to_radians().cos())
+            .asin()
+            .to_degrees();
         assert!((mx_lon - (60.0 + expected_dlon)).abs() < 1e-9);
         assert!((mn_lon - (60.0 - expected_dlon)).abs() < 1e-9);
         // The previously-dropped match now lies inside the box...

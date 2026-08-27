@@ -536,14 +536,8 @@ mod tests {
         dst.load(&bytes[..]).unwrap();
         let c = dst.collection("nodes");
         // Edges survive, both directions, with weights.
-        assert_eq!(
-            c.neighbors(b"a", "knows").unwrap(),
-            vec![b"b".to_vec()]
-        );
-        assert_eq!(
-            c.in_neighbors(b"b", "knows").unwrap(),
-            vec![b"a".to_vec()]
-        );
+        assert_eq!(c.neighbors(b"a", "knows").unwrap(), vec![b"b".to_vec()]);
+        assert_eq!(c.in_neighbors(b"b", "knows").unwrap(), vec![b"a".to_vec()]);
         assert_eq!(
             c.neighbors_weighted(b"a", "knows").unwrap(),
             vec![(b"b".to_vec(), 0.75)]

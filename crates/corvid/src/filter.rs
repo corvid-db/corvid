@@ -287,8 +287,7 @@ fn compare(found: &Value, op: CmpOp, rhs: &Value) -> bool {
 /// `value_order` and the scalar index's numeric lane); everything else is
 /// structural. NaN never equals anything.
 fn values_equal(a: &Value, b: &Value) -> bool {
-    if matches!(a, Value::Int(_) | Value::Float(_))
-        && matches!(b, Value::Int(_) | Value::Float(_))
+    if matches!(a, Value::Int(_) | Value::Float(_)) && matches!(b, Value::Int(_) | Value::Float(_))
     {
         value_order(a, b) == Some(Ordering::Equal)
     } else {

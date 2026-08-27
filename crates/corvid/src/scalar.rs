@@ -835,9 +835,7 @@ mod tests {
         c.insert(b"pos", &float_doc(0.0)).unwrap();
         c.create_scalar_index("x").unwrap();
 
-        let count = |p: crate::Predicate| {
-            c.query().filter(p).run().unwrap().len()
-        };
+        let count = |p: crate::Predicate| c.query().filter(p).run().unwrap().len();
         assert_eq!(count(field("x").eq(Value::Float(0.0))), 2);
         assert_eq!(count(field("x").eq(Value::Float(-0.0))), 2);
         assert_eq!(count(field("x").ge(Value::Int(0))), 2);

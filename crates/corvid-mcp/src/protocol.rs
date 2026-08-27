@@ -122,7 +122,11 @@ pub fn run_with_limit<R: BufRead, W: Write>(
                 Ok(req) => handle_request(server, &req),
                 Err(_) => Some(error_response(Json::Null, -32700, "parse error")),
             },
-            Err(_) => Some(error_response(Json::Null, -32700, "frame is not valid utf-8")),
+            Err(_) => Some(error_response(
+                Json::Null,
+                -32700,
+                "frame is not valid utf-8",
+            )),
         };
         if let Some(resp) = response {
             respond(&mut writer, resp)?;

@@ -982,7 +982,9 @@ mod tests {
         insert(&store, "ix", &p, b"far", &[10.0, 10.0]).unwrap();
         // Move x next to far; querying near far should surface both.
         insert(&store, "ix", &p, b"x", &[10.0, 10.0]).unwrap();
-        let got = search(&store, "ix", &p, &[10.0, 10.0], 2, 50).unwrap().unwrap();
+        let got = search(&store, "ix", &p, &[10.0, 10.0], 2, 50)
+            .unwrap()
+            .unwrap();
         let keys: HashSet<Vec<u8>> = got.into_iter().map(|(k, _)| k).collect();
         assert!(keys.contains(b"x".as_slice()));
         assert!(keys.contains(b"far".as_slice()));

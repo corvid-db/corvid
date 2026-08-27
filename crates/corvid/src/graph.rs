@@ -255,9 +255,7 @@ mod tests {
     fn unlink_on_reserved_collection_is_rejected() {
         let db = Db::open_in_memory().unwrap();
         // The edge namespace itself must not be writable through the public API.
-        let err = db
-            .collection("__edges__nodes")
-            .unlink(b"a", "r", b"b");
+        let err = db.collection("__edges__nodes").unlink(b"a", "r", b"b");
         assert!(matches!(err, Err(crate::Error::ReservedCollection(_))));
     }
 
