@@ -359,6 +359,25 @@ pub(crate) fn insert_in_txn(
     Ok(())
 }
 
+/// Insert a page of (doc_key, vector) pairs inside the caller's transaction
+/// with ONE node cache and ONE meta read-modify-write for the whole page —
+/// the atomicity of per-tx inserts at (near-)bulk speed.
+pub(crate) fn insert_page_in_txn(
+    tx: &mut crate::store::WriteBatch<'_>,
+    ns: &str,
+    p: &DiskParams,
+    page: &[(Vec<u8>, Vec<f32>)],
+) -> Result<()> {
+    let mut meta = read_meta(tx, ns)?;
+    let mut cache = Cache::new();
+    for (doc_key, vector) in page {
+        insert_node_in_txn(tx, ns, p, &mut cache, &mut meta, doc_key, vector)?;
+    }
+    flush_dirty(tx, ns, &mut cache)?;
+    tx.put(ns, &[TAG_META], &encode_meta(meta))?;
+    Ok(())
+}
+
 /// Test seam: insert one vector in its own transaction.
 #[cfg(test)]
 pub(crate) fn insert(
@@ -956,5 +975,37 @@ mod tests {
         let keys: HashSet<Vec<u8>> = got.into_iter().map(|(k, _)| k).collect();
         assert!(keys.contains(b"x".as_slice()));
         assert!(keys.contains(b"far".as_slice()));
+    }
+
+    /// A page insert produces the same graph state as per-doc inserts: build the
+    /// same corpus into two namespaces — one via insert_page_in_txn, one via
+    /// repeated insert_in_txn in a single transaction — and require identical
+    /// search results (top-5 keys, both k-ordered).
+    #[test]
+    fn page_insert_matches_per_doc_state() {
+        let store = Store::open_in_memory().unwrap();
+        let p = DiskParams::with_quant(Metric::L2, Quantization::None, 8, 64);
+        let items: Vec<(Vec<u8>, Vec<f32>)> = (0..50u8)
+            .map(|i| (vec![i], vec![i as f32, 1.0, 0.0, 0.0]))
+            .collect();
+        store
+            .transaction(|tx| insert_page_in_txn(tx, "ix", &p, &items))
+            .unwrap();
+        store
+            .transaction(|tx| {
+                for (k, v) in &items {
+                    insert_in_txn(tx, "ix2", &p, k, v)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let a = search(&store, "ix", &p, &[0.0, 1.0, 0.0, 0.0], 5, 64)
+            .unwrap()
+            .unwrap();
+        let b = search(&store, "ix2", &p, &[0.0, 1.0, 0.0, 0.0], 5, 64)
+            .unwrap()
+            .unwrap();
+        let keys = |r: &[(Vec<u8>, f32)]| r.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+        assert_eq!(keys(&a), keys(&b));
     }
 }

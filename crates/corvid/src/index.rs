@@ -598,11 +598,15 @@ impl Db {
             &kb,
             cursor,
             &mut |tx, page| {
+                let mut batch: Vec<(Vec<u8>, Vec<f32>)> = Vec::with_capacity(page.len());
                 for (key, bytes) in page {
                     let doc = Value::decode(bytes)?;
                     if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
-                        disk_hnsw::insert_in_txn(tx, &ns, &params, key, v)?;
+                        batch.push((key.clone(), v.to_vec()));
                     }
+                }
+                if !batch.is_empty() {
+                    disk_hnsw::insert_page_in_txn(tx, &ns, &params, &batch)?;
                 }
                 Ok(())
             },
