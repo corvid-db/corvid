@@ -201,6 +201,13 @@ fn unique_value_eq(a: &Value, b: &Value) -> bool {
                     .zip(ys.iter())
                     .all(|((kx, vx), (ky, vy))| kx == ky && unique_value_eq(vx, vy))
         }
+        (Value::Vector(xs), Value::Vector(ys)) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys.iter())
+                    .all(|(x, y)| x == y || (x.is_nan() && y.is_nan()))
+        }
         _ => a == b,
     }
 }
@@ -610,6 +617,60 @@ mod tests {
             .unwrap();
         let err = c.insert(b"d", &doc(&[("x", Value::Float(f64::NAN))]));
         assert!(matches!(err, Err(Error::SchemaViolation(_))));
+    }
+
+    /// Regression (review round 1): NaN equality must reach inside containers —
+    /// Vector (f32 elements) and Array (recursive Values) — not just top-level
+    /// Float fields.
+    #[test]
+    fn unique_nan_inside_containers_conflicts() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("vecs");
+        c.set_schema(&Schema::new().field(Field::new("v", FieldType::Vector).unique()))
+            .unwrap();
+        c.insert(b"a", &doc(&[("v", Value::Vector(vec![f32::NAN, 1.0]))]))
+            .unwrap();
+        let err = c.insert(b"b", &doc(&[("v", Value::Vector(vec![f32::NAN, 1.0]))]));
+        assert!(
+            matches!(err, Err(Error::SchemaViolation(_))),
+            "byte-identical vectors containing NaN must conflict"
+        );
+        // Negative control: a different vector is still fine.
+        c.insert(b"c", &doc(&[("v", Value::Vector(vec![1.0, f32::NAN]))]))
+            .unwrap();
+        assert_eq!(c.len().unwrap(), 2);
+
+        let c = db.collection("arrs");
+        c.set_schema(&Schema::new().field(Field::new("a", FieldType::Array).unique()))
+            .unwrap();
+        c.insert(
+            b"a",
+            &doc(&[("a", Value::Array(vec![Value::Float(f64::NAN)]))]),
+        )
+        .unwrap();
+        let err = c.insert(
+            b"b",
+            &doc(&[("a", Value::Array(vec![Value::Float(f64::NAN)]))]),
+        );
+        assert!(
+            matches!(err, Err(Error::SchemaViolation(_))),
+            "equal arrays containing NaN must conflict"
+        );
+
+        let c = db.collection("maps");
+        c.set_schema(&Schema::new().field(Field::new("m", FieldType::Map).unique()))
+            .unwrap();
+        let nan_map = || {
+            let mut m = BTreeMap::new();
+            m.insert("x".to_owned(), Value::Float(f64::NAN));
+            Value::Map(m)
+        };
+        c.insert(b"a", &doc(&[("m", nan_map())])).unwrap();
+        let err = c.insert(b"b", &doc(&[("m", nan_map())]));
+        assert!(
+            matches!(err, Err(Error::SchemaViolation(_))),
+            "equal maps containing NaN must conflict"
+        );
     }
 
     #[test]
