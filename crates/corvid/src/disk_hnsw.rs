@@ -76,9 +76,10 @@ impl DiskParams {
     /// Build the PQ probe for a query: under L2, precompute the asymmetric-
     /// distance table once (so each node is O(m) table lookups instead of an
     /// O(dim) reconstruct + distance); other metrics keep the query vector.
-    /// If the table cannot be built (dimension mismatch), fall back to the
-    /// reconstruction probe — slower, but correct; `search` declines
-    /// mismatched queries up front, so this is defense in depth.
+    /// If the table cannot be built (dimension mismatch), keep the query
+    /// vector: `search` declines dimension-mismatched queries before any
+    /// probe is built, so this arm is unreachable defense in depth — not a
+    /// correct fallback for mismatched dimensions.
     fn pq_probe(pq: &Pq, metric: Metric, query: Vec<f32>) -> DProbe {
         match metric {
             Metric::L2 => match pq.l2_table(&query) {

@@ -12,6 +12,17 @@ format and API may change without backward-compatibility guarantees.
   values are type-tagged (`i:1`, `f:1.5`, `b:true`), and texts that would be
   ambiguous with a tag are `t:`-escaped. Previously every key carried an
   `s:`-style type prefix. Breaking change ahead of 1.0.
+- `Pq::l2_table` now returns `Option<Vec<f32>>` (`None` on dimension mismatch
+  instead of an all-zero table); `adc_l2` scores out-of-range codes as
+  `INFINITY` instead of panicking. Breaking public-API change ahead of 1.0.
+  (audit A4)
+- Unique constraints are now enforced for non-index-encodable values
+  (Bytes/Array/Map/Vector) when a scalar index exists on the unique field,
+  and NaN (at any depth) conflicts with NaN: writes previously accepted may
+  now fail with `SchemaViolation`. (audit A3)
+- New public API: `Store::begin_bulk` / `Store::BulkScope` — a thread-local,
+  panic-safe relaxed-durability scope; `Db::bulk` now uses it (concurrent
+  writers on other threads are no longer affected). (audit B1)
 
 ## [0.1.1] - 2026-05-29
 

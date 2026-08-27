@@ -20,6 +20,7 @@
 //! committed documents (documents are the source of truth); a crash can only
 //! lose in-memory index state, which is reconstructed on the next open.
 
+use std::marker::PhantomData;
 use std::ops::Bound;
 use std::path::Path;
 
@@ -61,7 +62,12 @@ thread_local! {
 /// Guard marking the current thread as inside a bulk load (relaxed
 /// durability for write transactions started here). Dropping it — normally
 /// or on unwind — restores durable commits. Created by [`Store::begin_bulk`].
-pub struct BulkScope;
+///
+/// `!Send`/`!Sync` by construction: the guard owns a decrement of *this*
+/// thread's bulk depth, so dropping it on any other thread would leak the
+/// scope. Keep it on the thread that called `begin_bulk`.
+#[must_use = "dropping the guard immediately ends the bulk scope"]
+pub struct BulkScope(PhantomData<*const ()>);
 
 impl Drop for BulkScope {
     fn drop(&mut self) {
@@ -98,9 +104,10 @@ impl Store {
     /// Enter a bulk-load scope on the current thread. Write transactions
     /// started on this thread skip the per-commit fsync until the returned
     /// guard drops; make them durable with [`Store::flush`].
+    #[must_use = "dropping the guard immediately ends the bulk scope"]
     pub fn begin_bulk(&self) -> BulkScope {
         BULK_DEPTH.with(|d| d.set(d.get() + 1));
-        BulkScope
+        BulkScope(PhantomData)
     }
 
     /// Whether write transactions on the current thread would relax

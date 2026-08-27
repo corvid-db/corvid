@@ -1880,10 +1880,12 @@ mod tests {
         for (i, v) in [
             Value::Text("1".into()),
             Value::Text("i:1".into()), // ambiguous with Int tag → escaped
+            Value::Text("t:x".into()), // ambiguous with the escape tag itself
             Value::Int(1),
             Value::Float(1.0),
             Value::Float(-0.0),
             Value::Float(0.0),
+            Value::Bool(true),
         ]
         .into_iter()
         .enumerate()
@@ -1895,11 +1897,13 @@ mod tests {
         let groups = c.query().group_count("v").unwrap();
         assert_eq!(groups.get("1"), Some(&1)); // bare text
         assert_eq!(groups.get("t:i:1"), Some(&1)); // escaped text
+        assert_eq!(groups.get("t:t:x"), Some(&1)); // t:-prefixed text self-escapes
         assert_eq!(groups.get("i:1"), Some(&1));
         assert_eq!(groups.get("f:1"), Some(&1));
         assert_eq!(groups.get("f:0"), Some(&2)); // -0.0 == 0.0 for grouping
-        assert_eq!(groups.len(), 5);
-        assert_eq!(c.query().count_distinct("v").unwrap(), 5);
+        assert_eq!(groups.get("b:true"), Some(&1));
+        assert_eq!(groups.len(), 7);
+        assert_eq!(c.query().count_distinct("v").unwrap(), 7);
     }
 
     #[test]
