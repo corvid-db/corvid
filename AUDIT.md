@@ -14,6 +14,15 @@ audit time: `cargo test --workspace` 390 tests green, `cargo clippy -D warnings`
 - D4 — fixed in 281e6f3 (group keys: bare text, tagged non-text, t:-escaped ambiguity).
 
 Wave 1 exit gates green: fmt, clippy `-D warnings`, tests, coverage ≥ 90%.
+
+## Status 2026-08-27 — remediation wave 2 landed
+
+- A2 — fixed in b4982fd..b9cbdf1 (+ exit 1b17de9): all five index kinds (scalar, compound,
+  geo, FTS, vector) create via a persisted Building{cursor}→Complete watermark; queries never
+  serve Building defs (exact/bounded fallbacks); lazy first-use resume; dump/load materializes
+  Complete via create_* replay.
+
+Wave 2 exit gates green: fmt, clippy `-D warnings`, 445 tests, 95.13% line coverage.
 Full plan (5 waves): docs/superpowers/specs/2026-08-27-audit-remediation-design.md.
 
 Severity legend: **CRITICAL** breaks the project's own central contract. **MAJOR** wrong results,
