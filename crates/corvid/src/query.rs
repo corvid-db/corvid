@@ -21,10 +21,16 @@ use crate::value::Value;
 pub struct Hit {
     /// The document's key within the collection.
     pub key: Vec<u8>,
-    /// Distance to the query vector. Lower is nearer.
+    /// Distance to the query vector. Lower is nearer. Always the exact metric
+    /// distance recomputed from the stored document — never the ANN index's
+    /// internal approximation (e.g. Hamming counts under binary quantization).
     pub distance: f32,
     /// The full stored document.
     pub document: Value,
+    /// `true` when the candidate set came from an ANN index, whose recall may
+    /// be below 1 versus an exact scan; `false` on the exact path. The
+    /// `distance` itself is exact either way (audit B6).
+    pub approximate: bool,
 }
 
 /// One result of a text search: the document, its key, and its BM25 score
@@ -134,7 +140,10 @@ impl Collection<'_> {
     /// If a matching ANN index was created with
     /// [`Collection::create_vector_index`](crate::Collection::create_vector_index)
     /// it is used (approximate, faster); otherwise the search is exact
-    /// (brute-force). Documents that lack the field, whose field is not a
+    /// (brute-force). Either way each [`Hit::distance`] is the exact metric
+    /// distance recomputed from the stored document, and [`Hit::approximate`]
+    /// records whether the candidate set came from the index (recall may be
+    /// below 1). Documents that lack the field, whose field is not a
     /// [`Value::Vector`], or whose dimension differs from `query` are skipped
     /// (schema-on-read). Ties break by key order.
     pub fn vector_search(
@@ -146,16 +155,33 @@ impl Collection<'_> {
     ) -> Result<Vec<Hit>> {
         // Use a registered ANN index when one matches; else fall back to exact.
         if let Some(ranked) = self.db().ann_search(self.name(), field, query, k, metric)? {
-            let mut out = Vec::with_capacity(ranked.len());
-            for (key, distance) in ranked {
-                if let Some(document) = self.get(&key)? {
+            // The index's distances live on its own scale — Hamming bit counts
+            // for binary quantization, reconstruction error for scalar/PQ — so
+            // they are discarded and recomputed exactly from the stored
+            // documents (audit B6: callers must be able to trust `distance`
+            // and to set metric-unit thresholds). Candidates whose stored
+            // vector no longer matches the query dimension are skipped, parity
+            // with the exact path.
+            let mut out: Vec<Hit> = Vec::with_capacity(ranked.len());
+            for (key, _approx_distance) in ranked {
+                if let Some(document) = self.get(&key)?
+                    && let Some(v) = document.get_path(field).and_then(Value::as_vector)
+                    && v.len() == query.len()
+                {
                     out.push(Hit {
+                        distance: metric.distance(query, v),
                         key,
-                        distance,
                         document,
+                        approximate: true,
                     });
                 }
             }
+            out.sort_by(|a, b| {
+                a.distance
+                    .total_cmp(&b.distance)
+                    .then_with(|| a.key.cmp(&b.key))
+            });
+            out.truncate(k);
             return Ok(out);
         }
 
@@ -189,6 +215,7 @@ impl Collection<'_> {
                 key: c.key,
                 distance: c.dist,
                 document: c.doc,
+                approximate: false,
             })
             .collect())
     }
@@ -327,7 +354,7 @@ pub(crate) fn doc_map(cands: Vec<(Vec<u8>, Value)>) -> HashMap<Vec<u8>, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Db;
+    use crate::{Db, Quantization};
     use std::collections::BTreeMap;
 
     fn doc_with_vec(label: &str, v: Vec<f32>) -> Value {
@@ -535,6 +562,99 @@ mod tests {
             .text_search("body", "anything", 5)
             .unwrap();
         assert!(hits.is_empty());
+    }
+
+    /// Seed the same corpus into a plain (unindexed) and an ANN-indexed
+    /// collection so the exact and approximate paths can be compared.
+    fn seed_plain_and_indexed(corpus: &[(&[u8], Vec<f32>)]) -> (Db, Db) {
+        let plain = Db::open_in_memory().unwrap();
+        let indexed = Db::open_in_memory().unwrap();
+        for (key, v) in corpus {
+            plain
+                .collection("docs")
+                .insert(key, &doc_with_vec("x", v.clone()))
+                .unwrap();
+            indexed
+                .collection("docs")
+                .insert(key, &doc_with_vec("x", v.clone()))
+                .unwrap();
+        }
+        indexed
+            .collection("docs")
+            .create_vector_index_ondisk_quantized("embedding", Metric::Cosine, Quantization::Binary)
+            .unwrap();
+        (plain, indexed)
+    }
+
+    #[test]
+    fn ann_hits_have_exact_distances_and_flag() {
+        // A binary-quantized on-disk index reports raw distances on the
+        // Hamming bit-count scale (a: 0, b: 0, c: 1 below) — nothing like the
+        // cosine metric (a: 0, b: 1, c: 2). The rerank must replace them with
+        // the exact metric distances, and mark the hits approximate.
+        let corpus: &[(&[u8], Vec<f32>)] = &[
+            (b"a", vec![1.0, 0.0]),
+            (b"b", vec![0.0, 1.0]),
+            (b"c", vec![-1.0, 0.0]),
+        ];
+        let (plain, indexed) = seed_plain_and_indexed(corpus);
+        let exact = plain
+            .collection("docs")
+            .vector_search("embedding", &[1.0, 0.0], corpus.len(), Metric::Cosine)
+            .unwrap();
+        let ann = indexed
+            .collection("docs")
+            .vector_search("embedding", &[1.0, 0.0], corpus.len(), Metric::Cosine)
+            .unwrap();
+
+        assert!(exact.iter().all(|h| !h.approximate));
+        assert!(ann.iter().all(|h| h.approximate));
+        assert_eq!(ann.len(), exact.len());
+        let exact_by_key: HashMap<_, _> =
+            exact.iter().map(|h| (h.key.clone(), h.distance)).collect();
+        for h in &ann {
+            let &want = exact_by_key
+                .get(&h.key)
+                .expect("ANN candidate exists in the exact result set");
+            assert!(
+                (h.distance - want).abs() < 1e-6,
+                "key {:?}: ANN distance {} != exact {}",
+                String::from_utf8_lossy(&h.key),
+                h.distance,
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn ann_hits_are_reranked_into_exact_order() {
+        // The index's own sign-bit ranking disagrees with exact cosine: `x`
+        // wins on bits (Hamming 0 vs 1) but `y` wins on cosine (~0.005 vs
+        // ~0.71). Both are inside the index's top-k, so the rerank must hand
+        // them back in the exact order.
+        let corpus: &[(&[u8], Vec<f32>)] = &[
+            (b"x", vec![0.5, 2.0]),
+            (b"y", vec![1.0, -0.05]),
+            (b"z", vec![-1.0, -1.0]),
+        ];
+        let (plain, indexed) = seed_plain_and_indexed(corpus);
+        let query = [1.0, 0.05];
+        let exact: Vec<_> = plain
+            .collection("docs")
+            .vector_search("embedding", &query, 2, Metric::Cosine)
+            .unwrap()
+            .iter()
+            .map(|h| h.key.clone())
+            .collect();
+        let ann: Vec<_> = indexed
+            .collection("docs")
+            .vector_search("embedding", &query, 2, Metric::Cosine)
+            .unwrap()
+            .iter()
+            .map(|h| h.key.clone())
+            .collect();
+        assert_eq!(exact, vec![b"y".to_vec(), b"x".to_vec()]);
+        assert_eq!(ann, exact);
     }
 
     #[test]

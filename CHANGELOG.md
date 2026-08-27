@@ -7,6 +7,14 @@ format and API may change without backward-compatibility guarantees.
 ## [Unreleased]
 
 ### Changed
+- `Hit` gains `pub approximate: bool` (`true` when the candidate set came from
+  an ANN index, `false` on the exact path), and `vector_search` now reranks
+  ANN hits with exact metric distances recomputed from the stored documents —
+  previously indexed modes returned the index's internal distances (Hamming
+  bit counts for binary quantization, reconstruction approximations for
+  scalar/PQ), which made metric-unit thresholds such as `SemanticCache`'s
+  meaningless under quantized indexes. Breaking struct change ahead of 1.0.
+  (audit B6)
 - Group-key canonical form (affects `group_count`, `group_sum`, `group_avg`,
   `count_distinct`): text values are now bare keys (`"blog"`), non-text
   values are type-tagged (`i:1`, `f:1.5`, `b:true`), and texts that would be

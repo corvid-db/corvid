@@ -58,6 +58,11 @@ impl SemanticCache<'_> {
     /// Look up the cached value for `query`. Returns the value of the nearest
     /// entry within `threshold`, or `None` on a miss (no entry, nearest too
     /// far, or the entry lacks the value field).
+    ///
+    /// The distance compared against `threshold` is always the exact metric
+    /// distance, under any index mode: `vector_search` reranks ANN hits with
+    /// exact distances, so a quantized index on the embedding field does not
+    /// rescale the threshold's units (audit B6).
     pub fn get(&self, query: &[f32]) -> Result<Option<Value>> {
         let hits = self
             .collection
@@ -73,7 +78,7 @@ impl SemanticCache<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Db, Metric, Value};
+    use crate::{Db, Metric, Quantization, Value};
 
     fn cache_db() -> Db {
         Db::open_in_memory().unwrap()
@@ -161,6 +166,28 @@ mod tests {
             .collection("cache")
             .semantic_cache("q", "response", Metric::Cosine, 0.05);
         assert_eq!(cache.get(&[1.0, 0.0]).unwrap(), None);
+    }
+
+    #[test]
+    fn semantic_cache_under_quantized_index_hits_threshold() {
+        // A binary-quantized index reports distances on the Hamming bit-count
+        // scale: the stored [1.0, 0.001] vs query [1.0, -0.001] pair differs
+        // in one sign bit, so the raw distance is 1 — far outside a 0.05
+        // cosine threshold. The exact rerank makes the compared distance the
+        // true cosine (~2e-6), so the lookup hits. Pre-rerank this could
+        // never hit unless the sign bits matched exactly (Hamming 0).
+        let db = cache_db();
+        let c = db.collection("cache");
+        c.create_vector_index_quantized("q", Metric::Cosine, Quantization::Binary)
+            .unwrap();
+        let cache = c.semantic_cache("q", "response", Metric::Cosine, 0.05);
+        cache
+            .put(b"k1", vec![1.0, 0.001], Value::Text("answer".into()))
+            .unwrap();
+        assert_eq!(
+            cache.get(&[1.0, -0.001]).unwrap(),
+            Some(Value::Text("answer".into()))
+        );
     }
 
     #[test]
