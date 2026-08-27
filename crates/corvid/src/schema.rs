@@ -185,6 +185,52 @@ pub(crate) fn new_state() -> std::sync::Mutex<SchemaState> {
     std::sync::Mutex::new(SchemaState::default())
 }
 
+/// Value equality for unique constraints: like `PartialEq`, except NaN
+/// equals NaN (uniqueness is about identity of stored values, not IEEE
+/// ordering) and containers compare element-wise under the same rule.
+fn unique_value_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
+        (Value::Array(xs), Value::Array(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| unique_value_eq(x, y))
+        }
+        (Value::Map(xs), Value::Map(ys)) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys.iter())
+                    .all(|((kx, vx), (ky, vy))| kx == ky && unique_value_eq(vx, vy))
+        }
+        _ => a == b,
+    }
+}
+
+/// Scan-side unique check inside the caller's write transaction: reject any
+/// *other* key whose value at `field` equals `value` under
+/// [`unique_value_eq`]. Used when no scalar index serves the field, when the
+/// value is not index-encodable (containers), and for NaN (whose encoded
+/// bucket key is not guaranteed to collide).
+fn unique_scan_in_txn(
+    tx: &mut crate::store::WriteBatch<'_>,
+    collection: &str,
+    key: &[u8],
+    field: &str,
+    value: &Value,
+) -> Result<()> {
+    for (k, bytes) in tx.scan(collection)? {
+        if k == key {
+            continue;
+        }
+        let d = Value::decode(&bytes)?;
+        if d.get_path(field).is_some_and(|v| unique_value_eq(v, value)) {
+            return Err(Error::SchemaViolation(format!(
+                "field '{field}' must be unique; value already exists"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Db {
     /// Load persisted schemas. Called once on open.
     pub(crate) fn load_schemas(&self) -> Result<()> {
@@ -282,50 +328,44 @@ impl Db {
                     f.name
                 ))
             };
-            if self.has_scalar_index(collection, &f.name) {
-                // Walk exactly this value's bucket: index keys are
-                // `encoded_value ‖ doc_key`, so everything from `enc` until
-                // the first non-prefixed key shares the value.
-                let ns = crate::scalar::namespace(collection, &f.name);
-                let Some(enc) = crate::scalar::encode_value(value) else {
-                    continue;
-                };
-                let mut cursor = enc.clone();
-                'bucket: loop {
-                    let page = tx.scan_from(&ns, &cursor, 256)?;
-                    if page.is_empty() {
-                        break 'bucket;
-                    }
-                    let mut next = None;
-                    for (k, _) in &page {
-                        if !k.starts_with(&enc) {
+            let nan = matches!(value, Value::Float(x) if x.is_nan());
+            match if nan {
+                None
+            } else {
+                crate::scalar::encode_value(value)
+            } {
+                Some(enc) if self.has_scalar_index(collection, &f.name) => {
+                    // Walk exactly this value's bucket: index keys are
+                    // `encoded_value ‖ doc_key`, so everything from `enc`
+                    // until the first non-prefixed key shares the value.
+                    let ns = crate::scalar::namespace(collection, &f.name);
+                    let mut cursor = enc.clone();
+                    'bucket: loop {
+                        let page = tx.scan_from(&ns, &cursor, 256)?;
+                        if page.is_empty() {
                             break 'bucket;
                         }
-                        let doc_key = &k[enc.len()..];
-                        if doc_key != key {
-                            return Err(conflict_msg());
+                        let mut next = None;
+                        for (k, _) in &page {
+                            if !k.starts_with(&enc) {
+                                break 'bucket;
+                            }
+                            let doc_key = &k[enc.len()..];
+                            if doc_key != key {
+                                return Err(conflict_msg());
+                            }
+                            next = Some(k.clone());
                         }
-                        next = Some(k.clone());
-                    }
-                    match next {
-                        Some(mut c) => {
-                            c.push(0);
-                            cursor = c;
+                        match next {
+                            Some(mut c) => {
+                                c.push(0);
+                                cursor = c;
+                            }
+                            None => break 'bucket,
                         }
-                        None => break 'bucket,
                     }
                 }
-            } else {
-                // No scalar index: scan the collection within the txn.
-                for (k, bytes) in tx.scan(collection)? {
-                    if k == key {
-                        continue;
-                    }
-                    let d = Value::decode(&bytes)?;
-                    if d.get_path(&f.name) == Some(value) {
-                        return Err(conflict_msg());
-                    }
-                }
+                _ => unique_scan_in_txn(tx, collection, key, &f.name, value)?,
             }
         }
         Ok(())
@@ -442,9 +482,18 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let c = db.collection("users");
         c.set_schema(&schema()).unwrap();
-        let u1 = doc(&[("name", Value::Text("a".into())), ("email", Value::Text("x@x.com".into()))]);
-        let u2 = doc(&[("name", Value::Text("b".into())), ("email", Value::Text("y@x.com".into()))]);
-        let u3 = doc(&[("name", Value::Text("c".into())), ("email", Value::Text("x@x.com".into()))]);
+        let u1 = doc(&[
+            ("name", Value::Text("a".into())),
+            ("email", Value::Text("x@x.com".into())),
+        ]);
+        let u2 = doc(&[
+            ("name", Value::Text("b".into())),
+            ("email", Value::Text("y@x.com".into())),
+        ]);
+        let u3 = doc(&[
+            ("name", Value::Text("c".into())),
+            ("email", Value::Text("x@x.com".into())),
+        ]);
         let err = c.insert_batch(&[(b"u1", &u1), (b"u2", &u2), (b"u3", &u3)]);
         assert!(matches!(err, Err(Error::SchemaViolation(_))));
         // Nothing from the batch was committed.
@@ -513,6 +562,53 @@ mod tests {
                 ("email", Value::Text("x@x.com".into())),
             ]),
         );
+        assert!(matches!(err, Err(Error::SchemaViolation(_))));
+    }
+
+    /// Regression (audit A3): with a scalar index on a unique field whose values
+    /// are not index-encodable (Bytes/Array/Map/Vector), the constraint was
+    /// silently skipped. It must fall back to the scan comparison.
+    #[test]
+    fn unique_bytes_field_is_enforced_even_with_scalar_index() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("users");
+        c.set_schema(&Schema::new().field(Field::new("blob", FieldType::Bytes).unique()))
+            .unwrap();
+        c.create_scalar_index("blob").unwrap();
+        c.insert(b"u1", &doc(&[("blob", Value::Bytes(vec![1, 2, 3]))]))
+            .unwrap();
+        let err = c.insert(b"u2", &doc(&[("blob", Value::Bytes(vec![1, 2, 3]))]));
+        assert!(
+            matches!(err, Err(Error::SchemaViolation(_))),
+            "duplicate unique Bytes value must be rejected"
+        );
+        // A different value is still fine.
+        c.insert(b"u3", &doc(&[("blob", Value::Bytes(vec![4]))]))
+            .unwrap();
+        assert_eq!(c.len().unwrap(), 2);
+    }
+
+    /// Regression (audit A3): NaN never conflicted with NaN on a unique Float
+    /// field (IEEE `!=`). For uniqueness, NaN is the same stored value as NaN.
+    #[test]
+    fn unique_float_nan_conflicts_with_nan() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("users");
+        c.set_schema(&Schema::new().field(Field::new("x", FieldType::Float).unique()))
+            .unwrap();
+        c.insert(b"a", &doc(&[("x", Value::Float(f64::NAN))]))
+            .unwrap();
+        let err = c.insert(b"b", &doc(&[("x", Value::Float(f64::NAN))]));
+        assert!(
+            matches!(err, Err(Error::SchemaViolation(_))),
+            "duplicate NaN on a unique field must be rejected"
+        );
+        // Still true when a scalar index exists (NaN is not bucket-walkable).
+        c.create_scalar_index("x").unwrap();
+        c.delete(b"a").unwrap();
+        c.insert(b"c", &doc(&[("x", Value::Float(f64::NAN))]))
+            .unwrap();
+        let err = c.insert(b"d", &doc(&[("x", Value::Float(f64::NAN))]));
         assert!(matches!(err, Err(Error::SchemaViolation(_))));
     }
 
