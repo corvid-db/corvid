@@ -30,7 +30,7 @@ use crate::store::Store;
 use crate::value::Value;
 
 /// Reserved collection holding persisted scalar-index definitions.
-const SCALAR_DEFS: &str = "__scalar_indexes__";
+pub(crate) const SCALAR_DEFS: &str = "__scalar_indexes__";
 
 const FWD_TAG: u8 = 0x00;
 const LANE_BOOL: u8 = 0x01;
@@ -43,8 +43,10 @@ const COMPOUND_DEFS: &str = "__cscalar_indexes__";
 /// Per-database scalar-index registry.
 #[derive(Default)]
 pub(crate) struct ScalarState {
-    /// Single-field indexes: `(collection, field)`.
-    defs: std::collections::HashSet<(String, String)>,
+    /// Single-field indexes: `(collection, field)` → whether the index is
+    /// still **building** (an interrupted creation). Maintenance iterates all
+    /// defs; serviceability requires `building == false`.
+    defs: std::collections::HashMap<(String, String), bool>,
     /// Compound indexes: `(collection, ordered field list)`.
     compound: Vec<(String, Vec<String>)>,
 }
@@ -149,22 +151,6 @@ pub(crate) fn insert_in_txn(
         tx.put(ns, &fwd_key(doc_key), &enc)?;
     }
     Ok(())
-}
-
-/// Index many `(doc_key, value)` pairs in one transaction (bulk load).
-pub(crate) fn insert_many(store: &Store, ns: &str, items: &[(Vec<u8>, Value)]) -> Result<()> {
-    store.transaction(|tx| {
-        for (doc_key, value) in items {
-            remove_in_txn(tx, ns, doc_key)?;
-            if let Some(enc) = encode_value(value) {
-                let mut idx_key = enc.clone();
-                idx_key.extend_from_slice(doc_key);
-                tx.put(ns, &idx_key, &[])?;
-                tx.put(ns, &fwd_key(doc_key), &enc)?;
-            }
-        }
-        Ok(())
-    })
 }
 
 fn remove_in_txn(tx: &mut crate::store::WriteBatch<'_>, ns: &str, doc_key: &[u8]) -> Result<()> {
@@ -444,23 +430,47 @@ fn compound_candidates(
 }
 
 impl Db {
-    /// Load persisted scalar-index definitions. Called once on open.
+    /// Load persisted scalar-index definitions. Called once on open. Legacy
+    /// rows without state bytes decode as `Complete`; a `Building` row marks
+    /// the index for lazy resume on first use.
     pub(crate) fn load_scalar_defs(&self) -> Result<()> {
         let mut state = self.scalar().lock().expect("scalar lock");
-        for (key, _) in self.store().scan(SCALAR_DEFS)? {
+        for (key, value) in self.store().scan(SCALAR_DEFS)? {
             if let Some(def) = split_def_key(&key) {
-                state.defs.insert(def);
+                // Kind bytes are unused for scalar defs (empty).
+                let (_, st) = crate::index_build::decode_def(&value);
+                state.defs.insert(
+                    def,
+                    matches!(st, crate::index_build::DefState::Building { .. }),
+                );
             }
         }
         Ok(())
     }
 
-    /// Register (or replace) a scalar index on `field` for `collection`.
+    /// Register (or replace) a scalar index on `field` for `collection`: the
+    /// def row becomes `Building` (empty cursor) so a crash between
+    /// registration and backfill completion leaves a never-served,
+    /// resumable state. An in-flight `Building` row keeps its cursor, so a
+    /// re-registration resumes the interrupted backfill instead of rescanning.
     pub(crate) fn register_scalar_index(&self, collection: &str, field: &str) -> Result<()> {
-        self.store()
-            .put(SCALAR_DEFS, &def_key(collection, field), b"")?;
+        let key = def_key(collection, field);
+        let in_flight =
+            crate::index_build::read_building_cursor(self.store(), SCALAR_DEFS, &key)?.is_some();
+        if !in_flight {
+            self.store().put(
+                SCALAR_DEFS,
+                &key,
+                &crate::index_build::encode_def(
+                    &[],
+                    &crate::index_build::DefState::Building { cursor: vec![] },
+                ),
+            )?;
+        }
         let mut state = self.scalar().lock().expect("scalar lock");
-        state.defs.insert((collection.to_owned(), field.to_owned()));
+        state
+            .defs
+            .insert((collection.to_owned(), field.to_owned()), true);
         Ok(())
     }
 
@@ -499,22 +509,87 @@ impl Db {
         Ok(())
     }
 
+    /// Every field of `collection` with a scalar index, building or complete —
+    /// maintenance must keep all of them current so a resumed backfill and
+    /// concurrent writes overlap safely (idempotent upserts).
     fn scalar_fields(&self, collection: &str) -> Vec<String> {
         let state = self.scalar().lock().expect("scalar lock");
         state
             .defs
-            .iter()
+            .keys()
             .filter(|(c, _)| c == collection)
             .map(|(_, f)| f.clone())
             .collect()
     }
 
-    /// Whether `field` of `collection` has a scalar index.
+    /// Whether `field` of `collection` has a **complete** scalar index. A
+    /// building index is never serviceable: unique checks and query probes
+    /// conservatively fall back (the first probe resumes the build).
     pub(crate) fn has_scalar_index(&self, collection: &str, field: &str) -> bool {
         let state = self.scalar().lock().expect("scalar lock");
         state
             .defs
-            .contains(&(collection.to_owned(), field.to_owned()))
+            .get(&(collection.to_owned(), field.to_owned()))
+            .is_some_and(|building| !*building)
+    }
+
+    /// Flip a scalar index's in-memory def to complete after its backfill
+    /// committed `Complete` on disk.
+    pub(crate) fn mark_scalar_complete(&self, collection: &str, field: &str) {
+        let mut state = self.scalar().lock().expect("scalar lock");
+        state
+            .defs
+            .insert((collection.to_owned(), field.to_owned()), false);
+    }
+
+    /// Building scalar defs of `collection` as `(field, cursor)` jobs, read
+    /// from the def rows (disk is the resume truth after a crash).
+    pub(crate) fn collect_building_scalar(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut jobs = Vec::new();
+        for (key, value) in self.store().scan(SCALAR_DEFS)? {
+            let Some((coll, field)) = split_def_key(&key) else {
+                continue;
+            };
+            if coll != collection {
+                continue;
+            }
+            if let crate::index_build::DefState::Building { cursor } =
+                crate::index_build::decode_def(&value).1
+            {
+                jobs.push((field, cursor));
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// (Re-)run the atomic backfill for one scalar index from `cursor`, then
+    /// mark it complete — the exact driver invocation `create_scalar_index`
+    /// uses, shared with lazy resumes.
+    pub(crate) fn resume_scalar(&self, collection: &str, field: &str, cursor: &[u8]) -> Result<()> {
+        let ns = namespace(collection, field);
+        let kb: Vec<u8> = Vec::new();
+        crate::index_build::run_atomic_backfill(
+            self.store(),
+            collection,
+            SCALAR_DEFS,
+            &def_key(collection, field),
+            &kb,
+            cursor,
+            &mut |tx, page| {
+                for (key, bytes) in page {
+                    let doc = Value::decode(bytes)?;
+                    if let Some(value) = doc.get_path(field) {
+                        insert_in_txn(tx, &ns, key, value)?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        self.mark_scalar_complete(collection, field);
+        Ok(())
     }
 
     /// If `field` has a scalar index, return a *superset* of doc keys matching
@@ -530,6 +605,7 @@ impl Db {
         constraints: &[Constraint<'_>],
         cap: usize,
     ) -> Result<Option<Vec<Vec<u8>>>> {
+        self.try_resume_index_builds(collection)?;
         if !self.has_scalar_index(collection, field) {
             return Ok(None);
         }
@@ -549,6 +625,7 @@ impl Db {
         prefix: &str,
         cap: usize,
     ) -> Result<Option<Vec<Vec<u8>>>> {
+        self.try_resume_index_builds(collection)?;
         if !self.has_scalar_index(collection, field) {
             return Ok(None);
         }
@@ -611,10 +688,12 @@ impl Db {
         Ok(())
     }
 
-    /// All single-field scalar index definitions (for dump/migrate).
+    /// All single-field scalar index definitions (for dump/migrate). State is
+    /// intentionally dropped: dump/load replays creation, materializing each
+    /// def as `Complete`.
     pub(crate) fn scalar_specs(&self) -> Vec<(String, String)> {
         let state = self.scalar().lock().expect("scalar lock");
-        state.defs.iter().cloned().collect()
+        state.defs.keys().cloned().collect()
     }
 
     /// All compound index definitions (for dump/migrate).
@@ -749,28 +828,23 @@ impl Collection<'_> {
     /// Create (or replace) a scalar index on `field`, backfilling existing
     /// documents. Equality and range filters on `field` then use it instead of
     /// scanning the whole collection. The index is on disk and persists.
+    ///
+    /// Atomic and crash-safe (audit A2): the def is registered `Building`
+    /// before any backfill work; every page's index writes and cursor advance
+    /// commit in one transaction; completion is its own final transaction. A
+    /// crash or error leaves a resumable `Building` def that queries never
+    /// serve — the first filtered query (or a re-creation) resumes it.
     pub fn create_scalar_index(&self, field: &str) -> Result<()> {
         self.db().register_scalar_index(self.name(), field)?;
-        let ns = namespace(self.name(), field);
-        let mut cursor: Vec<u8> = Vec::new();
-        loop {
-            let page = self.db().store().scan_from(self.name(), &cursor, 2048)?;
-            if page.is_empty() {
-                break;
-            }
-            let mut batch: Vec<(Vec<u8>, Value)> = Vec::new();
-            for (key, bytes) in &page {
-                let doc = Value::decode(bytes)?;
-                if let Some(value) = doc.get_path(field) {
-                    batch.push((key.clone(), value.clone()));
-                }
-            }
-            if !batch.is_empty() {
-                insert_many(self.db().store(), &ns, &batch)?;
-            }
-            cursor = next_after(&page.last().unwrap().0);
-        }
-        Ok(())
+        // A def still Building from an interrupted creation resumes from its
+        // saved cursor; a Complete (or fresh) def backfills from the start.
+        let cursor = crate::index_build::read_building_cursor(
+            self.db().store(),
+            SCALAR_DEFS,
+            &def_key(self.name(), field),
+        )?;
+        self.db()
+            .resume_scalar(self.name(), field, &cursor.unwrap_or_default())
     }
 
     /// Create (or replace) a compound index over an ordered list of `fields`,
@@ -1304,5 +1378,57 @@ mod tests {
         let mut keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
         keys.sort();
         assert_eq!(keys, vec![b"a".to_vec(), b"d".to_vec()]);
+    }
+
+    /// A building scalar index is never served: filtered queries fall back to a
+    /// scan and stay correct; the first such query resumes the build.
+    #[test]
+    fn building_scalar_index_falls_back_then_resumes() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for i in 0..50i64 {
+            c.insert(&[i as u8], &rec(i)).unwrap();
+        }
+        // Forge a Building def exactly as an interrupted creation would leave it.
+        db.register_scalar_index("docs", "n").unwrap(); // registers Building
+        assert!(
+            !db.has_scalar_index("docs", "n"),
+            "building def must not be serviceable"
+        );
+        // Before resume: a filtered query must still be correct (scan fallback).
+        let rows = c
+            .query()
+            .filter(crate::field("n").ge(Value::Int(40)))
+            .run()
+            .unwrap();
+        assert_eq!(rows.len(), 10); // resumed by the query itself, then correct
+        // After the resume the def is complete and serviceable.
+        assert!(db.has_scalar_index("docs", "n"));
+    }
+
+    #[test]
+    fn legacy_stateless_scalar_def_is_complete() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"k", &rec(1)).unwrap();
+        db.register_scalar_index("docs", "n").unwrap();
+        // Overwrite the def row with the legacy empty form.
+        db.store()
+            .put(crate::scalar::SCALAR_DEFS, b"docs\x00n", b"")
+            .unwrap();
+        let fresh = Db::open_in_memory().unwrap(); // loaders on a fresh db
+        let _ = fresh; // state decode is covered below via reopen of a file db
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.collection("docs").insert(b"k", &rec(1)).unwrap();
+            db.register_scalar_index("docs", "n").unwrap();
+            db.store()
+                .put(crate::scalar::SCALAR_DEFS, b"docs\x00n", b"")
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert!(db.has_scalar_index("docs", "n")); // legacy → Complete → serviceable
     }
 }

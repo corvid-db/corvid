@@ -507,6 +507,12 @@ impl QueryBuilder<'_> {
         }
         let db = self.collection.db();
         let coll = self.collection.name();
+        // Before probing any index: resume interrupted builds. A `Building`
+        // def is never served, so without this a filtered query on a building
+        // index would scan forever and nothing would ever flip it Complete.
+        // Try-lock inside: a concurrent resumer means we just probe stale and
+        // fall back to the (correct) scan.
+        db.try_resume_index_builds(coll)?;
         // Cap candidates so an unselective predicate blows the cap (returns
         // None) and is skipped, instead of materialising a huge set.
         const CAP: usize = 100_000;

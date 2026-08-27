@@ -13,11 +13,6 @@
 //! Legacy defs (no state marker) decode as `Complete`; a malformed state
 //! decodes as `Building` with an empty cursor (backfill restarts — safe).
 
-// This module is the produced interface for wave-2 tasks 2-7 (the five index
-// kinds wire through it); nothing consumes it yet, so silence dead-code until
-// they land — remove this allow then.
-#![allow(dead_code)]
-
 use crate::error::Result;
 use crate::store::Store;
 

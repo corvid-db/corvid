@@ -29,9 +29,8 @@ pub struct Db {
     schemas: Mutex<crate::schema::SchemaState>,
     ttl: Mutex<crate::ttl::TtlState>,
     subscribers: Mutex<Subscribers>,
-    // Produced for wave-2 tasks 2-7 (lazy index-build resumes); nothing
-    // consumes it yet — remove this allow when they land.
-    #[allow(dead_code)]
+    /// Serialization point for lazy index-build resumes (try-lock only: a
+    /// query arriving while another thread resumes proceeds on fallbacks).
     index_resume: Mutex<()>,
 }
 
@@ -182,10 +181,28 @@ impl Db {
 
     /// Serialization point for lazy index-build resumes (try-lock only: a
     /// query arriving while another thread resumes proceeds on fallbacks).
-    // Consumed by wave-2 tasks 2-7; nothing calls it yet.
-    #[allow(dead_code)]
     pub(crate) fn index_resume(&self) -> &Mutex<()> {
         &self.index_resume
+    }
+
+    /// Resume any interrupted index builds for `collection` before its
+    /// indexes are consulted. Try-lock: if another thread is already
+    /// resuming, return and let callers run on their fallbacks.
+    pub(crate) fn try_resume_index_builds(&self, collection: &str) -> Result<()> {
+        let jobs = self.collect_building_scalar(collection)?; // Task 2: scalar only
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        // Bound to this call: a concurrent caller's try_lock fails and it
+        // proceeds on its fallback (results stay correct either way).
+        let resume = self.index_resume().try_lock();
+        if resume.is_err() {
+            return Ok(());
+        }
+        for (field, cursor) in jobs {
+            self.resume_scalar(collection, &field, &cursor)?;
+        }
+        Ok(())
     }
 
     /// The shared write path. One transaction covers the row write, the
