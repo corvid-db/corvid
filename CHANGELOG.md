@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/). Until 1.0 the on-disk
 format and API may change without backward-compatibility guarantees.
 
+## [Unreleased]
+
+### Changed
+- Group-key canonical form (affects `group_count`, `group_sum`, `group_avg`,
+  `count_distinct`): text values are now bare keys (`"blog"`), non-text
+  values are type-tagged (`i:1`, `f:1.5`, `b:true`), and texts that would be
+  ambiguous with a tag are `t:`-escaped. Previously every key carried an
+  `s:`-style type prefix. Breaking change ahead of 1.0.
+
 ## [0.1.1] - 2026-05-29
 
 ### Changed

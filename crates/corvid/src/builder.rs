@@ -235,10 +235,13 @@ impl QueryBuilder<'_> {
 
     /// Count matching documents grouped by the value at `field`.
     ///
-    /// Groups are keyed by a canonical string of the field value (text as-is;
-    /// int/float/bool stringified). Documents whose field is missing or is a
-    /// container are not counted. Like [`Self::count`], this aggregates over
-    /// the filtered set and ignores ranking.
+    /// Groups are keyed by the canonical form (spec decision 3): text is used
+    /// bare; int/float/bool are type-tagged (`i:1`, `f:1.5`, `b:true`) so
+    /// distinct types never collapse into one group; a text that would be
+    /// ambiguous with a tagged form (it starts with `i:`, `f:`, `b:`, or
+    /// `t:`) is escaped with a `t:` prefix. Documents whose field is missing
+    /// or is a container are not counted. Like [`Self::count`], this
+    /// aggregates over the filtered set and ignores ranking.
     pub fn group_count(self, field: &str) -> Result<BTreeMap<String, usize>> {
         let mut groups: BTreeMap<String, usize> = BTreeMap::new();
         self.for_each_match(|doc| {
@@ -316,8 +319,11 @@ impl QueryBuilder<'_> {
         Ok(best)
     }
 
-    /// The number of distinct values at `field` over the filtered set (by the
-    /// canonical group key; missing/container values are ignored).
+    /// The number of distinct values at `field` over the filtered set, by the
+    /// canonical group key (text bare; int/float/bool type-tagged `i:`/`f:`/
+    /// `b:` so distinct types stay distinct; a text that would be ambiguous
+    /// with a tagged form is `t:`-escaped; missing/container values are
+    /// ignored).
     pub fn count_distinct(self, field: &str) -> Result<usize> {
         let mut seen = std::collections::HashSet::new();
         self.for_each_match(|doc| {
@@ -329,6 +335,11 @@ impl QueryBuilder<'_> {
     }
 
     /// Sum `value_field` grouped by `group_field` (numeric values only).
+    /// Group keys use the canonical form (spec decision 3): text is used
+    /// bare; int/float/bool are type-tagged (`i:1`, `f:1.5`, `b:true`) so
+    /// distinct types never collapse into one group; a text that would be
+    /// ambiguous with a tagged form (it starts with `i:`, `f:`, `b:`, or
+    /// `t:`) is escaped with a `t:` prefix.
     pub fn group_sum(self, group_field: &str, value_field: &str) -> Result<BTreeMap<String, f64>> {
         let mut groups: BTreeMap<String, f64> = BTreeMap::new();
         self.for_each_match(|doc| {
@@ -343,6 +354,11 @@ impl QueryBuilder<'_> {
     }
 
     /// Mean of `value_field` grouped by `group_field` (numeric values only).
+    /// Group keys use the canonical form (spec decision 3): text is used
+    /// bare; int/float/bool are type-tagged (`i:1`, `f:1.5`, `b:true`) so
+    /// distinct types never collapse into one group; a text that would be
+    /// ambiguous with a tagged form (it starts with `i:`, `f:`, `b:`, or
+    /// `t:`) is escaped with a `t:` prefix.
     pub fn group_avg(self, group_field: &str, value_field: &str) -> Result<BTreeMap<String, f64>> {
         let mut sums: BTreeMap<String, (f64, usize)> = BTreeMap::new();
         self.for_each_match(|doc| {
@@ -1032,14 +1048,23 @@ impl QueryBuilder<'_> {
 
 /// A canonical group key for a scalar value, or `None` for containers/null.
 ///
-/// Keys are tagged by kind (`s:`, `i:`, `f:`, `b:`) so distinct types never
-/// collapse into one group — without the tag, `Text("1")`, `Int(1)`, and
-/// `Float(1.0)` all serialized to `"1"` and undercounted `count_distinct`.
-/// `-0.0` and `+0.0` share a group (they are numerically equal); NaN groups
-/// separately as `f:NaN`.
+/// The canonical form (spec decision 3): **text is used bare** — the
+/// natural, dominant case; int/float/bool are type-tagged (`i:1`, `f:1.5`,
+/// `b:true`) so distinct types never collapse into one group; and a text
+/// that would be ambiguous with a tagged form (it starts with `i:`, `f:`,
+/// `b:`, or `t:`) is escaped with a `t:` prefix. The mapping is injective:
+/// bare texts never start with any tag, tagged non-text keys start with
+/// `i:`/`f:`/`b:`, and escaped texts start with `t:` — three disjoint
+/// prefixes plus disjoint bare text. `-0.0` and `+0.0` share a group
+/// (numerically equal); NaN groups as `f:NaN`.
 fn group_key(v: &Value) -> Option<String> {
+    const TAGS: [&str; 4] = ["i:", "f:", "b:", "t:"];
     match v {
-        Value::Text(s) => Some(format!("s:{s}")),
+        Value::Text(s) => Some(if TAGS.iter().any(|t| s.starts_with(t)) {
+            format!("t:{s}")
+        } else {
+            s.clone()
+        }),
         Value::Int(i) => Some(format!("i:{i}")),
         Value::Float(f) => Some(format!("f:{}", if *f == 0.0 { 0.0 } else { *f })),
         Value::Bool(b) => Some(format!("b:{b}")),
@@ -1763,12 +1788,12 @@ mod tests {
 
         // Grouped.
         let gs = c.query().group_sum("cat", "n").unwrap();
-        assert_eq!(gs.get("s:a"), Some(&30.0));
-        assert_eq!(gs.get("s:b"), Some(&70.0));
-        assert_eq!(gs.get("s:c"), Some(&5.0));
+        assert_eq!(gs.get("a"), Some(&30.0));
+        assert_eq!(gs.get("b"), Some(&70.0));
+        assert_eq!(gs.get("c"), Some(&5.0));
         let ga = c.query().group_avg("cat", "n").unwrap();
-        assert_eq!(ga.get("s:a"), Some(&15.0));
-        assert_eq!(ga.get("s:b"), Some(&35.0));
+        assert_eq!(ga.get("a"), Some(&15.0));
+        assert_eq!(ga.get("b"), Some(&35.0));
     }
 
     #[test]
@@ -1816,8 +1841,8 @@ mod tests {
             .query()
             .group_count("category")
             .unwrap();
-        assert_eq!(groups.get("s:blog"), Some(&2));
-        assert_eq!(groups.get("s:news"), Some(&1));
+        assert_eq!(groups.get("blog"), Some(&2));
+        assert_eq!(groups.get("news"), Some(&1));
     }
 
     #[test]
@@ -1828,7 +1853,7 @@ mod tests {
         c.insert(b"b", &Value::Int(5)).unwrap(); // no "category" field
         let groups = c.query().group_count("category").unwrap();
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups.get("s:blog"), Some(&1));
+        assert_eq!(groups.get("blog"), Some(&1));
     }
 
     #[test]
@@ -1841,7 +1866,7 @@ mod tests {
             .group_count("category")
             .unwrap();
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups.get("s:blog"), Some(&2));
+        assert_eq!(groups.get("blog"), Some(&2));
     }
 
     /// Regression: distinct types must not collapse into one group
@@ -1854,6 +1879,7 @@ mod tests {
         let c = db.collection("docs");
         for (i, v) in [
             Value::Text("1".into()),
+            Value::Text("i:1".into()), // ambiguous with Int tag → escaped
             Value::Int(1),
             Value::Float(1.0),
             Value::Float(-0.0),
@@ -1867,13 +1893,13 @@ mod tests {
             c.insert(&[i as u8], &Value::Map(m)).unwrap();
         }
         let groups = c.query().group_count("v").unwrap();
-        assert_eq!(groups.get("s:1"), Some(&1));
+        assert_eq!(groups.get("1"), Some(&1)); // bare text
+        assert_eq!(groups.get("t:i:1"), Some(&1)); // escaped text
         assert_eq!(groups.get("i:1"), Some(&1));
         assert_eq!(groups.get("f:1"), Some(&1));
         assert_eq!(groups.get("f:0"), Some(&2)); // -0.0 == 0.0 for grouping
-        assert_eq!(groups.len(), 4);
-        // count_distinct agrees.
-        assert_eq!(c.query().count_distinct("v").unwrap(), 4);
+        assert_eq!(groups.len(), 5);
+        assert_eq!(c.query().count_distinct("v").unwrap(), 5);
     }
 
     #[test]
