@@ -47,8 +47,10 @@ pub(crate) struct ScalarState {
     /// still **building** (an interrupted creation). Maintenance iterates all
     /// defs; serviceability requires `building == false`.
     defs: std::collections::HashMap<(String, String), bool>,
-    /// Compound indexes: `(collection, ordered field list)`.
-    compound: Vec<(String, Vec<String>)>,
+    /// Compound indexes: `(collection, ordered field list)` → whether the
+    /// index is still **building** (an interrupted creation). Maintenance
+    /// iterates all defs; serviceability requires `building == false`.
+    compound: std::collections::HashMap<(String, Vec<String>), bool>,
 }
 
 pub(crate) fn new_state() -> std::sync::Mutex<ScalarState> {
@@ -661,30 +663,51 @@ impl Db {
         Ok(Some(out))
     }
 
-    /// Load persisted compound-index definitions. Called once on open.
+    /// Load persisted compound-index definitions. Called once on open. Legacy
+    /// rows without state bytes decode as `Complete`; a `Building` row marks
+    /// the index for lazy resume on first use.
     pub(crate) fn load_compound_defs(&self) -> Result<()> {
         let mut state = self.scalar().lock().expect("scalar lock");
-        for (key, _) in self.store().scan(COMPOUND_DEFS)? {
+        for (key, value) in self.store().scan(COMPOUND_DEFS)? {
             if let Some(def) = split_compound_def_key(&key) {
-                state.compound.push(def);
+                // Kind bytes are unused for compound defs (empty).
+                let (_, st) = crate::index_build::decode_def(&value);
+                state.compound.insert(
+                    def,
+                    matches!(st, crate::index_build::DefState::Building { .. }),
+                );
             }
         }
         Ok(())
     }
 
-    /// Register (or replace) a compound index over `fields` for `collection`.
+    /// Register (or replace) a compound index over `fields` for `collection`:
+    /// the def row becomes `Building` (empty cursor) so a crash between
+    /// registration and backfill completion leaves a never-served, resumable
+    /// state. An in-flight `Building` row keeps its cursor, so a
+    /// re-registration resumes the interrupted backfill instead of rescanning.
     pub(crate) fn register_compound_index(
         &self,
         collection: &str,
         fields: &[String],
     ) -> Result<()> {
-        self.store()
-            .put(COMPOUND_DEFS, &compound_def_key(collection, fields), b"")?;
-        let mut state = self.scalar().lock().expect("scalar lock");
-        let entry = (collection.to_owned(), fields.to_vec());
-        if !state.compound.contains(&entry) {
-            state.compound.push(entry);
+        let key = compound_def_key(collection, fields);
+        let in_flight =
+            crate::index_build::read_building_cursor(self.store(), COMPOUND_DEFS, &key)?.is_some();
+        if !in_flight {
+            self.store().put(
+                COMPOUND_DEFS,
+                &key,
+                &crate::index_build::encode_def(
+                    &[],
+                    &crate::index_build::DefState::Building { cursor: vec![] },
+                ),
+            )?;
         }
+        let mut state = self.scalar().lock().expect("scalar lock");
+        state
+            .compound
+            .insert((collection.to_owned(), fields.to_vec()), true);
         Ok(())
     }
 
@@ -696,21 +719,113 @@ impl Db {
         state.defs.keys().cloned().collect()
     }
 
-    /// All compound index definitions (for dump/migrate).
+    /// All compound index definitions (for dump/migrate). State is
+    /// intentionally dropped: dump/load replays creation, materializing each
+    /// def as `Complete`.
     pub(crate) fn compound_specs(&self) -> Vec<(String, Vec<String>)> {
         let state = self.scalar().lock().expect("scalar lock");
-        state.compound.clone()
+        state.compound.keys().cloned().collect()
     }
 
-    /// Compound indexes registered on `collection` (ordered field lists).
+    /// Compound indexes registered and **complete** on `collection` (ordered
+    /// field lists). A building index is never serviceable: query probes
+    /// conservatively fall back (the first probe resumes the build).
     pub(crate) fn compound_indexes(&self, collection: &str) -> Vec<Vec<String>> {
         let state = self.scalar().lock().expect("scalar lock");
         state
             .compound
             .iter()
-            .filter(|(c, _)| c == collection)
-            .map(|(_, f)| f.clone())
+            .filter(|((c, _), building)| c == collection && !*building)
+            .map(|((_, f), _)| f.clone())
             .collect()
+    }
+
+    /// Every compound index of `collection`, building or complete —
+    /// maintenance must keep all of them current so a resumed backfill and
+    /// concurrent writes overlap safely (idempotent upserts).
+    fn compound_fields(&self, collection: &str) -> Vec<Vec<String>> {
+        let state = self.scalar().lock().expect("scalar lock");
+        state
+            .compound
+            .iter()
+            .filter(|((c, _), _)| c == collection)
+            .map(|((_, f), _)| f.clone())
+            .collect()
+    }
+
+    /// Whether `fields` of `collection` has a **complete** compound index.
+    pub(crate) fn has_compound_index(&self, collection: &str, fields: &[String]) -> bool {
+        let state = self.scalar().lock().expect("scalar lock");
+        state
+            .compound
+            .get(&(collection.to_owned(), fields.to_vec()))
+            .is_some_and(|building| !*building)
+    }
+
+    /// Flip a compound index's in-memory def to complete after its backfill
+    /// committed `Complete` on disk.
+    pub(crate) fn mark_compound_complete(&self, collection: &str, fields: &[String]) {
+        let mut state = self.scalar().lock().expect("scalar lock");
+        state
+            .compound
+            .insert((collection.to_owned(), fields.to_vec()), false);
+    }
+
+    /// Building compound defs of `collection` as `(fields, cursor)` jobs,
+    /// read from the def rows (disk is the resume truth after a crash).
+    pub(crate) fn collect_building_compound(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<(Vec<String>, Vec<u8>)>> {
+        let mut jobs = Vec::new();
+        for (key, value) in self.store().scan(COMPOUND_DEFS)? {
+            let Some((coll, fields)) = split_compound_def_key(&key) else {
+                continue;
+            };
+            if coll != collection {
+                continue;
+            }
+            if let crate::index_build::DefState::Building { cursor } =
+                crate::index_build::decode_def(&value).1
+            {
+                jobs.push((fields, cursor));
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// (Re-)run the atomic backfill for one compound index from `cursor`,
+    /// then mark it complete — the exact driver invocation
+    /// `create_compound_index` uses, shared with lazy resumes.
+    pub(crate) fn resume_compound(
+        &self,
+        collection: &str,
+        fields: &[String],
+        cursor: &[u8],
+    ) -> Result<()> {
+        let ns = compound_namespace(collection, fields);
+        let kb: Vec<u8> = Vec::new();
+        crate::index_build::run_atomic_backfill(
+            self.store(),
+            collection,
+            COMPOUND_DEFS,
+            &compound_def_key(collection, fields),
+            &kb,
+            cursor,
+            &mut |tx, page| {
+                for (key, bytes) in page {
+                    let doc = Value::decode(bytes)?;
+                    let values: Option<Vec<&Value>> =
+                        fields.iter().map(|f| doc.get_path(f)).collect();
+                    if let Some(vs) = &values {
+                        compound_insert_in_txn(tx, &ns, key, vs)?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        self.mark_compound_complete(collection, fields);
+        Ok(())
     }
 
     /// Maintain every compound index on `collection` after a document write.
@@ -723,7 +838,7 @@ impl Db {
         key: &[u8],
         doc: &Value,
     ) -> Result<()> {
-        for fields in self.compound_indexes(collection) {
+        for fields in self.compound_fields(collection) {
             let ns = compound_namespace(collection, &fields);
             let values: Option<Vec<&Value>> = fields.iter().map(|f| doc.get_path(f)).collect();
             match &values {
@@ -742,7 +857,7 @@ impl Db {
         collection: &str,
         key: &[u8],
     ) -> Result<()> {
-        for fields in self.compound_indexes(collection) {
+        for fields in self.compound_fields(collection) {
             compound_remove_in_txn(tx, &compound_namespace(collection, &fields), key)?;
         }
         Ok(())
@@ -760,14 +875,9 @@ impl Db {
         tail: &[Constraint<'_>],
         cap: usize,
     ) -> Result<Option<Vec<Vec<u8>>>> {
-        let known = {
-            let state = self.scalar().lock().expect("scalar lock");
-            state
-                .compound
-                .iter()
-                .any(|(c, f)| c == collection && f == fields)
-        };
-        if !known || (eq_prefix.is_empty() && tail.is_empty()) {
+        self.try_resume_index_builds(collection)?;
+        if !self.has_compound_index(collection, fields) || (eq_prefix.is_empty() && tail.is_empty())
+        {
             return Ok(None);
         }
         let Some(prefix) = encode_tuple(eq_prefix) else {
@@ -852,30 +962,24 @@ impl Collection<'_> {
     /// prefix of the fields (optionally plus a range on the next field) then
     /// uses it. A document missing any of the fields is not indexed. On disk,
     /// persists.
+    ///
+    /// Atomic and crash-safe (audit A2): the def is registered `Building`
+    /// before any backfill work; every page's index writes and cursor advance
+    /// commit in one transaction; completion is its own final transaction. A
+    /// crash or error leaves a resumable `Building` def that queries never
+    /// serve — the first compound query (or a re-creation) resumes it.
     pub fn create_compound_index(&self, fields: &[&str]) -> Result<()> {
         let fields: Vec<String> = fields.iter().map(|f| (*f).to_owned()).collect();
         self.db().register_compound_index(self.name(), &fields)?;
-        let ns = compound_namespace(self.name(), &fields);
-        let mut cursor: Vec<u8> = Vec::new();
-        loop {
-            let page = self.db().store().scan_from(self.name(), &cursor, 2048)?;
-            if page.is_empty() {
-                break;
-            }
-            self.db().store().transaction(|tx| {
-                for (key, bytes) in &page {
-                    let doc = Value::decode(bytes)?;
-                    let values: Option<Vec<&Value>> =
-                        fields.iter().map(|f| doc.get_path(f)).collect();
-                    if let Some(vs) = &values {
-                        compound_insert_in_txn(tx, &ns, key, vs)?;
-                    }
-                }
-                Ok(())
-            })?;
-            cursor = next_after(&page.last().unwrap().0);
-        }
-        Ok(())
+        // A def still Building from an interrupted creation resumes from its
+        // saved cursor; a Complete (or fresh) def backfills from the start.
+        let cursor = crate::index_build::read_building_cursor(
+            self.db().store(),
+            COMPOUND_DEFS,
+            &compound_def_key(self.name(), &fields),
+        )?;
+        self.db()
+            .resume_compound(self.name(), &fields, &cursor.unwrap_or_default())
     }
 }
 
@@ -1404,6 +1508,75 @@ mod tests {
         assert_eq!(rows.len(), 10); // resumed by the query itself, then correct
         // After the resume the def is complete and serviceable.
         assert!(db.has_scalar_index("docs", "n"));
+    }
+
+    /// A building compound index is never served: filtered queries fall back
+    /// to a scan and stay correct; the first such query resumes the build.
+    #[test]
+    fn building_compound_index_falls_back_then_resumes() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for i in 0..50i64 {
+            let mut m = BTreeMap::new();
+            m.insert("a".to_owned(), Value::Text(format!("g{}", i % 2)));
+            m.insert("b".to_owned(), Value::Int(i));
+            c.insert(&[i as u8], &Value::Map(m)).unwrap();
+        }
+        // Forge a Building def exactly as an interrupted creation would leave
+        // it: registered, but with no backfill pages committed (empty index
+        // namespace).
+        let fields = vec!["a".to_owned(), "b".to_owned()];
+        db.register_compound_index("docs", &fields).unwrap();
+        assert!(
+            !db.has_compound_index("docs", &fields),
+            "building def must not be serviceable"
+        );
+        // Before resume: a prefix+range query must still be correct (scan
+        // fallback; the query itself resumes the build).
+        let rows = c
+            .query()
+            .filter(crate::field("a").eq(Value::Text("g1".into())))
+            .filter(crate::field("b").ge(Value::Int(40)))
+            .run()
+            .unwrap();
+        assert_eq!(rows.len(), 5); // i in {41,43,45,47,49}
+        // After the resume the def is complete and serviceable.
+        assert!(db.has_compound_index("docs", &fields));
+        let g1 = Value::Text("g1".into());
+        let got = db
+            .compound_candidates(
+                "docs",
+                &fields,
+                &[&g1],
+                &one(CmpOp::Ge, &Value::Int(40)),
+                1000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.len(), 5);
+    }
+
+    #[test]
+    fn legacy_stateless_compound_def_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = Db::open(&path).unwrap();
+            let c = db.collection("docs");
+            let mut m = BTreeMap::new();
+            m.insert("a".to_owned(), Value::Int(1));
+            m.insert("b".to_owned(), Value::Int(2));
+            c.insert(b"k", &Value::Map(m)).unwrap();
+            c.create_compound_index(&["a", "b"]).unwrap();
+            // Overwrite the def row with the legacy empty form.
+            db.store()
+                .put(COMPOUND_DEFS, b"docs\x00a\x00b", b"")
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let fields = vec!["a".to_owned(), "b".to_owned()];
+        assert!(db.has_compound_index("docs", &fields)); // legacy → Complete → serviceable
+        assert!(db.collect_building_compound("docs").unwrap().is_empty());
     }
 
     #[test]

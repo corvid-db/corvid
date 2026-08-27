@@ -189,8 +189,9 @@ impl Db {
     /// indexes are consulted. Try-lock: if another thread is already
     /// resuming, return and let callers run on their fallbacks.
     pub(crate) fn try_resume_index_builds(&self, collection: &str) -> Result<()> {
-        let jobs = self.collect_building_scalar(collection)?; // Task 2: scalar only
-        if jobs.is_empty() {
+        let scalar_jobs = self.collect_building_scalar(collection)?;
+        let compound_jobs = self.collect_building_compound(collection)?;
+        if scalar_jobs.is_empty() && compound_jobs.is_empty() {
             return Ok(());
         }
         // Bound to this call: a concurrent caller's try_lock fails and it
@@ -199,8 +200,11 @@ impl Db {
         if resume.is_err() {
             return Ok(());
         }
-        for (field, cursor) in jobs {
+        for (field, cursor) in scalar_jobs {
             self.resume_scalar(collection, &field, &cursor)?;
+        }
+        for (fields, cursor) in compound_jobs {
+            self.resume_compound(collection, &fields, &cursor)?;
         }
         Ok(())
     }
