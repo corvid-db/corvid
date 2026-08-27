@@ -5,6 +5,17 @@ Method: five parallel line-by-line adversarial reviews plus independent verifica
 headline claim against the source (all `file:line` refs below were confirmed). Build state at
 audit time: `cargo test --workspace` 390 tests green, `cargo clippy -D warnings` clean.
 
+## Status 2026-08-27 — remediation wave 1 landed
+
+- A1 — fixed in d85815a (ANN: tombstone old node before the dimension guard).
+- A3 — fixed in 92c0130 + b517ef3 (unique enforced on non-index-encodable values and NaN).
+- A4 — fixed in 97a4684 (PQ: bound-checked ADC codes, optioned L2 table, gated codebook dim).
+- B1 — fixed in eccdefc (bulk: thread-local, panic-safe relaxed-durability scope).
+- D4 — fixed in 281e6f3 (group keys: bare text, tagged non-text, t:-escaped ambiguity).
+
+Wave 1 exit gates green: fmt, clippy `-D warnings`, tests, coverage ≥ 90%.
+Full plan (5 waves): docs/superpowers/specs/2026-08-27-audit-remediation-design.md.
+
 Severity legend: **CRITICAL** breaks the project's own central contract. **MAJOR** wrong results,
 data loss, crash, or DoS reachable through normal/intended use. **MINOR** edge-case wrongness,
 behavioral inconsistency, or doc claims with behavioral impact. **NIT** hygiene.
