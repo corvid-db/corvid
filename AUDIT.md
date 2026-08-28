@@ -4,13 +4,19 @@ A deep audit of the entire workspace ran 2026-08-26 (original text preserved
 below). Its findings drove a five-wave remediation on 2026-08-27/28; all five
 waves landed on `master`. Gates (fmt, clippy `-D warnings`, `cargo test
 --workspace`, `cargo doc -D warnings`, coverage ≥ 90%) ran green at each wave
-exit; final numbers live in the wave-5 exit commit rather than being frozen
-here.
+exit; the wave-5 exit numbers are recorded in the block below.
 
 Finding IDs below follow the remediation spec's inventory
 (`docs/superpowers/specs/2026-08-27-audit-remediation-design.md`), which
 re-numbered the original audit's findings (its C0 / M1–M25 / minors) into
 `A#` high, `B#` medium, `C#` low/hygiene, `D#` docs/claims.
+
+Wave-5 exit (this commit, with `5134488`, `9704551`, `5b21e61`, `a9aba00`,
+`e23ebd9`): final gates green — fmt clean; clippy `--all-targets --workspace
+-D warnings` clean; `cargo test --workspace` 512 passed / 0 failed;
+`cargo doc --no-deps --workspace` under `RUSTDOCFLAGS="-D warnings"` clean;
+`cargo llvm-cov --workspace --fail-under-lines 90` green at 96.10% lines
+(regions 94.56%, functions 96.68%).
 
 ## Fixed
 
