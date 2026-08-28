@@ -537,17 +537,25 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Error::ReservedCollection",
         "Schema (ALTER)",
+        // Shared variant (conformance convention 1): raised by every write
+        // path's writability gate — the mutation tests cover the document
+        // paths, the graph test covers link/link_weighted/unlink.
         &[
             "mutations_insert_rejects_reserved_and_invalid_collection_names",
             "mutations_write_paths_reject_reserved_and_invalid_collection_names",
+            "graph_link_unlink_reject_reserved_and_invalid_collection_names",
         ],
     ),
     row(
         "corvid::Error::InvalidName",
         "Schema (ALTER)",
+        // Shared variant (conformance convention 1): document writes and
+        // graph writes (link/unlink) raise it through the same
+        // `ensure_writable` gate.
         &[
             "mutations_insert_rejects_reserved_and_invalid_collection_names",
             "mutations_write_paths_reject_reserved_and_invalid_collection_names",
+            "graph_link_unlink_reject_reserved_and_invalid_collection_names",
         ],
     ),
     row(
@@ -1133,25 +1141,76 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Collection::link",
         "Graph",
-        &["graph_smoke_link_neighbors_traverse_unlink"],
+        &[
+            "graph_smoke_link_neighbors_traverse_unlink",
+            "graph_link_new_edge_resolves_in_neighbors_and_in_neighbors",
+            "graph_link_duplicate_is_idempotent_and_reemits_insert_event",
+            "graph_link_self_loop_lists_self_but_traverse_excludes_start",
+            "graph_link_missing_endpoints_allowed_without_documents",
+            "graph_link_relation_isolation_empty_unicode_and_byte_prefix",
+            "graph_link_endpoint_keys_empty_and_unicode_in_byte_order",
+            "graph_link_unlink_reject_reserved_and_invalid_collection_names",
+        ],
     ),
-    row("corvid::Collection::link_weighted", "Graph", &[]),
-    row("corvid::Collection::neighbors_weighted", "Graph", &[]),
+    row(
+        "corvid::Collection::link_weighted",
+        "Graph",
+        &[
+            "graph_link_weighted_roundtrip_and_overwrite_semantics",
+            "graph_link_weighted_float_extremes_round_trip",
+        ],
+    ),
+    row(
+        "corvid::Collection::neighbors_weighted",
+        "Graph",
+        &[
+            "graph_link_weighted_roundtrip_and_overwrite_semantics",
+            "graph_link_weighted_float_extremes_round_trip",
+        ],
+    ),
     row(
         "corvid::Collection::unlink",
         "Graph",
-        &["graph_smoke_link_neighbors_traverse_unlink"],
+        &[
+            "graph_smoke_link_neighbors_traverse_unlink",
+            "graph_unlink_removes_edge_and_reverse_twin",
+            "graph_unlink_is_directional_reverse_direction_edge_survives",
+            "graph_unlink_missing_edge_is_silent_noop_returning_false",
+            "graph_unlink_removes_only_the_named_relation",
+            "graph_link_unlink_reject_reserved_and_invalid_collection_names",
+        ],
     ),
     row(
         "corvid::Collection::neighbors",
         "Graph",
-        &["graph_smoke_link_neighbors_traverse_unlink"],
+        &[
+            "graph_smoke_link_neighbors_traverse_unlink",
+            "graph_link_relation_isolation_empty_unicode_and_byte_prefix",
+            "graph_link_endpoint_keys_empty_and_unicode_in_byte_order",
+            "graph_neighbors_key_order_no_out_edges_and_missing_node",
+        ],
     ),
-    row("corvid::Collection::in_neighbors", "Graph", &[]),
+    row(
+        "corvid::Collection::in_neighbors",
+        "Graph",
+        &[
+            "graph_link_new_edge_resolves_in_neighbors_and_in_neighbors",
+            "graph_in_neighbors_mirror_target_only_and_mixed",
+            "graph_delete_cascades_edges_in_both_namespaces",
+        ],
+    ),
     row(
         "corvid::Collection::traverse",
         "Graph",
-        &["graph_smoke_link_neighbors_traverse_unlink"],
+        &[
+            "graph_smoke_link_neighbors_traverse_unlink",
+            "graph_traverse_depth_zero_empty_depth_one_equals_neighbors",
+            "graph_traverse_multi_hop_bfs_order_exact",
+            "graph_traverse_cycles_terminate_with_deduped_set",
+            "graph_traverse_branching_and_diamond_convergence_order",
+            "graph_traverse_relation_isolated_from_other_relations",
+            "graph_traverse_missing_start_node_is_empty",
+        ],
     ),
     // ===== join.rs =====
     row(
