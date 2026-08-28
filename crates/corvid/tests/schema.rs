@@ -1951,6 +1951,41 @@ fn schema_index_creation_validates_names_across_families() {
     }
 }
 
+/// RED pin (Task 11 review round 1): `select`'s projection carried a third
+/// hand-rolled dotted-path resolver that resolved `""` to a top-level `""`
+/// map key — while `field("")` predicates never match and
+/// `Value::get_path("")` is `None`. `select("")` must agree with that
+/// single path semantics: the name resolves no field, so the projection
+/// omits it and yields an empty map. Nested dotted projection is pinned
+/// alongside (it must be identical before and after the delegation to
+/// `get_path`).
+#[test]
+fn schema_select_empty_field_name_matches_get_path_semantics() {
+    let db = Db::open_in_memory().unwrap();
+    let c = db.collection("proj");
+    let mut m = BTreeMap::new();
+    m.insert(String::new(), Value::Int(5));
+    m.insert(
+        "meta".to_owned(),
+        map(&[("author", map(&[("name", text("ada"))]))]),
+    );
+    c.insert(b"k", &Value::Map(m)).unwrap();
+
+    // The empty field NAME resolves no field — same answer `field("")`
+    // predicates give (no match) and `get_path("")` gives (`None`): the
+    // projected document is an EMPTY map, not `{"": 5}`.
+    let rows = c.query().select([""]).run().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].document, map(&[]));
+
+    // Nested dotted paths project exactly as before the delegation.
+    let rows = c.query().select(["meta.author"]).run().unwrap();
+    assert_eq!(
+        rows[0].document,
+        map(&[("meta", map(&[("author", map(&[("name", text("ada"))]))]))])
+    );
+}
+
 // ===========================================================================
 // declared schemas — FieldType matrix and the Schema surface
 // ===========================================================================

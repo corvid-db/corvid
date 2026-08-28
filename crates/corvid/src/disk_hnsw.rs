@@ -501,21 +501,22 @@ fn insert_node_in_txn(
     match meta.dim {
         None => meta.dim = Some(vector.len() as u32),
         Some(d) if d as usize != vector.len() => {
-            // Same semantics as `delete_in_txn`: a keymap hit tombstones the
-            // node and counts one dead (saturating); a corrupt keymap value
-            // is dropped without touching a node or counting dead.
-            if let Some(old_bytes) = tx.get(ns, &keymap_key(doc_key))?
-                && let Some(old_id) = decode_keymap(&old_bytes)
-            {
-                if load(tx, ns, cache, p, old_id)?.is_some()
-                    && let Some(node) = cache.nodes.get_mut(&old_id)
-                {
-                    Rc::make_mut(node).deleted = true;
-                    cache.dirty.insert(old_id);
+            // Same semantics as `delete_in_txn`: a keymap hit tombstones
+            // the node and counts one dead (saturating); a corrupt keymap
+            // value is dropped without touching a node or counting dead;
+            // no keymap row → nothing to do at all (no-op delete skipped).
+            if let Some(old_bytes) = tx.get(ns, &keymap_key(doc_key))? {
+                tx.delete(ns, &keymap_key(doc_key))?;
+                if let Some(old_id) = decode_keymap(&old_bytes) {
+                    if load(tx, ns, cache, p, old_id)?.is_some()
+                        && let Some(node) = cache.nodes.get_mut(&old_id)
+                    {
+                        Rc::make_mut(node).deleted = true;
+                        cache.dirty.insert(old_id);
+                    }
+                    meta.dead = meta.dead.saturating_add(1);
                 }
-                meta.dead = meta.dead.saturating_add(1);
             }
-            tx.delete(ns, &keymap_key(doc_key))?;
             return Ok(());
         }
         _ => {}

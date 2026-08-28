@@ -841,6 +841,7 @@ static MANIFEST: &[Row] = &[
             "queries_select_empty_field_list_yields_empty_map_for_map_docs",
             "queries_select_non_map_documents_pass_through_unchanged",
             "queries_select_preserves_rank_scores_and_filter_visibility",
+            "schema_select_empty_field_name_matches_get_path_semantics",
         ],
     ),
     row(

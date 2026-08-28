@@ -1670,20 +1670,17 @@ fn project(document: Value, fields: &[String]) -> Value {
     }
     let mut out: BTreeMap<String, Value> = BTreeMap::new();
     for path in fields {
-        if let Some(value) = resolve_path(&document, path) {
+        // Resolution goes through the uniform field accessor (value.rs):
+        // identical dotted traversal plus its documented empty-path rule —
+        // `""` resolves no field. Task 11 review fix: this was a third
+        // hand-rolled resolver (after filter::resolve) that DID match a
+        // top-level `""` key, diverging from `field("")` predicates and from
+        // index maintenance; only the OUTPUT-shape builder below is local.
+        if let Some(value) = document.get_path(path) {
             insert_path(&mut out, path, value.clone());
         }
     }
     Value::Map(out)
-}
-
-/// Resolve a dotted path through nested maps.
-fn resolve_path<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
-    let mut current = doc;
-    for segment in path.split('.') {
-        current = current.get(segment)?;
-    }
-    Some(current)
 }
 
 /// Insert `value` at a dotted `path`, creating intermediate maps.
