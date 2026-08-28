@@ -86,17 +86,25 @@ static MANIFEST: &[Row] = &[
         &[
             "mutations_smoke_insert_roundtrips",
             "mutations_insert_roundtrips_every_value_variant",
+            "filters_compare_eq_matches_each_value_kind",
         ],
     ),
     row(
         "corvid::Value::Null",
         "WHERE",
-        &["mutations_insert_roundtrips_every_value_variant"],
+        &[
+            "mutations_insert_roundtrips_every_value_variant",
+            "filters_compare_eq_matches_each_value_kind",
+        ],
     ),
     row(
         "corvid::Value::Bool",
         "WHERE",
-        &["mutations_insert_roundtrips_every_value_variant"],
+        &[
+            "mutations_insert_roundtrips_every_value_variant",
+            "filters_compare_eq_matches_each_value_kind",
+            "filters_unordered_kinds_compare_false_for_ordered_ops",
+        ],
     ),
     row(
         "corvid::Value::Int",
@@ -104,6 +112,8 @@ static MANIFEST: &[Row] = &[
         &[
             "mutations_smoke_insert_roundtrips",
             "mutations_insert_roundtrips_every_value_variant",
+            "filters_compare_eq_matches_each_value_kind",
+            "filters_int_float_precision_beyond_2_pow_53",
         ],
     ),
     row(
@@ -112,6 +122,9 @@ static MANIFEST: &[Row] = &[
         &[
             "search_geo_smoke_within_radius_and_nearest",
             "mutations_insert_roundtrips_every_value_variant",
+            "filters_compare_eq_matches_each_value_kind",
+            "filters_nan_comparisons_all_false_except_ne",
+            "filters_int_float_precision_beyond_2_pow_53",
         ],
     ),
     row(
@@ -120,12 +133,17 @@ static MANIFEST: &[Row] = &[
         &[
             "mutations_smoke_insert_roundtrips",
             "mutations_insert_roundtrips_every_value_variant",
+            "filters_compare_eq_matches_each_value_kind",
+            "filters_text_ordering_lexicographic_utf8",
         ],
     ),
     row(
         "corvid::Value::Bytes",
         "WHERE",
-        &["mutations_insert_roundtrips_every_value_variant"],
+        &[
+            "mutations_insert_roundtrips_every_value_variant",
+            "filters_compare_eq_matches_each_value_kind",
+        ],
     ),
     row(
         "corvid::Value::Array",
@@ -133,6 +151,8 @@ static MANIFEST: &[Row] = &[
         &[
             "search_geo_smoke_within_radius_and_nearest",
             "mutations_insert_roundtrips_every_value_variant",
+            "filters_compare_eq_matches_each_value_kind",
+            "filters_nested_dotted_paths_traverse_maps_only",
         ],
     ),
     row(
@@ -141,6 +161,8 @@ static MANIFEST: &[Row] = &[
         &[
             "mutations_smoke_insert_roundtrips",
             "mutations_insert_roundtrips_every_value_variant",
+            "filters_compare_eq_matches_each_value_kind",
+            "filters_nested_dotted_paths_traverse_maps_only",
         ],
     ),
     row(
@@ -149,24 +171,61 @@ static MANIFEST: &[Row] = &[
         &[
             "search_vector_smoke_ranks_nearest_first_exact",
             "mutations_insert_roundtrips_every_value_variant",
+            "filters_compare_eq_matches_each_value_kind",
+            "filters_unordered_kinds_compare_false_for_ordered_ops",
         ],
     ),
     row("corvid::value::MAX_NESTING", "Lifecycle", &[]),
     row("corvid::Value::encode", "Lifecycle", &[]),
     row("corvid::Value::decode", "Lifecycle", &[]),
-    row("corvid::Value::get", "WHERE", &[]),
-    row("corvid::Value::get_path", "WHERE", &[]),
-    row("corvid::Value::as_bool", "WHERE", &[]),
-    row("corvid::Value::as_int", "WHERE", &[]),
-    row("corvid::Value::as_float", "WHERE", &[]),
-    row("corvid::Value::as_text", "WHERE", &[]),
-    row("corvid::Value::as_bytes", "WHERE", &[]),
-    row("corvid::Value::as_vector", "WHERE", &[]),
+    row(
+        "corvid::Value::get",
+        "WHERE",
+        &["filters_value_accessors_read_stored_kinds"],
+    ),
+    row(
+        "corvid::Value::get_path",
+        "WHERE",
+        &["filters_value_accessors_read_stored_kinds"],
+    ),
+    row(
+        "corvid::Value::as_bool",
+        "WHERE",
+        &["filters_value_accessors_read_stored_kinds"],
+    ),
+    row(
+        "corvid::Value::as_int",
+        "WHERE",
+        &["filters_value_accessors_read_stored_kinds"],
+    ),
+    row(
+        "corvid::Value::as_float",
+        "WHERE",
+        &["filters_value_accessors_read_stored_kinds"],
+    ),
+    row(
+        "corvid::Value::as_text",
+        "WHERE",
+        &["filters_value_accessors_read_stored_kinds"],
+    ),
+    row(
+        "corvid::Value::as_bytes",
+        "WHERE",
+        &["filters_value_accessors_read_stored_kinds"],
+    ),
+    row(
+        "corvid::Value::as_vector",
+        "WHERE",
+        &["filters_value_accessors_read_stored_kinds"],
+    ),
     // ===== filter.rs — predicates =====
     row(
         "corvid::CmpOp",
         "WHERE",
-        &["filters_smoke_field_eq_selects_matching_rows"],
+        &[
+            "filters_smoke_field_eq_selects_matching_rows",
+            "filters_field_builders_produce_claimed_predicates",
+        ],
     ),
     row(
         "corvid::CmpOp::Eq",
@@ -174,16 +233,49 @@ static MANIFEST: &[Row] = &[
         &[
             "filters_smoke_field_eq_selects_matching_rows",
             "mutations_update_maintains_scalar_index",
+            "filters_compare_eq_matches_each_value_kind",
         ],
     ),
-    row("corvid::CmpOp::Ne", "WHERE", &[]),
-    row("corvid::CmpOp::Lt", "WHERE", &[]),
-    row("corvid::CmpOp::Le", "WHERE", &[]),
-    row("corvid::CmpOp::Gt", "WHERE", &[]),
+    row(
+        "corvid::CmpOp::Ne",
+        "WHERE",
+        &[
+            "filters_compare_ne_and_missing_path_semantics",
+            "filters_nan_comparisons_all_false_except_ne",
+        ],
+    ),
+    row(
+        "corvid::CmpOp::Lt",
+        "WHERE",
+        &[
+            "filters_ordered_comparisons_numbers_and_edges",
+            "filters_text_ordering_lexicographic_utf8",
+        ],
+    ),
+    row(
+        "corvid::CmpOp::Le",
+        "WHERE",
+        &[
+            "filters_ordered_comparisons_numbers_and_edges",
+            "filters_between_inclusive_and_degenerate_bounds",
+        ],
+    ),
+    row(
+        "corvid::CmpOp::Gt",
+        "WHERE",
+        &[
+            "filters_ordered_comparisons_numbers_and_edges",
+            "filters_text_ordering_lexicographic_utf8",
+        ],
+    ),
     row(
         "corvid::CmpOp::Ge",
         "WHERE",
-        &["mutations_delete_where_counts_zero_partial_and_full"],
+        &[
+            "mutations_delete_where_counts_zero_partial_and_full",
+            "filters_ordered_comparisons_numbers_and_edges",
+            "filters_between_inclusive_and_degenerate_bounds",
+        ],
     ),
     row(
         "corvid::Predicate",
@@ -191,37 +283,116 @@ static MANIFEST: &[Row] = &[
         &[
             "filters_smoke_field_eq_selects_matching_rows",
             "mutations_delete_where_counts_zero_partial_and_full",
+            "filters_and_or_not_nesting_and_de_morgan",
         ],
     ),
     row(
         "corvid::Predicate::Compare",
         "WHERE",
-        &["filters_smoke_field_eq_selects_matching_rows"],
+        &[
+            "filters_smoke_field_eq_selects_matching_rows",
+            "filters_compare_eq_matches_each_value_kind",
+            "filters_ordered_comparisons_numbers_and_edges",
+        ],
     ),
-    row("corvid::Predicate::Exists", "WHERE", &[]),
-    row("corvid::Predicate::In", "WHERE", &[]),
-    row("corvid::Predicate::Between", "WHERE", &[]),
-    row("corvid::Predicate::StartsWith", "WHERE", &[]),
-    row("corvid::Predicate::Contains", "WHERE", &[]),
-    row("corvid::Predicate::GeoWithin", "Geo", &[]),
-    row("corvid::Predicate::And", "WHERE", &[]),
-    row("corvid::Predicate::Or", "WHERE", &[]),
-    row("corvid::Predicate::Not", "WHERE", &[]),
-    row("corvid::Predicate::and", "WHERE", &[]),
-    row("corvid::Predicate::or", "WHERE", &[]),
-    row("corvid::Predicate::eval", "WHERE", &[]),
+    row(
+        "corvid::Predicate::Exists",
+        "WHERE",
+        &["filters_exists_presence_semantics"],
+    ),
+    row(
+        "corvid::Predicate::In",
+        "WHERE",
+        &["filters_in_membership_matrix"],
+    ),
+    row(
+        "corvid::Predicate::Between",
+        "WHERE",
+        &["filters_between_inclusive_and_degenerate_bounds"],
+    ),
+    row(
+        "corvid::Predicate::StartsWith",
+        "WHERE",
+        &["filters_starts_with_prefix_semantics"],
+    ),
+    row(
+        "corvid::Predicate::Contains",
+        "WHERE",
+        &["filters_contains_substring_semantics"],
+    ),
+    row(
+        "corvid::Predicate::GeoWithin",
+        "Geo",
+        &[
+            "filters_geo_within_point_formats_and_boundary",
+            "filters_indexed_vs_scan_geo_window",
+        ],
+    ),
+    row(
+        "corvid::Predicate::And",
+        "WHERE",
+        &[
+            "filters_and_or_not_nesting_and_de_morgan",
+            "filters_predicate_combinators_and_direct_construction",
+        ],
+    ),
+    row(
+        "corvid::Predicate::Or",
+        "WHERE",
+        &[
+            "filters_and_or_not_nesting_and_de_morgan",
+            "filters_indexed_vs_scan_or_union",
+        ],
+    ),
+    row(
+        "corvid::Predicate::Not",
+        "WHERE",
+        &[
+            "filters_and_or_not_nesting_and_de_morgan",
+            "filters_predicate_combinators_and_direct_construction",
+        ],
+    ),
+    row(
+        "corvid::Predicate::and",
+        "WHERE",
+        &[
+            "filters_predicate_combinators_and_direct_construction",
+            "filters_multiple_filter_calls_intersect_like_and",
+        ],
+    ),
+    row(
+        "corvid::Predicate::or",
+        "WHERE",
+        &[
+            "filters_predicate_combinators_and_direct_construction",
+            "filters_indexed_vs_scan_or_union",
+        ],
+    ),
+    row(
+        "corvid::Predicate::eval",
+        "WHERE",
+        &[
+            "filters_compare_eq_matches_each_value_kind",
+            "filters_ordered_comparisons_numbers_and_edges",
+            "filters_starts_with_prefix_semantics",
+        ],
+    ),
     row(
         "corvid::field",
         "WHERE",
         &[
             "filters_smoke_field_eq_selects_matching_rows",
             "mutations_delete_where_counts_zero_partial_and_full",
+            "filters_field_builders_produce_claimed_predicates",
         ],
     ),
     row(
         "corvid::filter::FieldRef",
         "WHERE",
-        &["filters_smoke_field_eq_selects_matching_rows"],
+        &[
+            "filters_smoke_field_eq_selects_matching_rows",
+            "filters_field_builders_produce_claimed_predicates",
+        ],
     ),
     row(
         "corvid::filter::FieldRef::eq",
@@ -229,23 +400,99 @@ static MANIFEST: &[Row] = &[
         &[
             "filters_smoke_field_eq_selects_matching_rows",
             "mutations_update_maintains_scalar_index",
+            "filters_field_builders_produce_claimed_predicates",
+            "filters_compare_eq_matches_each_value_kind",
         ],
     ),
-    row("corvid::filter::FieldRef::ne", "WHERE", &[]),
-    row("corvid::filter::FieldRef::lt", "WHERE", &[]),
-    row("corvid::filter::FieldRef::le", "WHERE", &[]),
-    row("corvid::filter::FieldRef::gt", "WHERE", &[]),
+    row(
+        "corvid::filter::FieldRef::ne",
+        "WHERE",
+        &[
+            "filters_field_builders_produce_claimed_predicates",
+            "filters_compare_ne_and_missing_path_semantics",
+        ],
+    ),
+    row(
+        "corvid::filter::FieldRef::lt",
+        "WHERE",
+        &[
+            "filters_field_builders_produce_claimed_predicates",
+            "filters_ordered_comparisons_numbers_and_edges",
+        ],
+    ),
+    row(
+        "corvid::filter::FieldRef::le",
+        "WHERE",
+        &[
+            "filters_field_builders_produce_claimed_predicates",
+            "filters_ordered_comparisons_numbers_and_edges",
+        ],
+    ),
+    row(
+        "corvid::filter::FieldRef::gt",
+        "WHERE",
+        &[
+            "filters_field_builders_produce_claimed_predicates",
+            "filters_ordered_comparisons_numbers_and_edges",
+        ],
+    ),
     row(
         "corvid::filter::FieldRef::ge",
         "WHERE",
-        &["mutations_delete_where_counts_zero_partial_and_full"],
+        &[
+            "mutations_delete_where_counts_zero_partial_and_full",
+            "filters_field_builders_produce_claimed_predicates",
+            "filters_ordered_comparisons_numbers_and_edges",
+        ],
     ),
-    row("corvid::filter::FieldRef::exists", "WHERE", &[]),
-    row("corvid::filter::FieldRef::is_in", "WHERE", &[]),
-    row("corvid::filter::FieldRef::between", "WHERE", &[]),
-    row("corvid::filter::FieldRef::starts_with", "WHERE", &[]),
-    row("corvid::filter::FieldRef::contains", "WHERE", &[]),
-    row("corvid::filter::FieldRef::within_km", "Geo", &[]),
+    row(
+        "corvid::filter::FieldRef::exists",
+        "WHERE",
+        &[
+            "filters_exists_presence_semantics",
+            "filters_field_builders_produce_claimed_predicates",
+        ],
+    ),
+    row(
+        "corvid::filter::FieldRef::is_in",
+        "WHERE",
+        &[
+            "filters_in_membership_matrix",
+            "filters_field_builders_produce_claimed_predicates",
+        ],
+    ),
+    row(
+        "corvid::filter::FieldRef::between",
+        "WHERE",
+        &[
+            "filters_between_inclusive_and_degenerate_bounds",
+            "filters_field_builders_produce_claimed_predicates",
+        ],
+    ),
+    row(
+        "corvid::filter::FieldRef::starts_with",
+        "WHERE",
+        &[
+            "filters_starts_with_prefix_semantics",
+            "filters_field_builders_produce_claimed_predicates",
+        ],
+    ),
+    row(
+        "corvid::filter::FieldRef::contains",
+        "WHERE",
+        &[
+            "filters_contains_substring_semantics",
+            "filters_field_builders_produce_claimed_predicates",
+        ],
+    ),
+    row(
+        "corvid::filter::FieldRef::within_km",
+        "Geo",
+        &[
+            "filters_geo_within_point_formats_and_boundary",
+            "filters_indexed_vs_scan_geo_window",
+        ],
+    ),
     // ===== distance.rs — vector metrics =====
     row(
         "corvid::Metric",

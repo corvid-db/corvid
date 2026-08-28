@@ -797,6 +797,13 @@ impl QueryBuilder<'_> {
     /// (optionally with a range on the next field), the candidate keys for that
     /// prefix window (a verified superset), read from `reader`'s snapshot,
     /// else `None`. Picks the index that matches the longest equality prefix.
+    ///
+    /// Soundness gate: the window is a verified superset only when the
+    /// constraints cover EVERY field of the index (equality on a leading
+    /// prefix, plus at most one range/eq tail, exhausting the field list).
+    /// The compound index skips documents missing any indexed field, so a
+    /// query leaving a field unconstrained can match such documents while
+    /// the window cannot contain them — that shape must scan instead.
     fn compound_candidate_keys(&self, reader: &dyn SnapshotReader) -> Result<Option<Vec<Vec<u8>>>> {
         const CANDIDATE_CAP: usize = 100_000;
         let db = self.collection.db();
@@ -826,13 +833,16 @@ impl QueryBuilder<'_> {
             }
             // A range/eq on the field right after the prefix extends the window.
             let has_tail = prefix_len < fields.len() && !by_field(&fields[prefix_len]).is_empty();
-            if prefix_len == 0 && !has_tail {
-                continue; // leading field unconstrained → index unusable
+            if prefix_len + usize::from(has_tail) < fields.len() {
+                // Some trailing field is unconstrained: documents missing it
+                // match the filters but are not indexed, so the window would
+                // not be a superset — decline and let the scan serve the query.
+                continue;
             }
-            let score = prefix_len + has_tail as usize;
+            let score = prefix_len + usize::from(has_tail);
             if best
                 .as_ref()
-                .is_none_or(|(_, b, t)| score > *b + *t as usize)
+                .is_none_or(|(_, b, t)| score > *b + usize::from(*t))
             {
                 best = Some((fields, prefix_len, has_tail));
             }
@@ -1048,8 +1058,10 @@ impl QueryBuilder<'_> {
                 prefix_len += 1;
             }
             let has_tail = prefix_len < fields.len() && !by_field(&fields[prefix_len]).is_empty();
-            if prefix_len == 0 && !has_tail {
-                continue; // leading field unconstrained → index unusable
+            if prefix_len + usize::from(has_tail) < fields.len() {
+                // Soundness gate mirrored from `compound_candidate_keys`: a
+                // trailing unconstrained field admits unindexed matches.
+                continue;
             }
             let score = prefix_len + usize::from(has_tail);
             if best
@@ -2648,8 +2660,9 @@ mod tests {
             "geo disjunct with wrapping radius",
         );
 
-        // Compound kind: equality on the leading field of a compound index
-        // (no scalar index on that field, so the ladder reaches step 3).
+        // Compound kind: constraints covering every field of the compound
+        // index (equality prefix + range tail; no scalar index on the
+        // fields, so the ladder reaches step 3).
         let comp = seed();
         comp.collection("docs")
             .create_compound_index(&["category", "body"])
@@ -2657,9 +2670,22 @@ mod tests {
         parity(
             comp.collection("docs")
                 .query()
-                .filter(field("category").eq(Value::Text("blog".into()))),
+                .filter(field("category").eq(Value::Text("blog".into())))
+                .filter(field("body").le(Value::Text("s".into()))),
             PlanShape::IndexedWindow { kind: "compound" },
             "compound window",
+        );
+        // A prefix-only query (trailing field unconstrained) must decline:
+        // documents missing the trailing field match the filters but are
+        // not indexed, so the window would not be a verified superset.
+        parity(
+            comp.collection("docs")
+                .query()
+                .filter(field("category").eq(Value::Text("blog".into()))),
+            PlanShape::Scan {
+                collection: "docs".to_owned(),
+            },
+            "compound prefix-only declines to scan",
         );
 
         // Geo kind: a top-level GeoWithin over a geo index with a real bbox.
