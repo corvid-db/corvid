@@ -6,13 +6,46 @@ format and API may change without backward-compatibility guarantees.
 
 ## [Unreleased]
 
+### Added
+- Syntax-conformance program: every public construct of `corvid` and
+  `corvid-mcp` now has a committed surface manifest and radar
+  (`crates/*/tests/surface/`) that fails CI on any drift between the
+  manifest and the sources, rejects citations of nonexistent tests, and —
+  since the waves filled every row — enforces strict covering: each row
+  cites at least one conformance test. The only exemptions are the seven
+  redb-passthrough `Error` variants (`Transaction`, `Table`, `Storage`,
+  `Commit`, `SetDurability`, `Compaction`, `IncompatibleFormat`), fault
+  paths unreachable from the public API, listed with justifications in the
+  radar. The suites: 15 engine files (298 tests) by statement class —
+  mutations, filters, queries, aggregations, joins, graph, vector/text/
+  hybrid/geo search, schema, ttl, events, lifecycle, pq — plus the 78-test
+  MCP wire matrix over in-process duplex I/O. `docs/SYNTAX.md` is generated
+  from the manifests (a radar test re-renders and diffs it on every run;
+  `CORVID_GEN_SYNTAX=1 cargo test -p corvid --test surface syntax_md`
+  regenerates), documenting every construct with its covering tests and
+  the cross-class semantics notes (BM25 re-normalization under
+  pre-ranking predicates, `geo_within_bbox` key order, the NaN duality,
+  equality-per-construct).
+- New MCP tools `set_schema` / `get_schema` (`{collection, fields:
+  [{name, type, required?, unique?}]}`, read back with explicit flags;
+  `fields: []` declares an empty schema, distinct from no schema which
+  reads `null`), backed by a new public engine getter
+  `Collection::schema()`. Limit validation is unified across tools: an
+  invalid `limit` (negative/non-integer) is a `BadParams` error everywhere
+  instead of a silent default on `neighbors`/`in_neighbors`/`traverse`/
+  `geo`/`join` (valid-but-oversized still clamps to 10000 on list tools),
+  and invalid enum/flag params (`quant`, geo `k`, boolean flags) error
+  instead of falling back to a default.
+
 ### Changed
 - `Collection::compare_and_set` now compares the expected value with the
   engine's semantic value equality (the same rule unique constraints use:
   `NaN` equals `NaN` regardless of payload, `-0.0` equals `0.0`, containers
   element-wise) instead of encoded-byte identity — previously a `-0.0`
   expectation never matched a stored `0.0` (and vice versa), and differently
-  payloaded NaNs never matched. (Task 3 review ruling F4)
+  payloaded NaNs never matched; the comparison now decodes the stored row,
+  so a corrupt row surfaces its decode error instead of being byte-compared.
+  (Task 3 review ruling F4)
 - New public API: `QueryBuilder::plan_shape()` / `PlanShape` — the plan
   shape a query will take (what `explain()` prints); advisory.
 - Release workflow hardening: the GitHub release is created only after every
@@ -145,6 +178,49 @@ format and API may change without backward-compatibility guarantees.
   (audit B4)
 
 ### Fixed
+- A compound-index window was served for prefix-only queries (trailing
+  field unconstrained), but documents *missing* that field match the
+  filters while being absent from the index — the window was not a
+  verified superset and filtered queries silently omitted them. The
+  planner now serves a compound window only when the query's constraints
+  cover every field of the index (equality prefix + at most one trailing
+  range); prefix-only queries plan as a `Scan` (a `plan_shape()`/
+  `explain()` change for those queries) and return every matching
+  document. (found by the WHERE conformance wave)
+- On-disk vector index backfill: a page holding mixed vector dimensions
+  corrupted the index — the dimension-mismatch arm's tombstone re-read the
+  persisted meta row (stale mid-page, since a page persists meta only at
+  its end) and the re-sync clobbered the batch's accumulated counts,
+  reusing node ids and re-pinning the dimension to a later vector in the
+  same page. The tombstone now applies inline against the in-flight
+  meta/cache. (found by the schema/index conformance wave)
+- Unique-constraint checking keyed its bucket walk on the order-preserving
+  f64 encoding, which collapses numerically equal but distinct stored
+  values (`Int(7)` vs `Float(7.0)`, f64-rounded huge ints) — a second
+  document was rejected *only* when a scalar index existed, diverging from
+  the index-free path and from `compare_and_set`'s storage equality. The
+  walk now re-checks the actual stored value with semantic equality.
+  (found by the schema/index conformance wave)
+- Dotted-path resolution is unified on `Value::get_path`: the filter
+  layer's private resolver and `select()`'s projection used to resolve
+  `""` to a top-level `""`-keyed field while index maintenance and windows
+  treat `""` as resolving no field, so an unindexed collection could match
+  a document an indexed one served an empty window for.
+  (found by the schema/index conformance wave)
+- `geo_within_bbox` now returns its result in key order on every path —
+  the indexed path used to emit candidates in grid-cell order, so creating
+  an index reordered the same query's results. (found by the geo
+  conformance wave)
+- Deleting an absent key now still runs the graph-edge cascade (edges
+  linked against a never-inserted or already-deleted key were uncleanable
+  by `delete`), and purging a stranded TTL entry (expiry on a key with no
+  document) cascades the same way — the delete-path return and event
+  semantics (false, no events) are unchanged. (found by the graph and TTL
+  conformance waves)
+- MCP boolean flags (`set_schema`'s `required`/`unique`, `create_index`
+  and `create_text_index`'s `on_disk`) no longer coerce non-bool JSON to
+  `false`: a present-but-non-boolean value is a `BadParams` error naming
+  the flag. (found by the Task 14 fix round)
 - Overwriting a document whose vector field is HNSW-indexed with a
   different-dimension vector previously left the old node live in the graph:
   ANN results for the old dimension kept returning the key while exact
