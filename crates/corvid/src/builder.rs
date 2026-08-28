@@ -298,7 +298,7 @@ impl QueryBuilder<'_> {
 
     /// Count matching documents grouped by the value at `field`.
     ///
-    /// Groups are keyed by the canonical form (spec decision 3): text is used
+    /// Groups are keyed by the canonical form: text is used
     /// bare; int/float/bool are type-tagged (`i:1`, `f:1.5`, `b:true`) so
     /// distinct types never collapse into one group; a text that would be
     /// ambiguous with a tagged form (it starts with `i:`, `f:`, `b:`, or
@@ -404,7 +404,7 @@ impl QueryBuilder<'_> {
     }
 
     /// Sum `value_field` grouped by `group_field` (numeric values only).
-    /// Group keys use the canonical form (spec decision 3): text is used
+    /// Group keys use the canonical form: text is used
     /// bare; int/float/bool are type-tagged (`i:1`, `f:1.5`, `b:true`) so
     /// distinct types never collapse into one group; a text that would be
     /// ambiguous with a tagged form (it starts with `i:`, `f:`, `b:`, or
@@ -423,7 +423,7 @@ impl QueryBuilder<'_> {
     }
 
     /// Mean of `value_field` grouped by `group_field` (numeric values only).
-    /// Group keys use the canonical form (spec decision 3): text is used
+    /// Group keys use the canonical form: text is used
     /// bare; int/float/bool are type-tagged (`i:1`, `f:1.5`, `b:true`) so
     /// distinct types never collapse into one group; a text that would be
     /// ambiguous with a tagged form (it starts with `i:`, `f:`, `b:`, or
@@ -1391,7 +1391,7 @@ impl QueryBuilder<'_> {
 
 /// A canonical group key for a scalar value, or `None` for containers/null.
 ///
-/// The canonical form (spec decision 3): **text is used bare** — the
+/// The canonical form: **text is used bare** — the
 /// natural, dominant case; int/float/bool are type-tagged (`i:1`, `f:1.5`,
 /// `b:true`) so distinct types never collapse into one group; and a text
 /// that would be ambiguous with a tagged form (it starts with `i:`, `f:`,

@@ -147,8 +147,10 @@ the description is authoritative.
 5. **Corrupt on-disk index state surfaces as a typed error**
    (`Error::CorruptIndex`) rather than silent-empty — matches the
    never-panic, typed-errors rule and makes corruption diagnosable.
-6. **NaN equals NaN for uniqueness** (bit-canonical comparison) — uniqueness
-   is about identity of stored values, not IEEE comparison semantics.
+6. **NaN equals NaN for uniqueness** — all NaN bit patterns compare equal
+   for uniqueness (payload-insensitive; matches the implementation's
+   `is_nan` check, not a bit-canonical comparison) — uniqueness is about
+   identity of stored values, not IEEE comparison semantics.
 
 Non-goals: no new features, no performance work beyond what fixes require,
 no rewrite of subsystems the audit verified solid.

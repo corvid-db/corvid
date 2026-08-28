@@ -22,6 +22,13 @@ pub enum Value {
     /// A boolean.
     Bool(bool),
     /// A 64-bit signed integer. Timestamps are represented as integers.
+    ///
+    /// Precision note: comparisons against a [`Value::Float`] (and the
+    /// scalar index's shared numeric lane) convert through `f64`, which
+    /// represents integers exactly only up to 2^53 — beyond that, distinct
+    /// `i64` values can compare equal. Same-type `Int` comparisons are
+    /// exact. Nanosecond-epoch timestamps (~1.7e18) exceed 2^53: filter
+    /// them with integer bounds if distinctness matters.
     Int(i64),
     /// A 64-bit float.
     Float(f64),

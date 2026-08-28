@@ -1,52 +1,79 @@
-# corvid — deep audit findings
+# corvid — audit status
+
+A deep audit of the entire workspace ran 2026-08-26 (original text preserved
+below). Its findings drove a five-wave remediation on 2026-08-27/28; all five
+waves landed on `master`. Gates (fmt, clippy `-D warnings`, `cargo test
+--workspace`, `cargo doc -D warnings`, coverage ≥ 90%) ran green at each wave
+exit; final numbers live in the wave-5 exit commit rather than being frozen
+here.
+
+Finding IDs below follow the remediation spec's inventory
+(`docs/superpowers/specs/2026-08-27-audit-remediation-design.md`), which
+re-numbered the original audit's findings (its C0 / M1–M25 / minors) into
+`A#` high, `B#` medium, `C#` low/hygiene, `D#` docs/claims.
+
+## Fixed
+
+| Finding | One-line description | Commit(s) |
+|---|---|---|
+| A1 | ANN: overwriting an indexed doc with a different-dimension vector tombstones the old node (results match exact) | `d85815a` |
+| A2 | Index creation crash-safe: persisted `Building{cursor}`→`Complete` watermark, never-serving-Building, lazy resume, all five kinds | `b4982fd`..`5ac9eb5` |
+| A3 | Unique constraints enforced on non-index-encodable values; NaN conflicts with NaN | `92c0130`, `b517ef3` |
+| A4 | PQ: bound-checked ADC codes, `Option` L2 table on dim mismatch, gated codebook dim | `97a4684` |
+| A5 | Re-registering a vector index resets its namespace transactionally; no mixed encodings or leaks | `c6d4635` |
+| B1 | `Db::bulk`: thread-local, panic-safe relaxed-durability scope | `eccdefc` |
+| B2 | TTL maintenance decided inside the write txn; purge deletes compare-expiry | `b9e792d` |
+| B3 | Snapshot-scoped execution: one MVCC snapshot per query/aggregation/traverse | `f615dbd`, `ac9f0f3`, `b826640`, `cd14da0` |
+| B4 | Document delete cascades graph edges in-txn; link/unlink emit change events | `0cef6b0` |
+| B5 | On-disk HNSW compaction at `dead*2 > live`; over-fetch scales with dead count | `25d7d3f`, `c2cd13a` |
+| B6 | `vector_search` reranks ANN hits with exact distances; `Hit.approximate` | `7712729` |
+| B7 | Phrase fallback scores BM25 on the indexed paths' scale; index creation never reorders a query | `2ebe69d` |
+| B8 | `dump` single-snapshot and streaming; `load` streams + rejects reserved names on every replay path | `4c31e02` |
+| B9 | Availability characteristics documented (global registry mutex, namespace-clear write lock, O(E) edge cascade); lock split deferred | this commit (mitigation doc) |
+| B10 | `In`-union honors the 100k aggregate cap (falls back to scan) | `4c31e02` |
+| C1 | Decoders clamp allocations against remaining input; no unvalidated `with_capacity` | `19a8a74` |
+| C2 | Antimeridian bbox wraps (two longitude ranges); lat/lon validated at entry | `5134488` |
+| C3 | `explain()` reports the plan shape the executor will take (parity-pinned) | `9704551`, `5b21e61` |
+| C4 | `order_by`: missing AND incomparable values sort last (stable by key) | `5134488` |
+| C5 | i64-compared-via-f64 precision limit documented (value.rs/filter.rs) | this commit (docs) |
+| C6 | RRF k, MMR λ, Bm25Params validated (`Error::InvalidArgument`) | `5134488` |
+| C7 | Name validation: interior `__` and NUL rejected (`Error::InvalidName`) | `4c31e02` |
+| C8 | Backup: partial destination removed on mid-copy failure; residual race documented | `5134488` |
+| C9 | `insert_auto` reserves in-txn (no burned ids); `len` saturates | `4c31e02` |
+| C10 | Index-path tests observe service; `plan_shape`↔served-path parity matrix | `9704551`, `5b21e61` |
+| C11 | CI: iOS job, timeouts, concurrency; release: build-first, tag check, checksums, scoped permissions | `a9aba00` |
+| C12 | MCP convert fidelity limits documented (u64 > i64::MAX → lossy float; non-finite → null) | this commit (docs) |
+| C13 | Corrupt keymap values skip (no node-0 tombstoning); `Error::CorruptIndex` errors loudly | `19a8a74` |
+| C14 | Stop-word-collapsed phrase positions + S-stemmer limits documented | this commit (docs) |
+| D1 | README iOS/WASM rows made true (CI iOS job; measured wasm size) | `a9aba00` |
+| D2 | README true-predicate claim qualified with the `.approx()` opt-out | this commit |
+| D3 | store.rs/db.rs module docs rewritten to the post-remediation truth | this commit |
+| D4 | Group keys: bare text, tagged non-text, `t:`-escaped ambiguity | `281e6f3` |
+| D5 | DESIGN.md reconciled: layer map, future-spec markers, decision-log dates, closed open-questions, B9/deferred notes | this commit |
+| D6 | AUDIT.md rewritten as this status doc | this commit |
+
+## Open
+
+Deferred by decision (each with its rationale and follow-up destination), not
+dropped silently:
+
+| Item | Rationale / follow-up |
+|---|---|
+| Endpoint-indexed edge layout | Document delete cascades edges by scanning the collection's two edge namespaces — O(collection edge count) per delete. An endpoint-indexed (adjacency) layout removes the scan; taken up if delete churn on edge-heavy collections grows. |
+| Page-level single-snapshot | `page`/`page_where` walk in 1024-key chunks, each chunk its own read transaction; a page spanning concurrent writes observes mixed state (per-chunk consistent). Point-in-time needs use the snapshot-scoped builder. |
+| In-memory PQ | The in-memory HNSW supports None/Binary/Scalar only; PQ (+ ADC) is wired into the on-disk index — the footprint-critical path. In-memory PQ is a deliberate deferral (DESIGN.md). |
+| tracing / observability | No structured logging in the engine today; the Observability section is marked specified-not-implemented. Corrupt/unknown state surfaces as typed errors (`CorruptIndex`) rather than logs. |
+| `a__b` migration tooling | Dumps from pre-wave-4 databases with `__`-containing names fail at load's index/schema replay (`InvalidName`); no automated rename tool — rename collections or re-create indexes after load (DESIGN.md deferred notes). |
+| >4 GiB dump sections | The dump format's length prefixes are u32; a single value/count beyond 4 GiB cannot be represented. A future format version widens to u64 when a workload needs it. |
+
+---
+
+## Historical: original audit (2026-08-26)
 
 Date: 2026-08-26. Scope: entire workspace (`corvid` engine, `corvid-mcp`, `corvid-wasm`, CI, docs).
 Method: five parallel line-by-line adversarial reviews plus independent verification of every
 headline claim against the source (all `file:line` refs below were confirmed). Build state at
 audit time: `cargo test --workspace` 390 tests green, `cargo clippy -D warnings` clean.
-
-## Status 2026-08-27 — remediation wave 1 landed
-
-- A1 — fixed in d85815a (ANN: tombstone old node before the dimension guard).
-- A3 — fixed in 92c0130 + b517ef3 (unique enforced on non-index-encodable values and NaN).
-- A4 — fixed in 97a4684 (PQ: bound-checked ADC codes, optioned L2 table, gated codebook dim).
-- B1 — fixed in eccdefc (bulk: thread-local, panic-safe relaxed-durability scope).
-- D4 — fixed in 281e6f3 (group keys: bare text, tagged non-text, t:-escaped ambiguity).
-
-Wave 1 exit gates green: fmt, clippy `-D warnings`, tests, coverage ≥ 90%.
-
-## Status 2026-08-27 — remediation wave 2 landed
-
-- A2 — fixed in b4982fd..=b9cbdf1 (+ exit 1b17de9): all five index kinds (scalar, compound,
-  geo, FTS, vector) create via a persisted Building{cursor}→Complete watermark; queries never
-  serve Building defs (exact/bounded fallbacks); lazy first-use resume; dump/load materializes
-  Complete via create_* replay.
-
-Wave 2 exit gates green: fmt, clippy `-D warnings`, 445 tests, 95.13% line coverage.
-Full plan (5 waves): docs/superpowers/specs/2026-08-27-audit-remediation-design.md.
-
-## Status 2026-08-27 — remediation wave 3 landed
-
-- A5 — c6d4635; B5 — 25d7d3f; B6 — 7712729; C1/C13 — 19a8a74 (fix range 6eaddfc..=19a8a74,
-  closed by this exit commit's contention tests).
-- Perf restored in 6eaddfc: page-level batch insert in the atomic driver — creation bench
-  396ms vs the 545ms pre-driver bulk baseline (3.36s at wave-2 exit), atomicity unchanged.
-- B5 trigger: dead*2 > live, checked on the write path post-commit (every tombstone follows
-  an applied write); synchronous reset + re-backfill under the index_resume try-lock.
-
-Wave 3 exit gates green: fmt, clippy `-D warnings`, 470 tests, 95.34% line coverage.
-
-## Status 2026-08-27 — remediation wave 4 landed
-
-- B3 — f615dbd + ac9f0f3 + b826640: SnapshotReader trait; run/aggregations, index candidate
-  paths, and traverse execute on one MVCC snapshot per query.
-- B7 — 2ebe69d; B2 — b9e792d; B4 — 0cef6b0; B8/B10/C7/C9 — 4c31e02; carryovers — c2cd13a.
-- B5 recall completed (c2cd13a): disk_hnsw over-fetch scales with the dead count (0.965 vs
-  0.485 recall below the compaction trigger). Follow-up: delete's edge cascade scans O(E) per
-  collection (relation-first key layout) — endpoint index if delete churn grows.
-
-Wave 4 exit gates green: fmt, clippy `-D warnings`, 495 tests, 94.36% line coverage;
-query benches 1.00-1.01x vs wave-3 exit (≤1.2x met).
 
 Severity legend: **CRITICAL** breaks the project's own central contract. **MAJOR** wrong results,
 data loss, crash, or DoS reachable through normal/intended use. **MINOR** edge-case wrongness,

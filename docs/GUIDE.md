@@ -461,3 +461,17 @@ Point an MCP client at it. Tools mirror the engine: `store`, `patch`,
   `corvid::Result<T>`. User input never panics.
 - **No backward-compat before 1.0.** A format change is migrated with
   [`dump`/`load`](#operations); old files are refused, not silently read.
+
+## Known limitations
+
+- **Text analysis is conservative.** The plural stemmer is Harman's
+  S-stemmer, not a full Porter stemmer: it normalizes common plurals
+  (`dogs`→`dog`, `parties`→`party`) but not irregular or s-suffixed forms —
+  `boxes` stems to `boxe`, so it does **not** match `box` (`goes`→`goe`
+  likewise). Match such pairs by storing a normalized field or querying both
+  forms.
+- **Phrase positions are post-stop-word.** Token positions are assigned
+  after stop-word removal, so a stop word inside a phrase collapses out of
+  adjacency: `"quick the brown"` matches text containing `"quick brown"`
+  (see [`phrase_search`](#text-search)). There is no position gap for a
+  removed stop word — phrases match across them.

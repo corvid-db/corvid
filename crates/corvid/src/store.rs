@@ -14,11 +14,18 @@
 //! a [`ReadBatch`] over one consistent snapshot. The single-op helpers
 //! ([`Store::put`] etc.) are thin wrappers over these.
 //!
-//! Derived indexes (vector, full-text) are *not* written inside the document's
-//! transaction. They are maintained incrementally in memory and rebuilt from
-//! the documents on open, so a query always sees an index consistent with the
-//! committed documents (documents are the source of truth); a crash can only
-//! lose in-memory index state, which is reconstructed on the next open.
+//! Indexes come in two kinds with different consistency stories. *Persisted*
+//! indexes (scalar, compound, geo, on-disk FTS, on-disk HNSW) are derived
+//! state stored as ordinary records, and their maintenance joins the
+//! document's own write transaction — a commit covers the row and every
+//! persisted index update atomically, so a crash can never leave one
+//! disagreeing with the documents. *In-memory* indexes (HNSW graph, inverted
+//! text) are rebuilt lazily from the documents and maintained incrementally
+//! after a commit; they are derived state the next open or first query can
+//! always reconstruct, so they cannot go stale. Creating an index of either
+//! kind persists its definition through a `Building{cursor}` → `Complete`
+//! state machine (crash-safe creation; queries never serve a `Building`
+//! index).
 
 use std::marker::PhantomData;
 use std::ops::Bound;

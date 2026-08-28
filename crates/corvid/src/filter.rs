@@ -299,6 +299,11 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 ///
 /// Numbers compare numerically (ints and floats interoperate), text compares
 /// lexically. Everything else (bools, containers, mixed kinds) is unordered.
+///
+/// Precision: mixed `Int`/`Float` comparisons convert the integer through
+/// `f64` (the scalar index's numeric lane encodes `Int` the same way), so
+/// integers beyond 2^53 — e.g. nanosecond-epoch timestamps — can compare
+/// equal to distinct neighbors. Same-type comparisons are exact.
 pub(crate) fn value_order(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),

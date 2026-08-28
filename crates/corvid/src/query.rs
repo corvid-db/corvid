@@ -102,9 +102,12 @@ impl Collection<'_> {
     /// terms (corpus stats from the scanned corpus match the indexed paths'
     /// whole-corpus stats), so creating or dropping an index never reorders
     /// the same query (audit B7). Analysis (stop words, stemming) applies to
-    /// the phrase too, so `"the quick fox"` matches on the analyzed tokens.
-    /// Ties break by key. Like [`Collection::text_search`], the whole search
-    /// runs on one read snapshot (audit B3).
+    /// the phrase too, and positions are assigned *after* stop-word removal
+    /// on both sides: stop words collapse out of adjacency, so `"quick the
+    /// brown"` matches text containing `"quick brown"` (and vice versa) —
+    /// there is no position gap for a removed stop word. Ties break by key.
+    /// Like [`Collection::text_search`], the whole search runs on one read
+    /// snapshot (audit B3).
     pub fn phrase_search(&self, field: &str, phrase: &str, k: usize) -> Result<Vec<TextHit>> {
         // Resume discipline as [`Collection::text_search`]: before the snapshot.
         self.db().try_resume_index_builds(self.name())?;

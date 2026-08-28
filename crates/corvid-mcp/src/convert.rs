@@ -9,6 +9,12 @@
 //! Any other object becomes a [`corvid::Value::Map`]. A genuine map whose only
 //! key is `$vector`/`$bytes` with a matching array payload collides with the
 //! convention — an accepted limitation of representing typed values in JSON.
+//!
+//! Round-trip fidelity limits (accepted): a JSON integer beyond `i64::MAX`
+//! (u64 territory) has no engine representation and converts to a lossy
+//! `f64`; non-finite floats (`NaN`, `±inf`) have no JSON representation and
+//! convert to `null` on the way out — such values do not survive a
+//! JSON round trip.
 
 use std::collections::BTreeMap;
 

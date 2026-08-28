@@ -16,10 +16,13 @@ use crate::value::Value;
 
 /// An embedded document database.
 ///
-/// Holds the persistent byte store plus an in-memory cache of derived ANN
-/// indexes. Documents are the source of truth; an index is rebuilt from them
-/// whenever a write to its collection invalidates it, so queries never observe
-/// a stale index.
+/// Documents are the source of truth; every index is derived from them.
+/// Persisted indexes are maintained *inside* the document's write
+/// transaction, so they always agree with the committed rows. The in-memory
+/// ANN cache holds derived graphs rebuilt lazily from a fresh committed
+/// state under the registry lock — never a stale snapshot — so queries never
+/// observe an index behind the documents. Query execution reads one MVCC
+/// snapshot per query.
 pub struct Db {
     store: Store,
     indexes: Mutex<IndexState>,

@@ -73,11 +73,14 @@ Same Rust core. The storage backend is abstracted behind redb's `StorageBackend`
 
 ## Capability layers
 
-Bottom-up. Each layer depends only on those below. Layers above v0.1 are scaffolded as empty traits, not implemented.
+Bottom-up. Each layer depends only on those below. L0–L4 shipped in v0.1; L5
+partially shipped (graph, geo, sketches, reactive feeds, semantic cache, TTL —
+see the L5 section for what remains future). Layers are a conceptual map, not
+a build order: the L5 features that shipped did so against the stable L4 API.
 
 ### L0 — storage backend
 
-**v0.1 (wrapping redb):** this layer is just three impls of redb's `StorageBackend` trait — `pread/pwrite` (desktop/mobile), and `OPFS-SAHPool` (WASM, runs in a Worker). redb does **not** require mmap, which is what makes the OPFS path tractable. Checksums, group commit, page format, and crash recovery are **redb's concern**, not ours, as long as we wrap it.
+**v0.1 (wrapping redb):** this layer is redb's `pread/pwrite` file backend on desktop/mobile. The OPFS-SAHPool backend (WASM, runs in a Worker) is specified, not implemented — future, and the remaining blocker for browser persistence (see *Deliberately deferred*). redb does **not** require mmap, which is what makes the OPFS path tractable. Checksums, group commit, page format, and crash recovery are **redb's concern**, not ours, as long as we wrap it.
 
 **Future (from-scratch engine, post-v1):** if we ever replace redb, *this* layer grows to own the page format — big pages (16K–64K), prefix-compressed keys, whole-block CRC32C (hardware CRC), group commit, fsync coalescing. Listed here so the seam is documented, not because v0.1 builds it.
 
@@ -85,7 +88,7 @@ Bottom-up. Each layer depends only on those below. Layers above v0.1 are scaffol
 
 - Wrap **redb** as primary KV store
 - WAL + MVCC reads via redb's existing model
-- Compression: zstd for values above a threshold (applied by us, above redb)
+- Compression: zstd for values above a threshold (applied by us, above redb) — *specified, not implemented (future)*
 - Single writer (whole database), MVCC readers — redb's model, unchanged
 
 ### L2 — Schema and document layer
@@ -118,16 +121,21 @@ This is what survives across rewrites of everything below. Design carefully.
 - Hybrid: `rrf([vector_search, text_search])` and `mmr(candidates, lambda)` as first-class operators
 - Composition: every operator takes and returns a plan node. Filters push down into index scans.
 
-### L5 — Extended capabilities (post-v0.1)
+### L5 — Extended capabilities
 
-- Graph: native adjacency storage, BFS/DFS, multi-hop traversal with vector-similarity-as-edge-predicate
-- Spatial: R-tree (via [rstar](https://crates.io/crates/rstar)) and H3 (via [h3o](https://crates.io/crates/h3o))
-- Time-series patterns: append-only tables, delta encoding, Gorilla compression, sliding window aggregations
-- Probabilistic sketches: bloom, cuckoo, HLL, t-digest, MinHash + LSH
-- Reactive: subscriptions on tables and queries via WAL change capture
-- Semantic cache: vector-keyed cache layer for LLM responses
-- Embedding pipeline as column type: declare model, auto-embed + auto-index on insert
-- Approximate top-K with metadata filter pushdown
+Shipped: graph (native adjacency storage, `traverse`), spatial (grid-cell
+index for radius/bbox/nearest), probabilistic sketches (HyperLogLog, Bloom),
+reactive subscriptions on the write path, semantic cache, per-record TTL.
+Future items are marked below.
+
+- Graph: native adjacency storage, BFS/DFS, multi-hop traversal with vector-similarity-as-edge-predicate — *shipped* (`link`/`neighbors`/`traverse`)
+- Spatial: R-tree (via [rstar](https://crates.io/crates/rstar)) and H3 (via [h3o](https://crates.io/crates/h3o)) — *future; shipped instead: fixed-resolution grid cells (`create_geo_index`)*
+- Time-series patterns: append-only tables, delta encoding, Gorilla compression, sliding window aggregations — *future (per-record TTL shipped)*
+- Probabilistic sketches: bloom, cuckoo, HLL, t-digest, MinHash + LSH — *partially shipped (Bloom, HLL); cuckoo/t-digest/MinHash/LSH future*
+- Reactive: subscriptions on tables and queries via WAL change capture — *shipped (in-process change feeds)*
+- Semantic cache: vector-keyed cache layer for LLM responses — *shipped*
+- Embedding pipeline as column type: declare model, auto-embed + auto-index on insert — *future*
+- Approximate top-K with metadata filter pushdown — *partial: `.approx()` serves filtered ANN as over-fetch-then-filter (not a pushdown into the graph walk); true pushdown future*
 
 ### L6 — API surface
 
@@ -143,7 +151,7 @@ This is what survives across rewrites of everything below. Design carefully.
 |---|---|---|
 | Storage substrate | **Wrap** redb | Replaceable. Maybe fjall later when LSM patterns matter (append-heavy logs). |
 | WAL / MVCC | **Inherit** from redb | Don't reinvent. |
-| Compression | **Wrap** zstd via FFI | Physics, not legacy. |
+| Compression | **Wrap** zstd via FFI (specified, not implemented — future) | Physics, not legacy. |
 | JSON parsing | **Build thin** pure-Rust behind a trait (v0.1) | Replaceable component, not the identity. Seam to FFI C++ simdjson on native later if measured hot. |
 | Vector index | **Algorithm from hnswlib-rs, state in redb** | Not wrapped as storage (breaks the invariant). v0.1 may scaffold against hnswlib-rs's own persistence behind the (b) contract; HNSW state moves into redb entries as the real impl. |
 | Vector quantization | **Build** (light) | Binary + scalar + (later) PQ. Algorithm-clear, integration-heavy. |
@@ -169,27 +177,31 @@ Smallest coherent thing that's usable for my own AI work. Target: usable within 
 
 ### In v0.1
 
-- L0 VFS with all three backends
+- L0 VFS: pread/pwrite via redb on desktop/mobile (the OPFS-SAHPool backend for WASM is specified, not implemented — future; see *Deliberately deferred*)
 - L1 storage (redb wrap)
 - L2 schema with primitives + array + struct + JSON + embedding type
 - L3 indexes: primary B+-tree, secondary scalar B+-tree, HNSW vector with binary quantization, BM25 FTS
-- L4 algebra: scan, filter, project, join (hash + nested loop), group, sort, limit, vector_search, text_search, rrf, mmr
-- L5: none
+- L4 algebra: scan, filter, project, join (single-field key-lookup left-outer), group, sort, limit, vector_search, text_search, rrf, mmr
+- L5 (shipped beyond the original cut): graph, grid-cell spatial index, sketches, reactive feeds, semantic cache, TTL
 - L6: sync fluent builder API, native Rust result types
-- WASM: Worker build with OPFS-SAHPool
+- WASM: engine compiles to wasm32; the Worker + OPFS-SAHPool runtime is future
 
 ### Out of v0.1 (back-burner, in roughly this priority order)
 
-1. Graph adjacency + multi-hop traversal
-2. Reactive: in-process subscriptions and materialized views
-3. Semantic cache as a primitive
-4. Embedding-as-column-type with automatic pipeline
-5. Spatial (R-tree + H3)
-6. Probabilistic sketches as first-class index types
-7. Time-series compression
-8. PQ vector quantization, DiskANN path for large indexes
-9. Approximate top-K with metadata pushdown
-10. Arrow `RecordBatch` zero-copy result path for analytical queries
+Status: items 1, 3, and 6 shipped in full; 2, 5, and 8 partially
+(subscriptions / grid-cell spatial index / on-disk PQ); 4, 7, 9, and 10
+remain future.
+
+1. Graph adjacency + multi-hop traversal — shipped
+2. Reactive: in-process subscriptions and materialized views — subscriptions shipped; materialized views future
+3. Semantic cache as a primitive — shipped
+4. Embedding-as-column-type with automatic pipeline — future
+5. Spatial (R-tree + H3) — shipped as grid-cell spatial index; R-tree/H3 future
+6. Probabilistic sketches as first-class index types — shipped (Bloom, HLL)
+7. Time-series compression — future
+8. PQ vector quantization, DiskANN path for large indexes — PQ shipped on-disk; in-memory PQ and DiskANN future
+9. Approximate top-K with metadata pushdown — future (`.approx()` is over-fetch-then-filter)
+10. Arrow `RecordBatch` zero-copy result path for analytical queries — future
 
 ---
 
@@ -230,6 +242,10 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 - **Streaming cursor over ranked result sets**: keyset (cursor) pagination over a collection shipped (`page`/`page_where`, with a `next` cursor, no offset rescans); single-source ranked queries are bounded (index fast paths + streaming top-k) and filter-only queries stream. What remains is a public streaming *cursor* over arbitrary *ranked* result sets (incremental pull) — multi-source RRF fusion still materializes the candidate set.
 - **CJK / positional analysis**: phrase / positional text search shipped (`phrase_search`, positions stored in both the in-memory and on-disk inverted indexes; the analyzer does stop-word removal + S-stemming, shared by index and query). CJK segmentation is still future.
 - **Statistics-driven cost-based planning**: selectivity-driven index selection shipped — the builder probes every serviceable index (each capped) and drives on the smallest candidate set, so the most selective index wins without persisted statistics; `.plan()` gives an identity-hashable [`QueryPlan`] and `PlanCache` keys prepared work by shape. Choosing between viable index paths by an estimated *cost model* over persisted statistics is still future.
+- **Page-level single-snapshot for `page`/`page_where`**: each page walks in 1024-key chunks and each chunk opens its own read transaction, so one page spanning concurrent writes can observe a mixed state (every chunk is consistent; the page as a whole is not one snapshot). Single-snapshot paging is deferred until a workload needs it — queries that must be point-in-time use the builder, which is snapshot-scoped.
+- **`geo_nearest` per-radius snapshots**: the expanding-radius search re-runs `geo_within_radius` (its own read snapshot) per radius step; results are exact per step, but the k-nearest answer as a whole is not one snapshot.
+- **`bulk` panic skips the closing flush**: `Db::bulk` flushes (fsyncs) only on normal return — a panic inside the closure unwinds past the flush; the next durable commit on any thread makes the writes durable. Rebulk or reopen if you must not rely on that.
+- **No `a__b` migration tooling**: loading a dump taken from a pre-wave-4 database whose collection or index names contain `__` (e.g. `a__b`) fails at the index/schema replay with `Error::InvalidName` — the dump format preserves such names, the loader rejects them. Rename the collections (or re-create the indexes after load) on the source database before dumping.
 
 ---
 
@@ -297,6 +313,12 @@ The invariant says *one committed state, one WAL*. But hnswlib-rs and tantivy ea
 
 **Decided: destination is (b).** The invariant is the entire reason this database exists, and the identity gets built from scratch — so we do not wrap hnswlib-rs/tantivy *as storage*. We use their algorithms and store index state as redb entries. The one subtlety that keeps it shippable: **the contract is (b) from day one.** The public API and the guarantee the builder makes promise atomic single-WAL cross-modal semantics immediately, because the data model + API are the part we can't cheaply migrate. v0.1's *implementation* may scaffold with (a) reconcile-on-open behind that contract — but (a) is a hidden, throwaway implementation detail, never a promise. When (b) lands underneath, no API changes.
 
+### Known availability characteristics (audit B9, documented — not fixed)
+
+- **One global index-registry mutex during builds/compaction.** A lazy in-memory build or a compaction runs under the single registry mutex; vector searches on *any* collection block behind it for the build's duration. A per-collection lock split is a deferred future decision (recorded here, not silently dropped).
+- **Registration/compaction holds the write lock while clearing a namespace.** Re-registering or compacting an on-disk index clears its whole namespace in one write transaction; for a large index, redb's single database-wide write lock is held for that clear, so writers db-wide wait. Splitting the clear into bounded batches is the follow-up if re-registration of very large indexes becomes routine.
+- **Graph edge cascade is O(collection edge count) per delete.** Deleting a document removes its edges by paging through the collection's two edge namespaces (relation-first layout). An endpoint-indexed edge layout removes the scan — taken up if delete churn on edge-heavy collections grows (see AUDIT.md, Open).
+
 ---
 
 ## Fluent builder API
@@ -359,8 +381,8 @@ db.table("docs")
 
 ### Memory
 
-- Query-scope arenas (`bumpalo`) on hot paths. Zero allocations during query execution where possible.
-- One global buffer pool, sized per VFS backend.
+- Query-scope arenas (`bumpalo`) on hot paths, zero allocations during query execution where possible — *specified, not implemented (future)*
+- One global buffer pool, sized per VFS backend — *future*
 - Cache-line-aligned hot structures.
 
 ### Async vs sync
@@ -381,9 +403,9 @@ db.table("docs")
 
 ### Observability
 
-- Built-in query trace (`.explain()` and `.profile()`).
-- Structured logging via `tracing`.
-- Counters for cache hits, index probes, plan cache hits.
+- Built-in query trace (`.explain()` and `.profile()`) — `.explain()` shipped; `.profile()` future
+- Structured logging via `tracing` — *specified, not implemented (future)*
+- Counters for cache hits, index probes, plan cache hits — *future*
 - No metrics export to external systems in v0.1.
 
 ### Documentation discipline
@@ -398,11 +420,11 @@ db.table("docs")
 
 These need answers before specific layers can be implemented. Listed in rough order of when they block work.
 
-1. **Tantivy WASM bundle size.** Measured, not estimated. If unacceptable, ship bm25 crate over our own posting lists. Blocks: L3 FTS implementation.
+1. **Tantivy WASM bundle size — decided (moot).** Own BM25 over own posting lists shipped instead; tantivy was never adopted, so the bundle-size question never arose. (Kept for the record: borrowing its tokenizer/automaton ideas remains allowed by the component map.)
 2. **redb's behavior on OPFS-SAHPool.** Does it work out of the box? CoW B+-tree should be fine with single fd + sync I/O in Worker, but verify with a spike. Blocks: WASM build.
-3. **Cross-modal commit semantics — decided** (see *Critical tension*): destination (b) state-in-redb, contract (b) from day one, v0.1 may scaffold (a) behind it. Remaining concrete work: define the redb layout for HNSW nodes and posting lists, and the commit ordering within a single redb write txn.
+3. **Cross-modal commit semantics — decided and implemented** (see *Critical tension*): destination (b) state-in-redb, contract (b) from day one. The former "remaining concrete work" (redb layout for HNSW nodes and posting lists; commit ordering inside one write txn) is done — persisted index maintenance commits inside the document's transaction, and creation runs the `Building{cursor}`→`Complete` state machine (decision log, 2026-08-27 wave-2 row).
 7. **JSON parsing — decided.** One pure-Rust path behind a `JsonParser` trait for all targets in v0.1 (portable SIMD128 on WASM for free, no C++ FFI, smallest bundle). Clean seam to drop in C++ simdjson via FFI on **native only** *if and when* profiling shows JSON parsing is a real hot path. No premature optimization of a replaceable component. (General note: "SIMD everywhere" degrades on WASM — no AVX-512/NEON, only SIMD128.)
-8. **Filtered vector search — decided (semantics), open (implementation).** `.filter()` on `.vector_search()` is a **true predicate**: the result is the top-k rows satisfying the filter, never top-k-then-drop. Default is correct: push the predicate into the graph walk (filtered-ANN), and when selectivity makes ANN recall unreliable, fall back to exhaustive scan over matching rows to keep the guarantee. Explicit `.approx()` opts out for speed. Open part is purely the implementation (filtered-HNSW strategy + the selectivity threshold for the exhaustive fallback), not the contract.
+8. **Filtered vector search — decided (semantics), partially implemented.** `.filter()` on a vector source is a **true predicate**: the result is the top-k rows satisfying the filter, never top-k-then-drop. Shipped: the default filtered path runs exact (a bounded scan over matching rows — correct at any selectivity), and `.approx()` opts into the index (over-fetch then filter, which may return fewer than `limit` on a highly selective filter). Still future: pushing the predicate into the graph walk itself (filtered-HNSW) so the *indexed* path stays a true predicate without the full scan.
 4. **Plan cache identity hashing.** AST nodes need stable `Hash` impls that ignore allocator addresses. Closures cannot appear in the AST (already decided); but constants embed user data — design the hash to treat structural identity, not value identity, where appropriate.
 5. **Schema migration story.** "No backward compat" doesn't mean "no migration." Need a one-shot dump/load utility from format N to format N+1. Design it before declaring v1.0.
 6. **The first real app.** Which one? It shapes everything. Likely candidates: a personal RAG / second-brain system; a code-aware AI assistant memory store; an agent's working memory layer. Pick one, build it in parallel with v0.1.
@@ -410,6 +432,13 @@ These need answers before specific layers can be implemented. Listed in rough or
 ---
 
 ## Decision log (start)
+
+> Dating note: rows dated 2026-05-29 were backdated to the project's start
+> when this log was first written — they record decisions made during the
+> v0.1 build (history preserved, not rewritten). The 2026-08-27/28 rows are
+> the audit-remediation decisions, dated when decided (spec approval
+> 2026-08-27) with landing spread across the five remediation waves ending
+> 2026-08-28.
 
 | Date | Decision | Rationale |
 |---|---|---|

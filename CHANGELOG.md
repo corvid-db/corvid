@@ -7,6 +7,35 @@ format and API may change without backward-compatibility guarantees.
 ## [Unreleased]
 
 ### Changed
+- Release workflow hardening: the GitHub release is created only after every
+  matrix build succeeds, the tag is checked against the workspace version,
+  sha256 checksums are attached alongside the binaries, and `contents:write`
+  is scoped to the release job. CI adds an `aarch64-apple-ios` cross-compile
+  job (making the README's iOS row true), per-job `timeout-minutes`, and a
+  cancel-in-progress concurrency group. (audit C11/D1)
+- `explain()` now reports the plan shape the executor will actually take
+  (`AnnIndex`/`TextIndex`/`IndexedWindow`/`StreamingTopK`/`Scan`), pinned to
+  the planner's own decision logic by a parity test, instead of always
+  printing `scan(...)`. (audit C3)
+- `order_by` now sorts missing AND pairwise-incomparable values (mixed
+  types, containers) last, stable by key — previously incomparable values
+  interleaved by key. Descending reverses value order within the comparable
+  class only; the class order (comparable < incomparable < missing) is
+  fixed. (audit C4)
+- `geo_within_bbox` with `min_lon > max_lon` now treats the box as wrapping
+  the antimeridian and matches BOTH longitude ranges — previously it
+  silently matched nothing. All four bounds are validated at entry
+  (latitude in `[-90, 90]`, longitude in `[-180, 180]`, NaN rejected) with
+  `Error::InvalidArgument`. (audit C2)
+- Argument validation (audit C6): `fuse_rrf(k)` rejects `k <= 0` and NaN;
+  `rerank_mmr(lambda)` rejects λ outside `[0, 1]` and NaN; `Bm25Params`
+  construction rejects `b` outside `[0, 1]` or negative/NaN `k1`. All with
+  `Error::InvalidArgument` — previously garbage scores (infinity, inverted
+  diversity) were accepted silently.
+- A failed `Db::backup`/`Store::backup` now removes its partial destination
+  file (best-effort) before returning the error, so a mid-copy failure never
+  leaves debris that both masquerades as a backup and blocks future attempts
+  via the existing-path refusal. (audit C8)
 - User-supplied collection and field names may no longer contain `__`
   anywhere or a NUL byte: such names are rejected with a new
   `Error::InvalidName` (a leading `__` keeps `Error::ReservedCollection`).
@@ -100,6 +129,19 @@ format and API may change without backward-compatibility guarantees.
   (previously the edges were orphaned and only surfaced as dangling
   references), and `link`/`link_weighted`/`unlink` emit change events.
   (audit B4)
+
+### Fixed
+- Overwriting a document whose vector field is HNSW-indexed with a
+  different-dimension vector previously left the old node live in the graph:
+  ANN results for the old dimension kept returning the key while exact
+  search excluded it. The old node is now tombstoned before the dimension
+  check. (audit A1)
+- `purge_expired` no longer deletes a record that was rewritten after its
+  expiry was collected: each due key is re-read and deleted only if the
+  timestamp still matches, inside one transaction. TTL maintenance is also
+  decided inside the write transaction, so a plain insert can no longer
+  inherit a stale expiry from a racing `set_ttl`/`mark_ttl_collection`.
+  (audit B2)
 
 ## [0.1.1] - 2026-05-29
 
