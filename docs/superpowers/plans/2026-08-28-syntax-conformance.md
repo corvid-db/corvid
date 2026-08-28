@@ -323,6 +323,24 @@ miss), HyperLogLog (new/with_precision/add_bytes/add_hash/estimate bounds,
 precision bounds), BloomFilter (new fp bounds, add/contains, no false
 negatives), PlanCache (get miss/hit, get_or_insert_with, len/is_empty).
 
+### Task 13.5 (folded into Task 15): strict-mode exemptions and Pq rows
+
+Controller rulings at W5 exit (bind Task 15):
+- The seven redb-passthrough variants (`Error::{Transaction, Table,
+  Storage, Commit, SetDurability, Compaction, IncompatibleFormat}`) are
+  verified undrivable from the public API (fault paths unreachable; no
+  hooks per Ruling 3; IncompatibleFormat's version lives in redb META,
+  not the public byte layer). Strict mode ships with an explicit
+  `EXEMPT_FROM_STRICT` list in the radar — each entry with its one-line
+  justification — and the strict test must assert every exempt row is
+  EMPTY (no fake citations) and every non-exempt row is non-empty.
+  Growing the list requires a controller-reviewed commit.
+- The 12 `corvid::pq::Pq*` rows are publicly drivable and MUST gain real
+  conformance tests (drive Pq directly: train/encode/search determinism,
+  codebook sizes, recall sanity on fixed corpus) before strict mode.
+- Minor from Task 13: add the HLL bound-fragility note (std-upgrade could
+  shift DefaultHasher; bounds safe per-toolchain) to the test comment.
+
 ### Task 14: MCP wire conformance
 
 Fill `crates/corvid-mcp/tests/tools.rs` driving the server IN-PROCESS over
