@@ -292,6 +292,32 @@ impl Db {
         Ok(applied)
     }
 
+    /// The `insert_auto` write path (audit C9): the auto-id reservation, the
+    /// row write, the unique-constraint check, and every *persisted* index's
+    /// maintenance all commit in ONE transaction, so a failed insert cannot
+    /// burn an id — the counter increments only with the document it named.
+    /// Returns the freshly generated key.
+    pub(crate) fn write_auto_document(&self, collection: &str, doc: &Value) -> Result<Vec<u8>> {
+        let key = self.store().transaction(|tx| {
+            let id = tx.next_auto_id(collection)?;
+            // Zero-padded decimal: UTF-8 (round-trips through text APIs like
+            // MCP) and lexicographically ordered by id.
+            let key = format!("{id:020}").into_bytes();
+            self.validate_schema(collection, &key, doc)?;
+            self.validate_unique_in_txn(tx, collection, &key, doc)?;
+            tx.put(collection, &key, &doc.encode())?;
+            self.index_on_insert_in_txn(tx, collection, &key, doc)?;
+            self.fts_on_insert_in_txn(tx, collection, &key, doc)?;
+            self.scalar_on_insert_in_txn(tx, collection, &key, doc)?;
+            self.compound_on_insert_in_txn(tx, collection, &key, doc)?;
+            self.geo_on_insert_in_txn(tx, collection, &key, doc)?;
+            self.ttl_clear_in_txn(tx, collection, &key)?;
+            Ok(key)
+        })?;
+        self.finish_applied(collection, &key, Some(doc));
+        Ok(key)
+    }
+
     /// Post-commit work for an applied write: in-memory index maintenance
     /// (rebuildable state only), on-disk dead-fraction compaction checks
     /// (audit B5), and change events. Never affects durability — by this
@@ -327,6 +353,28 @@ impl Db {
     }
 }
 
+/// A u64 record count as usize, saturating (audit C9): on targets where
+/// usize is narrower than u64 a huge maintained count reports `usize::MAX`
+/// rather than truncating to a small, wildly wrong length.
+fn count_as_usize(n: u64) -> usize {
+    n.try_into().unwrap_or(usize::MAX)
+}
+
+/// Validate a user-supplied name (collection or field), audit C7: it must
+/// contain no NUL byte (NUL corrupts length-prefixed key/value encodings)
+/// and no `__` sequence (the engine builds internal namespaces and def keys
+/// from `__`-separated parts, so a user `a__b` could forge or collide with
+/// one — e.g. `x__edges__docs` or an index-def key). A LEADING `__` is
+/// additionally reserved and reported as [`crate::Error::ReservedCollection`]
+/// by [`Collection::ensure_writable`]. Breaking change ahead of 1.0: names
+/// with an interior `__` that pre-1.0 versions accepted are now rejected.
+pub(crate) fn validate_name(name: &str) -> Result<()> {
+    if name.contains('\0') || name.contains("__") {
+        return Err(crate::Error::InvalidName(name.to_owned()));
+    }
+    Ok(())
+}
+
 /// A handle to one collection of documents.
 ///
 /// Cheap to copy — it is just a borrow of the database and the collection
@@ -349,12 +397,13 @@ impl Collection<'_> {
     }
 
     /// Reject writes to engine-reserved collection names (the `__` prefix is
-    /// used for internal namespaces such as graph edges).
+    /// used for internal namespaces such as graph edges) and names that
+    /// could forge them (audit C7: any interior `__`, any NUL byte).
     pub(crate) fn ensure_writable(&self) -> Result<()> {
         if self.name.starts_with("__") {
             return Err(crate::Error::ReservedCollection(self.name.to_owned()));
         }
-        Ok(())
+        validate_name(self.name)
     }
 
     /// Insert or overwrite the document stored at `key`.
@@ -487,7 +536,7 @@ impl Collection<'_> {
 
     /// The number of documents in the collection (O(1), maintained counter).
     pub fn len(&self) -> Result<usize> {
-        Ok(self.db.store().count(self.name)? as usize)
+        Ok(count_as_usize(self.db.store().count(self.name)?))
     }
 
     /// Whether the collection is empty.
@@ -527,14 +576,12 @@ impl Collection<'_> {
 
     /// Insert `doc` under a freshly generated, monotonically increasing key
     /// (big-endian, so keys sort in insertion order). Returns the new key.
+    ///
+    /// Atomic (audit C9): the id is reserved inside the insert transaction,
+    /// so a failed insert (schema/unique violation) does not consume an id.
     pub fn insert_auto(&self, doc: &Value) -> Result<Vec<u8>> {
         self.ensure_writable()?;
-        let id = self.db.store().next_auto_id(self.name)?;
-        // Zero-padded decimal: UTF-8 (round-trips through text APIs like MCP)
-        // and lexicographically ordered by id.
-        let key = format!("{id:020}").into_bytes();
-        self.insert(&key, doc)?;
-        Ok(key)
+        self.db.write_auto_document(self.name, doc)
     }
 
     /// Fetch and decode the document at `key`, if present.
@@ -1054,6 +1101,61 @@ mod tests {
         assert_eq!(c.get(&k0).unwrap(), Some(Value::Int(10)));
     }
 
+    /// Audit C9: a failed `insert_auto` must not burn an id. The reservation
+    /// happens INSIDE the insert transaction, so a schema-violating document
+    /// (rejected up front) and a unique-constraint violation (rejected inside
+    /// the transaction, after the reservation) both roll the counter back and
+    /// the next insert reuses the same id.
+    #[test]
+    fn failed_insert_auto_does_not_burn_an_id() {
+        use crate::schema::{Field, FieldType, Schema};
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("events");
+        let s = Schema::new()
+            .field(Field::new("n", FieldType::Int).required())
+            .field(Field::new("u", FieldType::Text).unique());
+        c.set_schema(&s).unwrap();
+        c.create_scalar_index("u").unwrap();
+
+        fn ev(n: i64, u: &str) -> Value {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("n".to_owned(), Value::Int(n));
+            m.insert("u".to_owned(), Value::Text(u.to_owned()));
+            Value::Map(m)
+        }
+
+        // 1. Schema-violating doc → Err; the id it would have taken is NOT
+        //    consumed.
+        let mut bad = std::collections::BTreeMap::new();
+        bad.insert("n".to_owned(), Value::Text("not an int".into()));
+        assert!(c.insert_auto(&Value::Map(bad)).is_err());
+        assert_eq!(
+            c.insert_auto(&ev(0, "a")).unwrap(),
+            b"00000000000000000000".to_vec(),
+            "id 0 must be reissued"
+        );
+
+        // 2. Unique-constraint failure INSIDE the transaction (after the
+        //    reservation): the counter rolls back with the row.
+        assert!(c.insert_auto(&ev(1, "a")).is_err());
+        assert_eq!(
+            c.insert_auto(&ev(2, "b")).unwrap(),
+            b"00000000000000000001".to_vec(),
+            "id 1 must be reissued after the unique violation"
+        );
+    }
+
+    /// Audit C9: `len()` saturates instead of truncating on platforms where
+    /// usize is narrower than the u64 maintained count (unreachable on
+    /// 64-bit targets; pinned at the conversion).
+    #[test]
+    fn len_count_conversion_saturates() {
+        assert_eq!(count_as_usize(0), 0);
+        assert_eq!(count_as_usize(42), 42);
+        assert_eq!(count_as_usize(u64::MAX), usize::MAX);
+        assert_eq!(count_as_usize(usize::MAX as u64), usize::MAX);
+    }
+
     #[test]
     fn incompatible_format_version_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -1092,6 +1194,108 @@ mod tests {
             db.collection("docs").neighbors(b"a", "r").unwrap(),
             vec![b"b".to_vec()]
         );
+    }
+
+    /// C7 accept/reject table for user-supplied names: anything goes except
+    /// a NUL byte (corrupts length-prefixed encodings) and `__` anywhere
+    /// (could forge the engine's `__`-separated internal namespaces). A
+    /// LEADING `__` stays `ReservedCollection` (see ensure_writable).
+    #[test]
+    fn validate_name_accepts_and_rejects() {
+        // Accepts: single underscore, dashes, dots, spaces, unicode, empty.
+        for ok in ["docs", "a_b", "user-events", "v2.0", "my docs", "文档", ""] {
+            assert!(validate_name(ok).is_ok(), "{ok:?} must be accepted");
+        }
+        // Rejects: interior/trailing/leading `__` and any NUL byte.
+        for bad in ["a__b", "a__", "__x", "doc\0s", "\0"] {
+            assert!(
+                matches!(validate_name(bad), Err(crate::Error::InvalidName(_))),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// Interior `__` and NUL in COLLECTION names are rejected at the write
+    /// boundary (audit C7): such a name could collide with an engine
+    /// namespace (`__edges__`, `__ttl__`, index-def keys).
+    #[test]
+    fn collection_names_with_interior_underscores_or_nul_are_rejected() {
+        let db = Db::open_in_memory().unwrap();
+        for bad in ["a__b", "doc\0s"] {
+            let err = db.collection(bad).insert(b"k", &Value::Int(1));
+            assert!(
+                matches!(err, Err(crate::Error::InvalidName(_))),
+                "{bad:?} must be rejected on write"
+            );
+            assert_eq!(db.collection(bad).get(b"k").unwrap(), None);
+        }
+        // Leading `__` keeps its dedicated error.
+        assert!(matches!(
+            db.collection("__x").insert(b"k", &Value::Int(1)),
+            Err(crate::Error::ReservedCollection(_))
+        ));
+        // A single underscore is fine.
+        assert!(db.collection("a_b").insert(b"k", &Value::Int(1)).is_ok());
+    }
+
+    /// Field names on every index-creation path and on `set_schema` get the
+    /// same validation as collection names (audit C7 + B8: these paths also
+    /// now refuse engine-reserved COLLECTION names via ensure_writable).
+    #[test]
+    fn index_and_schema_field_names_are_validated() {
+        use crate::schema::{Field, FieldType, Schema};
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"k", &Value::Int(1)).unwrap();
+        for bad in ["a__b", "f\0"] {
+            assert!(matches!(
+                c.create_scalar_index(bad),
+                Err(crate::Error::InvalidName(_))
+            ));
+            assert!(matches!(
+                c.create_compound_index(&["x", bad]),
+                Err(crate::Error::InvalidName(_))
+            ));
+            assert!(matches!(
+                c.create_geo_index(bad),
+                Err(crate::Error::InvalidName(_))
+            ));
+            assert!(matches!(
+                c.create_text_index(bad),
+                Err(crate::Error::InvalidName(_))
+            ));
+            assert!(matches!(
+                c.create_text_index_ondisk(bad),
+                Err(crate::Error::InvalidName(_))
+            ));
+            assert!(matches!(
+                c.create_vector_index(bad, crate::Metric::Cosine),
+                Err(crate::Error::InvalidName(_))
+            ));
+            assert!(matches!(
+                c.create_vector_index_ondisk(bad, crate::Metric::Cosine),
+                Err(crate::Error::InvalidName(_))
+            ));
+            let s = Schema::new().field(Field::new(bad, FieldType::Int));
+            assert!(matches!(
+                c.set_schema(&s),
+                Err(crate::Error::InvalidName(_))
+            ));
+        }
+        // A reserved COLLECTION name is refused on these paths too (B8):
+        // creating an index over `__edges__docs` would corrupt the namespace.
+        let r = db.collection("__edges__docs");
+        assert!(matches!(
+            r.create_scalar_index("f"),
+            Err(crate::Error::ReservedCollection(_))
+        ));
+        let s = Schema::new().field(Field::new("f", FieldType::Int));
+        assert!(matches!(
+            r.set_schema(&s),
+            Err(crate::Error::ReservedCollection(_))
+        ));
+        // Valid field names still work.
+        assert!(c.create_scalar_index("a_b").is_ok());
     }
 
     #[test]

@@ -608,6 +608,8 @@ impl Collection<'_> {
     /// maintained incrementally. [`Collection::text_search`] on the same field
     /// then uses it instead of rescanning the corpus.
     pub fn create_text_index(&self, field: &str) -> Result<()> {
+        self.ensure_writable()?;
+        crate::db::validate_name(field)?;
         self.db()
             .register_text_index(self.name(), field, TextKind::InMemory)
     }
@@ -625,6 +627,8 @@ impl Collection<'_> {
     /// crash or error leaves a resumable `Building` def that queries never
     /// serve — the first text query (or a re-creation) resumes it.
     pub fn create_text_index_ondisk(&self, field: &str) -> Result<()> {
+        self.ensure_writable()?;
+        crate::db::validate_name(field)?;
         self.db()
             .register_text_index(self.name(), field, TextKind::OnDisk)?;
         // A def still Building from an interrupted creation resumes from its

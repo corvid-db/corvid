@@ -7,6 +7,29 @@ format and API may change without backward-compatibility guarantees.
 ## [Unreleased]
 
 ### Changed
+- User-supplied collection and field names may no longer contain `__`
+  anywhere or a NUL byte: such names are rejected with a new
+  `Error::InvalidName` (a leading `__` keeps `Error::ReservedCollection`).
+  Interior `__` sequences could forge or collide with engine-internal
+  namespaces and index-definition keys (`__edges__*`, `__ttl__*`, def
+  separators); NUL corrupts length-prefixed encodings. Enforced at every
+  write and index/schema-creation path. Breaking change ahead of 1.0:
+  collections or fields named like `a__b` that earlier versions accepted
+  are now rejected. (audit C7)
+- `Db::dump` now takes the whole dump from ONE read snapshot (catalog walk,
+  records, TTL/edge namespaces, auto-id counters) and streams records
+  without materializing the corpus; `Db::load` streams the dump file
+  through buffered reads instead of `read_to_end`, and rejects
+  engine-reserved collection names on every replay path (index and schema
+  sections join records/compound/TTL/edges). The dump format is unchanged.
+  (audit B8)
+- An `In` filter whose index-candidate union exceeds the shared 100_000-key
+  aggregate cap now falls back to a scan, like `OR` unions always did,
+  instead of materializing an unbounded key set. (audit B10)
+- `insert_auto` reserves the auto id inside the insert transaction: a failed
+  insert (schema or unique violation) no longer burns an id, and
+  `Collection::len` saturates at `usize::MAX` instead of truncating on
+  narrow targets. (audit C9)
 - `Hit` gains `pub approximate: bool` (`true` when the candidate set came from
   an ANN index, `false` on the exact path), and `vector_search` now reranks
   ANN hits with exact metric distances recomputed from the stored documents —

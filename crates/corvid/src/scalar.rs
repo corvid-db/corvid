@@ -955,6 +955,8 @@ impl Collection<'_> {
     /// crash or error leaves a resumable `Building` def that queries never
     /// serve — the first filtered query (or a re-creation) resumes it.
     pub fn create_scalar_index(&self, field: &str) -> Result<()> {
+        self.ensure_writable()?;
+        crate::db::validate_name(field)?;
         self.db().register_scalar_index(self.name(), field)?;
         // A def still Building from an interrupted creation resumes from its
         // saved cursor; a Complete (or fresh) def backfills from the start.
@@ -979,6 +981,10 @@ impl Collection<'_> {
     /// crash or error leaves a resumable `Building` def that queries never
     /// serve — the first compound query (or a re-creation) resumes it.
     pub fn create_compound_index(&self, fields: &[&str]) -> Result<()> {
+        self.ensure_writable()?;
+        for f in fields {
+            crate::db::validate_name(f)?;
+        }
         let fields: Vec<String> = fields.iter().map(|f| (*f).to_owned()).collect();
         self.db().register_compound_index(self.name(), &fields)?;
         // A def still Building from an interrupted creation resumes from its

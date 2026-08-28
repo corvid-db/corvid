@@ -905,6 +905,8 @@ impl Collection<'_> {
     /// then maintained incrementally. [`Collection::vector_search`] on the same
     /// `field`/`metric` uses it; other fields/metrics stay exact.
     pub fn create_vector_index(&self, field: &str, metric: Metric) -> Result<()> {
+        self.ensure_writable()?;
+        crate::db::validate_name(field)?;
         self.db().register_vector_index(
             self.name(),
             field,
@@ -923,6 +925,8 @@ impl Collection<'_> {
         metric: Metric,
         quant: Quantization,
     ) -> Result<()> {
+        self.ensure_writable()?;
+        crate::db::validate_name(field)?;
         self.db()
             .register_vector_index(self.name(), field, metric, quant, IndexKind::InMemory)
     }
@@ -962,6 +966,8 @@ impl Collection<'_> {
         // the same namespace). Lock order is index_resume → indexes()
         // (register/resume take the registry briefly inside); the inverse
         // never occurs.
+        self.ensure_writable()?;
+        crate::db::validate_name(field)?;
         let _guard = self.db().index_resume().lock().expect("index resume lock");
         self.db()
             .register_vector_index(self.name(), field, metric, quant, IndexKind::OnDisk)?;
@@ -997,6 +1003,8 @@ impl Collection<'_> {
         m: usize,
         k: usize,
     ) -> Result<()> {
+        self.ensure_writable()?;
+        crate::db::validate_name(field)?;
         let store = self.db().store();
         // Gather a training sample (bounded) from existing vectors.
         const SAMPLE_CAP: usize = 50_000;

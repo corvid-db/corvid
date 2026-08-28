@@ -640,8 +640,11 @@ impl QueryBuilder<'_> {
                 db.scalar_candidates(coll, path, &cons, CAP, reader)
             }
             Predicate::In { path, values } if db.has_scalar_index(coll, path) => {
-                let mut seen = std::collections::HashSet::new();
-                let mut out = Vec::new();
+                // Audit B10: every value's window is individually capped,
+                // but the UNION must honor the same aggregate cap as the
+                // OR path — an unselective In list falls back to a scan
+                // instead of materializing an unbounded key set.
+                let mut union = KeyUnion::with_cap(CAP);
                 for v in values {
                     let cons = [crate::scalar::Constraint {
                         op: CmpOp::Eq,
@@ -649,16 +652,14 @@ impl QueryBuilder<'_> {
                     }];
                     match db.scalar_candidates(coll, path, &cons, CAP, reader)? {
                         Some(ks) => {
-                            for k in ks {
-                                if seen.insert(k.clone()) {
-                                    out.push(k);
-                                }
+                            if !union.push(ks) {
+                                return Ok(None);
                             }
                         }
                         None => return Ok(None),
                     }
                 }
-                Ok(Some(out))
+                Ok(Some(union.finish()))
             }
             Predicate::StartsWith { path, prefix } if db.has_scalar_index(coll, path) => {
                 db.scalar_prefix_candidates(coll, path, prefix, CAP, reader)
@@ -690,24 +691,18 @@ impl QueryBuilder<'_> {
             if matches!(pred, Predicate::Or(..)) {
                 let mut disjuncts = Vec::new();
                 flatten_or(pred, &mut disjuncts);
-                let mut seen = std::collections::HashSet::new();
-                let mut out = Vec::new();
+                let mut union = KeyUnion::with_cap(CAP);
                 for d in disjuncts {
                     match self.predicate_candidates(d, reader)? {
                         Some(ks) => {
-                            for k in ks {
-                                if seen.insert(k.clone()) {
-                                    out.push(k);
-                                    if out.len() > CAP {
-                                        return Ok(None);
-                                    }
-                                }
+                            if !union.push(ks) {
+                                return Ok(None);
                             }
                         }
                         None => return Ok(None),
                     }
                 }
-                return Ok(Some(out));
+                return Ok(Some(union.finish()));
             }
         }
         Ok(None)
@@ -1147,6 +1142,48 @@ fn keep_smaller(best: &mut Option<Vec<Vec<u8>>>, candidate: Option<Vec<Vec<u8>>>
     }
 }
 
+/// Union-with-dedup of candidate key sets under the aggregate cap shared by
+/// the `In` and `OR` index fast paths (audit B10): each *individual* index
+/// window is already capped, but the union across an `In` list's values (or
+/// an `OR`'s disjuncts) is not — without this accumulator it could grow with
+/// the value count and materialize an unbounded set. [`KeyUnion::push`]
+/// reports `false` once the union exceeds the cap, so the caller bails to
+/// `Ok(None)` (a full scan) exactly like an unselective single window.
+struct KeyUnion {
+    seen: std::collections::HashSet<Vec<u8>>,
+    out: Vec<Vec<u8>>,
+    cap: usize,
+}
+
+impl KeyUnion {
+    fn with_cap(cap: usize) -> Self {
+        KeyUnion {
+            seen: std::collections::HashSet::new(),
+            out: Vec::new(),
+            cap,
+        }
+    }
+
+    /// Merge `keys` into the union; `false` once the deduped union exceeds
+    /// the cap (the caller must discard the set and fall back to a scan).
+    fn push(&mut self, keys: impl IntoIterator<Item = Vec<u8>>) -> bool {
+        for k in keys {
+            if self.seen.insert(k.clone()) {
+                self.out.push(k);
+                if self.out.len() > self.cap {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// The deduped union (only meaningful when every `push` returned `true`).
+    fn finish(self) -> Vec<Vec<u8>> {
+        self.out
+    }
+}
+
 /// Flatten a (possibly nested) `OR` predicate tree into its disjuncts.
 fn flatten_or<'a>(pred: &'a Predicate, out: &mut Vec<&'a Predicate>) {
     match pred {
@@ -1291,6 +1328,40 @@ mod tests {
     use crate::{Db, field};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    /// The In/OR union accumulator caps the aggregate (audit B10): pushes
+    /// dedupe, a union at exactly the cap stays usable, one past the cap
+    /// reports `false` so the caller bails to a scan. Pinned here because
+    /// driving the real 100_000-key cap needs a >100k-document fixture whose
+    /// predicate verification is quadratic in the In list; the wiring into
+    /// `predicate_candidates`/`or_candidate_keys` is the same `push` +
+    /// bail-on-`false` pattern in both arms.
+    #[test]
+    fn key_union_dedupes_and_caps_the_aggregate() {
+        let mut u = KeyUnion::with_cap(3);
+        assert!(u.push(vec![b"a".to_vec(), b"b".to_vec()]));
+        // Duplicates across pushes do not count twice.
+        assert!(u.push(vec![b"a".to_vec(), b"c".to_vec()]));
+        assert_eq!(
+            u.finish(),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+
+        // Exactly at the cap: still usable.
+        let mut u = KeyUnion::with_cap(2);
+        assert!(u.push(vec![b"x".to_vec()]));
+        assert!(u.push(vec![b"y".to_vec()]));
+        assert_eq!(u.finish().len(), 2);
+
+        // One past the cap: over.
+        let mut u = KeyUnion::with_cap(2);
+        assert!(u.push(vec![b"x".to_vec(), b"y".to_vec()]));
+        assert!(!u.push(vec![b"z".to_vec()]), "cap+1 must bail");
+
+        // A single oversized push bails too.
+        let mut u = KeyUnion::with_cap(1);
+        assert!(!u.push(vec![b"x".to_vec(), b"y".to_vec()]));
+    }
 
     fn doc(category: &str, body: &str, embedding: Vec<f32>) -> Value {
         let mut m = BTreeMap::new();

@@ -276,13 +276,22 @@ impl Db {
 
     /// Every edge in the database as
     /// `(collection, relation, from, to, weight)`, for dump/migrate. Edges of
-    /// reserved collections are engine-internal and excluded.
-    pub(crate) fn all_edges(&self) -> Result<Vec<EdgeRecord>> {
-        let collections = self.collections()?;
+    /// reserved collections are engine-internal and excluded. Reads the edge
+    /// namespaces (and the catalog walk) through `reader`, so a dump
+    /// enumerates them on the same snapshot as its records (audit B8).
+    pub(crate) fn all_edges_in(
+        &self,
+        reader: &dyn crate::store::SnapshotReader,
+    ) -> Result<Vec<EdgeRecord>> {
+        let collections = reader
+            .collections()?
+            .into_iter()
+            .filter(|n| !n.starts_with("__"))
+            .collect::<Vec<_>>();
         let mut out = Vec::new();
         for coll in collections {
             let c = self.collection(&coll);
-            for (key, value) in self.store().scan_prefix(&c.edges_name(), &[])? {
+            for (key, value) in reader.scan_prefix(&c.edges_name(), &[])? {
                 if let Some((rel, from, to)) = decode_edge_key(&key) {
                     out.push(EdgeRecord {
                         collection: coll.clone(),

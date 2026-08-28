@@ -387,6 +387,10 @@ impl Collection<'_> {
     /// validated against it; existing documents are left untouched (validation
     /// applies on write, not retroactively). Persists across reopen.
     pub fn set_schema(&self, schema: &Schema) -> Result<()> {
+        self.ensure_writable()?;
+        for f in schema.fields() {
+            crate::db::validate_name(&f.name)?;
+        }
         self.db().register_schema(self.name(), schema)
     }
 }

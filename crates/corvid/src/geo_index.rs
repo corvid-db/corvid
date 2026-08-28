@@ -439,6 +439,8 @@ impl Collection<'_> {
     /// crash or error leaves a resumable `Building` def that queries never
     /// serve — the first geo query (or a re-creation) resumes it.
     pub fn create_geo_index(&self, field: &str) -> Result<()> {
+        self.ensure_writable()?;
+        crate::db::validate_name(field)?;
         self.db().register_geo_index(self.name(), field)?;
         // A def still Building from an interrupted creation resumes from its
         // saved cursor; a Complete (or fresh) def backfills from the start.

@@ -176,7 +176,9 @@ impl Store {
 
     /// Atomically reserve the next monotonic auto-key id for `collection`.
     /// Big-endian encoding of the returned id keeps auto-keyed records in
-    /// insertion order.
+    /// insertion order. Note this commits its own transaction: paths that
+    /// must not burn an id on failure (e.g. `insert_auto`) reserve in-txn
+    /// via [`WriteBatch::next_auto_id`] instead.
     pub fn next_auto_id(&self, collection: &str) -> Result<u64> {
         let txn = self.db.begin_write()?;
         let id = {
@@ -188,25 +190,6 @@ impl Store {
         };
         txn.commit()?;
         Ok(id)
-    }
-
-    /// Every collection's auto-id counter as `(collection, next_id)`, for
-    /// dump/migrate. Without this, a dump→load cycle would re-issue used ids.
-    pub(crate) fn auto_id_snapshot(&self) -> Result<Vec<(String, u64)>> {
-        let txn = self.db.begin_read()?;
-        let meta = match txn.open_table(META) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
-        };
-        let mut out = Vec::new();
-        for entry in meta.iter()? {
-            let (k, v) = entry?;
-            if let Some(coll) = k.value().strip_prefix("auto:") {
-                out.push((coll.to_owned(), v.value()));
-            }
-        }
-        Ok(out)
     }
 
     /// Restore auto-id counters from a snapshot. Each counter becomes the max
@@ -621,6 +604,20 @@ impl WriteBatch<'_> {
         let catalog = self.txn.open_table(CATALOG)?;
         Ok(catalog.get(collection)?.map(|g| g.value()))
     }
+
+    /// Atomically reserve the next monotonic auto-key id for `collection`
+    /// inside THIS transaction (audit C9): the read-increment-write becomes
+    /// visible only when the surrounding transaction commits, so an aborted
+    /// insert (schema or unique failure after the reservation) rolls the
+    /// counter back instead of burning the id. In-transaction twin of
+    /// [`Store::next_auto_id`].
+    pub fn next_auto_id(&mut self, collection: &str) -> Result<u64> {
+        let mut meta = self.txn.open_table(META)?;
+        let key = format!("auto:{collection}");
+        let id = meta.get(key.as_str())?.map(|g| g.value()).unwrap_or(0);
+        meta.insert(key.as_str(), id + 1)?;
+        Ok(id)
+    }
 }
 
 /// A set of reads executed against one consistent snapshot.
@@ -631,6 +628,45 @@ pub struct ReadBatch<'txn> {
 }
 
 impl ReadBatch<'_> {
+    /// Every collection name known to the catalog, in name order, from this
+    /// batch's snapshot — so a dump's catalog walk shares its point in time
+    /// with the record streams that follow (audit B8). Mirrors
+    /// [`Store::collections`].
+    pub fn collections(&self) -> Result<Vec<String>> {
+        let catalog = match self.txn.open_table(CATALOG) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in catalog.iter()? {
+            let (name, _) = entry?;
+            out.push(name.value().to_owned());
+        }
+        Ok(out)
+    }
+
+    /// Every collection's auto-id counter as `(collection, next_id)`, from
+    /// this batch's snapshot, for dump/migrate (audit B8: reading counters
+    /// in the SAME snapshot as the records keeps a dump from capturing a
+    /// counter ahead of the documents it named). Without this, a dump→load
+    /// cycle would re-issue used ids.
+    pub fn auto_ids(&self) -> Result<Vec<(String, u64)>> {
+        let meta = match self.txn.open_table(META) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in meta.iter()? {
+            let (k, v) = entry?;
+            if let Some(coll) = k.value().strip_prefix("auto:") {
+                out.push((coll.to_owned(), v.value()));
+            }
+        }
+        Ok(out)
+    }
+
     /// Fetch the value at `key` within `collection`, if present.
     pub fn get(&self, collection: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let Some(id) = self.lookup_id(collection)? else {
@@ -763,6 +799,10 @@ pub(crate) trait SnapshotReader {
     fn get(&self, collection: &str, key: &[u8]) -> Result<Option<Vec<u8>>>;
     /// Return all `(key, value)` pairs in `collection`, in key order.
     fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// Every collection name in the catalog, in name order. Whole-database
+    /// consumers (dump) walk the catalog on the same snapshot as the records
+    /// (audit B8).
+    fn collections(&self) -> Result<Vec<String>>;
     /// Return up to `limit` pairs whose key is `>= start`, in key order.
     /// Paged window scans over the index namespaces run on this (audit B3).
     fn scan_from(
@@ -793,6 +833,10 @@ impl SnapshotReader for Store {
 
     fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         Store::scan(self, collection)
+    }
+
+    fn collections(&self) -> Result<Vec<String>> {
+        Store::collections(self)
     }
 
     fn scan_from(
@@ -826,6 +870,10 @@ impl SnapshotReader for ReadBatch<'_> {
 
     fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         ReadBatch::scan(self, collection)
+    }
+
+    fn collections(&self) -> Result<Vec<String>> {
+        ReadBatch::collections(self)
     }
 
     fn scan_from(

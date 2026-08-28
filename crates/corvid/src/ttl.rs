@@ -24,7 +24,7 @@ const TAG_IDX: u8 = 0x01;
 /// correctness (audit B2): plain writes decide expiry maintenance inside
 /// their transaction by probing the `__ttl__<collection>` namespace itself,
 /// so a marker that lags a concurrent commit cannot skip a needed clear.
-/// The marker remains a session cache (e.g. for [`Db::ttl_specs`]); the
+/// The marker remains a session cache (e.g. for [`Db::ttl_specs_in`]); the
 /// persistent form is always the namespace, rebuilt on open.
 #[derive(Default)]
 pub(crate) struct TtlState {
@@ -137,7 +137,12 @@ impl Db {
     }
 
     /// All per-record expiries as `(collection, doc_key, expires_at)` (dump).
-    pub(crate) fn ttl_specs(&self) -> Result<Vec<(String, Vec<u8>, i64)>> {
+    /// Reads the TTL namespaces through `reader`, so a dump enumerates them
+    /// on the same snapshot as its records (audit B8).
+    pub(crate) fn ttl_specs_in(
+        &self,
+        reader: &dyn crate::store::SnapshotReader,
+    ) -> Result<Vec<(String, Vec<u8>, i64)>> {
         let collections: Vec<String> = {
             let state = self.ttl().lock().expect("ttl lock");
             state.collections.iter().cloned().collect()
@@ -146,7 +151,7 @@ impl Db {
         for coll in collections {
             let ns = namespace(&coll);
             // Forward entries: [0x00] ‖ doc_key -> enc_ts.
-            for (key, value) in self.store().scan_prefix(&ns, &[TAG_FWD])? {
+            for (key, value) in reader.scan_prefix(&ns, &[TAG_FWD])? {
                 if key.len() > 1 && value.len() == 8 {
                     out.push((coll.clone(), key[1..].to_vec(), dec_ts(&value)));
                 }

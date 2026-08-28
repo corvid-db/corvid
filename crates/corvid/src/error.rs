@@ -56,6 +56,14 @@ pub enum Error {
     #[error("reserved collection name: {0}")]
     ReservedCollection(String),
 
+    /// A user-supplied name (collection, field) contained a NUL byte or a
+    /// `__` sequence (audit C7): NUL corrupts length-prefixed key encodings,
+    /// and `__` could forge or collide with the engine's internal
+    /// namespaces and index-def keys. Leading `__` is reported as
+    /// [`Error::ReservedCollection`] instead.
+    #[error("invalid name (NUL byte or `__` is not allowed): {0}")]
+    InvalidName(String),
+
     /// The on-disk file was written by an incompatible format version. Per
     /// project policy there is no migration: the old file must be reimported.
     #[error("incompatible format: file is v{found}, engine expects v{expected}")]
