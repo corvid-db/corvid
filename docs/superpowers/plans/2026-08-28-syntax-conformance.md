@@ -274,7 +274,13 @@ constraints (violation error variant, NaN==NaN rule, Vector equality,
 null uniqueness); name validation (interior `__`, NUL, reserved, empty);
 index-vs-scan result equivalence for every family; index observably used
 via plan_shape/explain; behavior when index exists on field then docs
-mutate (insert/update/delete keep results correct).
+mutate (insert/update/delete keep results correct) — INCLUDING
+compound-index maintenance under mutation: update/patch/CAS that removes
+or adds a TRAILING indexed field, then a prefix-only query (scan path
+must reflect the removal — stale entries must never surface; W2 ruling).
+Also re-verify the fix-round hardening from W2: the full-coverage
+soundness gate on compound windows (every indexed field constrained, or
+decline to scan) must hold — pin it once from the public API.
 
 ### Task 12: TTL + events conformance
 
@@ -320,10 +326,20 @@ payload behavior. Assert result JSON shapes exactly.
 ### Task 15: SYNTAX.md, strict radar, changelog, final sweep
 
 Generate `docs/SYNTAX.md` from the manifest (statement-class sections,
-every construct with its covering test names); DELETE `STRICT_COVERING`
-(radar always requires non-empty covering_tests) and make the manifest
-green under strict mode; CHANGELOG entry; verify no manifest row cites a
-test that does not exist; full gates + coverage report attached to report.
+every construct with its covering test names); SYNTAX.md must state: the
+pre-ranking-predicate semantics (filtered builder text queries
+re-normalize BM25 stats over the filtered candidate set);
+geo_within_bbox's portable key order; the NaN-duality note (predicate
+comparisons: NaN matches nothing; storage equality (CAS/unique): NaN==NaN);
+an explicit equality-is-per-construct section (CAS semantic NaN==NaN vs
+predicate NaN-never-equal vs join decimal-string Int≡Text vs tagged group
+keys). DELETE `STRICT_COVERING` (radar always requires non-empty
+covering_tests) and make the manifest green under strict mode; CHANGELOG
+entries — including the W2 compound-window soundness fix (omitted-
+documents bug + plan changes IndexedWindow→Scan for prefix-only) and a
+half-sentence on CAS now surfacing decode errors on corrupt rows; verify
+no manifest row cites a test that does not exist; full gates + coverage
+report attached to report.
 
 ## Conventions (added at W1 exit; bind all later tasks)
 
