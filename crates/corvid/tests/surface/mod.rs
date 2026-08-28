@@ -467,7 +467,8 @@ static MANIFEST: &[Row] = &[
         "corvid::Collection::compare_and_set",
         "Mutations",
         &[
-            "mutations_compare_and_set_swap_noop_delete_and_bitwise_float_equality",
+            "mutations_compare_and_set_swap_noop_delete_and_semantic_float_equality",
+            "mutations_compare_and_set_uses_semantic_value_equality",
             "mutations_compare_and_set_maintains_scalar_index",
         ],
     ),

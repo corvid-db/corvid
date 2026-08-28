@@ -191,7 +191,9 @@ pub(crate) fn new_state() -> std::sync::Mutex<SchemaState> {
 /// Value equality for unique constraints: like `PartialEq`, except NaN
 /// equals NaN (uniqueness is about identity of stored values, not IEEE
 /// ordering) and containers compare element-wise under the same rule.
-fn unique_value_eq(a: &Value, b: &Value) -> bool {
+/// Also the equality [`crate::Collection::compare_and_set`] compares
+/// expectations with — one engine-wide notion of "same stored value".
+pub(crate) fn unique_value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Float(x), Value::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
         (Value::Array(xs), Value::Array(ys)) => {

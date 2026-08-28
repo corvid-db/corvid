@@ -420,8 +420,9 @@ impl Collection<'_> {
         Ok(())
     }
 
-    /// Read-modify-write `key`: `f` receives the current document (if any) and
-    /// returns the new document (`Some`) or a deletion (`None`). Indexes stay
+    /// Read-modify-write `key`: `f` receives the current document (`None`
+    /// when `key` is absent — a missing document is not an error) and returns
+    /// the new document (`Some`) or a deletion (`None`). Indexes stay
     /// consistent. This is a convenience over get-then-insert and is **not**
     /// linearizable against concurrent writers to the same key — use
     /// [`Collection::compare_and_set`] when that matters.
@@ -459,7 +460,10 @@ impl Collection<'_> {
     /// value equals `expected` (`expected = None` means "must be absent").
     /// Returns whether the write was applied. The compare, the row write, the
     /// unique-constraint check, and every persisted index's maintenance all
-    /// happen in one transaction.
+    /// happen in one transaction. Equality is the engine's semantic value
+    /// equality (the same rule unique constraints use,
+    /// `schema::unique_value_eq`): `NaN` equals `NaN` regardless of payload,
+    /// `-0.0` equals `0.0`, and containers compare element-wise.
     pub fn compare_and_set(
         &self,
         key: &[u8],
@@ -470,10 +474,17 @@ impl Collection<'_> {
         if let Some(doc) = &new {
             self.db.validate_schema(self.name, key, doc)?;
         }
-        let expected_bytes = expected.map(Value::encode);
         let applied = self.db.store().transaction(|tx| {
-            let current = tx.get(self.name, key)?;
-            if current != expected_bytes {
+            let current = match tx.get(self.name, key)? {
+                Some(bytes) => Some(Value::decode(&bytes)?),
+                None => None,
+            };
+            let matches = match (&current, expected) {
+                (None, None) => true,
+                (Some(_), None) | (None, Some(_)) => false,
+                (Some(cur), Some(exp)) => crate::schema::unique_value_eq(cur, exp),
+            };
+            if !matches {
                 return Ok(false);
             }
             match &new {
@@ -551,7 +562,10 @@ impl Collection<'_> {
     /// than repeated [`Collection::insert`] (one commit instead of N). The
     /// whole batch is atomic: schema and unique checks see earlier items in
     /// the same batch, and every persisted index commits with the rows.
-    /// In-memory index updates and change events follow a successful commit.
+    /// Duplicate keys inside one batch follow [`Collection::insert`]'s
+    /// overwrite contract (last write wins); whole-batch rollback applies to
+    /// schema and unique violations. In-memory index updates and change
+    /// events follow a successful commit.
     pub fn insert_batch(&self, items: &[(&[u8], &Value)]) -> Result<()> {
         self.ensure_writable()?;
         // Fail fast on pure schema violations before opening the transaction.

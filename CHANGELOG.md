@@ -7,6 +7,12 @@ format and API may change without backward-compatibility guarantees.
 ## [Unreleased]
 
 ### Changed
+- `Collection::compare_and_set` now compares the expected value with the
+  engine's semantic value equality (the same rule unique constraints use:
+  `NaN` equals `NaN` regardless of payload, `-0.0` equals `0.0`, containers
+  element-wise) instead of encoded-byte identity — previously a `-0.0`
+  expectation never matched a stored `0.0` (and vice versa), and differently
+  payloaded NaNs never matched. (Task 3 review ruling F4)
 - New public API: `QueryBuilder::plan_shape()` / `PlanShape` — the plan
   shape a query will take (what `explain()` prints); advisory.
 - Release workflow hardening: the GitHub release is created only after every

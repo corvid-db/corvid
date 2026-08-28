@@ -13,8 +13,8 @@
 //! transaction, so a failed insert does not burn an id; `update` passes
 //! `Option<Value>` (missing docs are not an error); `patch` merges
 //! TOP-LEVEL map fields only (nested maps and arrays are replaced
-//! wholesale); `compare_and_set` compares encoded bytes, so `NaN` equals
-//! itself and `-0.0` is distinct from `0.0`.
+//! wholesale); `compare_and_set` compares values semantically (NaN equals
+//! NaN, `-0.0` equals `0.0`, containers recursively).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -35,6 +35,18 @@ fn map(pairs: &[(&str, Value)]) -> Value {
         m.insert((*k).to_owned(), v.clone());
     }
     Value::Map(m)
+}
+
+/// Read-modify-write transform shared by the update and events tests:
+/// bumps a seeded map document's `n` field to 9, asserting the seed was
+/// actually passed in.
+fn bump_n_to_9(cur: Option<Value>) -> Option<Value> {
+    let mut m = match cur {
+        Some(Value::Map(m)) => m,
+        _ => unreachable!("the caller seeds a map document first"),
+    };
+    m.insert("n".to_owned(), Value::Int(9));
+    Some(Value::Map(m))
 }
 
 #[test]
@@ -133,11 +145,11 @@ fn mutations_insert_roundtrips_every_value_variant() {
     }
     assert_eq!(c.len().unwrap(), cases.len());
 
-    // NaN is its own derived-PartialEq exception: compare bit patterns.
+    // NaN is its own derived-PartialEq exception: pin the exact bits.
     c.insert(b"float-nan", &Value::Float(f64::NAN)).unwrap();
     assert!(matches!(
         c.get(b"float-nan").unwrap(),
-        Some(Value::Float(f)) if f.is_nan()
+        Some(Value::Float(f)) if f.to_bits() == f64::NAN.to_bits()
     ));
     // -0.0 == 0.0 under PartialEq, so pin the exact bits instead.
     c.insert(b"float-neg-zero", &Value::Float(-0.0)).unwrap();
@@ -178,25 +190,24 @@ fn mutations_insert_overwrites_and_accepts_empty_key_and_empty_map() {
 #[test]
 fn mutations_insert_rejects_reserved_and_invalid_collection_names() {
     let db = Db::open_in_memory().unwrap();
-    for (name, variant) in [
-        ("__edges__docs", "reserved"),
-        ("a__b", "interior __"),
-        ("doc\0s", "NUL byte"),
-    ] {
+
+    // A leading `__` is the engine-reserved prefix.
+    let c = db.collection("__edges__docs");
+    let err = c.insert(b"k", &doc("x", 1)).unwrap_err();
+    assert!(matches!(err, Error::ReservedCollection(_)), "got {err:?}");
+    assert_eq!(c.get(b"k").unwrap(), None, "nothing stored");
+
+    // Interior `__` and a NUL byte could forge or corrupt engine namespaces.
+    for name in ["a__b", "doc\0s"] {
         let c = db.collection(name);
-        let err = c.insert(b"k", &doc("x", 1));
-        match variant {
-            "reserved" => assert!(
-                matches!(err, Err(Error::ReservedCollection(_))),
-                "{name:?} must be ReservedCollection, got {err:?}"
-            ),
-            _ => assert!(
-                matches!(err, Err(Error::InvalidName(_))),
-                "{name:?} must be InvalidName, got {err:?}"
-            ),
-        }
+        let err = c.insert(b"k", &doc("x", 1)).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidName(_)),
+            "{name:?}: got {err:?}"
+        );
         assert_eq!(c.get(b"k").unwrap(), None, "nothing stored under {name:?}");
     }
+
     // A single underscore stays legal.
     db.collection("a_b").insert(b"k", &doc("x", 1)).unwrap();
 }
@@ -473,15 +484,7 @@ fn mutations_update_maintains_scalar_index() {
         ks
     };
 
-    c.update(b"a", |cur| {
-        let mut m = match cur.unwrap() {
-            Value::Map(m) => m,
-            _ => unreachable!("seeded a map"),
-        };
-        m.insert("n".to_owned(), Value::Int(9));
-        Some(Value::Map(m))
-    })
-    .unwrap();
+    c.update(b"a", bump_n_to_9).unwrap();
     assert_eq!(
         keys_eq(1),
         Vec::<Vec<u8>>::new(),
@@ -613,10 +616,10 @@ fn mutations_patch_merges_top_level_and_replaces_non_maps() {
 
 /// Match applies the swap and returns true; mismatch returns false with the
 /// stored value untouched; `expected = None` means insert-if-absent; `new =
-/// None` is a conditional delete. Comparison is byte-level on the encoded
-/// value, so `NaN` matches itself and `-0.0` does NOT match `0.0`.
+/// None` is a conditional delete. Comparison uses the engine's semantic
+/// value equality (NaN equals NaN across payloads, `-0.0` equals `0.0`).
 #[test]
-fn mutations_compare_and_set_swap_noop_delete_and_bitwise_float_equality() {
+fn mutations_compare_and_set_swap_noop_delete_and_semantic_float_equality() {
     let db = Db::open_in_memory().unwrap();
     let c = db.collection("docs");
 
@@ -651,30 +654,110 @@ fn mutations_compare_and_set_swap_noop_delete_and_bitwise_float_equality() {
     assert!(c.compare_and_set(b"k", Some(&doc("a", 2)), None).unwrap());
     assert_eq!(c.get(b"k").unwrap(), None);
 
-    // Byte-level equality corners. Stored NaN: an expected NaN matches.
-    c.insert(b"nan", &Value::Float(f64::NAN)).unwrap();
+    // Semantic equality: NaN matches NaN even with different bit payloads…
+    let nan_a = f64::from_bits(0x7ff8_0000_0000_0000); // "quiet" NaN
+    let nan_b = f64::from_bits(0x7ff8_0000_0000_0001); // NaN with payload 1
+    assert_ne!(nan_a.to_bits(), nan_b.to_bits());
+    c.insert(b"nan", &Value::Float(nan_a)).unwrap();
     assert!(
-        c.compare_and_set(b"nan", Some(&Value::Float(f64::NAN)), Some(Value::Int(1)))
+        c.compare_and_set(b"nan", Some(&Value::Float(nan_b)), Some(Value::Int(1)))
             .unwrap()
     );
     assert_eq!(c.get(b"nan").unwrap(), Some(Value::Int(1)));
 
-    // Stored -0.0: expected +0.0 does NOT match (distinct encodings)…
+    // …and -0.0 matches +0.0 (zero identity, not encoding identity).
     c.insert(b"negz", &Value::Float(-0.0)).unwrap();
     assert!(
-        !c.compare_and_set(b"negz", Some(&Value::Float(0.0)), Some(Value::Int(2)))
-            .unwrap()
-    );
-    assert!(matches!(
-        c.get(b"negz").unwrap(),
-        Some(Value::Float(f)) if f.to_bits() == (-0.0f64).to_bits()
-    ));
-    // …while the exact -0.0 expectation does.
-    assert!(
-        c.compare_and_set(b"negz", Some(&Value::Float(-0.0)), Some(Value::Int(2)))
+        c.compare_and_set(b"negz", Some(&Value::Float(0.0)), Some(Value::Int(2)))
             .unwrap()
     );
     assert_eq!(c.get(b"negz").unwrap(), Some(Value::Int(2)));
+}
+
+/// CAS compares with the engine's semantic value equality — the same rule
+/// unique constraints use (`NaN == NaN`, `-0.0 == 0.0`, containers
+/// recursive) — not encoded-byte identity, so differently-encoded
+/// equal-value expectations still swap.
+#[test]
+fn mutations_compare_and_set_uses_semantic_value_equality() {
+    let db = Db::open_in_memory().unwrap();
+    let c = db.collection("docs");
+
+    // -0.0 stored, +0.0 expected: equal values, different bytes → swap.
+    c.insert(b"z", &Value::Float(0.0)).unwrap();
+    assert!(
+        c.compare_and_set(b"z", Some(&Value::Float(-0.0)), Some(Value::Int(1)))
+            .unwrap()
+    );
+    assert_eq!(c.get(b"z").unwrap(), Some(Value::Int(1)));
+
+    // And the mirror direction: -0.0 stored, +0.0 expected.
+    c.insert(b"z2", &Value::Float(-0.0)).unwrap();
+    assert!(
+        c.compare_and_set(b"z2", Some(&Value::Float(0.0)), Some(Value::Int(2)))
+            .unwrap()
+    );
+    assert_eq!(c.get(b"z2").unwrap(), Some(Value::Int(2)));
+
+    // NaN stored, differently-payloaded NaN expected → swap.
+    let nan_a = f64::from_bits(0x7ff8_0000_0000_0000);
+    let nan_b = f64::from_bits(0x7ff8_0000_0000_0001);
+    c.insert(b"n", &Value::Float(nan_a)).unwrap();
+    assert!(
+        c.compare_and_set(b"n", Some(&Value::Float(nan_b)), Some(Value::Null))
+            .unwrap()
+    );
+    assert_eq!(c.get(b"n").unwrap(), Some(Value::Null));
+
+    // Vector with NaN elements: element-wise semantic equality → swap. The
+    // element NaN payloads differ, so byte identity would have refused.
+    c.insert(b"v", &Value::Vector(vec![1.0, f32::from_bits(0x7fc0_0000)]))
+        .unwrap();
+    assert!(
+        c.compare_and_set(
+            b"v",
+            Some(&Value::Vector(vec![1.0, f32::from_bits(0x7fc0_0001)])),
+            Some(Value::Int(3)),
+        )
+        .unwrap()
+    );
+    assert_eq!(c.get(b"v").unwrap(), Some(Value::Int(3)));
+
+    // Nested map: the -0.0/0.0 rule applies recursively inside containers.
+    c.insert(b"m", &map(&[("cfg", map(&[("x", Value::Float(0.0))]))]))
+        .unwrap();
+    assert!(
+        c.compare_and_set(
+            b"m",
+            Some(&map(&[("cfg", map(&[("x", Value::Float(-0.0))]))])),
+            Some(Value::Int(4)),
+        )
+        .unwrap()
+    );
+    assert_eq!(c.get(b"m").unwrap(), Some(Value::Int(4)));
+
+    // Semantic equality still refuses genuinely different values.
+    c.insert(b"d", &Value::Float(0.0)).unwrap();
+    assert!(
+        !c.compare_and_set(b"d", Some(&Value::Float(1.0)), Some(Value::Int(5)))
+            .unwrap()
+    );
+    assert_eq!(c.get(b"d").unwrap(), Some(Value::Float(0.0)));
+    // And length-differing containers are never equal.
+    c.insert(b"arr", &Value::Array(vec![Value::Int(1), Value::Int(2)]))
+        .unwrap();
+    assert!(
+        !c.compare_and_set(
+            b"arr",
+            Some(&Value::Array(vec![Value::Int(1)])),
+            Some(Value::Int(6)),
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        c.get(b"arr").unwrap(),
+        Some(Value::Array(vec![Value::Int(1), Value::Int(2)]))
+    );
 }
 
 /// A scalar index follows a successful swap (old value stops matching, new
@@ -903,15 +986,7 @@ fn mutations_emit_change_events_per_mutation_kind() {
     let auto = c.insert_auto(&doc("x", 3)).unwrap();
     expected.push(ev(&auto, ChangeKind::Insert));
 
-    c.update(b"i1", |cur| {
-        let mut m = match cur.unwrap() {
-            Value::Map(m) => m,
-            _ => unreachable!("seeded a map"),
-        };
-        m.insert("n".to_owned(), Value::Int(9));
-        Some(Value::Map(m))
-    })
-    .unwrap();
+    c.update(b"i1", bump_n_to_9).unwrap();
     expected.push(ev(b"i1", ChangeKind::Insert));
 
     c.patch(b"i1", &map(&[("extra", Value::Bool(true))]))
