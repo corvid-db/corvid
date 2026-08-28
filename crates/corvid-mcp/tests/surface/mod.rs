@@ -297,6 +297,7 @@ static MANIFEST: &[Row] = &[
         &[
             "create_index_variants_then_search",
             "create_index_param_and_training_errors",
+            "index_tools_on_disk_flag_type_errors",
         ],
     ),
     row(
@@ -366,6 +367,7 @@ static MANIFEST: &[Row] = &[
         &[
             "create_text_index_memory_and_ondisk",
             "index_tools_param_and_name_errors",
+            "index_tools_on_disk_flag_type_errors",
         ],
     ),
     row(
@@ -446,6 +448,8 @@ static MANIFEST: &[Row] = &[
             "set_schema_required_and_type_violations",
             "set_schema_param_and_name_errors",
             "dump_load_preserves_schema_constraints",
+            "set_schema_flag_type_errors",
+            "set_schema_declared_empty_vs_undeclared_fields",
         ],
     ),
     row(
@@ -455,6 +459,7 @@ static MANIFEST: &[Row] = &[
             "set_schema_then_get_schema_roundtrips",
             "set_schema_param_and_name_errors",
             "dump_load_preserves_schema_constraints",
+            "set_schema_declared_empty_vs_undeclared_fields",
         ],
     ),
 ];

@@ -1422,6 +1422,16 @@ fn lifecycle_semantic_cache_threshold_units_follow_the_metric_l2() {
 /// corpus stays within the documented error bound. There is no union
 /// operation in the public surface (pinning the surface: merge is the
 /// caller's job).
+///
+/// Bound fragility: `add_bytes` hashes through std's `DefaultHasher`
+/// (SipHash-1-3 with fixed keys today). A std upgrade that swaps
+/// `DefaultHasher` changes which buckets each string lands in, which can
+/// move an estimate across a window edge even though the sketch math is
+/// unchanged. The asserted windows are sized to the documented HLL error
+/// for these corpus sizes under any reasonable hasher — they are safe
+/// per-toolchain, not hasher-independent: if a std change ever moves an
+/// estimate out, re-derive the window for the new toolchain rather than
+/// widening it blindly.
 #[test]
 fn lifecycle_hyperloglog_precision_clamps_estimates_and_ignores_duplicates() {
     assert_eq!(HyperLogLog::new().estimate(), 0);

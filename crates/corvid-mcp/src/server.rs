@@ -14,11 +14,16 @@
 //! - `search` — `{collection, filter?, vector?, text?, mmr?, rrf_k?, select?, limit?}`
 //!   → `{results: [{key, score, document}, ...]}`
 //! - `set_schema` — `{collection, fields: [{name, type, required?, unique?}]}`
-//!   → `{ok: true}`; `get_schema` reads it back.
+//!   → `{ok: true}`; `get_schema` reads it back. An explicit `fields: []`
+//!   declares an empty schema (read back as `[]`), distinct from no schema
+//!   (read back as `null`).
 //!
 //! Limit contract everywhere: a `limit` that is not a non-negative integer
 //! is a `BadParams` error; valid-but-oversized limits clamp to the hard cap
-//! (10000) on list tools and are rejected outright by search/page.
+//! (10000) on list tools and are rejected outright by search/page. Boolean
+//! flags (`on_disk`, schema `required`/`unique`) follow the same
+//! no-silent-fallback rule: absent means the documented default (`false`),
+//! present-but-not-a-boolean is a `BadParams` error, never a coerced value.
 //!
 //! A `filter` is a small predicate tree:
 //! `{op: "eq"|"ne"|"lt"|"le"|"gt"|"ge", field, value}`,
@@ -340,7 +345,7 @@ impl Server {
         let collection = str_param(p, "collection")?;
         let field = str_param(p, "field")?;
         let metric = parse_metric(p.get("metric"))?;
-        let on_disk = p.get("on_disk").and_then(Json::as_bool).unwrap_or(false);
+        let on_disk = bool_flag(p.get("on_disk"), "on_disk")?;
         let quant = parse_quant(p.get("quant"))?;
         let c = self.db.collection(collection);
         // `pq: {m, k}` builds an on-disk product-quantized index (overrides
@@ -360,7 +365,7 @@ impl Server {
     fn create_text_index(&self, p: &Json) -> Result<Json, ToolError> {
         let collection = str_param(p, "collection")?;
         let field = str_param(p, "field")?;
-        let on_disk = p.get("on_disk").and_then(Json::as_bool).unwrap_or(false);
+        let on_disk = bool_flag(p.get("on_disk"), "on_disk")?;
         let c = self.db.collection(collection);
         if on_disk {
             c.create_text_index_ondisk(field)?;
@@ -521,10 +526,10 @@ impl Server {
                 ToolError::BadParams("'fields' entries need a string 'name'".into())
             })?;
             let mut field = Field::new(name, parse_field_type(obj.get("type"))?);
-            if obj.get("required").and_then(Json::as_bool).unwrap_or(false) {
+            if bool_flag(obj.get("required"), "required")? {
                 field = field.required();
             }
-            if obj.get("unique").and_then(Json::as_bool).unwrap_or(false) {
+            if bool_flag(obj.get("unique"), "unique")? {
                 field = field.unique();
             }
             schema = schema.field(field);
@@ -736,6 +741,19 @@ fn f64_param(p: &Json, key: &str) -> Result<f64, ToolError> {
     p.get(key)
         .and_then(Json::as_f64)
         .ok_or_else(|| ToolError::BadParams(format!("missing number '{key}'")))
+}
+
+/// A boolean flag: absent → the documented default `false`; present but not
+/// a JSON boolean → `BadParams` naming the key. Present-but-invalid never
+/// silently coerces to the default — the same no-silent-fallbacks rule
+/// [`result_limit`] applies (`"yes"`, `1`, and `null` are all errors).
+fn bool_flag(value: Option<&Json>, key: &str) -> Result<bool, ToolError> {
+    match value {
+        None => Ok(false),
+        Some(j) => j.as_bool().ok_or_else(|| {
+            ToolError::BadParams(format!("'{key}' must be a boolean (true or false)"))
+        }),
+    }
 }
 
 fn obj_f64(obj: &serde_json::Map<String, Json>, key: &str) -> Result<f64, ToolError> {

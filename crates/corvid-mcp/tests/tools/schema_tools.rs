@@ -400,10 +400,127 @@ fn dump_load_preserves_schema_constraints() {
         json!({"fields": [{"name": "email", "type": "text", "required": false, "unique": true}]})
     );
     wire::starts_with(
-        &w.err(
+        &fresh.err(
             "store",
             json!({"collection": "users", "key": "b", "document": {"email": "a@x"}}),
         ),
         "schema violation: field 'email' must be unique; value already exists",
+    );
+}
+
+/// Boolean flags never coerce: a `required`/`unique` that is not a JSON
+/// boolean is BadParams naming the key (Task 14 fix round — previously a
+/// string flag silently meant `false`).
+#[test]
+fn set_schema_flag_type_errors() {
+    let mut w = Wire::new();
+    assert_eq!(
+        w.err(
+            "set_schema",
+            json!({"collection": "users", "fields": [
+                {"name": "name", "type": "text", "required": "yes"}
+            ]}),
+        ),
+        "bad params: 'required' must be a boolean (true or false)"
+    );
+    assert_eq!(
+        w.err(
+            "set_schema",
+            json!({"collection": "users", "fields": [
+                {"name": "email", "type": "text", "unique": 1}
+            ]}),
+        ),
+        "bad params: 'unique' must be a boolean (true or false)"
+    );
+    assert_eq!(
+        w.err(
+            "set_schema",
+            json!({"collection": "users", "fields": [
+                {"name": "ok", "type": "any", "required": null}
+            ]}),
+        ),
+        "bad params: 'required' must be a boolean (true or false)"
+    );
+    // An explicit false is accepted and round-trips as false.
+    assert_eq!(
+        w.ok(
+            "set_schema",
+            json!({"collection": "users", "fields": [
+                {"name": "n", "type": "any", "required": false, "unique": false}
+            ]}),
+        ),
+        json!({"ok": true})
+    );
+    assert_eq!(
+        w.ok("get_schema", json!({"collection": "users"})),
+        json!({"fields": [{"name": "n", "type": "any", "required": false, "unique": false}]})
+    );
+}
+
+/// The declared-empty vs undeclared schema distinction, pinned through the
+/// wire: `fields: []` declares an (empty) schema read back as `[]`; no
+/// schema at all reads back as `null`; `fields: null` is BadParams, not a
+/// third silent state.
+#[test]
+fn set_schema_declared_empty_vs_undeclared_fields() {
+    let mut w = Wire::new();
+    assert_eq!(
+        w.ok("get_schema", json!({"collection": "docs"})),
+        json!({"fields": null}),
+        "undeclared: null"
+    );
+    assert_eq!(
+        w.ok("set_schema", json!({"collection": "docs", "fields": []})),
+        json!({"ok": true}),
+        "an explicitly empty fields array is a valid declaration"
+    );
+    assert_eq!(
+        w.ok("get_schema", json!({"collection": "docs"})),
+        json!({"fields": []}),
+        "declared-empty: []"
+    );
+    // The empty schema is a schema (present, vacuous), not a removal: any
+    // document still stores.
+    w.store("docs", "a", json!({"anything": 1}));
+    assert_eq!(w.get("docs", "a"), json!({"anything": 1}));
+    // JSON null is not an array.
+    assert_eq!(
+        w.err("set_schema", json!({"collection": "docs2", "fields": null}),),
+        "bad params: 'fields' must be an array"
+    );
+    // A distinct collection stays undeclared throughout.
+    assert_eq!(
+        w.ok("get_schema", json!({"collection": "docs3"})),
+        json!({"fields": null})
+    );
+}
+
+/// The `on_disk` flag gets the same no-silent-coercion treatment: a
+/// non-boolean value is BadParams on both tools that take it; explicit
+/// false keeps its in-memory meaning.
+#[test]
+fn index_tools_on_disk_flag_type_errors() {
+    let mut w = Wire::new();
+    w.store("docs", "a", json!({"v": [1.0, 0.0]}));
+    assert_eq!(
+        w.err(
+            "create_index",
+            json!({"collection": "docs", "field": "v", "on_disk": "true"}),
+        ),
+        "bad params: 'on_disk' must be a boolean (true or false)"
+    );
+    assert_eq!(
+        w.err(
+            "create_text_index",
+            json!({"collection": "docs", "field": "v", "on_disk": 0}),
+        ),
+        "bad params: 'on_disk' must be a boolean (true or false)"
+    );
+    assert_eq!(
+        w.ok(
+            "create_index",
+            json!({"collection": "docs", "field": "v", "on_disk": false}),
+        ),
+        json!({"ok": true})
     );
 }
