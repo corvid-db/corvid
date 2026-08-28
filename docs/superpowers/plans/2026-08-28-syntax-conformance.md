@@ -218,6 +218,11 @@ weight if public.
 
 ### Task 8: Vector search conformance
 
+Prepend (W3 wave-review housekeeping, binding): (a) tighten the
+graph.rs:285-293 edges_on_delete_in_txn doc clause so it cannot be read as
+TTL-purge-purges-on-absent-rows (it does not — Task 12 owns that corner);
+(b) add graph.rs cascade tests as citations on the Collection::delete /
+delete_batch / delete_where rows.
 Fill `search_vector.rs`: Metric × Quantization full cross (None/Binary/
 Scalar × Cosine/Dot/L2) on a fixed corpus with known geometry: ranking
 order asserted, exact vs approx (approx=true uses index and returns
@@ -262,6 +267,9 @@ mutate (insert/update/delete keep results correct).
 
 ### Task 12: TTL + events conformance
 
+Prepend (W3 wave-review ruling, binding): make `purge_due_key` run the
+edge cascade regardless of `existed` (same contract as delete — a stranded
+TTL entry must not leave dangling edges; RED first).
 Fill `ttl.rs`: insert_with_ttl/set_ttl/ttl roundtrip, purge_expired at
 boundary (now == expires_at included/excluded per contract), purge
 idempotence, expired docs hidden from queries/get/count, TTL + index
