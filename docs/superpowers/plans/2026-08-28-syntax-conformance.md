@@ -343,6 +343,12 @@ Controller rulings at W5 exit (bind Task 15):
 
 ### Task 14: MCP wire conformance
 
+Prepend (W5 wave-review minors, binding): (a) tighten the disk_hnsw.rs
+~504 comment ("same semantics as delete_in_txn" overstates — the inline
+arm errors CorruptIndex on corrupt node rows while delete_in_txn silently
+skips; state the actual difference); (b) join.rs doc gains the half-sentence
+on how Int foreign keys match text keys (decimal-string encoding).
+
 Fill `crates/corvid-mcp/tests/tools.rs` driving the server IN-PROCESS over
 duplex in-memory I/O (no child processes — they evade coverage and flake):
 initialize/ping/tools/list envelopes; EVERY tool happy + each error path
