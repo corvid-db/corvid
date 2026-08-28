@@ -109,7 +109,7 @@ full **[API reference](https://i-rocky.github.io/corvid/api/corvid/)**.
 | Optional declared schema (`set_schema`): types/required/unique | ✅ |
 | Per-record TTL / expiry (`insert_with_ttl`, `purge_expired`) | ✅ injected clock |
 | MCP sidecar over stdio | ✅ |
-| WASM build (engine, ≈0.2 MB gzipped, CI-enforced) | ✅ in-memory; OPFS persistence ⏳ |
+| WASM build (engine, ≈0.2 MB gzipped; CI prints the measured size and enforces a 2 MB budget) | ✅ in-memory; OPFS persistence ⏳ |
 | Mobile cross-compile (aarch64 iOS/Android) | ✅ engine builds |
 
 Image search is vector search over image embeddings: embed in your app (CLIP

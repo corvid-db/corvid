@@ -7,9 +7,9 @@
 //! targets of a `(from, relation)` pair with a single prefix scan.
 //!
 //! Deleting a document cascades (in the delete's own transaction) to every
-//! edge attached to it — see [`Db::edges_on_delete_in_txn`] — and
-//! linking/unlinking emits change events after the commit, like every other
-//! write path.
+//! edge attached to it — see `Db::edges_on_delete_in_txn` (private; every
+//! document-delete path calls it) — and linking/unlinking emits change events
+//! after the commit, like every other write path.
 //!
 //! This is the traversal core for the agent-memory use case (entity/relation
 //! graphs). Graph algorithms beyond neighbor lookup and bounded BFS traversal
@@ -29,7 +29,8 @@ impl Collection<'_> {
     ///
     /// Endpoints do not have to exist as documents: an edge to an absent key
     /// is allowed and is cleaned up automatically when that endpoint document
-    /// is later deleted (see [`Db::edges_on_delete_in_txn`]).
+    /// is later deleted (by the same cascade `Db::edges_on_delete_in_txn`
+    /// runs for every delete path).
     ///
     /// Emits a [`ChangeEvent`] (kind [`ChangeKind::Insert`], keyed by `from`)
     /// after the transaction commits — never before, so subscribers only ever

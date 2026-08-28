@@ -1,31 +1,24 @@
 name: Release
 
 # Cut a release by pushing a tag like `v0.1.0`. Builds the corvid-mcp binary
-# for Linux (x86_64 + arm64), macOS (Intel + Apple Silicon), and Windows, and
-# attaches them to a GitHub release with generated notes.
+# for Linux (x86_64 + arm64), macOS (Intel + Apple Silicon), and Windows.
+# The GitHub release is created only AFTER every matrix build has succeeded
+# and the tag has been verified against the workspace version; the release
+# job then attaches the platform archives plus a checksums.txt of their
+# sha256 digests.
 on:
   push:
     tags:
       - "v*"
 
-permissions:
-  contents: write
+# Least privilege by default; each job scopes its own grant below.
+permissions: {}
 
 jobs:
-  create-release:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Create the release (idempotent)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view "$GITHUB_REF_NAME" \
-            || gh release create "$GITHUB_REF_NAME" \
-                 --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
-
-  upload-binaries:
-    needs: create-release
+  build:
+    name: build (${{ matrix.target }})
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -43,10 +36,56 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build & upload corvid-mcp
+      # dry-run: build + archive only. The archive lands in the workspace
+      # root as corvid-mcp-<tag>-<target>.tar.gz (or .zip on Windows) and is
+      # NOT attached to any release here — that happens in the release job,
+      # only once every matrix leg has succeeded.
+      - name: Build & archive corvid-mcp
         uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: corvid-mcp
           target: ${{ matrix.target }}
           archive: corvid-mcp-$tag-$target
-          token: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: true
+      - name: Upload archive as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: corvid-mcp-${{ matrix.target }}
+          path: corvid-mcp-*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match the workspace version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION=$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version = /{gsub(/[";]/,"",$3); print $3; exit}' Cargo.toml)
+          echo "tag: ${GITHUB_REF_NAME} (version part: ${TAG}), workspace version: ${VERSION}"
+          if [ -z "$VERSION" ] || [ "$TAG" != "$VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${VERSION:-<not found>}"
+            exit 1
+          fi
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate sha256 checksums
+        run: |
+          cd dist
+          ls -l
+          sha256sum corvid-mcp-* > checksums.txt
+          cat checksums.txt
+      - name: Create the release (idempotent) and attach assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" \
+            || gh release create "$GITHUB_REF_NAME" \
+                 --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          gh release upload "$GITHUB_REF_NAME" dist/corvid-mcp-* dist/checksums.txt --clobber

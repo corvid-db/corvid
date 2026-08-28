@@ -5,6 +5,11 @@ on:
     branches: [master]
   pull_request:
 
+# New pushes to a ref supersede the in-flight run for that ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -12,6 +17,7 @@ jobs:
   check:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,6 +38,7 @@ jobs:
   coverage:
     name: coverage (>= 90%)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,6 +52,7 @@ jobs:
   wasm:
     name: wasm build (< 2 MB gzipped)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -63,9 +71,10 @@ jobs:
             exit 1
           fi
 
-  mobile:
-    name: mobile cross-compile
+  mobile-android:
+    name: mobile cross-compile (Android)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -74,3 +83,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build engine for aarch64-android
         run: cargo build -p corvid --target aarch64-linux-android --release
+
+  mobile-ios:
+    name: mobile cross-compile (iOS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+      - name: Build engine for aarch64-ios
+        run: cargo build -p corvid --target aarch64-apple-ios --release
