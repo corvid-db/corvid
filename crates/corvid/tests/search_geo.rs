@@ -23,10 +23,10 @@
 //! * `geo_nearest` with k=0 is `Ok([])`, never an error; k beyond the number
 //!   of valid points returns all of them, nearest first.
 //! * Result ordering: radius and nearest sort by (distance, key) on every
-//!   path. `geo_within_bbox` returns KEY order on the scan path and
-//!   lat-cell/lon-cell/key order on the indexed path — both deterministic,
-//!   but different; the cross-path contract is the SET (pinned below and
-//!   reported: the `geo_within_bbox` doc comment overstates "in key order").
+//!   path. `geo_within_bbox` returns key order on EVERY path (review round
+//!   1 made the documented "in key order" portable: the indexed window's
+//!   cell-order candidates are re-sorted, so scan and indexed results are
+//!   byte-identical).
 //! * Points are `[lat, lon]` arrays or `{lat, lon}` maps (int or float
 //!   coordinates); extra map keys are ignored; arrays are ALWAYS [lat, lon]
 //!   — a swapped `[lon, lat]` document is just a different location on the
@@ -265,7 +265,7 @@ fn geo_within_radius_boundary_inclusive_and_ordering() {
     );
 
     // A few ULPs INSIDE the radius drops both boundary docs...
-    let eps = d * f64::EPSILON; // ~1.7 ULPs at this magnitude
+    let eps = d * f64::EPSILON; // 1-2 ULPs (depending on mantissa position)
     let hits = c.geo_within_radius("loc", 0.0, 0.0, d - eps).unwrap();
     assert_eq!(hit_keys(&hits), vec![b"origin".to_vec()]);
     // ...and a few ULPs OUTSIDE adds nothing new (already all three).
@@ -1002,7 +1002,8 @@ fn geo_index_twins_equivalence_and_live_mutations() {
             .unwrap()
     );
 
-    // -- bbox parity (sets: the two paths emit different orders) --
+    // -- bbox parity (exact rows: key order is the portable contract, so
+    //    scan and indexed are byte-identical, documents included) --
     let boxes: [(f64, f64, f64, f64); 4] = [
         (51.0, -1.0, 52.0, 1.0),
         (10.0, 170.0, 20.0, -170.0),  // antimeridian wrap
@@ -1011,9 +1012,9 @@ fn geo_index_twins_equivalence_and_live_mutations() {
     ];
     for (a, b, cc, d) in boxes {
         assert_eq!(
-            sorted_keys(row_keys(&scan.geo_within_bbox("loc", a, b, cc, d).unwrap())),
-            sorted_keys(row_keys(&idx.geo_within_bbox("loc", a, b, cc, d).unwrap())),
-            "bbox ({a}, {b}, {cc}, {d}): index must not change membership"
+            scan.geo_within_bbox("loc", a, b, cc, d).unwrap(),
+            idx.geo_within_bbox("loc", a, b, cc, d).unwrap(),
+            "bbox ({a}, {b}, {cc}, {d}): index must not change membership or order"
         );
     }
 
@@ -1065,36 +1066,41 @@ fn geo_index_twins_equivalence_and_live_mutations() {
     assert_eq!(idx.geo_nearest("loc", 0.0, 0.0, 100).unwrap().len(), 9);
 }
 
-/// `geo_within_bbox` result ORDER is path-dependent (pinned): the scan path
-/// emits key order, the indexed path emits lat-cell/lon-cell/key order
-/// (cells ascend northward here: z at lat 0 → m at 5 → a at 10). Membership
-/// is identical; only the sequence differs. NOTE: the method's doc comment
-/// says "in key order" — that holds for the scan path only (reported as an
-/// ambiguity; sets are the portable contract).
+/// `geo_within_bbox` result ORDER is the portable contract: KEY order on
+/// EVERY path, byte-identical between scan and indexed. The indexed window's
+/// candidates arrive in (lat_cell, lon_cell, key) order (cells ascend
+/// northward here: z at lat 0 → m at 5 → a at 10), so the method sorts its
+/// materialized result by key to honor the documented "in key order" on
+/// both paths — the sort is O(n log n) on the result set only.
 #[test]
-fn geo_bbox_result_order_scan_keys_vs_index_cells() {
+fn geo_bbox_result_order_is_key_order_on_every_path() {
     let docs = [
         (b"a" as &[u8], doc_arr(10.0, 10.0)),
         (b"m", doc_arr(5.0, 5.0)),
         (b"z", doc_arr(0.0, 0.0)),
     ];
     let (scan_db, idx_db) = twins("loc", &docs);
-    let rows = scan_db
+    let scan_rows = scan_db
         .collection("places")
         .geo_within_bbox("loc", -1.0, -1.0, 11.0, 11.0)
         .unwrap();
     assert_eq!(
-        row_keys(&rows),
-        vec![b"a".to_vec(), b"m".to_vec(), b"z".to_vec()]
+        row_keys(&scan_rows),
+        vec![b"a".to_vec(), b"m".to_vec(), b"z".to_vec()],
+        "the scan path emits key order"
     );
-    let rows = idx_db
+    let idx_rows = idx_db
         .collection("places")
         .geo_within_bbox("loc", -1.0, -1.0, 11.0, 11.0)
         .unwrap();
     assert_eq!(
-        row_keys(&rows),
-        vec![b"z".to_vec(), b"m".to_vec(), b"a".to_vec()],
-        "the indexed window emits cell order (lat 0 → 5 → 10), not key order"
+        row_keys(&idx_rows),
+        vec![b"a".to_vec(), b"m".to_vec(), b"z".to_vec()],
+        "the indexed path must emit key order too, not cell order"
+    );
+    assert_eq!(
+        scan_rows, idx_rows,
+        "paths are byte-identical, documents included"
     );
 }
 

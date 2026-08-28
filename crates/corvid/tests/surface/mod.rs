@@ -1366,7 +1366,8 @@ static MANIFEST: &[Row] = &[
             "geo_within_bbox_normal_inclusive_edges_and_key_order",
             "geo_within_bbox_degenerate_point_line_pole_and_globe",
             "geo_bbox_antimeridian_wrap_matches_both_sides",
-            "geo_bbox_result_order_scan_keys_vs_index_cells",
+            "geo_bbox_result_order_is_key_order_on_every_path",
+            "geo_bbox_validation_exact_error_variants",
         ],
     ),
     // ===== geo_index.rs =====

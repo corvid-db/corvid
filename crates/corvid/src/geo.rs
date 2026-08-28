@@ -156,6 +156,12 @@ impl Collection<'_> {
     /// Find documents whose `field` point falls within the bounding box
     /// `[min_lat, max_lat] × [min_lon, max_lon]`, in key order.
     ///
+    /// The key order is the portable contract: it holds identically on the
+    /// scan path (keys iterate in byte order) and on the indexed path (the
+    /// candidate window arrives in cell order — `lat_cell ‖ lon_cell ‖ key`
+    /// — so the materialized result is sorted by key; O(n log n) on the
+    /// result set only).
+    ///
     /// Audit C2: a box with `min_lon > max_lon` wraps the antimeridian and
     /// matches BOTH longitude ranges — `lon >= min_lon || lon <= max_lon` —
     /// so e.g. `(10, 170) → (20, -170)` covers 170°E eastward across ±180°
@@ -191,6 +197,11 @@ impl Collection<'_> {
                 out.push((key, document));
             }
         }
+        // The scan path iterates keys in byte order but the indexed window
+        // arrives in cell order — sort so the documented key order is
+        // byte-identical on both paths (a stable sort; already-sorted scan
+        // output stays put).
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
 }
