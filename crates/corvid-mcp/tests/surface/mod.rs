@@ -221,7 +221,7 @@ static MANIFEST: &[Row] = &[
     row(
         "mcp::envelope::tools/list",
         "MCP wire",
-        &["envelope_tools_list_all_27_with_schemas"],
+        &["envelope_tools_list_all_29_with_schemas"],
     ),
     row(
         "mcp::envelope::tools/call",
@@ -317,7 +317,7 @@ static MANIFEST: &[Row] = &[
         "MCP wire",
         &[
             "neighbors_and_in_neighbors_directions",
-            "list_tools_clamp_oversized_limit_instead_of_erroring",
+            "list_tools_clamp_oversized_limit_and_reject_invalid",
         ],
     ),
     row(
@@ -339,7 +339,7 @@ static MANIFEST: &[Row] = &[
         &[
             "join_left_outer_rows_and_missing_references",
             "join_int_foreign_key_matches_decimal_text_key",
-            "list_tools_clamp_oversized_limit_instead_of_erroring",
+            "list_tools_clamp_oversized_limit_and_reject_invalid",
         ],
     ),
     row(
@@ -347,7 +347,7 @@ static MANIFEST: &[Row] = &[
         "MCP wire",
         &[
             "neighbors_and_in_neighbors_directions",
-            "list_tools_clamp_oversized_limit_instead_of_erroring",
+            "list_tools_clamp_oversized_limit_and_reject_invalid",
         ],
     ),
     row(
@@ -435,6 +435,26 @@ static MANIFEST: &[Row] = &[
         &[
             "insert_auto_keys_ordered_and_distinct",
             "dump_then_load_roundtrips_through_the_wire",
+        ],
+    ),
+    row(
+        "mcp::tool::set_schema",
+        "MCP wire",
+        &[
+            "set_schema_then_get_schema_roundtrips",
+            "set_schema_unique_enforced_on_stores",
+            "set_schema_required_and_type_violations",
+            "set_schema_param_and_name_errors",
+            "dump_load_preserves_schema_constraints",
+        ],
+    ),
+    row(
+        "mcp::tool::get_schema",
+        "MCP wire",
+        &[
+            "set_schema_then_get_schema_roundtrips",
+            "set_schema_param_and_name_errors",
+            "dump_load_preserves_schema_constraints",
         ],
     ),
 ];

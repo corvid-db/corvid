@@ -414,6 +414,12 @@ impl Collection<'_> {
         }
         self.db().register_schema(self.name(), schema)
     }
+
+    /// The collection's declared schema, if one was set via
+    /// [`Collection::set_schema`] (or restored by a dump `load`).
+    pub fn schema(&self) -> Option<Schema> {
+        self.db().schema_of(self.name())
+    }
 }
 
 #[cfg(test)]

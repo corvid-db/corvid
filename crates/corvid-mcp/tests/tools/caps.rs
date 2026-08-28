@@ -118,9 +118,10 @@ fn page_cursor_walk_default_and_boundaries() {
 
 /// The LIST tools CLAMP an oversized `limit` to the hard maximum instead of
 /// erroring (unlike search/page, whose limits are validated): neighbors,
-/// in_neighbors, traverse, geo and join all succeed with limit 999999.
+/// in_neighbors, traverse, geo and join all succeed with limit 999999. An
+/// INVALID limit (negative or non-integer) is rejected everywhere alike.
 #[test]
-fn list_tools_clamp_oversized_limit_instead_of_erroring() {
+fn list_tools_clamp_oversized_limit_and_reject_invalid() {
     let mut w = Wire::new();
     for to in ["x", "y", "z"] {
         w.ok(
@@ -167,13 +168,48 @@ fn list_tools_clamp_oversized_limit_instead_of_erroring() {
                "foreign_key_field": "author_id", "limit": 2}),
     );
     assert_eq!(out["rows"].as_array().unwrap().len(), 2);
-    // A negative or non-integer limit is silently defaulted (as_u64 misses),
-    // not an error — pinned clamp-vs-validate split.
-    let out = w.ok(
-        "neighbors",
-        json!({"collection": "g", "from": "a", "relation": "r", "limit": -5}),
+
+    // Invalid limits error on every list tool — no silent defaulting.
+    for bad in [json!(-5), json!("two"), json!(1.5)] {
+        assert_eq!(
+            w.err(
+                "neighbors",
+                json!({"collection": "g", "from": "a", "relation": "r", "limit": bad}),
+            ),
+            "bad params: 'limit' must be a non-negative integer",
+            "neighbors limit {bad}"
+        );
+    }
+    assert_eq!(
+        w.err(
+            "in_neighbors",
+            json!({"collection": "g", "to": "x", "relation": "r", "limit": -1}),
+        ),
+        "bad params: 'limit' must be a non-negative integer"
     );
-    assert_eq!(out["neighbors"], json!(["x", "y", "z"]));
+    assert_eq!(
+        w.err(
+            "traverse",
+            json!({"collection": "g", "start": "a", "relation": "r", "hops": 1, "limit": "x"}),
+        ),
+        "bad params: 'limit' must be a non-negative integer"
+    );
+    assert_eq!(
+        w.err(
+            "geo",
+            json!({"collection": "docs", "field": "loc", "lat": 51.5, "lon": -0.13,
+                   "radius_km": 10.0, "limit": -1}),
+        ),
+        "bad params: 'limit' must be a non-negative integer"
+    );
+    assert_eq!(
+        w.err(
+            "join",
+            json!({"collection": "posts", "other": "authors",
+                   "foreign_key_field": "author_id", "limit": 1.5}),
+        ),
+        "bad params: 'limit' must be a non-negative integer"
+    );
 }
 
 /// A ~100 KB document round-trips through the wire byte-for-byte.

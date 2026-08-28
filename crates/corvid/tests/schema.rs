@@ -2097,3 +2097,25 @@ fn schema_field_type_matrix_and_fields_accessor() {
     };
     assert_eq!(msg, "field 'uniq' must be unique; value already exists");
 }
+
+/// `Collection::schema` returns the declared fields (or `None`), flags
+/// intact, and reflects replacement — the getter the MCP `get_schema` tool
+/// is built on.
+#[test]
+fn schema_getter_roundtrips_declared_fields() {
+    let db = Db::open_in_memory().unwrap();
+    let c = db.collection("users");
+    assert!(c.schema().is_none(), "no schema declared yet");
+
+    let s = Schema::new()
+        .field(Field::new("email", FieldType::Text).unique())
+        .field(Field::new("age", FieldType::Int).required());
+    c.set_schema(&s).unwrap();
+    let got = c.schema().expect("schema readable back");
+    assert_eq!(got.fields(), s.fields(), "fields and flags round-trip");
+
+    // Replacement is visible through the getter.
+    let s2 = Schema::new().field(Field::new("n", FieldType::Any));
+    c.set_schema(&s2).unwrap();
+    assert_eq!(c.schema().unwrap().fields(), s2.fields());
+}

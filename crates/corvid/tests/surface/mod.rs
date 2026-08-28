@@ -2046,6 +2046,11 @@ static MANIFEST: &[Row] = &[
             "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
         ],
     ),
+    row(
+        "corvid::Collection::schema",
+        "Schema (ALTER)",
+        &["schema_getter_roundtrips_declared_fields"],
+    ),
     // ===== reactive.rs — change feeds =====
     row(
         "corvid::ChangeKind",

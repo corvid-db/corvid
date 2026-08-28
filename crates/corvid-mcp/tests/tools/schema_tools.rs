@@ -3,7 +3,7 @@
 //! acknowledged, queries exact with and without the index, mutation after
 //! creation stays correct, and every param/name error surfaces.
 
-use serde_json::json;
+use serde_json::{Value as Json, json};
 
 use crate::wire::{self, Wire};
 
@@ -201,5 +201,209 @@ fn index_tools_param_and_name_errors() {
             json!({"collection": "docs", "fields": ["ok", "bad__name"]}),
         ),
         "invalid name (NUL byte or `__` is not allowed): bad__name",
+    );
+}
+
+/// The exact field-list the set/get schema tests declare.
+fn user_fields() -> Json {
+    json!([
+        {"name": "name", "type": "text", "required": true},
+        {"type": "int", "name": "age"},
+        {"name": "email", "type": "text", "unique": true},
+    ])
+}
+
+/// set_schema then get_schema round-trips the declared fields (name, type,
+/// required, unique — defaulted flags included); a collection without a
+/// schema reports fields: null.
+#[test]
+fn set_schema_then_get_schema_roundtrips() {
+    let mut w = Wire::new();
+    assert_eq!(
+        w.ok("get_schema", json!({"collection": "users"})),
+        json!({"fields": null}),
+        "no schema declared yet"
+    );
+    assert_eq!(
+        w.ok(
+            "set_schema",
+            json!({"collection": "users", "fields": user_fields()}),
+        ),
+        json!({"ok": true})
+    );
+    assert_eq!(
+        w.ok("get_schema", json!({"collection": "users"})),
+        json!({"fields": [
+            {"name": "name", "type": "text", "required": true, "unique": false},
+            {"name": "age", "type": "int", "required": false, "unique": false},
+            {"name": "email", "type": "text", "required": false, "unique": true},
+        ]}),
+        "flags are explicit on the way out, defaults included"
+    );
+    // Replacing a schema is allowed; the new one applies to later writes.
+    assert_eq!(
+        w.ok(
+            "set_schema",
+            json!({"collection": "users", "fields": [{"name": "n", "type": "any"}]}),
+        ),
+        json!({"ok": true})
+    );
+    assert_eq!(
+        w.ok("get_schema", json!({"collection": "users"})),
+        json!({"fields": [{"name": "n", "type": "any", "required": false, "unique": false}]})
+    );
+}
+
+/// A unique constraint set through the wire is enforced on every later
+/// store: a duplicate value fails with the engine's exact message, a fresh
+/// value succeeds, and deleting the holder frees the value.
+#[test]
+fn set_schema_unique_enforced_on_stores() {
+    let mut w = Wire::new();
+    assert_eq!(
+        w.ok(
+            "set_schema",
+            json!({"collection": "users", "fields": [
+                {"name": "email", "type": "text", "unique": true},
+            ]}),
+        ),
+        json!({"ok": true})
+    );
+    w.store("users", "a", json!({"email": "a@x"}));
+    wire::starts_with(
+        &w.err(
+            "store",
+            json!({"collection": "users", "key": "b", "document": {"email": "a@x"}}),
+        ),
+        "schema violation: field 'email' must be unique; value already exists",
+    );
+    // The failed store left nothing behind.
+    assert_eq!(w.get("users", "b"), Json::Null);
+    assert_eq!(
+        w.ok("count", json!({"collection": "users"})),
+        json!({"count": 1})
+    );
+    // A different value is fine; deleting the holder frees the value.
+    w.store("users", "b", json!({"email": "b@x"}));
+    assert_eq!(
+        w.ok("delete", json!({"collection": "users", "key": "a"})),
+        json!({"deleted": true})
+    );
+    w.store("users", "c", json!({"email": "a@x"}));
+    assert_eq!(w.get("users", "c"), json!({"email": "a@x"}));
+}
+
+/// Required-presence and type constraints surface the engine's
+/// SchemaViolation messages; a null value counts as missing for `required`.
+#[test]
+fn set_schema_required_and_type_violations() {
+    let mut w = Wire::new();
+    w.ok(
+        "set_schema",
+        json!({"collection": "users", "fields": [
+            {"name": "name", "type": "text", "required": true},
+            {"name": "age", "type": "int"},
+        ]}),
+    );
+    wire::starts_with(
+        &w.err(
+            "store",
+            json!({"collection": "users", "key": "k", "document": {"age": 5}}),
+        ),
+        "schema violation: field 'name' is required",
+    );
+    wire::starts_with(
+        &w.err(
+            "store",
+            json!({"collection": "users", "key": "k", "document": {"name": null, "age": 5}}),
+        ),
+        "schema violation: field 'name' is required",
+    );
+    wire::starts_with(
+        &w.err(
+            "store",
+            json!({"collection": "users", "key": "k", "document": {"name": "x", "age": "old"}}),
+        ),
+        "schema violation: field 'age' has the wrong type",
+    );
+    w.store("users", "k", json!({"name": "x", "age": 5}));
+    assert_eq!(w.get("users", "k"), json!({"name": "x", "age": 5}));
+}
+
+/// set_schema param errors: fields must be an array of objects with string
+/// names and known types; forbidden field names surface the engine's
+/// InvalidName error.
+#[test]
+fn set_schema_param_and_name_errors() {
+    let mut w = Wire::new();
+    assert_eq!(
+        w.err("set_schema", json!({"collection": "users"})),
+        "bad params: 'fields' must be an array"
+    );
+    assert_eq!(
+        w.err(
+            "set_schema",
+            json!({"collection": "users", "fields": ["email"]})
+        ),
+        "bad params: 'fields' entries must be objects"
+    );
+    assert_eq!(
+        w.err(
+            "set_schema",
+            json!({"collection": "users", "fields": [{"type": "text"}]}),
+        ),
+        "bad params: 'fields' entries need a string 'name'"
+    );
+    assert_eq!(
+        w.err(
+            "set_schema",
+            json!({"collection": "users", "fields": [{"name": "e", "type": "varchar"}]}),
+        ),
+        "bad params: 'type' must be one of: any, bool, int, float, text, bytes, vector, array, map"
+    );
+    assert_eq!(
+        w.err("set_schema", json!({"fields": []})),
+        "bad params: missing string 'collection'"
+    );
+    wire::starts_with(
+        &w.err(
+            "set_schema",
+            json!({"collection": "users", "fields": [{"name": "bad__name", "type": "any"}]}),
+        ),
+        "invalid name (NUL byte or `__` is not allowed): bad__name",
+    );
+    assert_eq!(
+        w.err("get_schema", json!({})),
+        "bad params: missing string 'collection'"
+    );
+}
+
+/// Schemas survive dump→load through the wire: the loaded server reports
+/// the declared fields and still enforces the unique constraint.
+#[test]
+fn dump_load_preserves_schema_constraints() {
+    let dir = tempfile::tempdir().unwrap();
+    let ps = dir.path().join("d.bin");
+    let ps = ps.to_str().unwrap();
+    let mut w = Wire::new();
+    w.ok(
+        "set_schema",
+        json!({"collection": "users", "fields": [{"name": "email", "type": "text", "unique": true}]}),
+    );
+    w.store("users", "a", json!({"email": "a@x"}));
+    w.ok("dump", json!({"path": ps}));
+
+    let mut fresh = Wire::new();
+    fresh.ok("load", json!({"path": ps}));
+    assert_eq!(
+        fresh.ok("get_schema", json!({"collection": "users"})),
+        json!({"fields": [{"name": "email", "type": "text", "required": false, "unique": true}]})
+    );
+    wire::starts_with(
+        &w.err(
+            "store",
+            json!({"collection": "users", "key": "b", "document": {"email": "a@x"}}),
+        ),
+        "schema violation: field 'email' must be unique; value already exists",
     );
 }

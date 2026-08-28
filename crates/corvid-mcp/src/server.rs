@@ -13,12 +13,19 @@
 //! - `delete` — `{collection, key}` → `{deleted: <bool>}`
 //! - `search` — `{collection, filter?, vector?, text?, mmr?, rrf_k?, select?, limit?}`
 //!   → `{results: [{key, score, document}, ...]}`
+//! - `set_schema` — `{collection, fields: [{name, type, required?, unique?}]}`
+//!   → `{ok: true}`; `get_schema` reads it back.
+//!
+//! Limit contract everywhere: a `limit` that is not a non-negative integer
+//! is a `BadParams` error; valid-but-oversized limits clamp to the hard cap
+//! (10000) on list tools and are rejected outright by search/page.
 //!
 //! A `filter` is a small predicate tree:
 //! `{op: "eq"|"ne"|"lt"|"le"|"gt"|"ge", field, value}`,
 //! `{op: "exists", field}`, `{op: "and"|"or", clauses: [...]}`,
 //! `{op: "not", clause: {...}}`.
 
+use corvid::schema::{Field, FieldType, Schema};
 use corvid::{Db, Metric, Predicate, Quantization, field};
 use serde_json::{Value as Json, json};
 
@@ -76,6 +83,8 @@ impl Server {
             "list_collections" => self.list_collections(),
             "count" => self.count(params),
             "insert_auto" => self.insert_auto(params),
+            "set_schema" => self.set_schema(params),
+            "get_schema" => self.get_schema(params),
             other => Err(ToolError::UnknownTool(other.to_owned())),
         }
     }
@@ -208,6 +217,9 @@ impl Server {
             let query = f32_array(v.get("query"))?;
             let k = bounded_limit(v, "k")?;
             let metric = parse_metric(v.get("metric"))?;
+            // Validated like create_index's quant so a typo can never be
+            // silently ignored; the accepted names carry no search meaning.
+            parse_quant(v.get("quant"))?;
             q = q.vector(vfield, query, k, metric);
         }
         if let Some(t) = p.get("text") {
@@ -295,7 +307,7 @@ impl Server {
             .db
             .collection(collection)
             .neighbors(from.as_bytes(), relation)?;
-        neighbors.truncate(result_limit(p));
+        neighbors.truncate(result_limit(p)?);
         Ok(json!({ "neighbors": keys_to_json(&neighbors) }))
     }
 
@@ -307,7 +319,7 @@ impl Server {
             .db
             .collection(collection)
             .in_neighbors(to.as_bytes(), relation)?;
-        neighbors.truncate(result_limit(p));
+        neighbors.truncate(result_limit(p)?);
         Ok(json!({ "neighbors": keys_to_json(&neighbors) }))
     }
 
@@ -320,7 +332,7 @@ impl Server {
             self.db
                 .collection(collection)
                 .traverse(start.as_bytes(), relation, hops)?;
-        nodes.truncate(result_limit(p));
+        nodes.truncate(result_limit(p)?);
         Ok(json!({ "nodes": keys_to_json(&nodes) }))
     }
 
@@ -446,13 +458,22 @@ impl Server {
         let lon = f64_param(p, "lon")?;
         let handle = self.db.collection(collection);
         // `k` (nearest-N) takes precedence over `radius_km` (within-radius).
-        let mut hits = if let Some(k) = p.get("k").and_then(Json::as_u64) {
-            handle.geo_nearest(field, lat, lon, k as usize)?
+        // A present-but-invalid k (string, negative, float) is a BadParams
+        // error, not a silent fall-through to the radius path.
+        let k =
+            match p.get("k") {
+                None => None,
+                Some(k) => Some(k.as_u64().ok_or_else(|| {
+                    ToolError::BadParams("'k' must be a non-negative integer".into())
+                })? as usize),
+            };
+        let mut hits = if let Some(k) = k {
+            handle.geo_nearest(field, lat, lon, k)?
         } else {
             let radius_km = f64_param(p, "radius_km")?;
             handle.geo_within_radius(field, lat, lon, radius_km)?
         };
-        hits.truncate(result_limit(p));
+        hits.truncate(result_limit(p)?);
         let results: Vec<Json> = hits
             .iter()
             .map(|h| {
@@ -471,7 +492,7 @@ impl Server {
         let other = str_param(p, "other")?;
         let fk = str_param(p, "foreign_key_field")?;
         let mut rows = self.db.collection(collection).join(other, fk)?;
-        rows.truncate(result_limit(p));
+        rows.truncate(result_limit(p)?);
         let out: Vec<Json> = rows
             .iter()
             .map(|r| {
@@ -483,6 +504,53 @@ impl Server {
             })
             .collect();
         Ok(json!({ "rows": out }))
+    }
+
+    fn set_schema(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let fields = p
+            .get("fields")
+            .and_then(Json::as_array)
+            .ok_or_else(|| ToolError::BadParams("'fields' must be an array".into()))?;
+        let mut schema = Schema::new();
+        for f in fields {
+            let obj = f
+                .as_object()
+                .ok_or_else(|| ToolError::BadParams("'fields' entries must be objects".into()))?;
+            let name = obj.get("name").and_then(Json::as_str).ok_or_else(|| {
+                ToolError::BadParams("'fields' entries need a string 'name'".into())
+            })?;
+            let mut field = Field::new(name, parse_field_type(obj.get("type"))?);
+            if obj.get("required").and_then(Json::as_bool).unwrap_or(false) {
+                field = field.required();
+            }
+            if obj.get("unique").and_then(Json::as_bool).unwrap_or(false) {
+                field = field.unique();
+            }
+            schema = schema.field(field);
+        }
+        self.db.collection(collection).set_schema(&schema)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn get_schema(&self, p: &Json) -> Result<Json, ToolError> {
+        let collection = str_param(p, "collection")?;
+        let Some(schema) = self.db.collection(collection).schema() else {
+            return Ok(json!({ "fields": null }));
+        };
+        let fields: Vec<Json> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                json!({
+                    "name": f.name,
+                    "type": field_type_name(f.ty),
+                    "required": f.required,
+                    "unique": f.unique,
+                })
+            })
+            .collect();
+        Ok(json!({ "fields": fields }))
     }
 }
 
@@ -610,12 +678,21 @@ const DEFAULT_SEARCH_LIMIT: usize = 100;
 const MAX_RESULT_LIMIT: usize = 10_000;
 
 /// The result cap for a list-returning tool: the `limit` param (clamped to
-/// [`MAX_RESULT_LIMIT`]), or the default.
-fn result_limit(p: &Json) -> usize {
-    p.get("limit")
-        .and_then(Json::as_u64)
-        .map(|n| (n as usize).min(MAX_RESULT_LIMIT))
-        .unwrap_or(DEFAULT_LIST_LIMIT)
+/// [`MAX_RESULT_LIMIT`]), or the default. An invalid limit — negative or
+/// not an integer — is a BadParams error rather than a silent default, the
+/// same rule [`search_or_page_limit`] applies; the difference is that a
+/// VALID but oversized limit clamps here (the documented hard cap) instead
+/// of erroring.
+fn result_limit(p: &Json) -> Result<usize, ToolError> {
+    match p.get("limit") {
+        None => Ok(DEFAULT_LIST_LIMIT),
+        Some(l) => {
+            let n = l.as_u64().ok_or_else(|| {
+                ToolError::BadParams("'limit' must be a non-negative integer".into())
+            })?;
+            Ok((n as usize).min(MAX_RESULT_LIMIT))
+        }
+    }
 }
 
 /// A caller-supplied result count that must be present and within bounds.
@@ -702,6 +779,53 @@ fn parse_metric(value: Option<&Json>) -> Result<Metric, ToolError> {
                 "'metric' must be one of: cosine, dot, l2".into(),
             )),
         },
+    }
+}
+
+/// The wire names of [`FieldType`], in the message order below.
+const FIELD_TYPES: &str = "any, bool, int, float, text, bytes, vector, array, map";
+
+/// Parse a schema field type string (absent → `any`); anything else is
+/// BadParams naming the accepted set.
+fn parse_field_type(value: Option<&Json>) -> Result<FieldType, ToolError> {
+    let name = match value {
+        None => return Ok(FieldType::Any),
+        Some(j) => j
+            .as_str()
+            .ok_or_else(|| ToolError::BadParams("'type' must be a string".into()))?,
+    };
+    let ty = match name {
+        "any" => FieldType::Any,
+        "bool" => FieldType::Bool,
+        "int" => FieldType::Int,
+        "float" => FieldType::Float,
+        "text" => FieldType::Text,
+        "bytes" => FieldType::Bytes,
+        "vector" => FieldType::Vector,
+        "array" => FieldType::Array,
+        "map" => FieldType::Map,
+        _ => {
+            return Err(ToolError::BadParams(format!(
+                "'type' must be one of: {FIELD_TYPES}"
+            )));
+        }
+    };
+    Ok(ty)
+}
+
+/// The wire name of a schema field type (the inverse of
+/// [`parse_field_type`]'s mapping).
+fn field_type_name(ty: FieldType) -> &'static str {
+    match ty {
+        FieldType::Any => "any",
+        FieldType::Bool => "bool",
+        FieldType::Int => "int",
+        FieldType::Float => "float",
+        FieldType::Text => "text",
+        FieldType::Bytes => "bytes",
+        FieldType::Vector => "vector",
+        FieldType::Array => "array",
+        FieldType::Map => "map",
     }
 }
 

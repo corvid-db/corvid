@@ -323,7 +323,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "neighbors",
-                "description": "List the targets of from --relation--> ? edges.",
+                "description": "List the targets of from --relation--> ? edges. Optional 'limit' (default 1000) must be a non-negative integer and is clamped to 10000.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -336,7 +336,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "traverse",
-                "description": "Breadth-first traversal following a relation up to N hops.",
+                "description": "Breadth-first traversal following a relation up to N hops. Optional 'limit' (default 1000) must be a non-negative integer and is clamped to 10000.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -350,7 +350,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "geo",
-                "description": "Geo search around (lat, lon), nearest first: pass radius_km for within-radius, or k for nearest-N.",
+                "description": "Geo search around (lat, lon), nearest first: pass radius_km for within-radius, or k for nearest-N. Both k and the optional limit (default 1000) must be non-negative integers; limit clamps to 10000.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -366,7 +366,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "join",
-                "description": "Left-outer join a collection to another by a foreign-key field.",
+                "description": "Left-outer join a collection to another by a foreign-key field. Optional 'limit' (default 1000) must be a non-negative integer and is clamped to 10000.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -379,7 +379,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "in_neighbors",
-                "description": "List the sources of incoming ? --relation--> to edges.",
+                "description": "List the sources of incoming ? --relation--> to edges. Optional 'limit' (default 1000) must be a non-negative integer and is clamped to 10000.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -392,7 +392,7 @@ fn tools_list() -> Json {
             },
             {
                 "name": "page",
-                "description": "Keyset pagination in key order: up to 'limit' rows with key after the 'after' cursor (optional 'filter'). Returns {rows, next} where next is the cursor for the following page (null at end). 'limit' is capped at 10000 (default 1000).",
+                "description": "Keyset pagination in key order: up to 'limit' rows with key after the 'after' cursor (optional 'filter'). Returns {rows, next} where next is the cursor for the following page (null at end). 'limit' defaults to 1000 and is capped at 10000; an invalid limit (negative or non-integer) is an error.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -401,7 +401,7 @@ fn tools_list() -> Json {
                         "after": { "type": "string" },
                         "filter": { "type": "object" }
                     },
-                    "required": ["collection", "limit"]
+                    "required": ["collection"]
                 }
             },
             {
@@ -523,6 +523,41 @@ fn tools_list() -> Json {
                         "document": {}
                     },
                     "required": ["collection", "document"]
+                }
+            },
+            {
+                "name": "set_schema",
+                "description": "Declare (or replace) a collection's schema: a fields array of {name, type (any|bool|int|float|text|bytes|vector|array|map), required?, unique?}. Subsequent stores are validated against it (type/required violations and duplicate unique values are rejected).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "fields": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "type": { "type": "string" },
+                                    "required": { "type": "boolean" },
+                                    "unique": { "type": "boolean" }
+                                },
+                                "required": ["name"]
+                            }
+                        }
+                    },
+                    "required": ["collection", "fields"]
+                }
+            },
+            {
+                "name": "get_schema",
+                "description": "Return a collection's declared schema fields (name, type, required, unique), or {fields: null} when none is declared.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" }
+                    },
+                    "required": ["collection"]
                 }
             }
         ]

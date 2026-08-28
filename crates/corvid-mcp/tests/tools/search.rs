@@ -334,12 +334,19 @@ fn search_modality_param_errors() {
         ),
         "bad params: 'metric' must be one of: cosine, dot, l2"
     );
-    // `quant` is a create_index param, not a search param: passing it inside
-    // the vector object is silently ignored (pinned — no error).
+    // `quant` inside the vector object is validated like create_index's:
+    // invalid strings error; the valid names are accepted.
+    assert_eq!(
+        w.err(
+            "search",
+            json!({"collection": "docs", "vector": {"field": "e", "query": [1.0], "k": 1, "quant": "wat"}}),
+        ),
+        "bad params: 'quant' must be one of: none, binary, scalar"
+    );
     assert_eq!(
         w.ok(
             "search",
-            json!({"collection": "docs", "vector": {"field": "e", "query": [1.0], "k": 1, "quant": "wat"}}),
+            json!({"collection": "docs", "vector": {"field": "e", "query": [1.0], "k": 1, "quant": "scalar"}}),
         )["results"],
         json!([])
     );
@@ -587,8 +594,8 @@ fn geo_radius_nearest_and_limit() {
 
 /// geo param errors: lat/lon/radius_km are required numbers (a non-numeric
 /// or missing one is BadParams naming the field); radius is required when k
-/// is absent, and a non-integer k silently falls back to the radius path
-/// (pinned quirk: `k` is read with as_u64).
+/// is absent; and a `k` that is not a non-negative integer (string,
+/// negative, float) is a BadParams error, not a silent radius fallback.
 #[test]
 fn geo_param_errors() {
     let mut w = Wire::new();
@@ -596,7 +603,7 @@ fn geo_param_errors() {
     assert_eq!(
         w.err(
             "geo",
-            json!({"collection": "docs", "field": "loc", "lon": 0.0, "radius_km": 5.0})
+            json!({"collection": "docs", "field": "loc", "lon": 0.0, "radius_km": 5.0}),
         ),
         "bad params: missing number 'lat'"
     );
@@ -610,7 +617,7 @@ fn geo_param_errors() {
     assert_eq!(
         w.err(
             "geo",
-            json!({"collection": "docs", "field": "loc", "lat": 51.5, "lon": 0.0})
+            json!({"collection": "docs", "field": "loc", "lat": 51.5, "lon": 0.0}),
         ),
         "bad params: missing number 'radius_km'"
     );
@@ -621,13 +628,25 @@ fn geo_param_errors() {
         ),
         "bad params: missing string 'field'",
     );
-    // Quirk, pinned: k=-1 is not a u64, so the call takes the radius path.
+    // A non-u64 k errors instead of silently taking the radius path.
+    for bad in [json!(-1), json!("2"), json!(1.5)] {
+        assert_eq!(
+            w.err(
+                "geo",
+                json!({"collection": "docs", "field": "loc", "lat": 51.5, "lon": -0.13,
+                       "k": bad, "radius_km": 5.0}),
+            ),
+            "bad params: 'k' must be a non-negative integer",
+            "geo k {bad}"
+        );
+    }
+    // k = 0 is a valid u64: nearest-0 returns no hits (not the radius path).
     let out = w.ok(
         "geo",
         json!({"collection": "docs", "field": "loc", "lat": 51.5, "lon": -0.13,
-               "k": -1, "radius_km": 5.0}),
+               "k": 0, "radius_km": 5.0}),
     );
-    assert_eq!(out["results"].as_array().unwrap().len(), 1);
+    assert_eq!(out["results"], json!([]));
 }
 
 /// create_index variants: the default in-memory build, explicit metric and

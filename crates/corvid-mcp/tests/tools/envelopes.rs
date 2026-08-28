@@ -48,15 +48,15 @@ fn envelope_ping_empty_result() {
     assert!(r.get("error").is_none());
 }
 
-/// tools/list: exactly the 27 advertised tools, each with an object
+/// tools/list: exactly the 29 advertised tools, each with an object
 /// inputSchema and a non-empty description. The exact-count assertion pins
 /// the manifest's tool inventory: adding a tool without a manifest row fails
 /// here and in the radar.
 #[test]
-fn envelope_tools_list_all_27_with_schemas() {
+fn envelope_tools_list_all_29_with_schemas() {
     let r = raw(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
     let tools = r["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 27, "the server advertises exactly 27 tools");
+    assert_eq!(tools.len(), 29, "the server advertises exactly 29 tools");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for expected in [
         "store",
@@ -86,6 +86,8 @@ fn envelope_tools_list_all_27_with_schemas() {
         "list_collections",
         "count",
         "insert_auto",
+        "set_schema",
+        "get_schema",
     ] {
         assert!(
             names.contains(&expected),
