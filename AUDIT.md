@@ -36,6 +36,18 @@ Full plan (5 waves): docs/superpowers/specs/2026-08-27-audit-remediation-design.
 
 Wave 3 exit gates green: fmt, clippy `-D warnings`, 470 tests, 95.34% line coverage.
 
+## Status 2026-08-27 — remediation wave 4 landed
+
+- B3 — f615dbd + ac9f0f3 + b826640: SnapshotReader trait; run/aggregations, index candidate
+  paths, and traverse execute on one MVCC snapshot per query.
+- B7 — 2ebe69d; B2 — b9e792d; B4 — 0cef6b0; B8/B10/C7/C9 — 4c31e02; carryovers — c2cd13a.
+- B5 recall completed (c2cd13a): disk_hnsw over-fetch scales with the dead count (0.965 vs
+  0.485 recall below the compaction trigger). Follow-up: delete's edge cascade scans O(E) per
+  collection (relation-first key layout) — endpoint index if delete churn grows.
+
+Wave 4 exit gates green: fmt, clippy `-D warnings`, 495 tests, 94.36% line coverage;
+query benches 1.00-1.01x vs wave-3 exit (≤1.2x met).
+
 Severity legend: **CRITICAL** breaks the project's own central contract. **MAJOR** wrong results,
 data loss, crash, or DoS reachable through normal/intended use. **MINOR** edge-case wrongness,
 behavioral inconsistency, or doc claims with behavioral impact. **NIT** hygiene.
