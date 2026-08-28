@@ -299,6 +299,12 @@ unsubscribe stop, cross-collection isolation.
 
 ### Task 13: Lifecycle conformance
 
+Prepend (Task 12 review nits, binding): (a) trim the doc comment on
+tests/events.rs events_dispatch_is_synchronous_post_commit... to claim only
+what the test asserts (mid-dispatch unsubscribe semantics are true of the
+source but not pinned there — either add the assertion or drop the claim);
+(b) add the one-line cost note at ttl.rs's purge cascade (unconditional
+cascade = paged scan of both edge namespaces, parity with delete-of-missing).
 Prepend (Task 11 routing, binding): drive `Error::CorruptIndex` through
 the public API (write a real db file with a vector index, corrupt index
 bytes on disk, reopen, query -> exact variant) so the manifest row gets a
