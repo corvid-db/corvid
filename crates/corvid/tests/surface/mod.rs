@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 /// One manifest row: a public construct, its statement class (one of
@@ -877,7 +878,14 @@ fn extract_public_surface() -> BTreeSet<&'static str> {
         let src =
             fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
         let toks = tokenize(&src);
-        parse_scope(&toks, &module, None, &mut raws, &mut aliases);
+        parse_scope(
+            &toks,
+            &module,
+            ScopeKind::Module,
+            None,
+            &mut raws,
+            &mut aliases,
+        );
     }
 
     // Map each pub type name to its defining module, so impl blocks (which
@@ -937,23 +945,75 @@ fn extract_public_surface() -> BTreeSet<&'static str> {
     out
 }
 
-/// All `fn` names defined anywhere under `dir` (for the test-existence radar).
+/// All test fns defined anywhere under `dir`: only fns carrying a `#[test]`
+/// attribute (optionally among other attributes and behind visibility /
+/// qualifier prefixes) are indexed — helper fns never qualify.
 fn collect_test_fns(dir: &Path) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
     for file in rust_files(dir) {
         let src =
             fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        let toks = tokenize(&src);
-        for pair in toks.windows(2) {
-            if matches!(&pair[0], Tok::Ident(kw) if kw == "fn")
-                && let Tok::Ident(name) = &pair[1]
-            {
-                let leaked: &'static str = Box::leak(name.as_str().to_owned().into_boxed_str());
-                out.insert(leaked);
-            }
+        for name in test_fn_names(&tokenize(&src)) {
+            let leaked: &'static str = Box::leak(name.into_boxed_str());
+            out.insert(leaked);
         }
     }
     out
+}
+
+/// The names of the `fn`s in `toks` that directly carry a `#[test]`
+/// attribute.
+fn test_fn_names(toks: &[Tok]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut c = Cursor::new(toks);
+    while c.peek().is_some() {
+        if c.at_punct('#') && matches!(c.toks.get(c.pos + 1), Some(Tok::Punct('['))) {
+            let attr_start = c.pos;
+            c.pos += 1; // now on '['
+            let end = c.group_end('[', ']');
+            let body = &c.toks[attr_start + 2..end - 1];
+            if matches!(body, [Tok::Ident(name)] if name == "test")
+                && let Some(name) = fn_name_after_test_attr(toks, end)
+            {
+                out.push(name);
+            }
+            c.pos = end;
+        } else {
+            c.pos += 1;
+        }
+    }
+    out
+}
+
+/// The name of the fn a `#[test]` attribute is attached to, if the tokens
+/// after the attribute (at `from`) are attribute/visibility/qualifier
+/// prefixes followed by `fn NAME`.
+fn fn_name_after_test_attr(toks: &[Tok], from: usize) -> Option<String> {
+    let mut c = Cursor { toks, pos: from };
+    loop {
+        if let Some(Tok::Ident(k)) = c.peek() {
+            match k.as_str() {
+                "fn" => {
+                    c.pos += 1;
+                    return next_ident(&mut c);
+                }
+                "pub" | "crate" | "async" | "unsafe" | "extern" | "const" => c.pos += 1,
+                _ => return None,
+            }
+        } else if matches!(
+            c.peek(),
+            Some(Tok::Punct('(')) | Some(Tok::Punct(')')) | Some(Tok::Literal)
+        ) {
+            c.pos += 1;
+        } else if c.at_punct('#') && matches!(c.toks.get(c.pos + 1), Some(Tok::Punct('['))) {
+            // A further attribute on the same fn (`#[test]
+            // #[should_panic]`).
+            c.pos += 1; // now on '['
+            c.pos = c.group_end('[', ']');
+        } else {
+            return None;
+        }
+    }
 }
 
 /// Every `.rs` file under `dir` (recursively), sorted for determinism.
@@ -1242,13 +1302,27 @@ enum Vis {
     Other,
 }
 
-/// Parse one scope's items — a file body, a `pub mod` body, or an inherent
-/// impl body (with `impl_ty` naming the self type) — recording public
-/// constructs into `raws` and crate-root re-exports into `aliases`.
+/// The kind of scope being parsed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    /// A module body (a file or an inline `pub mod`).
+    Module,
+    /// An inherent impl body: `pub fn`s are the type's public methods.
+    InherentImpl,
+    /// A `pub trait` body: every fn/type/const item is the trait's public
+    /// surface (trait items carry no visibility qualifier of their own).
+    PubTrait,
+}
+
+/// Parse one scope's items — a file body, a `pub mod` body, an inherent impl
+/// body, or a `pub trait` body (`owner` names the self/trait type for the
+/// latter two) — recording public constructs into `raws` and crate-root
+/// re-exports into `aliases`.
 fn parse_scope(
     toks: &[Tok],
     module: &str,
-    impl_ty: Option<&str>,
+    scope: ScopeKind,
+    owner: Option<&str>,
     raws: &mut Vec<Raw>,
     aliases: &mut BTreeSet<String>,
 ) {
@@ -1274,15 +1348,19 @@ fn parse_scope(
             break;
         }
         let vis = parse_vis(&mut c);
+        skip_fn_qualifiers(&mut c);
         let Some(Tok::Ident(kw)) = c.peek().cloned() else {
             c.skip_item();
             continue;
         };
         c.pos += 1;
         let public = vis == Vis::Public && !cfg_test;
+        // Inside a pub trait every item is public surface (visibility
+        // qualifiers are illegal on trait items), so recording ignores `vis`.
+        let recordable = public || scope == ScopeKind::PubTrait;
         match kw.as_str() {
             "use" => {
-                if public && module.is_empty() && impl_ty.is_none() {
+                if public && module.is_empty() && scope == ScopeKind::Module {
                     parse_root_use(&mut c, aliases);
                 }
                 c.skip_item();
@@ -1292,14 +1370,21 @@ fn parse_scope(
                     c.skip_item();
                     continue;
                 };
-                if public && impl_ty.is_none() && c.at_punct('{') {
+                if public && scope == ScopeKind::Module && c.at_punct('{') {
                     let end = c.group_end('{', '}');
                     let inner = if module.is_empty() {
                         name
                     } else {
                         format!("{module}::{name}")
                     };
-                    parse_scope(&c.toks[c.pos + 1..end - 1], &inner, None, raws, aliases);
+                    parse_scope(
+                        &c.toks[c.pos + 1..end - 1],
+                        &inner,
+                        ScopeKind::Module,
+                        None,
+                        raws,
+                        aliases,
+                    );
                     c.pos = end;
                 } else {
                     // Private or test-only module (`mod tests`): its contents
@@ -1309,31 +1394,35 @@ fn parse_scope(
                 }
             }
             "fn" => {
-                if public && let Some(name) = next_ident(&mut c) {
-                    record(impl_ty, module, name, raws);
+                if recordable && let Some(name) = next_ident(&mut c) {
+                    record(scope, owner, module, name, raws);
                 }
                 c.skip_item();
             }
             "const" | "static" => {
-                if public {
+                if recordable {
                     if c.at_ident("mut") {
                         c.pos += 1;
                     }
                     if let Some(name) = next_ident(&mut c) {
-                        record(impl_ty, module, name, raws);
+                        record(scope, owner, module, name, raws);
                     }
                 }
                 c.skip_item();
             }
             "type" | "struct" | "trait" => {
-                if public && let Some(name) = next_ident(&mut c) {
-                    record(impl_ty, module, name, raws);
+                if recordable && let Some(name) = next_ident(&mut c) {
+                    record(scope, owner, module, name.clone(), raws);
+                    if kw == "trait" && scope == ScopeKind::Module {
+                        parse_trait_body(&mut c, module, &name, raws, aliases);
+                        continue;
+                    }
                 }
                 c.skip_item();
             }
             "enum" => {
-                if public && let Some(name) = next_ident(&mut c) {
-                    record(impl_ty, module, name.clone(), raws);
+                if recordable && let Some(name) = next_ident(&mut c) {
+                    record(scope, owner, module, name.clone(), raws);
                     if c.at_punct('<') {
                         c.skip_group('<', '>');
                     }
@@ -1364,6 +1453,7 @@ fn parse_scope(
                     parse_scope(
                         &c.toks[c.pos + 1..end - 1],
                         module,
+                        ScopeKind::InherentImpl,
                         Some(&ty),
                         raws,
                         aliases,
@@ -1378,8 +1468,45 @@ fn parse_scope(
     }
 }
 
-fn record(impl_ty: Option<&str>, module: &str, name: String, raws: &mut Vec<Raw>) {
-    match impl_ty {
+/// Walk a `pub trait` body (the cursor is just past the trait name),
+/// recording every fn/type/const item as a member of the trait. Supertrait
+/// bounds, generics, and where clauses between the name and the body are
+/// scanned through (they cannot contain braces).
+fn parse_trait_body(
+    c: &mut Cursor,
+    module: &str,
+    ty: &str,
+    raws: &mut Vec<Raw>,
+    aliases: &mut BTreeSet<String>,
+) {
+    if c.at_punct('<') {
+        c.skip_group('<', '>');
+    }
+    while !c.at_punct('{') && c.peek().is_some() {
+        if c.at_punct(';') {
+            // A trait alias (`pub trait X = Y;`) has no body items.
+            c.pos += 1;
+            return;
+        }
+        c.pos += 1;
+    }
+    if c.peek().is_none() {
+        return;
+    }
+    let end = c.group_end('{', '}');
+    parse_scope(
+        &c.toks[c.pos + 1..end - 1],
+        module,
+        ScopeKind::PubTrait,
+        Some(ty),
+        raws,
+        aliases,
+    );
+    c.pos = end;
+}
+
+fn record(scope: ScopeKind, owner: Option<&str>, module: &str, name: String, raws: &mut Vec<Raw>) {
+    match owner.filter(|_| scope != ScopeKind::Module) {
         Some(ty) => raws.push(Raw::Method {
             ty: ty.to_owned(),
             name,
@@ -1388,6 +1515,34 @@ fn record(impl_ty: Option<&str>, module: &str, name: String, raws: &mut Vec<Raw>
             module: module.to_owned(),
             name,
         }),
+    }
+}
+
+/// Skip item qualifiers that may sit between a visibility and the item
+/// keyword: `pub async fn`, `pub unsafe fn`, `pub const fn`,
+/// `pub unsafe extern "C" fn`, `pub unsafe trait`, … (`const` only counts as
+/// a qualifier when an `fn` — possibly through further qualifiers —
+/// follows). The ABI string after `extern` is consumed too.
+fn skip_fn_qualifiers(c: &mut Cursor) {
+    loop {
+        let is_qualifier = match c.peek() {
+            Some(Tok::Ident(k)) => match k.as_str() {
+                "async" | "unsafe" | "extern" => true,
+                "const" => matches!(
+                    c.toks.get(c.pos + 1),
+                    Some(Tok::Ident(n)) if matches!(n.as_str(), "fn" | "async" | "unsafe" | "extern" | "const")
+                ),
+                _ => false,
+            },
+            _ => false,
+        };
+        if !is_qualifier {
+            return;
+        }
+        c.pos += 1;
+        if matches!(c.peek(), Some(Tok::Literal)) {
+            c.pos += 1; // the ABI string of `extern "C"`
+        }
     }
 }
 
@@ -1408,21 +1563,44 @@ fn parse_vis(c: &mut Cursor) -> Vis {
 
 /// Parse a crate-root `pub use` into re-export aliases: `pub use m::{A, B};`
 /// contributes `A` and `B`; `pub use m::item;` contributes `item`. Renames
-/// (`as`) contribute the alias.
+/// (`as`) contribute the alias. Globs and nested brace groups are rejected
+/// loudly — silently mishandling them would corrupt alias resolution and
+/// misname every row for the re-exported items.
 fn parse_root_use(c: &mut Cursor, aliases: &mut BTreeSet<String>) {
+    const GLOB_MSG: &str = "glob re-export (`pub use …::*`) in lib.rs: the radar cannot derive \
+         which names it exports; list the names explicitly or teach \
+         parse_root_use about globs";
+    const NESTED_MSG: &str = "nested brace group in a `pub use` in lib.rs: the radar only reads \
+         one-level `pub use m::{A, B};` lists; flatten the re-export or \
+         teach parse_root_use about nesting";
     let mut last: Option<String> = None;
     while let Some(t) = c.peek().cloned() {
         match t {
+            Tok::Punct('*') => panic!("{GLOB_MSG}"),
             Tok::Punct('{') => {
                 let end = c.group_end('{', '}');
+                for t in &c.toks[c.pos + 1..end - 1] {
+                    if matches!(t, Tok::Punct('*')) {
+                        panic!("{GLOB_MSG}");
+                    }
+                    if matches!(t, Tok::Punct('{')) {
+                        panic!("{NESTED_MSG}");
+                    }
+                }
                 let mut i = c.pos + 1;
+                let mut prev_name: Option<String> = None;
                 while i < end - 1 {
                     if let Some(Tok::Ident(name)) = c.toks.get(i) {
                         if name == "as" {
                             if let Some(Tok::Ident(alias)) = c.toks.get(i + 1) {
                                 aliases.insert(alias.clone());
                             }
+                            // `A as C` exports C, not A.
+                            if let Some(prev) = prev_name.take() {
+                                aliases.remove(&prev);
+                            }
                         } else {
+                            prev_name = Some(name.clone());
                             aliases.insert(name.clone());
                         }
                     }
@@ -1542,4 +1720,124 @@ fn is_cfg_test(body: &[Tok]) -> bool {
         [Tok::Ident(a), Tok::Punct('('), Tok::Ident(b), Tok::Punct(')')]
             if a == "cfg" && b == "test"
     )
+}
+
+// ===========================================================================
+// Extractor unit tests (synthetic sources, no filesystem involved).
+// ===========================================================================
+
+/// Qualified fns (`async`/`unsafe`/`const`/`extern "C"`) are recorded like
+/// any pub fn, and a pub trait contributes its own name plus one row per
+/// member (fn, default fn, associated type, associated const).
+#[test]
+fn radar_extracts_qualified_fns_and_pub_trait_members() {
+    let src = r#"
+        pub async fn afn() {}
+        pub unsafe fn ufn() {}
+        pub const fn cfn() -> u8 { 7 }
+        pub unsafe extern "C" fn efn() {}
+        fn private_helper() {}
+        pub trait Shape: Send {
+            fn area(&self) -> f64;
+            fn default_impl(&self) -> u8 { 0 }
+            type Output;
+            const CAP: usize;
+        }
+    "#;
+    let mut raws = Vec::new();
+    let mut aliases = BTreeSet::new();
+    parse_scope(
+        &tokenize(src),
+        "m",
+        ScopeKind::Module,
+        None,
+        &mut raws,
+        &mut aliases,
+    );
+    let names: BTreeSet<String> = raws
+        .iter()
+        .map(|r| match r {
+            Raw::ModuleItem { module, name } => format!("{module}::{name}"),
+            Raw::Variant { ty, variant, .. } => format!("{ty}::{variant}"),
+            Raw::Method { ty, name } => format!("{ty}::{name}"),
+        })
+        .collect();
+    for expected in [
+        "m::afn",
+        "m::ufn",
+        "m::cfn",
+        "m::efn",
+        "m::Shape",
+        "Shape::area",
+        "Shape::default_impl",
+        "Shape::Output",
+        "Shape::CAP",
+    ] {
+        assert!(names.contains(expected), "missing {expected} in {names:?}");
+    }
+    assert!(!names.contains("m::private_helper"));
+}
+
+/// Only fns directly carrying `#[test]` are indexed by the existence radar —
+/// plain helpers, `const fn`s, and other attributes never qualify.
+#[test]
+fn radar_indexes_only_test_attributed_fns() {
+    let src = r#"
+        fn plain_helper() {}
+        const fn const_helper() {}
+        #[test]
+        fn real_test() {}
+        #[test] #[should_panic]
+        fn attrs_after_test() {}
+        #[ignore]
+        #[test]
+        pub async fn qualified_test() {}
+        #[cfg(test)]
+        fn cfg_attr_is_not_a_test_attr() {}
+    "#;
+    let names = test_fn_names(&tokenize(src));
+    assert_eq!(
+        names,
+        vec![
+            "real_test".to_owned(),
+            "attrs_after_test".to_owned(),
+            "qualified_test".to_owned(),
+        ]
+    );
+}
+
+/// Glob and nested-brace re-exports are rejected loudly instead of silently
+/// corrupting the alias set; the plain and renamed forms keep working.
+#[test]
+fn radar_rejects_glob_and_nested_reexports() {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let run_use = |src: &str| {
+        catch_unwind(AssertUnwindSafe(|| {
+            let toks = tokenize(src);
+            let mut c = Cursor::new(&toks);
+            c.pos = 2; // past `pub use`
+            let mut aliases = BTreeSet::new();
+            parse_root_use(&mut c, &mut aliases);
+            aliases
+        }))
+    };
+
+    let glob = run_use("pub use m::*;");
+    let nested = run_use("pub use m::{a, n::{b}};");
+    std::panic::set_hook(prev_hook);
+    assert!(glob.is_err(), "a glob re-export must be rejected loudly");
+    assert!(
+        nested.is_err(),
+        "a nested brace group must be rejected loudly"
+    );
+
+    // Plain and renamed forms still resolve (and `A as C` exports only C).
+    let toks = tokenize("pub use m::{A, B as C};");
+    let mut c = Cursor::new(&toks);
+    c.pos = 2;
+    let mut aliases = BTreeSet::new();
+    parse_root_use(&mut c, &mut aliases);
+    assert_eq!(aliases, BTreeSet::from(["A".to_owned(), "C".to_owned()]));
 }
