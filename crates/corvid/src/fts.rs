@@ -422,10 +422,12 @@ impl Db {
         self.fts_search_in(collection, field, query, k, self.store())
     }
 
-    /// Snapshot-scoped twin of [`Db::fts_search`] (audit B3): every read —
-    /// on-disk postings, the lazy in-memory build, corpus stats — comes from
-    /// `reader`, so the ranked keys and the caller's document fetches share
-    /// one point in time. Does NOT resume interrupted builds
+    /// Snapshot-scoped twin of [`Db::fts_search`] (audit B3) for the reads
+    /// that were ALWAYS query-snapshot reads: on-disk postings, corpus
+    /// stats, and the caller's document fetches all read `reader`, so the
+    /// ranked keys and the documents share one point in time. The lazy
+    /// in-memory BUILD is deliberately NOT one of those reads — see the
+    /// build-under-lock contract inline. Does NOT resume interrupted builds
     /// (resuming writes): the caller resumes before its snapshot opens.
     pub(crate) fn fts_search_in(
         &self,
@@ -437,9 +439,18 @@ impl Db {
     ) -> Result<Option<RankedKeys>> {
         let map_key = (collection.to_owned(), field.to_owned());
 
-        // Build while holding the registry lock: a concurrent writer's
-        // maintenance blocks here and then applies to the fresh index, so no
-        // committed document can fall between the build snapshot and install.
+        // Build while holding the registry lock. Build-under-lock contract
+        // (wave-4 final review): the build reads a FRESH read transaction
+        // (`self.store()`, opened here under the lock — exactly the
+        // pre-wave-4 shape), NOT the caller's `reader`: it must observe all
+        // state committed as of this lock acquisition, so a doc committed
+        // after the caller's snapshot is correctly IN the installed
+        // postings (its maintenance no-opped only while unbuilt); reading
+        // the stale snapshot would hide it PERMANENTLY. The stale query
+        // itself merely omits it (fetch via the older reader returns None —
+        // omission-only). A concurrent writer's maintenance blocks on this
+        // lock and then applies to the fresh index, so nothing committed
+        // falls between the build's fresh read and the install.
         {
             let mut state = self.fts().lock().expect("fts lock");
             match state.defs.get(&map_key) {
@@ -455,7 +466,7 @@ impl Db {
                 Some((TextKind::OnDisk, true)) => return Ok(None),
                 Some((TextKind::InMemory, _)) => {
                     if !state.built.contains_key(&map_key) {
-                        let inv = build_inverted(reader, collection, field)?;
+                        let inv = build_inverted(self.store(), collection, field)?;
                         state.built.entry(map_key.clone()).or_insert(inv);
                     }
                 }
@@ -466,10 +477,13 @@ impl Db {
         Ok(state.built.get(&map_key).map(|inv| inv.search(query, k)))
     }
 
-    /// Snapshot-scoped phrase search (audit B3): every read — on-disk
-    /// postings with positions, the lazy in-memory build, corpus stats —
-    /// comes from `reader`. Resume discipline as [`Db::fts_search_in`]: the
-    /// caller resumes before its snapshot opens.
+    /// Snapshot-scoped phrase search (audit B3): the reads that were always
+    /// query-snapshot reads — on-disk postings with positions, corpus
+    /// stats, the caller's document fetches — come from `reader`. The lazy
+    /// in-memory build reads FRESH state under the lock instead, per the
+    /// build-under-lock contract in [`Db::fts_search_in`]. Resume discipline
+    /// as [`Db::fts_search_in`]: the caller resumes before its snapshot
+    /// opens.
     pub(crate) fn fts_phrase_search_in(
         &self,
         collection: &str,
@@ -479,7 +493,8 @@ impl Db {
         reader: &dyn SnapshotReader,
     ) -> Result<Option<RankedKeys>> {
         let map_key = (collection.to_owned(), field.to_owned());
-        // Same build-under-lock contract as [`Db::fts_search_in`].
+        // Same build-under-lock contract as [`Db::fts_search_in`]: the
+        // in-memory build reads `self.store()` (fresh), never `reader`.
         {
             let mut state = self.fts().lock().expect("fts lock");
             match state.defs.get(&map_key) {
@@ -492,7 +507,7 @@ impl Db {
                 Some((TextKind::OnDisk, true)) => return Ok(None),
                 Some((TextKind::InMemory, _)) => {
                     if !state.built.contains_key(&map_key) {
-                        let inv = build_inverted(reader, collection, field)?;
+                        let inv = build_inverted(self.store(), collection, field)?;
                         state.built.entry(map_key.clone()).or_insert(inv);
                     }
                 }
@@ -567,9 +582,14 @@ impl Db {
     }
 }
 
-/// Build an inverted index for `field` by scanning `collection` on `reader`'s
-/// snapshot (audit B3: the lazy build sees the same point in time as the
-/// query that triggered it).
+/// Build an inverted index for `field` by scanning `collection` on a FRESH
+/// read transaction from `reader` (the pre-wave-4 shape passes
+/// `self.store()`). NOT the caller's query snapshot: the build runs under
+/// the registry lock and must observe everything committed as of lock
+/// acquisition, so a doc committed after the caller's snapshot lands IN the
+/// postings (the stale query only omits it via its own fetch) instead of
+/// being permanently missing. See the build-under-lock contract in
+/// [`Db::fts_search_in`].
 fn build_inverted(reader: &dyn SnapshotReader, collection: &str, field: &str) -> Result<Inverted> {
     let mut inv = Inverted::default();
     for (key, bytes) in reader.scan(collection)? {
@@ -968,5 +988,108 @@ mod tests {
             .defs
             .get(&(coll.to_owned(), field.to_owned()))
             .map(|(_, building)| *building)
+    }
+
+    /// Wave-4 final review, deterministic form of the first-query race
+    /// (twin of the index.rs one): a read snapshot is pinned BEFORE any
+    /// concurrent write, the writer then commits text documents, and only
+    /// afterwards does the first query — running on that stale snapshot —
+    /// trigger the lazy in-memory inverted-index build. The build MUST read
+    /// fresh state (its own read transaction, opened under the registry
+    /// lock): reading the caller's stale snapshot installs postings missing
+    /// every writer document PERMANENTLY, because their post-commit
+    /// maintenance (`fts_on_insert_memory`) no-opped while the index was
+    /// still unbuilt. Reading fresh, only the stale query itself omits
+    /// them — its document fetch drops keys its snapshot lacks
+    /// (omission-only).
+    #[test]
+    fn stale_snapshot_first_query_hides_no_committed_text() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let c = db.collection("docs");
+        for i in 0..5u32 {
+            c.insert(
+                format!("s{i}").as_bytes(),
+                &doc("seed corpus fox text about caching"),
+            )
+            .unwrap();
+        }
+        // Registered but UNBUILT: the first search below builds it.
+        c.create_text_index("body").unwrap();
+
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let writer = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                go_rx.recv().unwrap();
+                for i in 0..50u32 {
+                    db.collection("docs")
+                        .insert(
+                            format!("w{i}").as_bytes(),
+                            &doc("writer corpus fox text about streaming"),
+                        )
+                        .unwrap();
+                }
+                done_tx.send(()).unwrap();
+            })
+        };
+
+        // Pin the read snapshot NOW — the writer's commits are strictly
+        // after it, so this reader can never see them.
+        db.store()
+            .read(|r| {
+                go_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+
+                // First query on the stale snapshot: builds the postings.
+                let ranked = db
+                    .fts_search_in("docs", "body", "fox", 100, r)
+                    .unwrap()
+                    .expect("the registered in-memory index serves");
+                // The build observed fresh state, so the writer's docs are
+                // in the postings...
+                assert!(
+                    ranked.iter().any(|(k, _)| k.starts_with(b"w")),
+                    "the lazy build must see commits newer than the caller's snapshot"
+                );
+                // ...but this stale query's document fetch drops exactly
+                // those (omission-only).
+                for (key, _) in &ranked {
+                    let fetched = db.collection("docs").get_in(r, key).unwrap();
+                    assert_eq!(
+                        fetched.is_some(),
+                        key.starts_with(b"s"),
+                        "stale-query fetch must drop post-snapshot keys only"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        writer.join().unwrap();
+
+        // The permanent-hiding property: once writes stop, a later (fresh)
+        // query finds EVERY committed document via the shared term "fox".
+        let keys: Vec<Vec<u8>> = db
+            .collection("docs")
+            .text_search("body", "fox", 1000)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.key)
+            .collect();
+        for i in 0..5u32 {
+            assert!(
+                keys.contains(&format!("s{i}").into_bytes()),
+                "seed document s{i} missing from the index"
+            );
+        }
+        for i in 0..50u32 {
+            assert!(
+                keys.contains(&format!("w{i}").into_bytes()),
+                "document w{i} was permanently hidden from the index"
+            );
+        }
     }
 }

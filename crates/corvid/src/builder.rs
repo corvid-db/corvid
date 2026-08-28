@@ -904,12 +904,17 @@ impl QueryBuilder<'_> {
     /// Resume interrupted index builds for this collection BEFORE a query
     /// snapshot opens. Resumes take write transactions and registry locks,
     /// so they must not run inside execution (audit B3 discipline). Gated on
-    /// filters exactly like the probe it precedes: a filterless query never
-    /// consults an index, so it never needed to resume one. Try-lock inside:
-    /// a concurrent resumer means we just probe stale and fall back to the
-    /// (correct) scan.
+    /// "this query will consult an index", mirroring the probes it
+    /// precedes: a filtered query may drive the scalar/geo fast path
+    /// (`indexed_candidates`), and a single-source query drives the ANN or
+    /// text index paths (`ann_candidates`/`text_candidates`) even with no
+    /// filters — that is the normal `.vector(...)`/`.text(...)` shape.
+    /// Only a filterless, zero-or-multi-source query never consults an
+    /// index (pure streaming/scan), so only it skips resuming. Try-lock
+    /// inside: a concurrent resumer means we just probe stale and fall back
+    /// to the (correct) scan.
     fn resume_index_builds(&self) -> Result<()> {
-        if self.filters.is_empty() {
+        if self.filters.is_empty() && self.sources.len() != 1 {
             return Ok(());
         }
         self.collection
@@ -2270,5 +2275,65 @@ mod tests {
         assert!(keys.contains(&b"vec".to_vec()));
         assert!(keys.contains(&b"txt".to_vec()));
         assert_eq!(keys[0], b"vec".to_vec());
+    }
+
+    /// Wave-4 final review: a FILTERLESS single-source query (the normal
+    /// `.vector(...)`/`.text(...)` shape) consults an index via
+    /// `ann_candidates`/`text_candidates`, so it must resume interrupted
+    /// (Building) builds before its snapshot opens like any filtered query
+    /// — the old `filters.is_empty()` early-return left such defs Building
+    /// forever, served by the exact fallback.
+    #[test]
+    fn filterless_single_source_query_resumes_building_index() {
+        use crate::index_build::{DefState, decode_def, encode_def};
+
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"a", &doc("blog", "rust embedded database", vec![1.0, 0.0]))
+            .unwrap();
+        c.create_vector_index_ondisk("embedding", Metric::L2)
+            .unwrap();
+
+        // Forge an interrupted creation exactly as a crash would leave it:
+        // same def bytes, state flipped to Building{cursor: []}.
+        const INDEX_DEFS: &str = "__indexes__"; // mirrors index.rs
+        let def_row_key: Vec<u8> = b"docs\0embedding".to_vec(); // coll \0 field
+        let row = db
+            .store()
+            .get(INDEX_DEFS, &def_row_key)
+            .unwrap()
+            .expect("the on-disk creation wrote a def row");
+        let (kb, _) = decode_def(&row);
+        db.store()
+            .put(
+                INDEX_DEFS,
+                &def_row_key,
+                &encode_def(&kb, &DefState::Building { cursor: vec![] }),
+            )
+            .unwrap();
+        db.load_index_defs().unwrap();
+        // Sanity: the forged job exists to be resumed.
+        assert_eq!(db.collect_building_vector("docs").unwrap().len(), 1);
+
+        // Filterless single-source query: no filters, one vector source.
+        let rows = db
+            .collection("docs")
+            .query()
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::L2)
+            .run()
+            .unwrap();
+        assert_eq!(rows[0].key, b"a".to_vec());
+
+        // The query resumed the build: the durable def row is Complete.
+        let row = db
+            .store()
+            .get(INDEX_DEFS, &def_row_key)
+            .unwrap()
+            .expect("def row survives the resume");
+        let (_, st) = decode_def(&row);
+        assert!(
+            matches!(st, DefState::Complete),
+            "filterless single-source query must resume a Building def"
+        );
     }
 }

@@ -280,7 +280,10 @@ impl Collection<'_> {
     /// caller's epoch). The record behaves normally until purged. The row and
     /// its expiry commit atomically — a crash can never leave an immortal
     /// record that was asked to expire.
+    ///
+    /// Rejects engine-reserved collection names, like every write path.
     pub fn insert_with_ttl(&self, key: &[u8], doc: &crate::Value, expires_at: i64) -> Result<()> {
+        self.ensure_writable()?;
         self.db()
             .write_document(self.name(), key, Some(doc), Some(expires_at))?;
         Ok(())
@@ -542,5 +545,26 @@ mod tests {
         assert_eq!(c.ttl(b"stays").unwrap(), None);
         // A later full purge finds nothing left.
         assert_eq!(c.purge_expired(1000).unwrap(), 0);
+    }
+
+    /// Wave-4 final review: `insert_with_ttl` must reject unwritable
+    /// collection names like every other write path (`insert` etc. all run
+    /// `ensure_writable`). Pre-fix it wrote straight through `write_document`:
+    /// a reserved name like `__edges__docs` is the edge namespace of a real
+    /// collection, and an interior `__` could forge engine namespaces
+    /// (audit C7).
+    #[test]
+    fn insert_with_ttl_rejects_reserved_and_invalid_names() {
+        let db = Db::open_in_memory().unwrap();
+        let err = db
+            .collection("__edges__docs")
+            .insert_with_ttl(b"k", &rec(1), 100)
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ReservedCollection(_)));
+        let err = db
+            .collection("a__b")
+            .insert_with_ttl(b"k", &rec(1), 100)
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidName(_)));
     }
 }

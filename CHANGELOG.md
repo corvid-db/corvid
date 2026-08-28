@@ -83,6 +83,23 @@ format and API may change without backward-compatibility guarantees.
 - Re-registering an on-disk vector index — for any parameter change or none —
   now always rebuilds from scratch in one transactional reset; same-parameter
   re-creation no longer resumes a partial backfill. (audit A5)
+- `phrase_search`'s no-index fallback now scores hits with BM25 (corpus
+  stats gathered in the same pass) on the same scale as the indexed paths,
+  instead of raw occurrence counts: `TextHit::score` values change for
+  unindexed phrase queries and their ordering may change. Creating or
+  dropping an index no longer reorders the same phrase query. (audit B7)
+- Queries, aggregations (`count`/`group_count`/`sum`/`avg`), and `traverse`
+  now execute against a single MVCC snapshot: candidate generation,
+  verification, ranking, and document fetches all observe one point in
+  time, so a query can no longer return a result set matching no committed
+  state (omission-only mid-write anomalies remain possible within a query,
+  never torn reads). The lazy in-memory index builds deliberately read
+  fresh committed state under the registry lock, so a concurrent commit is
+  never permanently hidden from an in-memory index. (audit B3)
+- Deleting a document now removes its graph edges in the same transaction
+  (previously the edges were orphaned and only surfaced as dangling
+  references), and `link`/`link_weighted`/`unlink` emit change events.
+  (audit B4)
 
 ## [0.1.1] - 2026-05-29
 

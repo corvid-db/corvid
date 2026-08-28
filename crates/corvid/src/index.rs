@@ -448,11 +448,14 @@ impl Db {
         self.ann_search_in(collection, field, query, k, metric, self.store())
     }
 
-    /// Snapshot-scoped twin of [`Db::ann_search`]: the on-disk graph search,
-    /// its def re-check, and the lazy in-memory build all read `reader`, so
-    /// candidate keys and the caller's document fetches share one point in
-    /// time (audit B3). Does NOT resume interrupted builds (resuming
-    /// writes): the caller resumes before its snapshot opens.
+    /// Snapshot-scoped twin of [`Db::ann_search`] for the reads that were
+    /// ALWAYS query-snapshot reads: the on-disk graph search, its def
+    /// re-check, and the caller's document fetch/verify all read `reader`,
+    /// so candidate keys and documents share one point in time (audit B3).
+    /// The lazy in-memory BUILD is deliberately NOT one of those reads —
+    /// see the build-under-lock contract below. Does NOT resume interrupted
+    /// builds (resuming writes): the caller resumes before its snapshot
+    /// opens.
     pub(crate) fn ann_search_in(
         &self,
         collection: &str,
@@ -516,25 +519,38 @@ impl Db {
             };
         }
 
-        // Build (or compact) while holding the registry lock. A concurrent
-        // writer's maintenance blocks on this lock and then applies to the
-        // freshly installed graph, so no committed document can fall between
-        // the build's snapshot and the install — the race that
-        // otherwise permanently hid such documents from ANN search.
+        // Build (or compact) while holding the registry lock. Build-under-lock
+        // contract (wave-4 final review): the build reads a FRESH read
+        // transaction (`self.store()`, opened here under the lock — exactly
+        // the pre-wave-4 shape), NOT the caller's `reader`. The build MUST
+        // observe all state committed as of this lock acquisition: a doc
+        // committed after the caller's snapshot but before the build is
+        // correctly IN the installed graph (its post-commit maintenance
+        // no-opped only because the graph was unbuilt at commit time);
+        // reading the caller's stale snapshot would instead install a graph
+        // missing it PERMANENTLY — until a compaction or re-register that
+        // may never come. The stale query itself merely omits the doc: the
+        // caller fetches it via its own (older) reader, gets None, and
+        // drops it — omission-only, consistent with some point in time. A
+        // concurrent writer's maintenance meanwhile blocks on this lock and
+        // then applies to the freshly installed graph, so no committed
+        // document can fall between the build's fresh read and the install.
         {
             let mut state = self.indexes().lock().expect("index lock");
             if !state.built.contains_key(&map_key) {
-                let built = build_index(reader, collection, field, def.clone())?;
+                let built = build_index(self.store(), collection, field, def.clone())?;
                 state.built.entry(map_key.clone()).or_insert(built);
             }
 
-            // Compact if more than half the graph is tombstoned.
+            // Compact if more than half the graph is tombstoned. The rebuild
+            // reads fresh state under the lock for the same reason as the
+            // first build above.
             let needs_compact = state
                 .built
                 .get(&map_key)
                 .is_some_and(|b| !b.node_to_key.is_empty() && b.dead() * 2 > b.node_to_key.len());
             if needs_compact {
-                let built = build_index(reader, collection, field, def.clone())?;
+                let built = build_index(self.store(), collection, field, def.clone())?;
                 state.built.insert(map_key.clone(), built);
             }
         }
@@ -812,9 +828,13 @@ fn install_def_over_cleared_namespace(
     })
 }
 
-/// Build a fresh index for `field` by scanning `collection` on `reader`'s
-/// snapshot (audit B3: the lazy build sees the same point in time as the
-/// query that triggered it).
+/// Build a fresh index for `field` by scanning `collection` on a FRESH read
+/// transaction from `reader` (the pre-wave-4 shape passes `self.store()`).
+/// NOT the caller's query snapshot: the build runs under the registry lock
+/// and must observe everything committed as of lock acquisition, so a doc
+/// committed after the caller's snapshot lands IN the graph (the stale
+/// query only omits it via its own fetch) instead of being permanently
+/// missing. See the build-under-lock contract in [`Db::ann_search_in`].
 fn build_index(
     reader: &dyn SnapshotReader,
     collection: &str,
@@ -2494,6 +2514,98 @@ mod tests {
                 hits[0].key,
                 format!("k{i}").into_bytes(),
                 "document k{i} was lost from the index"
+            );
+        }
+    }
+
+    /// Wave-4 final review, deterministic form of the first-query race: a
+    /// read snapshot is pinned BEFORE any concurrent write, the writer then
+    /// commits, and only afterwards does the first query — running on that
+    /// stale snapshot — trigger the lazy in-memory build. The build MUST
+    /// read fresh state (its own read transaction, opened under the
+    /// registry lock): reading the caller's stale snapshot installs a graph
+    /// missing every writer document PERMANENTLY, because their post-commit
+    /// maintenance (`index_on_insert_memory`) no-opped while the graph was
+    /// still unbuilt. Reading fresh, the graph contains them and only the
+    /// stale query itself omits them — its fetch/verify drops keys its
+    /// snapshot lacks (omission-only, consistent with some point in time).
+    #[test]
+    fn stale_snapshot_first_query_hides_no_committed_document() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let c = db.collection("docs");
+        for i in 0..5u32 {
+            c.insert(format!("s{i}").as_bytes(), &doc(vec![i as f32, 0.0]))
+                .unwrap();
+        }
+        // Registered but UNBUILT: the first search below builds it.
+        c.create_vector_index("embedding", Metric::L2).unwrap();
+
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let writer = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                go_rx.recv().unwrap();
+                for i in 0..50u32 {
+                    let v = vec![100.0 + i as f32, 0.0];
+                    db.collection("docs")
+                        .insert(format!("w{i}").as_bytes(), &doc(v))
+                        .unwrap();
+                }
+                done_tx.send(()).unwrap();
+            })
+        };
+
+        // Pin the read snapshot NOW — the writer's commits are strictly
+        // after it, so this reader can never see them.
+        db.store()
+            .read(|r| {
+                go_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+
+                // First query on the stale snapshot: builds the graph.
+                let ranked = db
+                    .ann_search_in("docs", "embedding", &[0.0, 0.0], 100, Metric::L2, r)
+                    .unwrap()
+                    .expect("the registered in-memory index serves");
+                // The build observed fresh state, so the graph holds the
+                // writer's docs as candidates...
+                assert!(
+                    ranked.iter().any(|(k, _)| k.starts_with(b"w")),
+                    "the lazy build must see commits newer than the caller's snapshot"
+                );
+                // ...but this stale query's document fetch drops exactly
+                // those (omission-only): seed keys verify, writer keys
+                // fetch None on the pinned snapshot.
+                for (key, _) in &ranked {
+                    let fetched = db.collection("docs").get_in(r, key).unwrap();
+                    assert_eq!(
+                        fetched.is_some(),
+                        key.starts_with(b"s"),
+                        "stale-query fetch must drop post-snapshot keys only"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        writer.join().unwrap();
+
+        // The permanent-hiding property: once writes stop, a later (fresh)
+        // query finds EVERY committed document. Pre-fix, each w-doc was
+        // missing forever (graph built from the stale snapshot, maintenance
+        // already skipped it while unbuilt).
+        let c = db.collection("docs");
+        for i in 0..50u32 {
+            let hits = c
+                .vector_search("embedding", &[100.0 + i as f32, 0.0], 1, Metric::L2)
+                .unwrap();
+            assert_eq!(
+                hits[0].key,
+                format!("w{i}").into_bytes(),
+                "document w{i} was permanently hidden from the index"
             );
         }
     }
