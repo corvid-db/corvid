@@ -301,3 +301,21 @@ every construct with its covering test names); DELETE `STRICT_COVERING`
 (radar always requires non-empty covering_tests) and make the manifest
 green under strict mode; CHANGELOG entry; verify no manifest row cites a
 test that does not exist; full gates + coverage report attached to report.
+
+## Conventions (added at W1 exit; bind all later tasks)
+
+1. **Shared error variants cite every raiser.** A row like
+   `Error::InvalidArgument` (raised by hybrid params, geo validation, and
+   text k-bounds alike) keeps ONE primary class but its `covering_tests`
+   must, by the time strict mode lands, cite tests driving it through every
+   raiser's class. Task 15's SYNTAX.md generator annotates such rows as
+   shared across classes.
+2. **Covering-test names are globally unique and descriptive.**
+   `covering_tests` entries are bare fn names, so uniqueness across the
+   whole tests/ tree is enforced by the radar (added in Task 3
+   housekeeping); prefer `<construct>_<behavior>` names.
+3. **Radar self-tests are not citable.** `tests/surface/` is excluded from
+   the covering-test index (Task 3 housekeeping).
+4. **Ruling reaffirmed:** conformance tests use only the public API; the
+   radar's `#[test]`-only indexer is the citation mechanism (a cited fn
+   must be a real `#[test]`).
