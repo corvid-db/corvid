@@ -9,6 +9,7 @@
 #[derive(Debug, Clone, Copy)]
 pub struct Bm25Params {
     /// Term-frequency saturation. Higher means tf keeps mattering longer.
+    /// Must be non-negative and finite.
     pub k1: f32,
     /// Length normalization in `[0, 1]`. 0 disables it.
     pub b: f32,
@@ -18,6 +19,37 @@ impl Default for Bm25Params {
     /// The widely used defaults `k1 = 1.2`, `b = 0.75`.
     fn default() -> Self {
         Self { k1: 1.2, b: 0.75 }
+    }
+}
+
+impl Bm25Params {
+    /// Construct BM25 parameters, validating their domains (audit C6):
+    /// `k1` must be non-negative and finite, `b` in `[0, 1]` (NaN rejected
+    /// for both — it poisons every score silently). Out-of-range input
+    /// returns [`crate::Error::InvalidArgument`] instead of degrading
+    /// ranking. [`Bm25Params::default`] is always valid.
+    pub fn new(k1: f32, b: f32) -> crate::error::Result<Self> {
+        let p = Self { k1, b };
+        p.validate()?;
+        Ok(p)
+    }
+
+    /// Check the parameter domains (audit C6): `k1 >= 0` and finite,
+    /// `b` in `[0, 1]`. NaN fails both tests.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if !self.k1.is_finite() || self.k1 < 0.0 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "Bm25Params: k1 must be >= 0, got {}",
+                self.k1
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.b) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "Bm25Params: b must be in [0, 1], got {}",
+                self.b
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -257,5 +289,27 @@ mod tests {
         let short = term_score(2, 5, 10.0, 1.0, p);
         let long = term_score(2, 50, 10.0, 1.0, p);
         assert!(close(short, long));
+    }
+
+    /// Audit C6: the validated constructor rejects out-of-domain parameters
+    /// (`k1 < 0` or NaN, `b` outside `[0, 1]` or NaN) with
+    /// `Error::InvalidArgument` instead of letting them silently poison
+    /// every score; the closed-interval boundaries are accepted, and the
+    /// engine's defaults always validate.
+    #[test]
+    fn bm25_params_new_validates_ranges() {
+        // Valid, including the boundaries.
+        assert!(Bm25Params::new(1.2, 0.75).is_ok());
+        assert!(Bm25Params::new(0.0, 0.0).is_ok());
+        assert!(Bm25Params::new(2.0, 1.0).is_ok());
+        // Invalid k1 (negative or NaN).
+        assert!(Bm25Params::new(-0.1, 0.75).is_err());
+        assert!(Bm25Params::new(f32::NAN, 0.75).is_err());
+        // Invalid b (outside [0, 1] or NaN).
+        assert!(Bm25Params::new(1.2, -0.1).is_err());
+        assert!(Bm25Params::new(1.2, 1.5).is_err());
+        assert!(Bm25Params::new(1.2, f32::NAN).is_err());
+        // The engine's defaults always validate.
+        assert!(Bm25Params::default().validate().is_ok());
     }
 }

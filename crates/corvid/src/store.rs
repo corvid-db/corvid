@@ -221,11 +221,36 @@ impl Store {
     /// it — an existing path is refused with
     /// [`crate::Error::BackupTargetExists`]. The result is a complete,
     /// independent database openable with [`Store::open`].
+    ///
+    /// Audit C8: a backup that fails anywhere after the exists() check
+    /// removes the partial destination (best-effort) before returning the
+    /// original error, so a failed backup never leaves debris behind —
+    /// debris would both masquerade as a valid backup and block every
+    /// future attempt via the exists() refusal. The residual
+    /// check-then-create race (another creator winning the window between
+    /// `exists()` and `Database::create`) is accepted: corvid is a
+    /// single-process embedded engine, so concurrent backups of one store
+    /// are the caller's responsibility to serialize.
     pub fn backup(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         if path.exists() {
             return Err(crate::Error::BackupTargetExists(path.display().to_string()));
         }
+        let result = self.backup_tables(path);
+        if result.is_err() {
+            // Audit C8: no debris. Best-effort — the remove can itself fail
+            // (nothing was created; the file is held elsewhere) — the
+            // original error is what the caller needs.
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
+
+    /// The table copy underlying [`Store::backup`]: snapshot the source,
+    /// create the destination, copy each table in one destination
+    /// transaction. Any error propagates to the caller, which then removes
+    /// the partial destination.
+    fn backup_tables(&self, path: &Path) -> Result<()> {
         let src = self.db.begin_read()?;
         let dst = Database::create(path)?;
         let wtx = dst.begin_write()?;
@@ -1030,6 +1055,38 @@ mod tests {
         // The old backup is untouched by the refused attempt.
         let b = Store::open(&bak).unwrap();
         assert_eq!(b.get("docs", b"a").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    /// Audit C8: a backup that fails anywhere after the exists() check must
+    /// leave no partial destination behind — debris would both masquerade as
+    /// a valid backup and block every future attempt (the exists() refusal).
+    /// Failure is forced by making the target's parent directory read-only.
+    #[test]
+    #[cfg(unix)]
+    fn failed_backup_leaves_no_debris() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("src.db");
+        let s = Store::open(&src_path).unwrap();
+        s.put("docs", b"a", b"v1").unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let target = sub.join("backup.db");
+
+        let mut perms = std::fs::metadata(&sub).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&sub, perms).unwrap();
+        let result = s.backup(&target);
+        // Restore writability before asserting so tempdir cleanup always works.
+        let mut perms = std::fs::metadata(&sub).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&sub, perms).unwrap();
+
+        assert!(result.is_err(), "backup into a read-only parent must fail");
+        assert!(
+            !target.exists(),
+            "a failed backup must not leave a partial destination behind"
+        );
     }
 
     #[test]

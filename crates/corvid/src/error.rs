@@ -64,6 +64,15 @@ pub enum Error {
     #[error("invalid name (NUL byte or `__` is not allowed): {0}")]
     InvalidName(String),
 
+    /// A caller-supplied argument is outside its valid domain (audit C6/C2):
+    /// a non-positive or NaN RRF constant, an MMR `lambda` outside `[0, 1]`,
+    /// BM25 parameters outside their ranges, or geographic coordinates
+    /// outside latitude/longitude bounds. Rejected loudly at the execution
+    /// entry points instead of silently degrading ranking or matching
+    /// nothing.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
     /// The on-disk file was written by an incompatible format version. Per
     /// project policy there is no migration: the old file must be reimported.
     #[error("incompatible format: file is v{found}, engine expects v{expected}")]

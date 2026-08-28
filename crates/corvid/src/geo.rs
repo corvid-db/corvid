@@ -155,6 +155,16 @@ impl Collection<'_> {
 
     /// Find documents whose `field` point falls within the bounding box
     /// `[min_lat, max_lat] × [min_lon, max_lon]`, in key order.
+    ///
+    /// Audit C2: a box with `min_lon > max_lon` wraps the antimeridian and
+    /// matches BOTH longitude ranges — `lon >= min_lon || lon <= max_lon` —
+    /// so e.g. `(10, 170) → (20, -170)` covers 170°E eastward across ±180°
+    /// to 170°W. The wrapped window is not index-accelerated (the spatial
+    /// index refuses it and the query falls back to a scan) but stays exact.
+    /// All four bounds are validated at entry — latitude in `[-90, 90]`,
+    /// longitude in `[-180, 180]`, NaN rejected — yielding
+    /// [`crate::Error::InvalidArgument`] instead of silently matching
+    /// nothing.
     pub fn geo_within_bbox(
         &self,
         field: &str,
@@ -163,18 +173,44 @@ impl Collection<'_> {
         max_lat: f64,
         max_lon: f64,
     ) -> Result<Vec<(Vec<u8>, Value)>> {
+        validate_bbox(min_lat, min_lon, max_lat, max_lon)?;
+        let wrapped = min_lon > max_lon;
         let scanned = self.geo_scan_set(field, Some((min_lat, min_lon, max_lat, max_lon)))?;
         let mut out = Vec::new();
         for (key, document) in scanned {
             if let Some((lat, lon)) = document.get_path(field).and_then(extract_point)
                 && (min_lat..=max_lat).contains(&lat)
-                && (min_lon..=max_lon).contains(&lon)
+                && if wrapped {
+                    // Antimeridian wrap: two longitude ranges, not one.
+                    lon >= min_lon || lon <= max_lon
+                } else {
+                    (min_lon..=max_lon).contains(&lon)
+                }
             {
                 out.push((key, document));
             }
         }
         Ok(out)
     }
+}
+
+/// Reject bounding-box bounds outside their domains (audit C2): latitude in
+/// `[-90, 90]`, longitude in `[-180, 180]`. NaN fails every range test, so
+/// it is rejected here rather than silently matching nothing downstream.
+fn validate_bbox(min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> Result<()> {
+    for (name, v, lo, hi) in [
+        ("min_lat", min_lat, -90.0, 90.0),
+        ("max_lat", max_lat, -90.0, 90.0),
+        ("min_lon", min_lon, -180.0, 180.0),
+        ("max_lon", max_lon, -180.0, 180.0),
+    ] {
+        if !(lo..=hi).contains(&v) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "geo_within_bbox: {name} = {v} is outside [{lo}, {hi}]"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -336,6 +372,64 @@ mod tests {
         assert!(keys.contains(&b"london".to_vec()));
         assert!(keys.contains(&b"greenwich".to_vec()));
         assert!(!keys.contains(&b"paris".to_vec()));
+    }
+
+    /// Audit C2: a box whose `min_lon > max_lon` wraps the antimeridian and
+    /// must match BOTH longitude ranges (`lon >= min_lon || lon <= max_lon`).
+    /// The old interval test silently matched nothing. Verified on the scan
+    /// path and the indexed path alike (the geo index refuses wrapped
+    /// windows and falls back to the scan — correct, just unaccelerated).
+    #[test]
+    fn bbox_wrapping_antimeridian_matches_both_sides() {
+        fn run(indexed: bool, label: &str) {
+            let db = Db::open_in_memory().unwrap();
+            let c = db.collection("places");
+            c.insert(b"east", &place("east", 15.0, 175.0)).unwrap();
+            c.insert(b"west", &place("west", 15.0, -175.0)).unwrap();
+            c.insert(b"mid", &place("mid", 15.0, 0.0)).unwrap();
+            c.insert(b"south", &place("south", -15.0, 178.0)).unwrap();
+            if indexed {
+                c.create_geo_index("loc").unwrap();
+            }
+            let out = c.geo_within_bbox("loc", 10.0, 170.0, 20.0, -170.0).unwrap();
+            let mut keys: Vec<_> = out.iter().map(|(k, _)| k.clone()).collect();
+            keys.sort();
+            assert_eq!(
+                keys,
+                vec![b"east".to_vec(), b"west".to_vec()],
+                "{label}: the wrapped box must match both sides of the antimeridian"
+            );
+        }
+        run(false, "scan");
+        run(true, "indexed");
+    }
+
+    /// Audit C2: bounds outside their domains are rejected loudly with
+    /// `Error::InvalidArgument` instead of silently matching nothing (NaN
+    /// compares false against every range, so it is rejected here too).
+    #[test]
+    fn bbox_rejects_out_of_domain_coordinates() {
+        let db = seed();
+        let c = db.collection("places");
+        // (min_lat, min_lon, max_lat, max_lon), each row invalid somewhere.
+        for args in [
+            (91.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, -90.5, 0.0),
+            (0.0, 181.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, -180.5),
+            (f64::NAN, 0.0, 0.0, 0.0),
+            (0.0, f64::NAN, 0.0, 0.0),
+        ] {
+            assert!(
+                matches!(
+                    c.geo_within_bbox("loc", args.0, args.1, args.2, args.3),
+                    Err(crate::Error::InvalidArgument(_))
+                ),
+                "bbox {args:?} must be rejected, not silently match nothing"
+            );
+        }
+        // The domain boundaries themselves are accepted.
+        assert!(c.geo_within_bbox("loc", -90.0, -180.0, 90.0, 180.0).is_ok());
     }
 
     #[test]

@@ -700,7 +700,9 @@ pub(crate) fn search(
     // ranks ahead of the live ones, `k` live nodes remain among the
     // candidates — recall no longer decays as tombstones accumulate (the
     // compaction trigger instead bounds the cost this width adds).
-    let want = ef_search.max(k) + meta.dead as usize;
+    // Saturating: a pathological `dead` counter can never panic the search
+    // (wave-5 deferred guard).
+    let want = ef_search.max(k).saturating_add(meta.dead as usize);
     let w = search_layer_r(reader, ns, p, &mut cache, query, &[cur], want, 0)?;
 
     let mut out = Vec::new();

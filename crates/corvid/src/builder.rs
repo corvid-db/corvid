@@ -161,14 +161,19 @@ impl QueryBuilder<'_> {
     }
 
     /// Set the Reciprocal Rank Fusion constant (default [`DEFAULT_RRF_K`]).
+    /// Must be positive and finite: any other value (zero, negative, NaN) is
+    /// rejected with [`crate::Error::InvalidArgument`] when the query
+    /// executes (audit C6 — the builder stays fluent; execution validates).
     pub fn fuse_rrf(mut self, k: f32) -> Self {
         self.rrf_k = k;
         self
     }
 
     /// Diversify results with Maximal Marginal Relevance. `lambda` in `[0, 1]`
-    /// trades relevance (1.0) against diversity (0.0). Requires a vector source
-    /// to supply the query and metric; without one this is a no-op.
+    /// trades relevance (1.0) against diversity (0.0); values outside the
+    /// range (or NaN) are rejected with [`crate::Error::InvalidArgument`]
+    /// when the query executes (audit C6). Requires a vector source to
+    /// supply the query and metric; without one this is a no-op.
     pub fn rerank_mmr(mut self, lambda: f32) -> Self {
         self.mmr_lambda = Some(lambda);
         self
@@ -187,10 +192,14 @@ impl QueryBuilder<'_> {
         self
     }
 
-    /// Order results by a scalar field instead of by rank. `descending`
-    /// reverses the order. Rows missing the field (or with an incomparable
-    /// value) sort to the end. Comparable values: int/float (numeric), text
-    /// (lexical).
+    /// Order results by a scalar field instead of by rank. Rows fall into
+    /// three classes (audit C4): values present and comparable (int/float
+    /// numerically, text lexically) come first, in value order; values
+    /// present but pairwise incomparable (bools, containers, NaN) come after
+    /// them, in key order; rows missing the field come last. Ties within a
+    /// class break by key. `descending` reverses the value order WITHIN the
+    /// comparable class only — the class order itself is fixed, so
+    /// incomparable and missing values always sort last.
     pub fn order_by(mut self, field: impl Into<String>, descending: bool) -> Self {
         self.order_by = Some((field.into(), descending));
         self
@@ -227,6 +236,7 @@ impl QueryBuilder<'_> {
     /// Like [`Self::run`], the whole aggregate executes on one read snapshot
     /// (audit B3).
     pub fn count(self) -> Result<usize> {
+        self.validate_args()?;
         // No filters → use the maintained O(1) counter.
         if self.filters.is_empty() {
             return self.collection.len();
@@ -273,6 +283,7 @@ impl QueryBuilder<'_> {
     /// stream observes one read snapshot (audit B3), so an aggregate built on
     /// it never mixes states from two points in time.
     fn for_each_match(&self, mut f: impl FnMut(&Value)) -> Result<()> {
+        self.validate_args()?;
         self.resume_index_builds()?;
         self.collection.db().store().read(|r| {
             if let Some(cands) = self.indexed_candidates(r)? {
@@ -396,6 +407,31 @@ impl QueryBuilder<'_> {
             .into_iter()
             .map(|(g, (s, n))| (g, s / n as f64))
             .collect())
+    }
+
+    /// Validate caller-supplied ranking parameters (audit C6). The fluent
+    /// builder stores arguments as given — returning `Result` from every
+    /// chain link would break the API — so every execution entry point
+    /// ([`Self::run`], [`Self::count`], and the aggregates via
+    /// [`Self::for_each_match`]) rejects out-of-domain values with
+    /// [`crate::Error::InvalidArgument`] before touching the store.
+    /// Execution-time validation keeps the chain fluent and the errors typed.
+    fn validate_args(&self) -> Result<()> {
+        if !self.rrf_k.is_finite() || self.rrf_k <= 0.0 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "fuse_rrf: k must be > 0, got {}",
+                self.rrf_k
+            )));
+        }
+        if let Some(lambda) = self.mmr_lambda
+            && !(0.0..=1.0).contains(&lambda)
+        {
+            // The range test also catches NaN (not contained).
+            return Err(crate::Error::InvalidArgument(format!(
+                "rerank_mmr: lambda must be in [0, 1], got {lambda}"
+            )));
+        }
+        Ok(())
     }
 
     /// Try the ANN fast path: a single vector source whose field/metric has a
@@ -890,6 +926,10 @@ impl QueryBuilder<'_> {
 
     /// Execute the query and return the ranked rows.
     ///
+    /// Ranking parameters are validated first (audit C6): an out-of-domain
+    /// `fuse_rrf`/`rerank_mmr` value fails fast with
+    /// [`crate::Error::InvalidArgument`] before any store access.
+    ///
     /// ONE read snapshot covers the whole query (audit B3): every document
     /// read — candidate verification, ANN/text fetch loops, streaming and
     /// full scans — observes a single point in time, so the result always
@@ -897,6 +937,7 @@ impl QueryBuilder<'_> {
     /// Interrupted index builds are resumed first, before that snapshot
     /// opens, so nothing inside query execution writes.
     pub fn run(self) -> Result<Vec<ResultRow>> {
+        self.validate_args()?;
         self.resume_index_builds()?;
         self.collection.db().store().read(|r| self.run_with(r))
     }
@@ -996,16 +1037,7 @@ impl QueryBuilder<'_> {
             ordered.sort_by(|(ka, _), (kb, _)| {
                 let va = docs.get(ka).and_then(|d| d.get_path(field));
                 let vb = docs.get(kb).and_then(|d| d.get_path(field));
-                match (va, vb) {
-                    (Some(a), Some(b)) => {
-                        let base = crate::filter::value_order(a, b).unwrap_or(Ordering::Equal);
-                        let base = if *descending { base.reverse() } else { base };
-                        base.then_with(|| ka.cmp(kb))
-                    }
-                    (Some(_), None) => Ordering::Less, // present sorts before missing
-                    (None, Some(_)) => Ordering::Greater,
-                    (None, None) => ka.cmp(kb),
-                }
+                compare_by_field_class(va, vb, *descending, ka, kb)
             });
         }
 
@@ -1209,21 +1241,55 @@ fn as_number(v: &Value) -> Option<f64> {
     }
 }
 
-/// Sort `(key, doc)` pairs by a scalar field, missing/incomparable last, ties
-/// by key. `descending` reverses the value comparison.
-fn sort_by_field(buf: &mut [(Vec<u8>, Value)], field: &str, descending: bool) {
-    buf.sort_by(
-        |(ka, da), (kb, db)| match (da.get_path(field), db.get_path(field)) {
+/// The ordering class of a row's `order_by` value (audit C4): `0` = present
+/// and comparable (int/float/text — [`crate::filter::value_order`] is defined
+/// for the kind, checked via `value_order(v, v)`), `1` = present but
+/// pairwise incomparable (bools, containers, NaN), `2` = missing. Comparing
+/// classes FIRST makes missing AND incomparable rows sort after the
+/// comparable group instead of interleaving by key. The class order is fixed
+/// under `descending` — only the value order within the comparable class
+/// reverses.
+fn order_class(v: Option<&Value>) -> u8 {
+    match v {
+        Some(v) => u8::from(crate::filter::value_order(v, v).is_none()),
+        None => 2,
+    }
+}
+
+/// The order_by comparator shared by [`QueryBuilder::run_with`] and
+/// [`sort_by_field`] (audit C4): class first (`order_class` — fixed under
+/// `descending`), then the value comparison within the comparable class
+/// (reversed by `descending`; pairwise-incomparable kinds inside the class,
+/// e.g. an Int against a Text, fall back to key order), then key.
+fn compare_by_field_class(
+    va: Option<&Value>,
+    vb: Option<&Value>,
+    descending: bool,
+    ka: &[u8],
+    kb: &[u8],
+) -> Ordering {
+    order_class(va)
+        .cmp(&order_class(vb))
+        .then_with(|| match (va, vb) {
             (Some(a), Some(b)) => {
                 let base = crate::filter::value_order(a, b).unwrap_or(Ordering::Equal);
                 let base = if descending { base.reverse() } else { base };
                 base.then_with(|| ka.cmp(kb))
             }
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => ka.cmp(kb),
-        },
-    );
+            // Equal classes mean both present or both missing; the missing
+            // pair has no value comparison, the present pair is handled above.
+            _ => ka.cmp(kb),
+        })
+}
+
+/// Sort `(key, doc)` pairs by a scalar field using the order_by class rule
+/// (audit C4): comparable values in value order, then pairwise-incomparable
+/// values in key order, then rows missing the field; ties by key.
+/// `descending` reverses the value order within the comparable class only.
+fn sort_by_field(buf: &mut [(Vec<u8>, Value)], field: &str, descending: bool) {
+    buf.sort_by(|(ka, da), (kb, db)| {
+        compare_by_field_class(da.get_path(field), db.get_path(field), descending, ka, kb)
+    });
 }
 
 /// Narrow a document to the named field paths, which may be dotted
@@ -1532,6 +1598,85 @@ mod tests {
             .run()
             .unwrap();
         assert_eq!(rows[0].key, b"a".to_vec());
+    }
+
+    /// Audit C6: `fuse_rrf` is validated at execution entry (the builder
+    /// stays fluent — invalid values are stored, then rejected by run/count/
+    /// aggregates with `Error::InvalidArgument`): k must be positive and
+    /// finite. Zero, negatives, and NaN divide nothing useful in RRF and
+    /// used to flow into the scores silently.
+    #[test]
+    fn fuse_rrf_rejects_non_positive_and_nan() {
+        let db = seed();
+        for bad in [0.0f32, -1.0, f32::NAN] {
+            let err = db
+                .collection("docs")
+                .query()
+                .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+                .text("body", "rust", 10)
+                .fuse_rrf(bad)
+                .run()
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::InvalidArgument(_)),
+                "fuse_rrf({bad}) must be rejected"
+            );
+            // Aggregates validate too, not just run.
+            let err = db
+                .collection("docs")
+                .query()
+                .fuse_rrf(bad)
+                .count()
+                .unwrap_err();
+            assert!(matches!(err, crate::Error::InvalidArgument(_)));
+        }
+        // Positive values are accepted, down to the smallest positive f32.
+        for good in [f32::MIN_POSITIVE, 60.0] {
+            assert!(
+                db.collection("docs")
+                    .query()
+                    .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+                    .text("body", "rust", 10)
+                    .fuse_rrf(good)
+                    .run()
+                    .is_ok(),
+                "fuse_rrf({good}) must be accepted"
+            );
+        }
+    }
+
+    /// Audit C6: `rerank_mmr`'s lambda must lie in `[0, 1]` (NaN included in
+    /// the rejection) — outside it, MMR's relevance/diversity trade-off is
+    /// meaningless. Rejected at execution entry with
+    /// `Error::InvalidArgument`; the boundaries themselves are accepted.
+    #[test]
+    fn rerank_mmr_rejects_out_of_range_and_nan() {
+        let db = seed();
+        for bad in [-0.1f32, 1.1, f32::NAN] {
+            let err = db
+                .collection("docs")
+                .query()
+                .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+                .rerank_mmr(bad)
+                .run()
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::InvalidArgument(_)),
+                "rerank_mmr({bad}) must be rejected"
+            );
+        }
+        // The closed-interval boundaries are accepted.
+        for good in [0.0f32, 1.0] {
+            assert!(
+                db.collection("docs")
+                    .query()
+                    .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+                    .rerank_mmr(good)
+                    .run()
+                    .is_ok(),
+                "rerank_mmr({good}) must be accepted"
+            );
+        }
     }
 
     #[test]
@@ -1865,6 +2010,214 @@ mod tests {
         let rows = c.query().order_by("n", false).run().unwrap();
         assert_eq!(rows[0].key, b"has".to_vec());
         assert_eq!(rows[1].key, b"missing".to_vec());
+    }
+
+    /// Seed for the order_by class tests: three comparable Ints, two
+    /// pairwise-incomparable Bools with keys that sort BEFORE the Ints' keys
+    /// (so interleave-by-key — the old behavior — is distinguishable from
+    /// class grouping), and one row missing the field.
+    fn order_class_seed(c: &crate::Collection) {
+        let row = |v: Option<Value>| {
+            let mut m = BTreeMap::new();
+            if let Some(v) = v {
+                m.insert("v".to_owned(), v);
+            }
+            Value::Map(m)
+        };
+        c.insert(b"b1", &row(Some(Value::Bool(true)))).unwrap();
+        c.insert(b"b0", &row(Some(Value::Bool(false)))).unwrap();
+        c.insert(b"i3", &row(Some(Value::Int(3)))).unwrap();
+        c.insert(b"i1", &row(Some(Value::Int(1)))).unwrap();
+        c.insert(b"i2", &row(Some(Value::Int(2)))).unwrap();
+        c.insert(b"zz", &row(None)).unwrap();
+    }
+
+    /// Audit C4: order_by's class rule — comparable values (int/float/text)
+    /// first in value order, pairwise-incomparable values (bools, containers,
+    /// NaN) after them (key order within the class), missing last. The old
+    /// comparators treated an incomparable pair as `Equal`, so bools
+    /// interleaved by key ahead of the comparable group.
+    #[test]
+    fn order_by_sorts_incomparable_after_comparable_and_missing_last() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        order_class_seed(&c);
+        let rows = c.query().order_by("v", false).run().unwrap();
+        let keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                b"i1".to_vec(),
+                b"i2".to_vec(),
+                b"i3".to_vec(),
+                b"b0".to_vec(),
+                b"b1".to_vec(),
+                b"zz".to_vec()
+            ],
+            "comparable group in value order, then incomparable, then missing"
+        );
+    }
+
+    /// Audit C4: `descending` reverses the value order WITHIN the comparable
+    /// class only — the class order itself is fixed, so incomparable and
+    /// missing values still sort last.
+    #[test]
+    fn order_by_descending_reverses_values_but_not_classes() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        order_class_seed(&c);
+        let rows = c.query().order_by("v", true).run().unwrap();
+        let keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                b"i3".to_vec(),
+                b"i2".to_vec(),
+                b"i1".to_vec(),
+                b"b0".to_vec(),
+                b"b1".to_vec(),
+                b"zz".to_vec()
+            ],
+            "descending reverses the comparable values, not the classes"
+        );
+    }
+
+    /// Audit C4, mixed kinds: Int and Text are each comparable (class 0), so
+    /// they form ONE group ahead of the bools; within that group each kind is
+    /// value-ordered among its own (cross-kind pairs stay pairwise
+    /// incomparable → key order). The same class rule must hold on the
+    /// ranked-source arm of `run_with` (step 5), not just the filter-only
+    /// sort paths.
+    #[test]
+    fn order_by_mixed_kinds_group_comparable_ahead_of_incomparable() {
+        let seed_mixed = |c: &crate::Collection, embed: bool| {
+            let row = |v: Value| {
+                let mut m = BTreeMap::new();
+                m.insert("v".to_owned(), v);
+                if embed {
+                    m.insert("e".to_owned(), Value::Vector(vec![1.0, 0.0]));
+                }
+                Value::Map(m)
+            };
+            c.insert(b"t1", &row(Value::Text("a".into()))).unwrap();
+            c.insert(b"t2", &row(Value::Text("b".into()))).unwrap();
+            c.insert(b"n2", &row(Value::Int(2))).unwrap();
+            c.insert(b"n1", &row(Value::Int(1))).unwrap();
+            c.insert(b"b1", &row(Value::Bool(true))).unwrap();
+            let mut m = BTreeMap::new();
+            if embed {
+                m.insert("e".to_owned(), Value::Vector(vec![1.0, 0.0]));
+            }
+            c.insert(b"zz", &Value::Map(m)).unwrap();
+        };
+        let check = |keys: &[Vec<u8>]| {
+            let pos = |k: &[u8]| keys.iter().position(|x| x == k).unwrap();
+            // Every comparable row precedes every incomparable row, which
+            // precedes the missing one.
+            for comp in [
+                b"t1".as_ref(),
+                b"t2".as_ref(),
+                b"n1".as_ref(),
+                b"n2".as_ref(),
+            ] {
+                assert!(
+                    pos(comp) < pos(b"b1"),
+                    "comparable {comp:?} must precede the bool"
+                );
+                assert!(
+                    pos(comp) < pos(b"zz"),
+                    "comparable {comp:?} must precede missing"
+                );
+            }
+            assert!(pos(b"b1") < pos(b"zz"));
+            // Within the comparable group, each kind is value-ordered.
+            assert!(pos(b"t1") < pos(b"t2"), "texts in lexical order");
+            assert!(pos(b"n1") < pos(b"n2"), "ints in numeric order");
+        };
+
+        // Filter-only query (streaming sort path).
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        seed_mixed(&c, false);
+        let keys: Vec<_> = c
+            .query()
+            .order_by("v", false)
+            .run()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        check(&keys);
+
+        // Ranked-source query: a vector source runs the fused path, and the
+        // order_by arm of run_with (step 5) re-sorts by the same class rule.
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        seed_mixed(&c, true);
+        let keys: Vec<_> = c
+            .query()
+            .vector("e", vec![1.0, 0.0], 100, Metric::Cosine)
+            .order_by("v", false)
+            .run()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        check(&keys);
+    }
+
+    /// Audit C4 parity: the scalar-index fast path (which sorts via
+    /// `sort_by_field` over the indexed candidate set) and the plain scan
+    /// must agree on the class rule.
+    #[test]
+    fn order_by_class_rule_matches_between_scan_and_indexed_paths() {
+        let plain = Db::open_in_memory().unwrap();
+        order_class_seed_with_tag(&plain.collection("docs"));
+        let indexed = Db::open_in_memory().unwrap();
+        let ic = indexed.collection("docs");
+        order_class_seed_with_tag(&ic);
+        ic.create_scalar_index("tag").unwrap();
+
+        let run = |db: &Db| {
+            db.collection("docs")
+                .query()
+                .filter(field("tag").eq(Value::Text("t".into())))
+                .order_by("v", false)
+                .run()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(&plain), run(&indexed));
+        assert_eq!(
+            run(&indexed),
+            vec![
+                b"i1".to_vec(),
+                b"i2".to_vec(),
+                b"i3".to_vec(),
+                b"b0".to_vec(),
+                b"b1".to_vec()
+            ]
+        );
+    }
+
+    /// The class-test seed plus a `tag` field every row carries, so a scalar
+    /// index on `tag` can drive the indexed candidate path.
+    fn order_class_seed_with_tag(c: &crate::Collection) {
+        let row = |v: Option<Value>| {
+            let mut m = BTreeMap::new();
+            m.insert("tag".to_owned(), Value::Text("t".into()));
+            if let Some(v) = v {
+                m.insert("v".to_owned(), v);
+            }
+            Value::Map(m)
+        };
+        c.insert(b"b1", &row(Some(Value::Bool(true)))).unwrap();
+        c.insert(b"b0", &row(Some(Value::Bool(false)))).unwrap();
+        c.insert(b"i3", &row(Some(Value::Int(3)))).unwrap();
+        c.insert(b"i1", &row(Some(Value::Int(1)))).unwrap();
+        c.insert(b"i2", &row(Some(Value::Int(2)))).unwrap();
     }
 
     #[test]

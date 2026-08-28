@@ -560,15 +560,19 @@ mod tests {
         // d's only edge pointed at a; traversing from d reaches nothing.
         assert!(c.neighbors(b"d", "knows").unwrap().is_empty());
         assert!(c.traverse(b"d", "knows", 5).unwrap().is_empty());
-        // Edge rows are absent in BOTH namespaces (a's key ranges scan empty).
-        for (rel, ns) in [
-            ("knows", "__edges__nodes"),
-            ("likes", "__edges__nodes"),
-            ("knows", "__redges__nodes"),
+        // Edge rows are absent in BOTH namespaces: a's key ranges scan empty,
+        // and so does the range keyed by c that held the reverse TWIN of
+        // a's a-likes->c edge (the twin's first node is c, so it is not
+        // covered by a's own prefix scans above).
+        for (rel, ns, node) in [
+            ("knows", "__edges__nodes", &b"a"[..]),
+            ("likes", "__edges__nodes", &b"a"[..]),
+            ("knows", "__redges__nodes", &b"a"[..]),
+            ("likes", "__redges__nodes", &b"c"[..]),
         ] {
             assert!(
                 db.store()
-                    .scan_prefix(ns, &neighbor_prefix(rel, b"a"))
+                    .scan_prefix(ns, &neighbor_prefix(rel, node))
                     .unwrap()
                     .is_empty()
             );

@@ -461,7 +461,32 @@ impl Db {
                 Some((TextKind::OnDisk, false)) => {
                     let ns = disk_fts::namespace(collection, field);
                     drop(state);
-                    return Ok(Some(disk_fts::search(reader, &ns, query, k)?));
+                    let ranked = disk_fts::search(reader, &ns, query, k)?;
+                    // Registry-lag guard (wave-5, twin of the ANN one in
+                    // [`Db::ann_search_in`]): a concurrent registration or
+                    // compaction may have committed between this reader's
+                    // registry snapshot (Complete, taken above) and the
+                    // postings search just performed — its transaction
+                    // cleared the namespace and flipped the def row to
+                    // `Building`, and absent postings search as empty.
+                    // Serving that empty vector would be a silent wrong
+                    // answer; re-read the def row (one point-get, on the
+                    // same snapshot) and if it now says `Building`, declare
+                    // the index unserviceable (`Ok(None)` → the caller's
+                    // exact fallback). A row that still says `Complete`
+                    // means a genuinely empty index — serve the empty result
+                    // as before.
+                    if ranked.is_empty()
+                        && crate::index_build::read_building_cursor(
+                            reader,
+                            TEXT_DEFS,
+                            &def_key(collection, field),
+                        )?
+                        .is_some()
+                    {
+                        return Ok(None);
+                    }
+                    return Ok(Some(ranked));
                 }
                 Some((TextKind::OnDisk, true)) => return Ok(None),
                 Some((TextKind::InMemory, _)) => {
@@ -502,7 +527,24 @@ impl Db {
                 Some((TextKind::OnDisk, false)) => {
                     let ns = disk_fts::namespace(collection, field);
                     drop(state);
-                    return Ok(Some(disk_fts::phrase_search(reader, &ns, phrase, k)?));
+                    let ranked = disk_fts::phrase_search(reader, &ns, phrase, k)?;
+                    // Registry-lag guard, exactly as in [`Db::fts_search_in`]:
+                    // empty ranked + a def row that now says `Building` means
+                    // the namespace was cleared beneath this reader's stale
+                    // registry snapshot — fall back (`Ok(None)`) instead of
+                    // serving the silent empty result. `Complete` is a
+                    // genuinely empty index and still serves empty.
+                    if ranked.is_empty()
+                        && crate::index_build::read_building_cursor(
+                            reader,
+                            TEXT_DEFS,
+                            &def_key(collection, field),
+                        )?
+                        .is_some()
+                    {
+                        return Ok(None);
+                    }
+                    return Ok(Some(ranked));
                 }
                 Some((TextKind::OnDisk, true)) => return Ok(None),
                 Some((TextKind::InMemory, _)) => {
@@ -921,6 +963,82 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "a completed on-disk index must serve"
+        );
+    }
+
+    /// Registry-lag regression (wave-5 deferred guard, twin of the ANN one in
+    /// index.rs): a reader whose registry snapshot says `Complete` can reach
+    /// the disk postings search AFTER a concurrent registration/compaction
+    /// committed its namespace clear + `Building` flip — the absent postings
+    /// search as empty, which used to be served as a silent wrong answer.
+    /// The empty-result re-check must re-read the def row: `Building` →
+    /// `Ok(None)` (exact fallback), `Complete` → a genuinely empty index
+    /// still serves empty.
+    #[test]
+    fn registry_lag_empty_disk_result_falls_back_when_row_says_building() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db);
+        // Register an on-disk index WITHOUT backfilling: def row → Building
+        // over an EMPTY namespace (exactly the post-registration /
+        // mid-compaction disk state).
+        db.register_text_index("docs", "body", TextKind::OnDisk)
+            .unwrap();
+        // Pin the interleaving: with the resume lock held, the query's own
+        // lazy-resume attempt cannot run (try-lock fails), so the forged
+        // state below is what the reader actually observes.
+        let _guard = db.index_resume().lock().unwrap();
+        // Forge the in-memory def to Complete — the reader's stale registry
+        // snapshot after a concurrent registration flipped the row beneath it.
+        {
+            let mut state = db.fts().lock().unwrap();
+            state.defs.insert(
+                ("docs".to_owned(), "body".to_owned()),
+                (TextKind::OnDisk, false),
+            );
+        }
+        // fts_search must NOT serve the silent empty result: the def row
+        // says Building → Ok(None) (cannot serve → exact fallback).
+        assert!(
+            db.fts_search("docs", "body", "fox", 10).unwrap().is_none(),
+            "a postings search over a just-cleared namespace must fall back, not serve empty"
+        );
+        // So text_search takes the exact fallback — at parity with an
+        // unindexed twin.
+        let twin = Db::open_in_memory().unwrap();
+        seed(&twin);
+        let c = db.collection("docs");
+        let tc = twin.collection("docs");
+        for q in ["fox", "dog", "fox dog"] {
+            let got: Vec<_> = c
+                .text_search("body", q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.key)
+                .collect();
+            let want: Vec<_> = tc
+                .text_search("body", q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.key)
+                .collect();
+            assert_eq!(got, want, "fallback results for {q:?} must equal the twin");
+        }
+        // Negative control: flip the ROW to Complete as well — a genuinely
+        // empty index keeps serving the empty result as before.
+        db.store()
+            .put(
+                TEXT_DEFS,
+                &def_key("docs", "body"),
+                &crate::index_build::encode_def(
+                    &[kind_byte(TextKind::OnDisk)],
+                    &crate::index_build::DefState::Complete,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            db.fts_search("docs", "body", "fox", 10).unwrap(),
+            Some(Vec::new()),
+            "a Complete def over an empty namespace is a genuinely empty index"
         );
     }
 
