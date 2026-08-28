@@ -587,4 +587,30 @@ fn events_dispatch_is_synchronous_post_commit_and_in_mutation_order() {
             ev("docs", b"k", ChangeKind::Delete),
         ]
     );
+
+    // Mid-dispatch unsubscribe (second db: the unsubscribing callback needs a
+    // 'static handle on it): the callback list is cloned before dispatch, so
+    // the first subscriber unsubscribing the second MID-EVENT cannot stop the
+    // second's already-cloned callback for the event in flight — the removal
+    // applies to the NEXT event.
+    let db2 = Arc::new(Db::open_in_memory().unwrap());
+    let (log2, cb2) = recorder();
+    let slot = Arc::new(Mutex::new(None::<SubscriptionId>));
+    {
+        let handle = Arc::clone(&db2);
+        let sink = Arc::clone(&slot);
+        db2.subscribe(move |_: &ChangeEvent| {
+            if let Some(id) = *sink.lock().unwrap() {
+                handle.unsubscribe(id);
+            }
+        });
+    }
+    let id2 = db2.subscribe(cb2);
+    *slot.lock().unwrap() = Some(id2);
+    let c2 = db2.collection("docs");
+    c2.insert(b"k", &Value::Int(1)).unwrap();
+    assert_eq!(log2.lock().unwrap().len(), 1);
+    // The next event no longer reaches the unsubscribed callback.
+    c2.insert(b"k2", &Value::Int(2)).unwrap();
+    assert_eq!(log2.lock().unwrap().len(), 1);
 }

@@ -210,7 +210,10 @@ impl Db {
             // The edge cascade runs REGARDLESS of `existed` (W3 ruling):
             // same contract as delete — a stranded expiry entry on a key
             // that never was (or no longer is) a document must not leave
-            // dangling edges behind.
+            // dangling edges behind. Cost note: the unconditional cascade
+            // paged-scans BOTH edge namespaces even when there was no row
+            // (parity with delete-of-missing — an endpoint is not a key
+            // prefix, so presence cannot be probed cheaply).
             self.edges_on_delete_in_txn(tx, collection, key)?;
             // Drop both TTL entries. The forward entry was verified above,
             // inside this same transaction, so these are exactly the

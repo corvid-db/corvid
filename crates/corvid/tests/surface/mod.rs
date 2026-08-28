@@ -175,9 +175,27 @@ static MANIFEST: &[Row] = &[
             "filters_unordered_kinds_compare_false_for_ordered_ops",
         ],
     ),
-    row("corvid::value::MAX_NESTING", "Lifecycle", &[]),
-    row("corvid::Value::encode", "Lifecycle", &[]),
-    row("corvid::Value::decode", "Lifecycle", &[]),
+    row(
+        "corvid::value::MAX_NESTING",
+        "Lifecycle",
+        &["lifecycle_value_decode_enforces_max_nesting_bound"],
+    ),
+    row(
+        "corvid::Value::encode",
+        "Lifecycle",
+        &[
+            "lifecycle_dump_load_roundtrips_every_value_variant_bytes_exact",
+            "lifecycle_value_decode_enforces_max_nesting_bound",
+        ],
+    ),
+    row(
+        "corvid::Value::decode",
+        "Lifecycle",
+        &[
+            "lifecycle_dump_load_roundtrips_every_value_variant_bytes_exact",
+            "lifecycle_value_decode_enforces_max_nesting_bound",
+        ],
+    ),
     row(
         "corvid::Value::get",
         "WHERE",
@@ -586,7 +604,13 @@ static MANIFEST: &[Row] = &[
         ],
     ),
     // ===== error.rs — error vocabulary =====
-    row("corvid::Result", "Lifecycle", &[]),
+    row(
+        "corvid::Result",
+        "Lifecycle",
+        // The alias is the error type of every engine call; named explicitly
+        // by the Store surface test's bindings.
+        &["lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts"],
+    ),
     row(
         "corvid::Error",
         "Lifecycle",
@@ -595,15 +619,39 @@ static MANIFEST: &[Row] = &[
             "mutations_insert_rejects_reserved_and_invalid_collection_names",
         ],
     ),
-    row("corvid::Error::Database", "Lifecycle", &[]),
+    row(
+        "corvid::Error::Database",
+        "Lifecycle",
+        // Shared variant (conformance convention 1): the redb file-creation
+        // and file-lock failures wrap into it — driven by open under a
+        // missing parent dir, the second-handle exclusive lock, and backup
+        // into a bad path.
+        &[
+            "lifecycle_db_open_real_file_persists_across_reopen_and_rejects_missing_parent",
+            "lifecycle_db_open_second_handle_to_same_file_hits_the_redb_exclusive_lock",
+            "lifecycle_db_backup_restores_identical_state_and_pins_error_paths",
+        ],
+    ),
     row("corvid::Error::Transaction", "Lifecycle", &[]),
     row("corvid::Error::Table", "Lifecycle", &[]),
     row("corvid::Error::Storage", "Lifecycle", &[]),
     row("corvid::Error::Commit", "Lifecycle", &[]),
     row("corvid::Error::SetDurability", "Lifecycle", &[]),
     row("corvid::Error::Compaction", "Lifecycle", &[]),
-    row("corvid::Error::Decode", "Lifecycle", &[]),
-    row("corvid::Error::CorruptIndex", "Schema (ALTER)", &[]),
+    row(
+        "corvid::Error::Decode",
+        "Lifecycle",
+        // Task 13: driven through the public codec and through storage (a
+        // too-deep raw record surfaces the same variant from Collection::get).
+        &["lifecycle_value_decode_enforces_max_nesting_bound"],
+    ),
+    row(
+        "corvid::Error::CorruptIndex",
+        "Schema (ALTER)",
+        // Task 11 routing (Task 13): corrupted on-disk index bytes in a real
+        // db file → reopen → query → exact variant.
+        &["lifecycle_corrupt_ondisk_index_bytes_on_disk_error_queries_with_exact_variant"],
+    ),
     row(
         "corvid::Error::ReservedCollection",
         "Schema (ALTER)",
@@ -676,9 +724,28 @@ static MANIFEST: &[Row] = &[
             "mutations_insert_auto_failure_does_not_burn_an_id",
         ],
     ),
-    row("corvid::Error::InvalidDump", "Lifecycle", &[]),
-    row("corvid::Error::BackupTargetExists", "Lifecycle", &[]),
-    row("corvid::Error::Io", "Lifecycle", &[]),
+    row(
+        "corvid::Error::InvalidDump",
+        "Lifecycle",
+        // Reserved names, bad magic, and truncated streams — the engine-level
+        // pins (corvid-mcp drives the wire form in Task 14).
+        &["lifecycle_load_rejects_reserved_names_and_malformed_streams"],
+    ),
+    row(
+        "corvid::Error::BackupTargetExists",
+        "Lifecycle",
+        &[
+            "lifecycle_db_backup_restores_identical_state_and_pins_error_paths",
+            "lifecycle_store_backup_copies_to_an_independent_openable_file",
+        ],
+    ),
+    row(
+        "corvid::Error::Io",
+        "Lifecycle",
+        // Task 13: dump to a failing Write and load from a failing Read both
+        // surface the exact variant.
+        &["lifecycle_dump_of_empty_db_loads_empty_and_io_errors_surface"],
+    ),
     // ===== builder.rs — the fluent query language =====
     row(
         "corvid::ResultRow",
@@ -955,7 +1022,11 @@ static MANIFEST: &[Row] = &[
             "aggregations_indexed_vs_scan_equivalent_for_every_aggregate",
         ],
     ),
-    row("corvid::QueryBuilder::plan", "Lifecycle", &[]),
+    row(
+        "corvid::QueryBuilder::plan",
+        "Lifecycle",
+        &["lifecycle_query_plan_key_is_canonical_for_identical_shapes"],
+    ),
     row(
         "corvid::QueryBuilder::plan_shape",
         "Lifecycle",
@@ -992,23 +1063,55 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Db",
         "Lifecycle",
-        &["mutations_smoke_insert_roundtrips"],
+        &[
+            "mutations_smoke_insert_roundtrips",
+            "lifecycle_db_open_real_file_persists_across_reopen_and_rejects_missing_parent",
+        ],
     ),
-    row("corvid::Db::open", "Lifecycle", &[]),
+    row(
+        "corvid::Db::open",
+        "Lifecycle",
+        &[
+            "lifecycle_db_open_real_file_persists_across_reopen_and_rejects_missing_parent",
+            "lifecycle_db_open_second_handle_to_same_file_hits_the_redb_exclusive_lock",
+        ],
+    ),
     row(
         "corvid::Db::open_in_memory",
         "Lifecycle",
-        &["mutations_smoke_insert_roundtrips"],
+        &[
+            "mutations_smoke_insert_roundtrips",
+            "lifecycle_db_open_in_memory_instances_are_isolated",
+        ],
     ),
     row(
         "corvid::Db::collection",
         "Lifecycle",
         &["mutations_smoke_insert_roundtrips"],
     ),
-    row("corvid::Db::backup", "Lifecycle", &[]),
-    row("corvid::Db::bulk", "Lifecycle", &[]),
-    row("corvid::Db::compact", "Lifecycle", &[]),
-    row("corvid::Db::collections", "Lifecycle", &[]),
+    row(
+        "corvid::Db::backup",
+        "Lifecycle",
+        &["lifecycle_db_backup_restores_identical_state_and_pins_error_paths"],
+    ),
+    row(
+        "corvid::Db::bulk",
+        "Lifecycle",
+        &[
+            "lifecycle_db_bulk_is_a_durability_scope_writes_before_err_persist",
+            "lifecycle_db_bulk_happy_path_applies_and_survives_reopen",
+        ],
+    ),
+    row(
+        "corvid::Db::compact",
+        "Lifecycle",
+        &["lifecycle_db_compact_keeps_data_intact_and_tolerates_double_compact"],
+    ),
+    row(
+        "corvid::Db::collections",
+        "Lifecycle",
+        &["lifecycle_db_collections_filters_graph_ttl_and_index_namespaces"],
+    ),
     row(
         "corvid::Collection",
         "Mutations",
@@ -1164,42 +1267,195 @@ static MANIFEST: &[Row] = &[
         ],
     ),
     // ===== store.rs — the byte KV layer =====
-    row("corvid::Store", "Lifecycle", &[]),
-    row("corvid::Store::open", "Lifecycle", &[]),
-    row("corvid::Store::open_in_memory", "Lifecycle", &[]),
-    row("corvid::Store::set_relaxed_durability", "Lifecycle", &[]),
-    row("corvid::Store::begin_bulk", "Lifecycle", &[]),
-    row("corvid::Store::flush", "Lifecycle", &[]),
-    row("corvid::Store::compact", "Lifecycle", &[]),
-    row("corvid::Store::next_auto_id", "Lifecycle", &[]),
-    row("corvid::Store::backup", "Lifecycle", &[]),
-    row("corvid::Store::transaction", "Lifecycle", &[]),
-    row("corvid::Store::read", "Lifecycle", &[]),
-    row("corvid::Store::put", "Lifecycle", &[]),
-    row("corvid::Store::get", "Lifecycle", &[]),
-    row("corvid::Store::delete", "Lifecycle", &[]),
-    row("corvid::Store::scan", "Lifecycle", &[]),
-    row("corvid::Store::collections", "Lifecycle", &[]),
-    row("corvid::Store::scan_from", "Lifecycle", &[]),
-    row("corvid::Store::count", "Lifecycle", &[]),
-    row("corvid::Store::for_each", "Lifecycle", &[]),
-    row("corvid::Store::scan_prefix", "Lifecycle", &[]),
-    row("corvid::store::BulkScope", "Lifecycle", &[]),
-    row("corvid::store::WriteBatch", "Lifecycle", &[]),
-    row("corvid::store::WriteBatch::put", "Lifecycle", &[]),
-    row("corvid::store::WriteBatch::get", "Lifecycle", &[]),
-    row("corvid::store::WriteBatch::delete", "Lifecycle", &[]),
-    row("corvid::store::WriteBatch::scan", "Lifecycle", &[]),
-    row("corvid::store::WriteBatch::scan_from", "Lifecycle", &[]),
-    row("corvid::store::WriteBatch::next_auto_id", "Lifecycle", &[]),
-    row("corvid::store::ReadBatch", "Lifecycle", &[]),
-    row("corvid::store::ReadBatch::collections", "Lifecycle", &[]),
-    row("corvid::store::ReadBatch::auto_ids", "Lifecycle", &[]),
-    row("corvid::store::ReadBatch::get", "Lifecycle", &[]),
-    row("corvid::store::ReadBatch::scan", "Lifecycle", &[]),
-    row("corvid::store::ReadBatch::scan_from", "Lifecycle", &[]),
-    row("corvid::store::ReadBatch::scan_prefix", "Lifecycle", &[]),
-    row("corvid::store::ReadBatch::for_each", "Lifecycle", &[]),
+    row(
+        "corvid::Store",
+        "Lifecycle",
+        &["lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts"],
+    ),
+    row(
+        "corvid::Store::open",
+        "Lifecycle",
+        &[
+            "lifecycle_store_begin_bulk_scopes_nest_and_flush_makes_writes_durable",
+            "lifecycle_store_backup_copies_to_an_independent_openable_file",
+        ],
+    ),
+    row(
+        "corvid::Store::open_in_memory",
+        "Lifecycle",
+        &["lifecycle_store_transaction_commit_rollback_and_write_batch_surface"],
+    ),
+    row(
+        "corvid::Store::set_relaxed_durability",
+        "Lifecycle",
+        &["lifecycle_store_set_relaxed_durability_and_flush_keep_data_durable"],
+    ),
+    row(
+        "corvid::Store::begin_bulk",
+        "Lifecycle",
+        &["lifecycle_store_begin_bulk_scopes_nest_and_flush_makes_writes_durable"],
+    ),
+    row(
+        "corvid::Store::flush",
+        "Lifecycle",
+        &[
+            "lifecycle_store_begin_bulk_scopes_nest_and_flush_makes_writes_durable",
+            "lifecycle_store_set_relaxed_durability_and_flush_keep_data_durable",
+        ],
+    ),
+    row(
+        "corvid::Store::compact",
+        "Lifecycle",
+        &["lifecycle_db_compact_keeps_data_intact_and_tolerates_double_compact"],
+    ),
+    row(
+        "corvid::Store::next_auto_id",
+        "Lifecycle",
+        &[
+            "lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts",
+            "lifecycle_store_transaction_commit_rollback_and_write_batch_surface",
+        ],
+    ),
+    row(
+        "corvid::Store::backup",
+        "Lifecycle",
+        &["lifecycle_store_backup_copies_to_an_independent_openable_file"],
+    ),
+    row(
+        "corvid::Store::transaction",
+        "Lifecycle",
+        &["lifecycle_store_transaction_commit_rollback_and_write_batch_surface"],
+    ),
+    row(
+        "corvid::Store::read",
+        "Lifecycle",
+        &["lifecycle_store_read_batch_is_one_snapshot_and_mirrors_standalone_ops"],
+    ),
+    row(
+        "corvid::Store::put",
+        "Lifecycle",
+        &["lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts"],
+    ),
+    row(
+        "corvid::Store::get",
+        "Lifecycle",
+        &["lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts"],
+    ),
+    row(
+        "corvid::Store::delete",
+        "Lifecycle",
+        &["lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts"],
+    ),
+    row(
+        "corvid::Store::scan",
+        "Lifecycle",
+        &["lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts"],
+    ),
+    row(
+        "corvid::Store::collections",
+        "Lifecycle",
+        &["lifecycle_db_collections_filters_graph_ttl_and_index_namespaces"],
+    ),
+    row(
+        "corvid::Store::scan_from",
+        "Lifecycle",
+        &["lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts"],
+    ),
+    row(
+        "corvid::Store::count",
+        "Lifecycle",
+        &["lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts"],
+    ),
+    row(
+        "corvid::Store::for_each",
+        "Lifecycle",
+        &["lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts"],
+    ),
+    row(
+        "corvid::Store::scan_prefix",
+        "Lifecycle",
+        &["lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts"],
+    ),
+    row(
+        "corvid::store::BulkScope",
+        "Lifecycle",
+        &["lifecycle_store_begin_bulk_scopes_nest_and_flush_makes_writes_durable"],
+    ),
+    row(
+        "corvid::store::WriteBatch",
+        "Lifecycle",
+        &["lifecycle_store_transaction_commit_rollback_and_write_batch_surface"],
+    ),
+    row(
+        "corvid::store::WriteBatch::put",
+        "Lifecycle",
+        &["lifecycle_store_transaction_commit_rollback_and_write_batch_surface"],
+    ),
+    row(
+        "corvid::store::WriteBatch::get",
+        "Lifecycle",
+        &["lifecycle_store_transaction_commit_rollback_and_write_batch_surface"],
+    ),
+    row(
+        "corvid::store::WriteBatch::delete",
+        "Lifecycle",
+        &["lifecycle_store_transaction_commit_rollback_and_write_batch_surface"],
+    ),
+    row(
+        "corvid::store::WriteBatch::scan",
+        "Lifecycle",
+        &["lifecycle_store_transaction_commit_rollback_and_write_batch_surface"],
+    ),
+    row(
+        "corvid::store::WriteBatch::scan_from",
+        "Lifecycle",
+        &["lifecycle_store_transaction_commit_rollback_and_write_batch_surface"],
+    ),
+    row(
+        "corvid::store::WriteBatch::next_auto_id",
+        "Lifecycle",
+        &["lifecycle_store_transaction_commit_rollback_and_write_batch_surface"],
+    ),
+    row(
+        "corvid::store::ReadBatch",
+        "Lifecycle",
+        &["lifecycle_store_read_batch_is_one_snapshot_and_mirrors_standalone_ops"],
+    ),
+    row(
+        "corvid::store::ReadBatch::collections",
+        "Lifecycle",
+        &["lifecycle_store_read_batch_is_one_snapshot_and_mirrors_standalone_ops"],
+    ),
+    row(
+        "corvid::store::ReadBatch::auto_ids",
+        "Lifecycle",
+        &["lifecycle_store_read_batch_is_one_snapshot_and_mirrors_standalone_ops"],
+    ),
+    row(
+        "corvid::store::ReadBatch::get",
+        "Lifecycle",
+        &["lifecycle_store_read_batch_is_one_snapshot_and_mirrors_standalone_ops"],
+    ),
+    row(
+        "corvid::store::ReadBatch::scan",
+        "Lifecycle",
+        &["lifecycle_store_read_batch_is_one_snapshot_and_mirrors_standalone_ops"],
+    ),
+    row(
+        "corvid::store::ReadBatch::scan_from",
+        "Lifecycle",
+        &["lifecycle_store_read_batch_is_one_snapshot_and_mirrors_standalone_ops"],
+    ),
+    row(
+        "corvid::store::ReadBatch::scan_prefix",
+        "Lifecycle",
+        &["lifecycle_store_read_batch_is_one_snapshot_and_mirrors_standalone_ops"],
+    ),
+    row(
+        "corvid::store::ReadBatch::for_each",
+        "Lifecycle",
+        &["lifecycle_store_read_batch_is_one_snapshot_and_mirrors_standalone_ops"],
+    ),
     // ===== query.rs — retrieval primitives =====
     row(
         "corvid::Hit",
@@ -1865,21 +2121,89 @@ static MANIFEST: &[Row] = &[
         ],
     ),
     // ===== semantic_cache.rs =====
-    row("corvid::SemanticCache", "Lifecycle", &[]),
-    row("corvid::Collection::semantic_cache", "Lifecycle", &[]),
-    row("corvid::SemanticCache::put", "Lifecycle", &[]),
-    row("corvid::SemanticCache::get", "Lifecycle", &[]),
+    row(
+        "corvid::SemanticCache",
+        "Lifecycle",
+        &[
+            "lifecycle_semantic_cache_threshold_and_nearest_entry_semantics_cosine",
+            "lifecycle_semantic_cache_threshold_units_follow_the_metric_l2",
+        ],
+    ),
+    row(
+        "corvid::Collection::semantic_cache",
+        "Lifecycle",
+        &[
+            "lifecycle_semantic_cache_threshold_and_nearest_entry_semantics_cosine",
+            "lifecycle_semantic_cache_threshold_units_follow_the_metric_l2",
+        ],
+    ),
+    row(
+        "corvid::SemanticCache::put",
+        "Lifecycle",
+        &["lifecycle_semantic_cache_threshold_and_nearest_entry_semantics_cosine"],
+    ),
+    row(
+        "corvid::SemanticCache::get",
+        "Lifecycle",
+        &[
+            "lifecycle_semantic_cache_threshold_and_nearest_entry_semantics_cosine",
+            "lifecycle_semantic_cache_threshold_units_follow_the_metric_l2",
+        ],
+    ),
     // ===== sketch.rs — probabilistic sketches =====
-    row("corvid::HyperLogLog", "Lifecycle", &[]),
-    row("corvid::HyperLogLog::new", "Lifecycle", &[]),
-    row("corvid::HyperLogLog::with_precision", "Lifecycle", &[]),
-    row("corvid::HyperLogLog::add_bytes", "Lifecycle", &[]),
-    row("corvid::HyperLogLog::add_hash", "Lifecycle", &[]),
-    row("corvid::HyperLogLog::estimate", "Lifecycle", &[]),
-    row("corvid::BloomFilter", "Lifecycle", &[]),
-    row("corvid::BloomFilter::new", "Lifecycle", &[]),
-    row("corvid::BloomFilter::add_bytes", "Lifecycle", &[]),
-    row("corvid::BloomFilter::contains_bytes", "Lifecycle", &[]),
+    row(
+        "corvid::HyperLogLog",
+        "Lifecycle",
+        &["lifecycle_hyperloglog_precision_clamps_estimates_and_ignores_duplicates"],
+    ),
+    row(
+        "corvid::HyperLogLog::new",
+        "Lifecycle",
+        &["lifecycle_hyperloglog_precision_clamps_estimates_and_ignores_duplicates"],
+    ),
+    row(
+        "corvid::HyperLogLog::with_precision",
+        "Lifecycle",
+        &["lifecycle_hyperloglog_precision_clamps_estimates_and_ignores_duplicates"],
+    ),
+    row(
+        "corvid::HyperLogLog::add_bytes",
+        "Lifecycle",
+        &[
+            "lifecycle_hyperloglog_precision_clamps_estimates_and_ignores_duplicates",
+            "lifecycle_hyperloglog_add_hash_is_the_precomputed_twin_of_add_bytes",
+        ],
+    ),
+    row(
+        "corvid::HyperLogLog::add_hash",
+        "Lifecycle",
+        &["lifecycle_hyperloglog_add_hash_is_the_precomputed_twin_of_add_bytes"],
+    ),
+    row(
+        "corvid::HyperLogLog::estimate",
+        "Lifecycle",
+        &["lifecycle_hyperloglog_precision_clamps_estimates_and_ignores_duplicates"],
+    ),
+    row(
+        "corvid::BloomFilter",
+        "Lifecycle",
+        &["lifecycle_bloom_filter_no_false_negatives_and_bounded_fp_rate"],
+    ),
+    row(
+        "corvid::BloomFilter::new",
+        "Lifecycle",
+        &["lifecycle_bloom_filter_no_false_negatives_and_bounded_fp_rate"],
+    ),
+    row(
+        "corvid::BloomFilter::add_bytes",
+        "Lifecycle",
+        &["lifecycle_bloom_filter_no_false_negatives_and_bounded_fp_rate"],
+    ),
+    row(
+        "corvid::BloomFilter::contains_bytes",
+        "Lifecycle",
+        &["lifecycle_bloom_filter_no_false_negatives_and_bounded_fp_rate"],
+    ),
     row(
         "corvid::Collection::approx_distinct",
         "Aggregations",
@@ -1948,12 +2272,25 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Db::dump",
         "Lifecycle",
-        &["lifecycle_smoke_dump_load_roundtrips_documents"],
+        &[
+            "lifecycle_smoke_dump_load_roundtrips_documents",
+            "lifecycle_dump_load_roundtrips_every_value_variant_bytes_exact",
+            "lifecycle_dump_load_roundtrips_every_index_family_ttl_edges_schema_and_autoids",
+            "lifecycle_dump_load_into_nonempty_db_merges_records_and_counters",
+            "lifecycle_dump_of_empty_db_loads_empty_and_io_errors_surface",
+        ],
     ),
     row(
         "corvid::Db::load",
         "Lifecycle",
-        &["lifecycle_smoke_dump_load_roundtrips_documents"],
+        &[
+            "lifecycle_smoke_dump_load_roundtrips_documents",
+            "lifecycle_dump_load_roundtrips_every_value_variant_bytes_exact",
+            "lifecycle_dump_load_roundtrips_every_index_family_ttl_edges_schema_and_autoids",
+            "lifecycle_dump_load_into_nonempty_db_merges_records_and_counters",
+            "lifecycle_load_rejects_reserved_names_and_malformed_streams",
+            "lifecycle_dump_of_empty_db_loads_empty_and_io_errors_surface",
+        ],
     ),
     // ===== pq.rs — product quantization =====
     row("corvid::pq::Pq", "Vector search", &[]),
@@ -1969,15 +2306,51 @@ static MANIFEST: &[Row] = &[
     row("corvid::pq::Pq::to_bytes", "Vector search", &[]),
     row("corvid::pq::Pq::from_bytes", "Vector search", &[]),
     // ===== plan.rs — plan identity and cache =====
-    row("corvid::QueryPlan", "Lifecycle", &[]),
-    row("corvid::QueryPlan::key", "Lifecycle", &[]),
-    row("corvid::PlanCache", "Lifecycle", &[]),
-    row("corvid::PlanCache::new", "Lifecycle", &[]),
-    row("corvid::PlanCache::get", "Lifecycle", &[]),
-    row("corvid::PlanCache::insert", "Lifecycle", &[]),
-    row("corvid::PlanCache::get_or_insert_with", "Lifecycle", &[]),
-    row("corvid::PlanCache::len", "Lifecycle", &[]),
-    row("corvid::PlanCache::is_empty", "Lifecycle", &[]),
+    row(
+        "corvid::QueryPlan",
+        "Lifecycle",
+        &["lifecycle_query_plan_key_is_canonical_for_identical_shapes"],
+    ),
+    row(
+        "corvid::QueryPlan::key",
+        "Lifecycle",
+        &["lifecycle_query_plan_key_is_canonical_for_identical_shapes"],
+    ),
+    row(
+        "corvid::PlanCache",
+        "Lifecycle",
+        &["lifecycle_plan_cache_miss_hit_insert_replace_and_closure_runs_once"],
+    ),
+    row(
+        "corvid::PlanCache::new",
+        "Lifecycle",
+        &["lifecycle_plan_cache_miss_hit_insert_replace_and_closure_runs_once"],
+    ),
+    row(
+        "corvid::PlanCache::get",
+        "Lifecycle",
+        &["lifecycle_plan_cache_miss_hit_insert_replace_and_closure_runs_once"],
+    ),
+    row(
+        "corvid::PlanCache::insert",
+        "Lifecycle",
+        &["lifecycle_plan_cache_miss_hit_insert_replace_and_closure_runs_once"],
+    ),
+    row(
+        "corvid::PlanCache::get_or_insert_with",
+        "Lifecycle",
+        &["lifecycle_plan_cache_miss_hit_insert_replace_and_closure_runs_once"],
+    ),
+    row(
+        "corvid::PlanCache::len",
+        "Lifecycle",
+        &["lifecycle_plan_cache_miss_hit_insert_replace_and_closure_runs_once"],
+    ),
+    row(
+        "corvid::PlanCache::is_empty",
+        "Lifecycle",
+        &["lifecycle_plan_cache_miss_hit_insert_replace_and_closure_runs_once"],
+    ),
 ];
 
 // ===========================================================================
