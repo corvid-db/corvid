@@ -52,37 +52,46 @@ impl Collection<'_> {
     /// Documents lacking the field or whose field is not [`Value::Text`] are
     /// not part of the corpus. Documents that contain none of the query terms
     /// are omitted. Ties break by key order.
+    ///
+    /// The whole search — postings scan and document fetches — runs on ONE
+    /// read snapshot (audit B3): the result always matches some committed
+    /// state even while writers commit concurrently.
     pub fn text_search(&self, field: &str, query: &str, k: usize) -> Result<Vec<TextHit>> {
-        // Use an inverted index when one is registered; else exact over a scan.
-        if let Some(ranked) = self.db().fts_search(self.name(), field, query, k)? {
-            let mut out = Vec::with_capacity(ranked.len());
-            for (key, score) in ranked {
-                if let Some(document) = self.get(&key)? {
-                    out.push(TextHit {
+        // Resume interrupted builds BEFORE the snapshot opens (resumes write;
+        // audit B3 discipline).
+        self.db().try_resume_index_builds(self.name())?;
+        self.db().store().read(|r| {
+            // Use an inverted index when one is registered; else exact over a scan.
+            if let Some(ranked) = self.db().fts_search_in(self.name(), field, query, k, r)? {
+                let mut out = Vec::with_capacity(ranked.len());
+                for (key, score) in ranked {
+                    if let Some(document) = self.get_in(r, &key)? {
+                        out.push(TextHit {
+                            key,
+                            score,
+                            document,
+                        });
+                    }
+                }
+                return Ok(out);
+            }
+
+            let cands = self.scan_in(r)?;
+            let mut ranked = ranked_bm25(&cands, field, query);
+            ranked.truncate(k);
+            let mut docs = doc_map(cands);
+            Ok(ranked
+                .into_iter()
+                .map(|(key, score)| {
+                    let document = docs.remove(&key).expect("ranked key came from cands");
+                    TextHit {
                         key,
                         score,
                         document,
-                    });
-                }
-            }
-            return Ok(out);
-        }
-
-        let cands = self.scan()?;
-        let mut ranked = ranked_bm25(&cands, field, query);
-        ranked.truncate(k);
-        let mut docs = doc_map(cands);
-        Ok(ranked
-            .into_iter()
-            .map(|(key, score)| {
-                let document = docs.remove(&key).expect("ranked key came from cands");
-                TextHit {
-                    key,
-                    score,
-                    document,
-                }
-            })
-            .collect())
+                    }
+                })
+                .collect())
+        })
     }
 
     /// Return up to `k` documents whose `field` text contains `phrase` as a
@@ -91,47 +100,56 @@ impl Collection<'_> {
     /// Uses the text index's stored positions when one is registered; otherwise
     /// scans exactly. Analysis (stop words, stemming) applies to the phrase too,
     /// so `"the quick fox"` matches on the analyzed tokens. Ties break by key.
+    /// Like [`Collection::text_search`], the whole search runs on one read
+    /// snapshot (audit B3).
     pub fn phrase_search(&self, field: &str, phrase: &str, k: usize) -> Result<Vec<TextHit>> {
-        if let Some(ranked) = self.db().fts_phrase_search(self.name(), field, phrase, k)? {
-            let mut out = Vec::with_capacity(ranked.len());
-            for (key, score) in ranked {
-                if let Some(document) = self.get(&key)? {
-                    out.push(TextHit {
-                        key,
-                        score,
-                        document,
-                    });
+        // Resume discipline as [`Collection::text_search`]: before the snapshot.
+        self.db().try_resume_index_builds(self.name())?;
+        self.db().store().read(|r| {
+            if let Some(ranked) =
+                self.db()
+                    .fts_phrase_search_in(self.name(), field, phrase, k, r)?
+            {
+                let mut out = Vec::with_capacity(ranked.len());
+                for (key, score) in ranked {
+                    if let Some(document) = self.get_in(r, &key)? {
+                        out.push(TextHit {
+                            key,
+                            score,
+                            document,
+                        });
+                    }
                 }
+                return Ok(out);
             }
-            return Ok(out);
-        }
 
-        // Exact fallback: scan, matching the phrase as a token-sequence window.
-        let phrase_terms = analyze(phrase);
-        if phrase_terms.is_empty() || k == 0 {
-            return Ok(Vec::new());
-        }
-        let mut hits: Vec<TextHit> = Vec::new();
-        self.for_each_doc(|key, doc| {
-            if let Some(text) = doc.get_path(field).and_then(Value::as_text) {
-                let tokens = analyze(text);
-                let occurrences = tokens
-                    .windows(phrase_terms.len())
-                    .filter(|w| *w == phrase_terms.as_slice())
-                    .count();
-                if occurrences > 0 {
-                    hits.push(TextHit {
-                        key: key.to_vec(),
-                        score: occurrences as f32,
-                        document: doc,
-                    });
-                }
+            // Exact fallback: scan, matching the phrase as a token-sequence window.
+            let phrase_terms = analyze(phrase);
+            if phrase_terms.is_empty() || k == 0 {
+                return Ok(Vec::new());
             }
-            Ok(true)
-        })?;
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
-        hits.truncate(k);
-        Ok(hits)
+            let mut hits: Vec<TextHit> = Vec::new();
+            self.for_each_doc_in(r, |key, doc| {
+                if let Some(text) = doc.get_path(field).and_then(Value::as_text) {
+                    let tokens = analyze(text);
+                    let occurrences = tokens
+                        .windows(phrase_terms.len())
+                        .filter(|w| *w == phrase_terms.as_slice())
+                        .count();
+                    if occurrences > 0 {
+                        hits.push(TextHit {
+                            key: key.to_vec(),
+                            score: occurrences as f32,
+                            document: doc,
+                        });
+                    }
+                }
+                Ok(true)
+            })?;
+            hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
+            hits.truncate(k);
+            Ok(hits)
+        })
     }
 
     /// Return the `k` documents whose embedding in field `field` is nearest to
@@ -146,6 +164,11 @@ impl Collection<'_> {
     /// below 1). Documents that lack the field, whose field is not a
     /// [`Value::Vector`], or whose dimension differs from `query` are skipped
     /// (schema-on-read). Ties break by key order.
+    ///
+    /// The whole search — ANN graph traversal or exact stream, and the
+    /// document fetches that verify it — runs on ONE read snapshot (audit
+    /// B3): the result always matches some committed state even while
+    /// writers commit concurrently.
     pub fn vector_search(
         &self,
         field: &str,
@@ -153,71 +176,79 @@ impl Collection<'_> {
         k: usize,
         metric: Metric,
     ) -> Result<Vec<Hit>> {
-        // Use a registered ANN index when one matches; else fall back to exact.
-        if let Some(ranked) = self.db().ann_search(self.name(), field, query, k, metric)? {
-            // The index's distances live on its own scale — Hamming bit counts
-            // for binary quantization, reconstruction error for scalar/PQ — so
-            // they are discarded and recomputed exactly from the stored
-            // documents (audit B6: callers must be able to trust `distance`
-            // and to set metric-unit thresholds). Candidates whose stored
-            // vector no longer matches the query dimension are skipped, parity
-            // with the exact path.
-            let mut out: Vec<Hit> = Vec::with_capacity(ranked.len());
-            for (key, _approx_distance) in ranked {
-                if let Some(document) = self.get(&key)?
-                    && let Some(v) = document.get_path(field).and_then(Value::as_vector)
+        // Resume interrupted builds BEFORE the snapshot opens (resumes write;
+        // audit B3 discipline).
+        self.db().try_resume_index_builds(self.name())?;
+        self.db().store().read(|r| {
+            // Use a registered ANN index when one matches; else fall back to exact.
+            if let Some(ranked) =
+                self.db()
+                    .ann_search_in(self.name(), field, query, k, metric, r)?
+            {
+                // The index's distances live on their own scale — Hamming bit
+                // counts for binary quantization, reconstruction error for
+                // scalar/PQ — so they are discarded and recomputed exactly
+                // from the stored documents (audit B6: callers must be able
+                // to trust `distance` and to set metric-unit thresholds).
+                // Candidates whose stored vector no longer matches the query
+                // dimension are skipped, parity with the exact path.
+                let mut out: Vec<Hit> = Vec::with_capacity(ranked.len());
+                for (key, _approx_distance) in ranked {
+                    if let Some(document) = self.get_in(r, &key)?
+                        && let Some(v) = document.get_path(field).and_then(Value::as_vector)
+                        && v.len() == query.len()
+                    {
+                        out.push(Hit {
+                            distance: metric.distance(query, v),
+                            key,
+                            document,
+                            approximate: true,
+                        });
+                    }
+                }
+                out.sort_by(|a, b| {
+                    a.distance
+                        .total_cmp(&b.distance)
+                        .then_with(|| a.key.cmp(&b.key))
+                });
+                out.truncate(k);
+                return Ok(out);
+            }
+
+            // Exact search streams the collection through a bounded top-k heap:
+            // O(n) time but O(k) memory, so an unindexed search never materializes
+            // the whole collection.
+            let mut heap: BinaryHeap<NearCand> = BinaryHeap::new();
+            self.for_each_doc_in(r, |key, doc| {
+                if let Some(v) = doc.get_path(field).and_then(Value::as_vector)
                     && v.len() == query.len()
                 {
-                    out.push(Hit {
-                        distance: metric.distance(query, v),
-                        key,
-                        document,
-                        approximate: true,
-                    });
+                    let cand = NearCand {
+                        dist: metric.distance(query, v),
+                        key: key.to_vec(),
+                        doc,
+                    };
+                    if heap.len() < k {
+                        heap.push(cand);
+                    } else if heap.peek().is_some_and(|worst| cand < *worst) {
+                        heap.pop();
+                        heap.push(cand);
+                    }
                 }
-            }
-            out.sort_by(|a, b| {
-                a.distance
-                    .total_cmp(&b.distance)
-                    .then_with(|| a.key.cmp(&b.key))
-            });
-            out.truncate(k);
-            return Ok(out);
-        }
-
-        // Exact search streams the collection through a bounded top-k heap:
-        // O(n) time but O(k) memory, so an unindexed search never materializes
-        // the whole collection.
-        let mut heap: BinaryHeap<NearCand> = BinaryHeap::new();
-        self.for_each_doc(|key, doc| {
-            if let Some(v) = doc.get_path(field).and_then(Value::as_vector)
-                && v.len() == query.len()
-            {
-                let cand = NearCand {
-                    dist: metric.distance(query, v),
-                    key: key.to_vec(),
-                    doc,
-                };
-                if heap.len() < k {
-                    heap.push(cand);
-                } else if heap.peek().is_some_and(|worst| cand < *worst) {
-                    heap.pop();
-                    heap.push(cand);
-                }
-            }
-            Ok(true)
-        })?;
-        let mut out: Vec<NearCand> = heap.into_vec();
-        out.sort_by(|a, b| a.dist.total_cmp(&b.dist).then_with(|| a.key.cmp(&b.key)));
-        Ok(out
-            .into_iter()
-            .map(|c| Hit {
-                key: c.key,
-                distance: c.dist,
-                document: c.doc,
-                approximate: false,
-            })
-            .collect())
+                Ok(true)
+            })?;
+            let mut out: Vec<NearCand> = heap.into_vec();
+            out.sort_by(|a, b| a.dist.total_cmp(&b.dist).then_with(|| a.key.cmp(&b.key)));
+            Ok(out
+                .into_iter()
+                .map(|c| Hit {
+                    key: c.key,
+                    distance: c.dist,
+                    document: c.doc,
+                    approximate: false,
+                })
+                .collect())
+        })
     }
 }
 

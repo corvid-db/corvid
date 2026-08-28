@@ -401,8 +401,9 @@ impl QueryBuilder<'_> {
     /// Try the ANN fast path: a single vector source whose field/metric has a
     /// registered index. Returns the (already filtered) candidate set, or
     /// `None` to fall back to an exact scan. Filtered queries only take this
-    /// path under [`Self::approx`]. Document fetches read `reader`, so the
-    /// verification shares the caller's snapshot (audit B3).
+    /// path under [`Self::approx`]. The graph search and the document
+    /// fetches both read `reader`, so the whole path shares the caller's
+    /// snapshot (audit B3).
     fn ann_candidates(&self, reader: &dyn SnapshotReader) -> Result<Option<Candidates>> {
         if self.sources.len() != 1 {
             return Ok(None);
@@ -419,10 +420,14 @@ impl QueryBuilder<'_> {
         if !self.filters.is_empty() && !self.approx {
             return Ok(None);
         }
-        let Some(ranked) =
-            self.collection
-                .db()
-                .ann_search(self.collection.name(), field, query, *k, *metric)?
+        let Some(ranked) = self.collection.db().ann_search_in(
+            self.collection.name(),
+            field,
+            query,
+            *k,
+            *metric,
+            reader,
+        )?
         else {
             return Ok(None);
         };
@@ -441,8 +446,9 @@ impl QueryBuilder<'_> {
     /// straight from the index (bounded memory, no corpus rescan), then verify
     /// filters. `None` to fall back. Filtered queries take this only under
     /// [`Self::approx`] (the index ranks before filtering, so a selective
-    /// filter may leave fewer than `k`). Document fetches read `reader`, so
-    /// the verification shares the caller's snapshot (audit B3).
+    /// filter may leave fewer than `k`). The postings scan and the document
+    /// fetches both read `reader`, so the whole path shares the caller's
+    /// snapshot (audit B3).
     fn text_candidates(&self, reader: &dyn SnapshotReader) -> Result<Option<Candidates>> {
         if self.sources.len() != 1 {
             return Ok(None);
@@ -456,7 +462,7 @@ impl QueryBuilder<'_> {
         let Some(ranked) =
             self.collection
                 .db()
-                .fts_search(self.collection.name(), field, query, *k)?
+                .fts_search_in(self.collection.name(), field, query, *k, reader)?
         else {
             return Ok(None);
         };
@@ -527,8 +533,9 @@ impl QueryBuilder<'_> {
     /// each. Returns the filtered set, or `None` to fall back to a full scan.
     ///
     /// An equality predicate is preferred (most selective); otherwise the first
-    /// range predicate is used. Documents are verified against `reader` (the
-    /// caller's snapshot, audit B3). Interrupted index builds are resumed by
+    /// range predicate is used. The index window scans AND the document
+    /// verification both read `reader` — the whole candidate+verify pass is
+    /// one point in time (audit B3). Interrupted index builds are resumed by
     /// the caller BEFORE that snapshot opens ([`Self::resume_index_builds`]).
     fn indexed_candidates(&self, reader: &dyn SnapshotReader) -> Result<Option<Candidates>> {
         if self.filters.is_empty() {
@@ -574,7 +581,7 @@ impl QueryBuilder<'_> {
                     .collect();
                 keep_smaller(
                     &mut best,
-                    db.scalar_candidates(coll, path, &constraints, CAP)?,
+                    db.scalar_candidates(coll, path, &constraints, CAP, reader)?,
                 );
             }
         }
@@ -584,13 +591,13 @@ impl QueryBuilder<'_> {
                 pred,
                 Predicate::Between { .. } | Predicate::In { .. } | Predicate::StartsWith { .. }
             ) {
-                keep_smaller(&mut best, self.predicate_candidates(pred)?);
+                keep_smaller(&mut best, self.predicate_candidates(pred, reader)?);
             }
         }
         // 3. Whole-query alternative drivers: compound prefix, geo, OR union.
-        keep_smaller(&mut best, self.compound_candidate_keys()?);
-        keep_smaller(&mut best, self.geo_candidate_keys()?);
-        keep_smaller(&mut best, self.or_candidate_keys()?);
+        keep_smaller(&mut best, self.compound_candidate_keys(reader)?);
+        keep_smaller(&mut best, self.geo_candidate_keys(reader)?);
+        keep_smaller(&mut best, self.or_candidate_keys(reader)?);
 
         match best {
             Some(keys) => self.verify_candidates(reader, keys),
@@ -599,8 +606,13 @@ impl QueryBuilder<'_> {
     }
 
     /// Index-serviceable candidate keys for a *single* predicate (eq/range/in/
-    /// between/starts_with on a scalar index, or geo within), else `None`.
-    fn predicate_candidates(&self, pred: &Predicate) -> Result<Option<Vec<Vec<u8>>>> {
+    /// between/starts_with on a scalar index, or geo within), read from
+    /// `reader`'s snapshot, else `None`.
+    fn predicate_candidates(
+        &self,
+        pred: &Predicate,
+        reader: &dyn SnapshotReader,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
         const CAP: usize = 100_000;
         let db = self.collection.db();
         let coll = self.collection.name();
@@ -612,7 +624,7 @@ impl QueryBuilder<'_> {
                 ) && db.has_scalar_index(coll, path) =>
             {
                 let cons = [crate::scalar::Constraint { op: *op, value }];
-                db.scalar_candidates(coll, path, &cons, CAP)
+                db.scalar_candidates(coll, path, &cons, CAP, reader)
             }
             Predicate::Between { path, low, high } if db.has_scalar_index(coll, path) => {
                 let cons = [
@@ -625,7 +637,7 @@ impl QueryBuilder<'_> {
                         value: high,
                     },
                 ];
-                db.scalar_candidates(coll, path, &cons, CAP)
+                db.scalar_candidates(coll, path, &cons, CAP, reader)
             }
             Predicate::In { path, values } if db.has_scalar_index(coll, path) => {
                 let mut seen = std::collections::HashSet::new();
@@ -635,7 +647,7 @@ impl QueryBuilder<'_> {
                         op: CmpOp::Eq,
                         value: v,
                     }];
-                    match db.scalar_candidates(coll, path, &cons, CAP)? {
+                    match db.scalar_candidates(coll, path, &cons, CAP, reader)? {
                         Some(ks) => {
                             for k in ks {
                                 if seen.insert(k.clone()) {
@@ -649,7 +661,7 @@ impl QueryBuilder<'_> {
                 Ok(Some(out))
             }
             Predicate::StartsWith { path, prefix } if db.has_scalar_index(coll, path) => {
-                db.scalar_prefix_candidates(coll, path, prefix, CAP)
+                db.scalar_prefix_candidates(coll, path, prefix, CAP, reader)
             }
             Predicate::GeoWithin {
                 path,
@@ -659,7 +671,7 @@ impl QueryBuilder<'_> {
             } if db.has_geo_index(coll, path) => {
                 match crate::geo_index::radius_bbox(*lat, *lon, *radius_km) {
                     Some((mn_lat, mn_lon, mx_lat, mx_lon)) => {
-                        db.geo_candidates(coll, path, mn_lat, mn_lon, mx_lat, mx_lon)
+                        db.geo_candidates(coll, path, mn_lat, mn_lon, mx_lat, mx_lon, reader)
                     }
                     None => Ok(None),
                 }
@@ -672,7 +684,7 @@ impl QueryBuilder<'_> {
     /// serviceable, the union of their candidate key sets (deduped, capped) — so
     /// a disjunction stays sub-linear. `None` if any disjunct can't use an index
     /// (then the whole thing must scan, to avoid missing matches).
-    fn or_candidate_keys(&self) -> Result<Option<Vec<Vec<u8>>>> {
+    fn or_candidate_keys(&self, reader: &dyn SnapshotReader) -> Result<Option<Vec<Vec<u8>>>> {
         const CAP: usize = 100_000;
         for pred in &self.filters {
             if matches!(pred, Predicate::Or(..)) {
@@ -681,7 +693,7 @@ impl QueryBuilder<'_> {
                 let mut seen = std::collections::HashSet::new();
                 let mut out = Vec::new();
                 for d in disjuncts {
-                    match self.predicate_candidates(d)? {
+                    match self.predicate_candidates(d, reader)? {
                         Some(ks) => {
                             for k in ks {
                                 if seen.insert(k.clone()) {
@@ -703,9 +715,9 @@ impl QueryBuilder<'_> {
 
     /// If a compound index's leading fields are pinned by equality filters
     /// (optionally with a range on the next field), the candidate keys for that
-    /// prefix window (a verified superset), else `None`. Picks the index that
-    /// matches the longest equality prefix.
-    fn compound_candidate_keys(&self) -> Result<Option<Vec<Vec<u8>>>> {
+    /// prefix window (a verified superset), read from `reader`'s snapshot,
+    /// else `None`. Picks the index that matches the longest equality prefix.
+    fn compound_candidate_keys(&self, reader: &dyn SnapshotReader) -> Result<Option<Vec<Vec<u8>>>> {
         const CANDIDATE_CAP: usize = 100_000;
         let db = self.collection.db();
         let coll = self.collection.name();
@@ -769,13 +781,13 @@ impl QueryBuilder<'_> {
             Vec::new()
         };
 
-        db.compound_candidates(coll, &fields, &eq_prefix, &tail, CANDIDATE_CAP)
+        db.compound_candidates(coll, &fields, &eq_prefix, &tail, CANDIDATE_CAP, reader)
     }
 
     /// If a top-level `GeoWithin` filter targets a geo-indexed field, the
-    /// candidate doc keys for its bounding box (a verified superset), else
-    /// `None`.
-    fn geo_candidate_keys(&self) -> Result<Option<Vec<Vec<u8>>>> {
+    /// candidate doc keys for its bounding box (a verified superset, read
+    /// from `reader`'s snapshot), else `None`.
+    fn geo_candidate_keys(&self, reader: &dyn SnapshotReader) -> Result<Option<Vec<Vec<u8>>>> {
         let db = self.collection.db();
         let coll = self.collection.name();
         for pred in &self.filters {
@@ -789,7 +801,7 @@ impl QueryBuilder<'_> {
                 && let Some((min_lat, min_lon, max_lat, max_lon)) =
                     crate::geo_index::radius_bbox(*lat, *lon, *radius_km)
             {
-                return db.geo_candidates(coll, path, min_lat, min_lon, max_lat, max_lon);
+                return db.geo_candidates(coll, path, min_lat, min_lon, max_lat, max_lon, reader);
             }
         }
         Ok(None)
@@ -911,13 +923,11 @@ impl QueryBuilder<'_> {
     }
 
     /// The execution core of [`Self::run`]: the entire query — candidate
-    /// generation, verification, ranking, fusion, rerank, ordering,
-    /// pagination, projection — reads `reader` and nothing else, so the
-    /// caller-supplied read transaction is the query's single point-in-time
-    /// view. Nothing inside writes or resumes builds. (The `Db` index
-    /// helpers consulted here still open their own transactions until the
-    /// candidate paths are threaded onto the reader; every document fetch is
-    /// already on `reader`.)
+    /// generation (index window scans included), verification, ranking,
+    /// fusion, rerank, ordering, pagination, projection — reads `reader` and
+    /// nothing else, so the caller-supplied read transaction is the query's
+    /// single point-in-time view. Nothing inside writes or resumes builds
+    /// (those happen in [`Self::run`] before the snapshot opens).
     pub(crate) fn run_with(&self, reader: &dyn SnapshotReader) -> Result<Vec<ResultRow>> {
         // Pick the narrowest / most-bounded source for the candidate set:
         //   1. a filter-driven scalar/geo index; with no retrieval sources,
@@ -1276,6 +1286,7 @@ mod tests {
     use super::*;
     use crate::{Db, field};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn doc(category: &str, body: &str, embedding: Vec<f32>) -> Value {
         let mut m = BTreeMap::new();
@@ -2008,6 +2019,96 @@ mod tests {
             assert!(
                 keys.is_empty() || keys == vec![b"k".to_vec()],
                 "query result {keys:?} matches no single snapshot"
+            );
+        }
+        writer.join().unwrap();
+    }
+
+    /// Wave-4 audit B3, scenario 3 (the indexed candidate window): the
+    /// discriminator is the index scan itself, not the per-key fetch. Docs
+    /// "a" and "z" SWAP the flipped field in one transaction (`insert_batch`):
+    /// state A = (z.n=1, a.n=2), state B = (z.n=2, a.n=1), so at every point
+    /// in time exactly one of them matches n==1 — valid answers are
+    /// {fillers, z} or {fillers, a}, never {fillers} alone and never both.
+    /// With scalar indexes on `tag` and `n`, the old shape ran each index
+    /// window in its OWN read transaction after the verification snapshot
+    /// had already opened: a swap landing between them yields candidates
+    /// from one state and documents from the other, losing both docs — a
+    /// set matching no point in time. One snapshot for window + verify
+    /// cannot produce it. The 4100 fillers (keys between "a" and "z", all
+    /// n=1) make the n-window span two `PAGE`s and stretch the
+    /// probe-to-verify gap wide enough to observe the race.
+    #[test]
+    fn indexed_window_scan_and_verify_share_one_snapshot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const FILLERS: usize = 4100; // > PAGE (4096): the n-window scans 2 pages
+        let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
+        let c = db.collection("docs");
+        let doc = |n: i64| {
+            let mut m = BTreeMap::new();
+            m.insert("tag".to_owned(), Value::Text("t".into()));
+            m.insert("n".to_owned(), Value::Int(n));
+            Value::Map(m)
+        };
+        // Fillers in chunks (keys "f0000".."f4099" sort between "a" and "z").
+        let filler_docs: Vec<(Vec<u8>, Value)> = (0..FILLERS)
+            .map(|i| (format!("f{i:04}").into_bytes(), doc(1)))
+            .collect();
+        for chunk in filler_docs.chunks(500) {
+            let items: Vec<(&[u8], &Value)> =
+                chunk.iter().map(|(k, v)| (k.as_slice(), v)).collect();
+            c.insert_batch(&items).unwrap();
+        }
+        c.insert(b"a", &doc(2)).unwrap(); // state A: a.n=2, z.n=1
+        c.insert(b"z", &doc(1)).unwrap();
+        c.create_scalar_index("tag").unwrap();
+        c.create_scalar_index("n").unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let w = Arc::clone(&db);
+        let fin = Arc::clone(&done);
+        let writer = std::thread::spawn(move || {
+            for i in 0..800 {
+                // Swap: A -> B -> A -> ... atomically in one transaction.
+                let (nz, na) = if i % 2 == 0 { (2, 1) } else { (1, 2) };
+                let dz = doc(nz);
+                let da = doc(na);
+                w.collection("docs")
+                    .insert_batch(&[(b"z", &dz), (b"a", &da)])
+                    .unwrap();
+            }
+            fin.store(true, Ordering::Release);
+        });
+
+        let mut checks = 0usize;
+        while !done.load(Ordering::Acquire) || checks < 20 {
+            checks += 1;
+            let keys: Vec<Vec<u8>> = db
+                .collection("docs")
+                .query()
+                .filter(field("tag").eq(Value::Text("t".into())))
+                .filter(field("n").eq(Value::Int(1)))
+                .run()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.key)
+                .collect();
+            let has_a = keys.contains(&b"a".to_vec());
+            let has_z = keys.contains(&b"z".to_vec());
+            assert_eq!(
+                keys.len(),
+                FILLERS + 1,
+                "query result holds {} of {} fillers (missing {} fillers alongside the flip)",
+                keys.len(),
+                FILLERS + 1,
+                FILLERS + 1 - keys.len().min(FILLERS + 1)
+            );
+            assert!(
+                has_a ^ has_z,
+                "query result matched no single snapshot: \
+                 fillers + {{a={has_a}, z={has_z}}} — the swap means exactly \
+                 one of them matches at every point in time"
             );
         }
         writer.join().unwrap();

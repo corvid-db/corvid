@@ -646,11 +646,13 @@ pub(crate) fn delete_in_txn(
     Ok(true)
 }
 
-/// Search for the `k` nearest live document keys to `query`. Returns `None`
+/// Search for the `k` nearest live document keys to `query`, reading meta and
+/// nodes from `reader`'s snapshot (audit B3: the candidate keys and the
+/// caller's document fetches share one point in time). Returns `None`
 /// when the index cannot honestly serve the query — a dimension mismatch —
 /// so the caller falls back to an exact scan instead of getting garbage.
 pub(crate) fn search(
-    store: &Store,
+    reader: &dyn crate::store::SnapshotReader,
     ns: &str,
     p: &DiskParams,
     query: &[f32],
@@ -660,56 +662,54 @@ pub(crate) fn search(
     if k == 0 {
         return Ok(Some(Vec::new()));
     }
-    store.read(|r| {
-        let meta = match r.get(ns, &[TAG_META])? {
-            Some(b) => decode_meta(&b).ok_or_else(|| corrupt(ns, "malformed meta row"))?,
-            None => return Ok(Some(Vec::new())),
-        };
-        // Dimension gate (unset on legacy namespaces → accept-all).
-        if let Some(d) = meta.dim
-            && d as usize != query.len()
-        {
-            return Ok(None);
-        }
-        // A PQ index can only serve queries matching its codebook dimension
-        // (covers legacy namespaces whose meta.dim is unset).
-        if let Some(pq) = &p.pq
-            && pq.dim() != query.len()
-        {
-            return Ok(None);
-        }
-        let Some(entry) = meta.entry else {
-            return Ok(Some(Vec::new()));
-        };
-        let mut cache = Cache::new();
-        let top = load_r(r, ns, &mut cache, p, entry)?
-            .map(|n| n.layers.len() - 1)
-            .unwrap_or(0);
+    let meta = match reader.get(ns, &[TAG_META])? {
+        Some(b) => decode_meta(&b).ok_or_else(|| corrupt(ns, "malformed meta row"))?,
+        None => return Ok(Some(Vec::new())),
+    };
+    // Dimension gate (unset on legacy namespaces → accept-all).
+    if let Some(d) = meta.dim
+        && d as usize != query.len()
+    {
+        return Ok(None);
+    }
+    // A PQ index can only serve queries matching its codebook dimension
+    // (covers legacy namespaces whose meta.dim is unset).
+    if let Some(pq) = &p.pq
+        && pq.dim() != query.len()
+    {
+        return Ok(None);
+    }
+    let Some(entry) = meta.entry else {
+        return Ok(Some(Vec::new()));
+    };
+    let mut cache = Cache::new();
+    let top = load_r(reader, ns, &mut cache, p, entry)?
+        .map(|n| n.layers.len() - 1)
+        .unwrap_or(0);
 
-        let mut cur = entry;
-        for layer in (1..=top).rev() {
-            let w = search_layer_r(r, ns, p, &mut cache, query, &[cur], 1, layer)?;
-            if let Some(c) = w.first() {
-                cur = c.id;
+    let mut cur = entry;
+    for layer in (1..=top).rev() {
+        let w = search_layer_r(reader, ns, p, &mut cache, query, &[cur], 1, layer)?;
+        if let Some(c) = w.first() {
+            cur = c.id;
+        }
+    }
+    // Over-fetch so tombstoned hits don't crowd out live ones.
+    let want = ef_search.max(k) * 2;
+    let w = search_layer_r(reader, ns, p, &mut cache, query, &[cur], want, 0)?;
+
+    let mut out = Vec::new();
+    for c in w {
+        if let Some(node) = cache.nodes.get(&c.id)
+            && !node.deleted
+        {
+            out.push((node.doc_key.clone(), c.dist));
+            if out.len() == k {
+                break;
             }
         }
-        // Over-fetch so tombstoned hits don't crowd out live ones.
-        let want = ef_search.max(k) * 2;
-        let w = search_layer_r(r, ns, p, &mut cache, query, &[cur], want, 0)?;
-
-        let mut out = Vec::new();
-        for c in w {
-            if let Some(node) = cache.nodes.get(&c.id)
-                && !node.deleted
-            {
-                out.push((node.doc_key.clone(), c.dist));
-                if out.len() == k {
-                    break;
-                }
-            }
-        }
-        Ok(Some(out))
-    })
+    }
+    Ok(Some(out))
 }
 
 /// Ranked `(doc_key, distance)` results, nearest first.
@@ -782,7 +782,7 @@ fn load(
 }
 
 fn load_r(
-    r: &crate::store::ReadBatch<'_>,
+    r: &dyn crate::store::SnapshotReader,
     ns: &str,
     cache: &mut Cache,
     p: &DiskParams,
@@ -869,7 +869,7 @@ macro_rules! search_layer_impl {
 }
 
 search_layer_impl!(search_layer, &crate::store::WriteBatch<'_>, load);
-search_layer_impl!(search_layer_r, &crate::store::ReadBatch<'_>, load_r);
+search_layer_impl!(search_layer_r, &dyn crate::store::SnapshotReader, load_r);
 
 /// Keep only the `m` nearest neighbours of `node` on `layer` (in the cache).
 fn prune(

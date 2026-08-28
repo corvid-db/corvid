@@ -100,28 +100,53 @@ impl Collection<'_> {
     /// Breadth-first traversal following `relation` up to `hops` hops from
     /// `start`. Returns the reachable nodes (excluding `start`) in BFS order,
     /// each at most once. Cycles terminate; `hops == 0` yields nothing.
+    ///
+    /// The whole traversal runs on ONE read snapshot (audit B3): every hop's
+    /// neighbor scan observes a single point in time, so the reachable set
+    /// always matches some committed state even while writers link/unlink
+    /// concurrently.
     pub fn traverse(&self, start: &[u8], relation: &str, hops: usize) -> Result<Vec<Vec<u8>>> {
-        let mut visited: HashSet<Vec<u8>> = HashSet::new();
-        visited.insert(start.to_vec());
-        let mut frontier = vec![start.to_vec()];
-        let mut result = Vec::new();
+        self.db().store().read(|r| {
+            let mut visited: HashSet<Vec<u8>> = HashSet::new();
+            visited.insert(start.to_vec());
+            let mut frontier = vec![start.to_vec()];
+            let mut result = Vec::new();
 
-        for _ in 0..hops {
-            let mut next = Vec::new();
-            for node in &frontier {
-                for to in self.neighbors(node, relation)? {
-                    if visited.insert(to.clone()) {
-                        result.push(to.clone());
-                        next.push(to);
+            for _ in 0..hops {
+                let mut next = Vec::new();
+                for node in &frontier {
+                    for to in self.neighbors_in(r, node, relation)? {
+                        if visited.insert(to.clone()) {
+                            result.push(to.clone());
+                            next.push(to);
+                        }
                     }
                 }
+                if next.is_empty() {
+                    break;
+                }
+                frontier = next;
             }
-            if next.is_empty() {
-                break;
-            }
-            frontier = next;
-        }
-        Ok(result)
+            Ok(result)
+        })
+    }
+
+    /// Snapshot-scoped twin of [`Collection::neighbors`]: the targets of
+    /// every `from --relation--> ?` edge, in key order, read from `reader`'s
+    /// snapshot (audit B3 — used by [`Collection::traverse`] so a whole
+    /// traversal sees one point in time).
+    fn neighbors_in(
+        &self,
+        reader: &dyn crate::store::SnapshotReader,
+        from: &[u8],
+        relation: &str,
+    ) -> Result<Vec<Vec<u8>>> {
+        let prefix = neighbor_prefix(relation, from);
+        let edges = reader.scan_prefix(&self.edges_name(), &prefix)?;
+        Ok(edges
+            .into_iter()
+            .map(|(key, _)| key.get(prefix.len()..).unwrap_or(&[]).to_vec())
+            .collect())
     }
 
     /// The sibling collection holding this collection's forward edges.

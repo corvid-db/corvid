@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use crate::error::Result;
-use crate::store::Store;
+use crate::store::SnapshotReader;
 use crate::text::{Bm25Params, analyze, idf, term_score};
 
 const TAG_POST: u8 = b'P';
@@ -143,13 +143,18 @@ fn decode_meta(b: &[u8]) -> Meta {
 
 /// Test seam: index one document in its own transaction.
 #[cfg(test)]
-pub(crate) fn insert(store: &Store, ns: &str, doc_key: &[u8], text: &str) -> Result<()> {
+pub(crate) fn insert(
+    store: &crate::store::Store,
+    ns: &str,
+    doc_key: &[u8],
+    text: &str,
+) -> Result<()> {
     store.transaction(|tx| insert_in_txn(tx, ns, doc_key, text))
 }
 
 /// Test seam: remove one document in its own transaction.
 #[cfg(test)]
-pub(crate) fn delete(store: &Store, ns: &str, doc_key: &[u8]) -> Result<()> {
+pub(crate) fn delete(store: &crate::store::Store, ns: &str, doc_key: &[u8]) -> Result<()> {
     store.transaction(|tx| delete_in_txn(tx, ns, doc_key))
 }
 
@@ -246,12 +251,19 @@ fn index_in_txn(
     Ok(())
 }
 
-/// BM25 search over the on-disk postings, touching only the query terms.
-pub(crate) fn search(store: &Store, ns: &str, query: &str, k: usize) -> Result<Ranked> {
+/// BM25 search over the on-disk postings on `reader`'s snapshot, touching
+/// only the query terms (audit B3: postings and the caller's document
+/// fetches share one point in time).
+pub(crate) fn search(
+    reader: &dyn SnapshotReader,
+    ns: &str,
+    query: &str,
+    k: usize,
+) -> Result<Ranked> {
     if k == 0 {
         return Ok(Vec::new());
     }
-    let meta = store
+    let meta = reader
         .get(ns, &[TAG_META])?
         .map(|b| decode_meta(&b))
         .unwrap_or_default();
@@ -272,7 +284,7 @@ pub(crate) fn search(store: &Store, ns: &str, query: &str, k: usize) -> Result<R
     let mut scores: HashMap<Vec<u8>, f32> = HashMap::new();
     for term in &query_terms {
         let prefix = term_prefix(term);
-        let postings = store.scan_prefix(ns, &prefix)?;
+        let postings = reader.scan_prefix(ns, &prefix)?;
         let df = postings.len();
         if df == 0 {
             continue;
@@ -295,12 +307,18 @@ pub(crate) fn search(store: &Store, ns: &str, query: &str, k: usize) -> Result<R
 }
 
 /// Phrase search: BM25-ranked docs containing the analyzed `phrase` as a
-/// consecutive in-order run of tokens, using stored positions.
-pub(crate) fn phrase_search(store: &Store, ns: &str, phrase: &str, k: usize) -> Result<Ranked> {
+/// consecutive in-order run of tokens, using stored positions, all reads on
+/// `reader`'s snapshot (audit B3).
+pub(crate) fn phrase_search(
+    reader: &dyn SnapshotReader,
+    ns: &str,
+    phrase: &str,
+    k: usize,
+) -> Result<Ranked> {
     if k == 0 {
         return Ok(Vec::new());
     }
-    let meta = store
+    let meta = reader
         .get(ns, &[TAG_META])?
         .map(|b| decode_meta(&b))
         .unwrap_or_default();
@@ -320,7 +338,7 @@ pub(crate) fn phrase_search(store: &Store, ns: &str, phrase: &str, k: usize) -> 
     let mut per_term: Vec<(DocPostings, usize)> = Vec::with_capacity(terms.len());
     for term in &terms {
         let prefix = term_prefix(term);
-        let postings = store.scan_prefix(ns, &prefix)?;
+        let postings = reader.scan_prefix(ns, &prefix)?;
         let df = postings.len();
         if df == 0 {
             return Ok(Vec::new()); // a term absent everywhere → no phrase match
@@ -390,6 +408,7 @@ fn phrase_aligned(lists: &[&Vec<u32>]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
 
     fn build(store: &Store, ns: &str) {
         insert(store, ns, b"a", "the quick brown fox").unwrap();

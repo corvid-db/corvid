@@ -23,7 +23,7 @@
 use crate::db::{Collection, Db};
 use crate::error::Result;
 use crate::geo::extract_point;
-use crate::store::Store;
+use crate::store::SnapshotReader;
 use crate::value::Value;
 
 /// Reserved collection holding persisted geo-index definitions.
@@ -124,11 +124,12 @@ fn remove_in_txn(tx: &mut crate::store::WriteBatch<'_>, ns: &str, doc_key: &[u8]
 const PAGE: usize = 4096;
 
 /// Candidate doc keys whose cell overlaps the bounding box (a verified superset
-/// for the caller). Returns `None` when the field isn't indexed or the box
-/// spans more than [`ROW_CAP`] cell rows / candidates (fall back to a scan).
-/// The box must not wrap the antimeridian (`min_lon <= max_lon`).
+/// for the caller), read from `reader`'s snapshot (audit B3). Returns `None`
+/// when the field isn't indexed or the box spans more than [`ROW_CAP`] cell
+/// rows / candidates (fall back to a scan). The box must not wrap the
+/// antimeridian (`min_lon <= max_lon`).
 fn bbox_candidates(
-    store: &Store,
+    reader: &dyn SnapshotReader,
     ns: &str,
     min_lat: f64,
     min_lon: f64,
@@ -147,7 +148,7 @@ fn bbox_candidates(
         let start = row_start(lat_c, lon0);
         let mut cursor = start.to_vec();
         loop {
-            let page = store.scan_from(ns, &cursor, PAGE)?;
+            let page = reader.scan_from(ns, &cursor, PAGE)?;
             if page.is_empty() {
                 break;
             }
@@ -388,7 +389,11 @@ impl Db {
     }
 
     /// If `field` has a geo index, a verified superset of doc keys whose point
-    /// falls in the bounding box. `None` when not indexed or over the cap.
+    /// falls in the bounding box, read from `reader`'s snapshot (audit B3).
+    /// `None` when not indexed or over the cap. Interrupted builds are NOT
+    /// resumed here (resuming writes): the caller resumes before its snapshot
+    /// opens.
+    #[allow(clippy::too_many_arguments)] // the bbox travels as its four bounds
     pub(crate) fn geo_candidates(
         &self,
         collection: &str,
@@ -397,13 +402,13 @@ impl Db {
         min_lon: f64,
         max_lat: f64,
         max_lon: f64,
+        reader: &dyn SnapshotReader,
     ) -> Result<Option<Vec<Vec<u8>>>> {
-        self.try_resume_index_builds(collection)?;
         if !self.has_geo_index(collection, field) || min_lon > max_lon {
             return Ok(None);
         }
         let ns = namespace(collection, field);
-        bbox_candidates(self.store(), &ns, min_lat, min_lon, max_lat, max_lon)
+        bbox_candidates(reader, &ns, min_lat, min_lon, max_lat, max_lon)
     }
 }
 
@@ -511,7 +516,7 @@ mod tests {
         let db = seeded();
         // bbox around London: must include london + greenwich, exclude paris.
         let got = db
-            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0)
+            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0, db.store())
             .unwrap()
             .unwrap();
         assert!(got.iter().any(|k| k == b"london"));
@@ -523,7 +528,7 @@ mod tests {
     fn unindexed_returns_none() {
         let db = seeded();
         assert!(
-            db.geo_candidates("places", "other", 0.0, 0.0, 1.0, 1.0)
+            db.geo_candidates("places", "other", 0.0, 0.0, 1.0, 1.0, db.store())
                 .unwrap()
                 .is_none()
         );
@@ -534,7 +539,7 @@ mod tests {
         let db = seeded();
         // min_lon > max_lon (antimeridian wrap) → fall back.
         assert!(
-            db.geo_candidates("places", "loc", 0.0, 170.0, 1.0, -170.0)
+            db.geo_candidates("places", "loc", 0.0, 170.0, 1.0, -170.0, db.store())
                 .unwrap()
                 .is_none()
         );
@@ -547,14 +552,14 @@ mod tests {
         // Move london far away → no longer in the London box.
         c.insert(b"london", &place(0.0, 0.0)).unwrap();
         let got = db
-            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0)
+            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0, db.store())
             .unwrap()
             .unwrap();
         assert!(!got.iter().any(|k| k == b"london"));
         // Delete greenwich → gone.
         c.delete(b"greenwich").unwrap();
         let got = db
-            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0)
+            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0, db.store())
             .unwrap()
             .unwrap();
         assert!(got.is_empty());
@@ -572,7 +577,7 @@ mod tests {
         }
         let db = Db::open(&path).unwrap();
         let got = db
-            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0)
+            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0, db.store())
             .unwrap()
             .unwrap();
         assert_eq!(got, vec![b"london".to_vec()]);
@@ -629,7 +634,7 @@ mod tests {
         // def must not be served: geo_candidates reports "no usable index"...
         let _guard = db.index_resume().lock().unwrap();
         assert!(
-            db.geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0)
+            db.geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0, db.store())
                 .unwrap()
                 .is_none(),
             "a building geo index must not be served"
@@ -644,9 +649,13 @@ mod tests {
         assert_eq!(db.collect_building_geo("places").unwrap().len(), 1);
         drop(_guard);
         // Once the resume lock is free, the next query resumes the backfill
-        // and the completed index serves.
+        // (resumes live at the query entry points now, audit B3) and the
+        // completed index serves.
+        let hits = c.geo_within_radius("loc", 51.5, -0.13, 50.0).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(db.has_geo_index("places", "loc"));
         let got = db
-            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0)
+            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0, db.store())
             .unwrap()
             .unwrap();
         assert!(got.iter().any(|k| k == b"london"));
@@ -671,7 +680,7 @@ mod tests {
         assert!(db.has_geo_index("places", "loc")); // legacy → Complete → serviceable
         assert!(db.collect_building_geo("places").unwrap().is_empty());
         let got = db
-            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0)
+            .geo_candidates("places", "loc", 51.0, -1.0, 52.0, 1.0, db.store())
             .unwrap()
             .unwrap();
         assert_eq!(got, vec![b"london".to_vec()]);

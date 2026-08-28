@@ -20,7 +20,7 @@ use crate::disk_hnsw::{self, DiskParams};
 use crate::distance::Metric;
 use crate::error::Result;
 use crate::hnsw::{DEFAULT_EF_CONSTRUCTION, DEFAULT_M, Hnsw, Quantization};
-use crate::store::Store;
+use crate::store::{SnapshotReader, Store};
 use crate::value::Value;
 
 /// Reserved collection holding persisted index definitions.
@@ -427,7 +427,12 @@ impl Db {
     }
 
     /// If a matching index is registered, return the approximate nearest `k`
-    /// keys with distances; otherwise `None` (the caller falls back to exact).
+    /// keys with distances; otherwise `None` (the caller falls back to
+    /// exact). Opens its own per-op read transactions and resumes interrupted
+    /// builds first — the resume-before-snapshot contract lives in the query
+    /// entry points, which use [`Db::ann_search_in`] instead; this
+    /// standalone form remains for direct (test) probing outside a snapshot.
+    #[cfg(test)]
     pub(crate) fn ann_search(
         &self,
         collection: &str,
@@ -440,6 +445,23 @@ impl Db {
         // def is never served, so without this nothing would ever flip it
         // Complete). Must run before the index lock: a resume takes it.
         self.try_resume_index_builds(collection)?;
+        self.ann_search_in(collection, field, query, k, metric, self.store())
+    }
+
+    /// Snapshot-scoped twin of [`Db::ann_search`]: the on-disk graph search,
+    /// its def re-check, and the lazy in-memory build all read `reader`, so
+    /// candidate keys and the caller's document fetches share one point in
+    /// time (audit B3). Does NOT resume interrupted builds (resuming
+    /// writes): the caller resumes before its snapshot opens.
+    pub(crate) fn ann_search_in(
+        &self,
+        collection: &str,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        metric: Metric,
+        reader: &dyn SnapshotReader,
+    ) -> Result<Option<RankedKeys>> {
         let map_key = (collection.to_owned(), field.to_owned());
 
         // Decide what work to do under a short lock; build/scan unlocked.
@@ -451,20 +473,20 @@ impl Db {
             }
         };
 
-        // On-disk indexes are served directly from the store (bounded memory).
-        // A building one is never served — the caller falls back to an exact
-        // scan while the resume above finishes it (this also covers a crash
-        // before the first backfill chunk: a Building def with an empty
-        // namespace never serves silently-empty results). A `None` from the
-        // search means "cannot serve this query" (dimension mismatch) — fall
-        // back to exact like every other unserveable case.
+        // On-disk indexes are served directly from the reader (bounded
+        // memory). A building one is never served — the caller falls back to
+        // an exact scan while the resume above finishes it (this also covers
+        // a crash before the first backfill chunk: a Building def with an
+        // empty namespace never serves silently-empty results). A `None`
+        // from the search means "cannot serve this query" (dimension
+        // mismatch) — fall back to exact like every other unserveable case.
         if def.kind.is_on_disk() {
             if def.building {
                 return Ok(None);
             }
             let ns = disk_hnsw::namespace(collection, field);
             let ef = (k * 4).max(64);
-            return match disk_hnsw::search(self.store(), &ns, &def.disk_params(), query, k, ef)? {
+            return match disk_hnsw::search(reader, &ns, &def.disk_params(), query, k, ef)? {
                 Some(ranked) if ranked.is_empty() => {
                     // Registry-lag window: a concurrent registration or
                     // compaction may have committed between this reader's
@@ -473,13 +495,13 @@ impl Db {
                     // namespace and flipped the def row to `Building`, and an
                     // absent meta row searches as empty. Serving that empty
                     // vector would be a silent wrong answer; re-read the def
-                    // row (one point-get) and if it now says `Building`,
-                    // declare the index unserviceable (`Ok(None)` → the
-                    // caller's exact fallback). A row that still says
-                    // `Complete` means a genuinely empty index — serve the
-                    // empty result as before.
+                    // row (one point-get, on the same snapshot) and if it now
+                    // says `Building`, declare the index unserviceable
+                    // (`Ok(None)` → the caller's exact fallback). A row that
+                    // still says `Complete` means a genuinely empty index —
+                    // serve the empty result as before.
                     if crate::index_build::read_building_cursor(
-                        self.store(),
+                        reader,
                         INDEX_DEFS,
                         &def_key(collection, field),
                     )?
@@ -497,12 +519,12 @@ impl Db {
         // Build (or compact) while holding the registry lock. A concurrent
         // writer's maintenance blocks on this lock and then applies to the
         // freshly installed graph, so no committed document can fall between
-        // the build's store snapshot and the install — the race that
+        // the build's snapshot and the install — the race that
         // otherwise permanently hid such documents from ANN search.
         {
             let mut state = self.indexes().lock().expect("index lock");
             if !state.built.contains_key(&map_key) {
-                let built = build_index(self.store(), collection, field, def.clone())?;
+                let built = build_index(reader, collection, field, def.clone())?;
                 state.built.entry(map_key.clone()).or_insert(built);
             }
 
@@ -512,7 +534,7 @@ impl Db {
                 .get(&map_key)
                 .is_some_and(|b| !b.node_to_key.is_empty() && b.dead() * 2 > b.node_to_key.len());
             if needs_compact {
-                let built = build_index(self.store(), collection, field, def.clone())?;
+                let built = build_index(reader, collection, field, def.clone())?;
                 state.built.insert(map_key.clone(), built);
             }
         }
@@ -791,10 +813,17 @@ fn install_def_over_cleared_namespace(
     })
 }
 
-/// Build a fresh index for `field` by scanning `collection`.
-fn build_index(store: &Store, collection: &str, field: &str, def: VectorDef) -> Result<BuiltIndex> {
+/// Build a fresh index for `field` by scanning `collection` on `reader`'s
+/// snapshot (audit B3: the lazy build sees the same point in time as the
+/// query that triggered it).
+fn build_index(
+    reader: &dyn SnapshotReader,
+    collection: &str,
+    field: &str,
+    def: VectorDef,
+) -> Result<BuiltIndex> {
     let mut built = BuiltIndex::new(def);
-    for (key, bytes) in store.scan(collection)? {
+    for (key, bytes) in reader.scan(collection)? {
         let doc = Value::decode(&bytes)?;
         if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
             built.add(&key, v.to_vec());

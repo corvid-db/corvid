@@ -94,25 +94,37 @@ impl Collection<'_> {
     /// The set of `(key, document)` to evaluate a geo predicate against: the
     /// indexed candidate set for `bbox` if a spatial index serves it, else the
     /// full collection scan. `bbox` is `(min_lat, min_lon, max_lat, max_lon)`.
+    /// The whole set — index window, document fetches, fallback scan — reads
+    /// ONE snapshot (audit B3); interrupted builds are resumed before it
+    /// opens (resumes write).
     fn geo_scan_set(
         &self,
         field: &str,
         bbox: Option<(f64, f64, f64, f64)>,
     ) -> Result<Vec<(Vec<u8>, Value)>> {
-        if let Some((min_lat, min_lon, max_lat, max_lon)) = bbox
-            && let Some(keys) =
-                self.db()
-                    .geo_candidates(self.name(), field, min_lat, min_lon, max_lat, max_lon)?
-        {
-            let mut out = Vec::with_capacity(keys.len());
-            for key in keys {
-                if let Some(doc) = self.get(&key)? {
-                    out.push((key, doc));
+        self.db().try_resume_index_builds(self.name())?;
+        self.db().store().read(|r| {
+            if let Some((min_lat, min_lon, max_lat, max_lon)) = bbox
+                && let Some(keys) = self.db().geo_candidates(
+                    self.name(),
+                    field,
+                    min_lat,
+                    min_lon,
+                    max_lat,
+                    max_lon,
+                    r,
+                )?
+            {
+                let mut out = Vec::with_capacity(keys.len());
+                for key in keys {
+                    if let Some(doc) = self.get_in(r, &key)? {
+                        out.push((key, doc));
+                    }
                 }
+                return Ok(out);
             }
-            return Ok(out);
-        }
-        self.scan()
+            self.scan_in(r)
+        })
     }
 
     /// Find the `k` documents whose `field` point is nearest to `(lat, lon)`,

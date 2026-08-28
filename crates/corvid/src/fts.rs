@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use crate::db::{Collection, Db};
 use crate::disk_fts;
 use crate::error::Result;
-use crate::store::Store;
+use crate::store::SnapshotReader;
 use crate::text::{Bm25Params, analyze, idf, term_score};
 use crate::value::Value;
 
@@ -402,7 +402,12 @@ impl Db {
     }
 
     /// If a text index is registered, return the BM25-ranked top `k` keys;
-    /// otherwise `None` (the caller falls back to an exact scan).
+    /// otherwise `None` (the caller falls back to an exact scan). Opens its
+    /// own per-op read transactions and resumes interrupted builds first —
+    /// the resume-before-snapshot contract lives in the query entry points,
+    /// which use [`Db::fts_search_in`] instead; this standalone form remains
+    /// for direct (test) probing outside a snapshot.
+    #[cfg(test)]
     pub(crate) fn fts_search(
         &self,
         collection: &str,
@@ -414,6 +419,22 @@ impl Db {
         // def is never served, so without this nothing would ever flip it
         // Complete). Must run before the fts lock: a resume takes it.
         self.try_resume_index_builds(collection)?;
+        self.fts_search_in(collection, field, query, k, self.store())
+    }
+
+    /// Snapshot-scoped twin of [`Db::fts_search`] (audit B3): every read —
+    /// on-disk postings, the lazy in-memory build, corpus stats — comes from
+    /// `reader`, so the ranked keys and the caller's document fetches share
+    /// one point in time. Does NOT resume interrupted builds
+    /// (resuming writes): the caller resumes before its snapshot opens.
+    pub(crate) fn fts_search_in(
+        &self,
+        collection: &str,
+        field: &str,
+        query: &str,
+        k: usize,
+        reader: &dyn SnapshotReader,
+    ) -> Result<Option<RankedKeys>> {
         let map_key = (collection.to_owned(), field.to_owned());
 
         // Build while holding the registry lock: a concurrent writer's
@@ -429,12 +450,12 @@ impl Db {
                 Some((TextKind::OnDisk, false)) => {
                     let ns = disk_fts::namespace(collection, field);
                     drop(state);
-                    return Ok(Some(disk_fts::search(self.store(), &ns, query, k)?));
+                    return Ok(Some(disk_fts::search(reader, &ns, query, k)?));
                 }
                 Some((TextKind::OnDisk, true)) => return Ok(None),
                 Some((TextKind::InMemory, _)) => {
                     if !state.built.contains_key(&map_key) {
-                        let inv = build_inverted(self.store(), collection, field)?;
+                        let inv = build_inverted(reader, collection, field)?;
                         state.built.entry(map_key.clone()).or_insert(inv);
                     }
                 }
@@ -445,19 +466,20 @@ impl Db {
         Ok(state.built.get(&map_key).map(|inv| inv.search(query, k)))
     }
 
-    /// Like [`Db::fts_search`] but matching `phrase` as a consecutive in-order
-    /// run of tokens (positions). `None` if `field` has no text index.
-    pub(crate) fn fts_phrase_search(
+    /// Snapshot-scoped phrase search (audit B3): every read — on-disk
+    /// postings with positions, the lazy in-memory build, corpus stats —
+    /// comes from `reader`. Resume discipline as [`Db::fts_search_in`]: the
+    /// caller resumes before its snapshot opens.
+    pub(crate) fn fts_phrase_search_in(
         &self,
         collection: &str,
         field: &str,
         phrase: &str,
         k: usize,
+        reader: &dyn SnapshotReader,
     ) -> Result<Option<RankedKeys>> {
-        // Same resume-before-serve contract as [`Db::fts_search`].
-        self.try_resume_index_builds(collection)?;
         let map_key = (collection.to_owned(), field.to_owned());
-        // Same build-under-lock contract as [`Db::fts_search`].
+        // Same build-under-lock contract as [`Db::fts_search_in`].
         {
             let mut state = self.fts().lock().expect("fts lock");
             match state.defs.get(&map_key) {
@@ -465,12 +487,12 @@ impl Db {
                 Some((TextKind::OnDisk, false)) => {
                     let ns = disk_fts::namespace(collection, field);
                     drop(state);
-                    return Ok(Some(disk_fts::phrase_search(self.store(), &ns, phrase, k)?));
+                    return Ok(Some(disk_fts::phrase_search(reader, &ns, phrase, k)?));
                 }
                 Some((TextKind::OnDisk, true)) => return Ok(None),
                 Some((TextKind::InMemory, _)) => {
                     if !state.built.contains_key(&map_key) {
-                        let inv = build_inverted(self.store(), collection, field)?;
+                        let inv = build_inverted(reader, collection, field)?;
                         state.built.entry(map_key.clone()).or_insert(inv);
                     }
                 }
@@ -545,10 +567,12 @@ impl Db {
     }
 }
 
-/// Build an inverted index for `field` by scanning `collection`.
-fn build_inverted(store: &Store, collection: &str, field: &str) -> Result<Inverted> {
+/// Build an inverted index for `field` by scanning `collection` on `reader`'s
+/// snapshot (audit B3: the lazy build sees the same point in time as the
+/// query that triggered it).
+fn build_inverted(reader: &dyn SnapshotReader, collection: &str, field: &str) -> Result<Inverted> {
     let mut inv = Inverted::default();
-    for (key, bytes) in store.scan(collection)? {
+    for (key, bytes) in reader.scan(collection)? {
         let doc = Value::decode(&bytes)?;
         if let Some(text) = doc.get_path(field).and_then(Value::as_text) {
             inv.add(&key, text);

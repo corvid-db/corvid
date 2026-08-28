@@ -26,7 +26,7 @@
 use crate::db::{Collection, Db};
 use crate::error::Result;
 use crate::filter::CmpOp;
-use crate::store::Store;
+use crate::store::SnapshotReader;
 use crate::value::Value;
 
 /// Reserved collection holding persisted scalar-index definitions.
@@ -228,12 +228,13 @@ fn min_opt(cur: Option<Vec<u8>>, b: Vec<u8>) -> Vec<u8> {
     }
 }
 
-/// Scan the `[lower, upper]` window within `lane`, returning candidate doc keys
-/// (a verified superset). Stops and returns `None` if the candidate count would
-/// exceed `cap` — the caller then falls back to a bounded scan, so a
-/// low-selectivity filter never materialises an unbounded set in memory.
+/// Scan the `[lower, upper]` window within `lane` on `reader`'s snapshot,
+/// returning candidate doc keys (a verified superset). Stops and returns
+/// `None` if the candidate count would exceed `cap` — the caller then falls
+/// back to a bounded scan, so a low-selectivity filter never materialises an
+/// unbounded set in memory.
 fn window_candidates(
-    store: &Store,
+    reader: &dyn SnapshotReader,
     ns: &str,
     lane: u8,
     lower: &[u8],
@@ -244,7 +245,7 @@ fn window_candidates(
     let mut out = Vec::new();
     let mut cursor = lower.to_vec();
     loop {
-        let page = store.scan_from(ns, &cursor, PAGE)?;
+        let page = reader.scan_from(ns, &cursor, PAGE)?;
         if page.is_empty() {
             break;
         }
@@ -368,12 +369,13 @@ fn compound_remove_in_txn(
     Ok(())
 }
 
-/// Scan a compound index: a fixed equality `prefix` over the leading fields,
-/// then an optional range `window` over the next field. Returns a verified
-/// superset of doc keys, or `None` if it would exceed `cap`. `n_fields` is the
-/// index arity (to locate the doc key past all encoded values).
+/// Scan a compound index on `reader`'s snapshot: a fixed equality `prefix`
+/// over the leading fields, then an optional range `window` over the next
+/// field. Returns a verified superset of doc keys, or `None` if it would
+/// exceed `cap`. `n_fields` is the index arity (to locate the doc key past
+/// all encoded values).
 fn compound_candidates(
-    store: &Store,
+    reader: &dyn SnapshotReader,
     ns: &str,
     prefix: &[u8],
     tail: Option<(Vec<u8>, Option<Vec<u8>>)>,
@@ -394,7 +396,7 @@ fn compound_candidates(
     let mut out = Vec::new();
     let mut cursor = start;
     loop {
-        let page = store.scan_from(ns, &cursor, PAGE)?;
+        let page = reader.scan_from(ns, &cursor, PAGE)?;
         if page.is_empty() {
             break;
         }
@@ -595,19 +597,23 @@ impl Db {
     }
 
     /// If `field` has a scalar index, return a *superset* of doc keys matching
-    /// every `constraint` (the caller must verify with the exact predicate).
+    /// every `constraint` (the caller must verify with the exact predicate),
+    /// reading the index window from `reader` — one snapshot for the candidate
+    /// set and the verification that follows (audit B3).
     ///
     /// `None` when the field is not indexed, the constraints aren't
     /// range-serviceable, or the candidate set would exceed `cap` (in which
-    /// case a full scan is the better — and bounded — plan).
+    /// case a full scan is the better — and bounded — plan). Interrupted
+    /// builds are NOT resumed here: resuming writes, so it must happen before
+    /// the caller's snapshot opens (the query entry points do).
     pub(crate) fn scalar_candidates(
         &self,
         collection: &str,
         field: &str,
         constraints: &[Constraint<'_>],
         cap: usize,
+        reader: &dyn SnapshotReader,
     ) -> Result<Option<Vec<Vec<u8>>>> {
-        self.try_resume_index_builds(collection)?;
         if !self.has_scalar_index(collection, field) {
             return Ok(None);
         }
@@ -615,19 +621,21 @@ impl Db {
             return Ok(None);
         };
         let ns = namespace(collection, field);
-        window_candidates(self.store(), &ns, lane, &lower, upper.as_deref(), cap)
+        window_candidates(reader, &ns, lane, &lower, upper.as_deref(), cap)
     }
 
     /// Doc keys whose indexed text value at `field` starts with `prefix` (a
-    /// verified superset). `None` if not indexed or over `cap`.
+    /// verified superset), read from `reader`'s snapshot (audit B3). `None` if
+    /// not indexed or over `cap`. Resume discipline as
+    /// [`Db::scalar_candidates`]: the caller resumes before its snapshot.
     pub(crate) fn scalar_prefix_candidates(
         &self,
         collection: &str,
         field: &str,
         prefix: &str,
         cap: usize,
+        reader: &dyn SnapshotReader,
     ) -> Result<Option<Vec<Vec<u8>>>> {
-        self.try_resume_index_builds(collection)?;
         if !self.has_scalar_index(collection, field) {
             return Ok(None);
         }
@@ -637,7 +645,7 @@ impl Db {
         let mut out = Vec::new();
         let mut cursor = pbytes.clone();
         loop {
-            let page = self.store().scan_from(&ns, &cursor, PAGE)?;
+            let page = reader.scan_from(&ns, &cursor, PAGE)?;
             if page.is_empty() {
                 break;
             }
@@ -865,8 +873,10 @@ impl Db {
 
     /// A verified superset of doc keys for a compound index `fields`: equality
     /// `eq_prefix` over the leading fields, then optional range `tail`
-    /// constraints over the next field. `None` if no such index, the prefix is
-    /// empty with no tail, or the candidate set exceeds `cap`.
+    /// constraints over the next field, read from `reader`'s snapshot (audit
+    /// B3). `None` if no such index, the prefix is empty with no tail, or the
+    /// candidate set exceeds `cap`. Resume discipline as
+    /// [`Db::scalar_candidates`]: the caller resumes before its snapshot.
     pub(crate) fn compound_candidates(
         &self,
         collection: &str,
@@ -874,8 +884,8 @@ impl Db {
         eq_prefix: &[&Value],
         tail: &[Constraint<'_>],
         cap: usize,
+        reader: &dyn SnapshotReader,
     ) -> Result<Option<Vec<Vec<u8>>>> {
-        self.try_resume_index_builds(collection)?;
         if !self.has_compound_index(collection, fields) || (eq_prefix.is_empty() && tail.is_empty())
         {
             return Ok(None);
@@ -892,7 +902,7 @@ impl Db {
             }
         };
         let ns = compound_namespace(collection, fields);
-        compound_candidates(self.store(), &ns, &prefix, tail_window, fields.len(), cap)
+        compound_candidates(reader, &ns, &prefix, tail_window, fields.len(), cap)
     }
 }
 
@@ -986,6 +996,7 @@ impl Collection<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
     use crate::{Db, field};
     use std::collections::BTreeMap;
 
@@ -1106,7 +1117,13 @@ mod tests {
         // returns the right docs (parity with dotted-path filter semantics).
         c.create_scalar_index("meta.score").unwrap();
         let got = db
-            .scalar_candidates("docs", "meta.score", &one(CmpOp::Eq, &Value::Int(7)), 1000)
+            .scalar_candidates(
+                "docs",
+                "meta.score",
+                &one(CmpOp::Eq, &Value::Int(7)),
+                1000,
+                db.store(),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(got, vec![vec![7u8]]);
@@ -1170,14 +1187,14 @@ mod tests {
         let a0 = Value::Int(0);
         // Eq on the leading field only: all docs with a == 0.
         let got = db
-            .compound_candidates("docs", &fields, &[&a0], &[], 1000)
+            .compound_candidates("docs", &fields, &[&a0], &[], 1000, db.store())
             .unwrap()
             .unwrap();
         assert_eq!(got.len(), 7); // i in {0,3,6,9,12,15,18}
         // Unregistered field list → None.
         let other = vec!["a".to_owned()];
         assert!(
-            db.compound_candidates("docs", &other, &[&a0], &[], 1000)
+            db.compound_candidates("docs", &other, &[&a0], &[], 1000, db.store())
                 .unwrap()
                 .is_none()
         );
@@ -1200,7 +1217,7 @@ mod tests {
         let fields = vec!["a".to_owned(), "b".to_owned()];
         let (a, b) = (Value::Int(1), Value::Int(2));
         let got = db
-            .compound_candidates("docs", &fields, &[&a, &b], &[], 1000)
+            .compound_candidates("docs", &fields, &[&a, &b], &[], 1000, db.store())
             .unwrap()
             .unwrap();
         assert_eq!(got, vec![b"k".to_vec()]);
@@ -1267,7 +1284,13 @@ mod tests {
     fn eq_returns_matching_keys() {
         let db = db_with_index();
         let mut got = db
-            .scalar_candidates("docs", "n", &one(CmpOp::Eq, &Value::Int(3)), 1000)
+            .scalar_candidates(
+                "docs",
+                "n",
+                &one(CmpOp::Eq, &Value::Int(3)),
+                1000,
+                db.store(),
+            )
             .unwrap()
             .unwrap();
         got.sort();
@@ -1280,7 +1303,13 @@ mod tests {
         // `>` includes the boundary bucket (superset for the caller to verify):
         // it must contain every true match (n=3,2,3) and exclude the far side.
         let gt = db
-            .scalar_candidates("docs", "n", &one(CmpOp::Gt, &Value::Int(1)), 1000)
+            .scalar_candidates(
+                "docs",
+                "n",
+                &one(CmpOp::Gt, &Value::Int(1)),
+                1000,
+                db.store(),
+            )
             .unwrap()
             .unwrap();
         for k in [b"a".as_slice(), b"c", b"d"] {
@@ -1289,7 +1318,13 @@ mod tests {
 
         // `<=` must contain n=1 (b) and n=2 (c), never the larger values.
         let le = db
-            .scalar_candidates("docs", "n", &one(CmpOp::Le, &Value::Int(2)), 1000)
+            .scalar_candidates(
+                "docs",
+                "n",
+                &one(CmpOp::Le, &Value::Int(2)),
+                1000,
+                db.store(),
+            )
             .unwrap()
             .unwrap();
         for k in [b"b".as_slice(), b"c"] {
@@ -1304,7 +1339,7 @@ mod tests {
         // A range covering everything, with a cap below the match count, must
         // signal fall-back (None) rather than materialise the set.
         let got = db
-            .scalar_candidates("docs", "n", &one(CmpOp::Ge, &Value::Int(0)), 2)
+            .scalar_candidates("docs", "n", &one(CmpOp::Ge, &Value::Int(0)), 2, db.store())
             .unwrap();
         assert!(got.is_none(), "over-cap range must fall back");
     }
@@ -1324,7 +1359,7 @@ mod tests {
             },
         ];
         assert!(
-            db.scalar_candidates("docs", "n", &constraints, 1000)
+            db.scalar_candidates("docs", "n", &constraints, 1000, db.store())
                 .unwrap()
                 .is_none()
         );
@@ -1352,7 +1387,7 @@ mod tests {
             },
         ];
         let mut got = db
-            .scalar_candidates("docs", "x", &constraints, 1000)
+            .scalar_candidates("docs", "x", &constraints, 1000, db.store())
             .unwrap()
             .unwrap();
         got.sort();
@@ -1375,12 +1410,19 @@ mod tests {
                 "s",
                 &one(CmpOp::Eq, &Value::Text("hello".into())),
                 100,
+                db.store(),
             )
             .unwrap()
             .unwrap();
         assert_eq!(s, vec![b"t".to_vec()]);
         let f = db
-            .scalar_candidates("docs", "flag", &one(CmpOp::Eq, &Value::Bool(true)), 100)
+            .scalar_candidates(
+                "docs",
+                "flag",
+                &one(CmpOp::Eq, &Value::Bool(true)),
+                100,
+                db.store(),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(f, vec![b"b".to_vec()]);
@@ -1402,7 +1444,13 @@ mod tests {
             .unwrap();
         c.create_scalar_index("arr").unwrap();
         let got = db
-            .scalar_candidates("docs", "arr", &one(CmpOp::Eq, &Value::Int(1)), 100)
+            .scalar_candidates(
+                "docs",
+                "arr",
+                &one(CmpOp::Eq, &Value::Int(1)),
+                100,
+                db.store(),
+            )
             .unwrap();
         // Int query value pins a numeric lane with no entries → empty superset.
         assert_eq!(got, Some(vec![]));
@@ -1412,9 +1460,15 @@ mod tests {
     fn unindexed_field_returns_none() {
         let db = db_with_index();
         assert!(
-            db.scalar_candidates("docs", "other", &one(CmpOp::Eq, &Value::Int(1)), 1000)
-                .unwrap()
-                .is_none()
+            db.scalar_candidates(
+                "docs",
+                "other",
+                &one(CmpOp::Eq, &Value::Int(1)),
+                1000,
+                db.store()
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -1422,9 +1476,15 @@ mod tests {
     fn ne_is_not_serviceable() {
         let db = db_with_index();
         assert!(
-            db.scalar_candidates("docs", "n", &one(CmpOp::Ne, &Value::Int(1)), 1000)
-                .unwrap()
-                .is_none()
+            db.scalar_candidates(
+                "docs",
+                "n",
+                &one(CmpOp::Ne, &Value::Int(1)),
+                1000,
+                db.store()
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -1435,7 +1495,13 @@ mod tests {
         // Overwrite a (3 -> 9): no longer an eq-3 candidate.
         c.insert(b"a", &rec(9)).unwrap();
         let mut three = db
-            .scalar_candidates("docs", "n", &one(CmpOp::Eq, &Value::Int(3)), 1000)
+            .scalar_candidates(
+                "docs",
+                "n",
+                &one(CmpOp::Eq, &Value::Int(3)),
+                1000,
+                db.store(),
+            )
             .unwrap()
             .unwrap();
         three.sort();
@@ -1443,10 +1509,16 @@ mod tests {
         // Delete d: gone from the index.
         c.delete(b"d").unwrap();
         assert!(
-            db.scalar_candidates("docs", "n", &one(CmpOp::Eq, &Value::Int(3)), 1000)
-                .unwrap()
-                .unwrap()
-                .is_empty()
+            db.scalar_candidates(
+                "docs",
+                "n",
+                &one(CmpOp::Eq, &Value::Int(3)),
+                1000,
+                db.store()
+            )
+            .unwrap()
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -1464,7 +1536,13 @@ mod tests {
         }
         let db = Db::open(&path).unwrap();
         let got = db
-            .scalar_candidates("docs", "n", &one(CmpOp::Eq, &Value::Int(2)), 1000)
+            .scalar_candidates(
+                "docs",
+                "n",
+                &one(CmpOp::Eq, &Value::Int(2)),
+                1000,
+                db.store(),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(got, vec![b"b".to_vec()]);
@@ -1528,9 +1606,15 @@ mod tests {
         // index"...
         let _guard = db.index_resume().lock().unwrap();
         assert!(
-            db.scalar_candidates("docs", "n", &one(CmpOp::Eq, &Value::Int(3)), 1000)
-                .unwrap()
-                .is_none(),
+            db.scalar_candidates(
+                "docs",
+                "n",
+                &one(CmpOp::Eq, &Value::Int(3)),
+                1000,
+                db.store()
+            )
+            .unwrap()
+            .is_none(),
             "a building scalar index must not be served"
         );
         // ...so the filtered query falls back to an exact scan and stays
@@ -1554,7 +1638,13 @@ mod tests {
         assert_eq!(rows.len(), 10);
         assert!(db.has_scalar_index("docs", "n"));
         let got = db
-            .scalar_candidates("docs", "n", &one(CmpOp::Eq, &Value::Int(3)), 1000)
+            .scalar_candidates(
+                "docs",
+                "n",
+                &one(CmpOp::Eq, &Value::Int(3)),
+                1000,
+                db.store(),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(got, vec![vec![3u8]], "a completed scalar index must serve");
@@ -1600,6 +1690,7 @@ mod tests {
                 &[&g1],
                 &one(CmpOp::Ge, &Value::Int(40)),
                 1000,
+                db.store(),
             )
             .unwrap()
             .unwrap();
@@ -1630,7 +1721,7 @@ mod tests {
         let g1 = Value::Text("g1".into());
         let tail = one(CmpOp::Ge, &Value::Int(40));
         assert!(
-            db.compound_candidates("docs", &fields, &[&g1], &tail, 1000)
+            db.compound_candidates("docs", &fields, &[&g1], &tail, 1000, db.store())
                 .unwrap()
                 .is_none(),
             "a building compound index must not be served"
@@ -1658,7 +1749,7 @@ mod tests {
         assert_eq!(rows.len(), 5);
         assert!(db.has_compound_index("docs", &fields));
         let mut got = db
-            .compound_candidates("docs", &fields, &[&g1], &tail, 1000)
+            .compound_candidates("docs", &fields, &[&g1], &tail, 1000, db.store())
             .unwrap()
             .unwrap();
         got.sort();

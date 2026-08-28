@@ -764,10 +764,7 @@ pub(crate) trait SnapshotReader {
     /// Return all `(key, value)` pairs in `collection`, in key order.
     fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     /// Return up to `limit` pairs whose key is `>= start`, in key order.
-    // Unused outside tests until wave-4 Task 3 threads the reader into the
-    // index candidate paths (paged window scans) — impls alone don't count
-    // as a use for rustc's dead-code lint.
-    #[allow(dead_code)]
+    /// Paged window scans over the index namespaces run on this (audit B3).
     fn scan_from(
         &self,
         collection: &str,
@@ -775,8 +772,7 @@ pub(crate) trait SnapshotReader {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     /// Return all pairs whose key starts with `prefix`, in key order.
-    // Same staging note as `scan_from` above (Task 3: prefix windows).
-    #[allow(dead_code)]
+    /// Prefix scans (postings, edges) run on this (audit B3).
     fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     /// Stream every pair in `collection` to `f` in key order; `f` returns
     /// `false` to stop early. Its slices are valid only for the call.

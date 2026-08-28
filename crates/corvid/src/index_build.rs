@@ -86,13 +86,15 @@ pub(crate) fn decode_def(value: &[u8]) -> (Vec<u8>, DefState) {
     }
 }
 
-/// The def row's current cursor iff it exists and is `Building`.
+/// The def row's current cursor iff it exists and is `Building`. Read via
+/// `reader`, so an in-snapshot re-check (e.g. the ANN registry-lag guard)
+/// stays on the caller's snapshot (audit B3).
 pub(crate) fn read_building_cursor(
-    store: &Store,
+    reader: &dyn crate::store::SnapshotReader,
     defs_ns: &str,
     def_key: &[u8],
 ) -> Result<Option<Vec<u8>>> {
-    Ok(match store.get(defs_ns, def_key)? {
+    Ok(match reader.get(defs_ns, def_key)? {
         Some(v) => match decode_def(&v).1 {
             DefState::Building { cursor } => Some(cursor),
             DefState::Complete => None,
