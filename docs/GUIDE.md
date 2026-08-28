@@ -266,7 +266,10 @@ across reopen. Choose by scale and footprint:
 
 **Scalar** — `create_scalar_index(field)` makes equality/range filters and
 counts sub-linear. `create_compound_index(&["a", "b"])` covers
-prefix-equality + a trailing range across several fields. Works on nested
+prefix-equality + a trailing range across several fields — a prefix-only
+equality (trailing field unconstrained) declines to the scan path (identical
+results; `explain()`/`plan_shape()` report `Scan`), because documents
+missing the trailing field are absent from the index. Works on nested
 fields (`create_scalar_index("meta.score")`).
 
 **Geo** — `create_geo_index(field)` makes radius/bbox/nearest sub-linear.
@@ -448,7 +451,13 @@ Point an MCP client at it. Tools mirror the engine: `store`, `patch`,
 `phrase_search`, `count`, `geo`, `join`, `link`, `unlink`, `neighbors`,
 `in_neighbors`, `traverse`, `create_index`, `create_text_index`,
 `create_scalar_index`, `create_compound_index`, `create_geo_index`, `backup`,
-`dump`, `load`, `list_collections`, `insert_auto`. The `search` tool takes
+`dump`, `load`, `list_collections`, `insert_auto`, `set_schema`,
+`get_schema`. `set_schema` declares (or replaces) a collection's schema — a
+fields array of `{name, type (any|bool|int|float|text|bytes|vector|array|map),
+required?, unique?}` — that subsequent stores are validated against (type and
+required violations, duplicate unique values);
+`get_schema` returns the declared fields, or `{fields: null}` when none is
+declared. The `search` tool takes
 `{filter, vector, text, mmr, rrf_k, select, limit}` — the hybrid builder as JSON.
 
 ## Conventions & errors

@@ -71,7 +71,11 @@ so a highly selective filter may return fewer than `limit` rows (see the
   `link`, `unlink`, `neighbors`, `in_neighbors`, `traverse`, `create_index`,
   `create_text_index`, `create_scalar_index`, `create_compound_index`,
   `create_geo_index`, `backup`, `dump`, `load`, `list_collections`,
-  `insert_auto`.
+  `insert_auto`, `set_schema`, `get_schema`. `set_schema` declares (or
+  replaces) a collection's schema — a fields array of `{name, type,
+  required?, unique?}` — that subsequent stores are validated against;
+  `get_schema` returns the declared fields, or `{fields: null}` when none is
+  declared.
 
 A task-oriented walkthrough of every feature is in the **[user guide](docs/GUIDE.md)**.
 The **[website](https://i-rocky.github.io/corvid/)** hosts an overview and the
