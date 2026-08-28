@@ -20,7 +20,12 @@ use crate::error::Result;
 const TAG_FWD: u8 = 0x00;
 const TAG_IDX: u8 = 0x01;
 
-/// Collections that have used TTL (so plain writes know to maintain expiry).
+/// Collections that have used TTL this session. Not load-bearing for write
+/// correctness (audit B2): plain writes decide expiry maintenance inside
+/// their transaction by probing the `__ttl__<collection>` namespace itself,
+/// so a marker that lags a concurrent commit cannot skip a needed clear.
+/// The marker remains a session cache (e.g. for [`Db::ttl_specs`]); the
+/// persistent form is always the namespace, rebuilt on open.
 #[derive(Default)]
 pub(crate) struct TtlState {
     collections: HashSet<String>,
@@ -60,8 +65,9 @@ fn idx_key(ts: i64, doc_key: &[u8]) -> Vec<u8> {
 }
 
 impl Db {
-    /// Note which collections already have a TTL index, so plain writes to them
-    /// maintain expiry. Called once on open.
+    /// Rebuild the session's TTL-collection markers from the store. Called
+    /// once on open. (The `__ttl__*` namespaces themselves are the durable
+    /// record; the marker is only a cache.)
     pub(crate) fn load_ttl_collections(&self) -> Result<()> {
         let mut state = self.ttl().lock().expect("ttl lock");
         for name in self.store().collections()? {
@@ -70,14 +76,6 @@ impl Db {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn ttl_enabled(&self, collection: &str) -> bool {
-        self.ttl()
-            .lock()
-            .expect("ttl lock")
-            .collections
-            .contains(collection)
     }
 
     /// Set (or replace) `key`'s expiry timestamp.
@@ -110,15 +108,20 @@ impl Db {
     }
 
     /// Clear `key`'s expiry inside the caller's write transaction.
+    ///
+    /// The maintenance decision is made IN the transaction (audit B2): the
+    /// per-key forward lookup inside [`remove_in_txn`] is the probe. A write
+    /// transaction observes the latest committed state, so even a collection
+    /// whose in-memory marker has not been set yet (another writer committed
+    /// TTL state moments ago) gets its stale expiry cleared — the marker is
+    /// never consulted here, so it cannot race the decision. For a key with
+    /// no expiry entry the probe is a single point-read and a no-op.
     pub(crate) fn ttl_clear_in_txn(
         &self,
         tx: &mut crate::store::WriteBatch<'_>,
         collection: &str,
         key: &[u8],
     ) -> Result<()> {
-        if !self.ttl_enabled(collection) {
-            return Ok(());
-        }
         remove_in_txn(tx, &namespace(collection), key)
     }
 
@@ -158,16 +161,13 @@ impl Db {
         Ok(self.store().get(&ns, &fwd_key(key))?.map(|b| dec_ts(&b)))
     }
 
-    /// Delete every record in `collection` whose expiry is `<= now`. Returns the
-    /// number purged. Records are removed through the normal delete path, so all
-    /// indexes and the TTL index stay consistent.
-    ///
-    /// Each candidate's expiry is re-checked before its delete: a record whose
-    /// expiry changed (or was cleared by a plain overwrite) since the scan is
-    /// skipped, so the purge can never remove a legitimately rewritten record.
-    pub(crate) fn purge_expired(&self, collection: &str, now: i64) -> Result<usize> {
+    /// The collect phase of a purge: every `(doc_key, expires_at)` in
+    /// `collection` whose expiry is `<= now`, in expiry order. Exposed so
+    /// the collect → mutate → delete interleaving is testable (audit B2):
+    /// the delete phase re-verifies each entry, so anything mutated after
+    /// this scan is skipped, not deleted.
+    pub(crate) fn due_keys(&self, collection: &str, now: i64) -> Result<Vec<(Vec<u8>, i64)>> {
         let ns = namespace(collection);
-        // Collect due doc keys from the sorted index (stop once past `now`).
         let mut due: Vec<(Vec<u8>, i64)> = Vec::new();
         let mut cursor = vec![TAG_IDX];
         'outer: loop {
@@ -189,21 +189,63 @@ impl Db {
             next.push(0);
             cursor = next;
         }
-        // Delete each (cascades through indexes + clears its TTL entry).
-        let handle = self.collection(collection);
-        let mut purged = 0;
-        for (key, ts) in due {
-            if self.ttl_of(collection, &key)? != Some(ts) {
-                continue; // rewritten or cleared since the scan — not due anymore
+        Ok(due)
+    }
+
+    /// The delete phase for one key collected by [`Db::due_keys`]:
+    /// compare-expiry-and-delete in ONE transaction (audit B2). The forward
+    /// entry is re-read inside the transaction, and the record is removed —
+    /// through the same in-transaction index maintenance a delete uses —
+    /// only if it still decodes to exactly `ts`. If the entry changed or
+    /// vanished (the record was rewritten, re-expired, or deleted since the
+    /// scan), nothing happens: the purge can never remove a legitimately
+    /// rewritten record. A stranded expiry entry (no document behind it) is
+    /// dropped without counting. Returns whether a document was removed.
+    pub(crate) fn purge_due_key(&self, collection: &str, key: &[u8], ts: i64) -> Result<bool> {
+        let ns = namespace(collection);
+        let removed = self.store().transaction(|tx| {
+            // Compare-expiry: the forward entry must still be the exact
+            // expiry the collect phase observed.
+            match tx.get(&ns, &fwd_key(key))? {
+                Some(b) if dec_ts(&b) == ts => {}
+                _ => return Ok(false), // rewritten or cleared since the scan
             }
-            if handle.delete(&key)? {
+            let existed = tx.delete(collection, key)?;
+            if existed {
+                // The same in-transaction cascade a normal delete performs
+                // (TTL entries are removed explicitly below instead).
+                self.index_on_delete_in_txn(tx, collection, key)?;
+                self.fts_on_delete_in_txn(tx, collection, key)?;
+                self.scalar_on_delete_in_txn(tx, collection, key)?;
+                self.compound_on_delete_in_txn(tx, collection, key)?;
+                self.geo_on_delete_in_txn(tx, collection, key)?;
+            }
+            // Drop both TTL entries. The forward entry was verified above,
+            // inside this same transaction, so these are exactly the
+            // collected entries.
+            tx.delete(&ns, &idx_key(ts, key))?;
+            tx.delete(&ns, &fwd_key(key))?;
+            Ok(existed)
+        })?;
+        if removed {
+            self.finish_applied(collection, key, None);
+        }
+        Ok(removed)
+    }
+
+    /// Delete every record in `collection` whose expiry is `<= now`. Returns the
+    /// number purged. Records are removed through the normal delete path, so all
+    /// indexes and the TTL index stay consistent.
+    ///
+    /// Each candidate's expiry is re-verified inside the same transaction as
+    /// its delete: a record whose expiry changed (or was cleared by a plain
+    /// overwrite) since the scan is skipped, so the purge can never remove a
+    /// legitimately rewritten record.
+    pub(crate) fn purge_expired(&self, collection: &str, now: i64) -> Result<usize> {
+        let mut purged = 0;
+        for (key, ts) in self.due_keys(collection, now)? {
+            if self.purge_due_key(collection, &key, ts)? {
                 purged += 1;
-            } else {
-                // Expiry entry without a document (e.g. the expiry was set
-                // before any write landed). Drop it so future purges stop
-                // rescanning it.
-                self.store()
-                    .transaction(|tx| remove_in_txn(tx, &ns, &key))?;
             }
         }
         Ok(purged)
@@ -386,20 +428,60 @@ mod tests {
         assert_eq!(c.purge_expired(300).unwrap(), 0);
     }
 
+    /// The marker race, made deterministic: writer A's `insert_with_ttl`
+    /// commits its `__ttl__` entries but has not yet marked the collection
+    /// in memory when writer B's plain insert runs. B's write transaction
+    /// must still see the committed `__ttl__` namespace and clear the stale
+    /// expiry — the fresh immortal document must not carry A's old expiry
+    /// (and must not be deleted by a later purge at that timestamp).
+    #[test]
+    fn plain_insert_clears_stale_expiry_committed_concurrently() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert_with_ttl(b"k", &rec(1), 100).unwrap();
+        // Forge the raced state directly: committed TTL entries, marker absent.
+        db.ttl().lock().unwrap().collections.remove("docs");
+        // Writer B: plain insert at the same key.
+        c.insert(b"k", &rec(2)).unwrap();
+        // The stale expiry was cleared inside B's transaction.
+        assert_eq!(c.ttl(b"k").unwrap(), None);
+        // A purge at the old timestamp finds nothing due and keeps the doc.
+        assert_eq!(c.purge_expired(1000).unwrap(), 0);
+        assert_eq!(c.get(b"k").unwrap(), Some(rec(2)));
+    }
+
     /// A purge must never delete a record whose expiry changed after the
     /// scan — a plain overwrite clears the expiry, and the rewritten record
     /// (new value, no TTL) has to survive the purge that was in flight.
     #[test]
-    fn purge_skips_records_whose_expiry_changed_since_scan() {
+    fn purge_delete_survives_interleaved_rewrite() {
         let db = Db::open_in_memory().unwrap();
         let c = db.collection("docs");
-        c.insert_with_ttl(b"k", &rec(1), 100).unwrap();
-        // Simulate the interleaving directly: collect the due key (as the
-        // purge does), then rewrite the record (clearing its expiry), then
-        // verify the purge does not remove the fresh document.
-        c.insert(b"k", &rec(2)).unwrap(); // plain write → expiry cleared
-        assert_eq!(c.ttl(b"k").unwrap(), None);
+        c.insert_with_ttl(b"doomed", &rec(1), 100).unwrap();
+        c.insert_with_ttl(b"stays", &rec(2), 100).unwrap();
+
+        // Collect the due set, exactly as a purge does...
+        let due = db.due_keys("docs", 200).unwrap();
+        assert_eq!(due.len(), 2);
+
+        // ...then interleave a plain rewrite at one collected key: the fresh
+        // document is immortal (the rewrite clears the expiry in its own
+        // transaction).
+        c.insert(b"doomed", &rec(9)).unwrap();
+
+        // Delete phase: the rewritten record survives; the still-due one goes.
+        let mut purged = 0;
+        for (key, ts) in &due {
+            if db.purge_due_key("docs", key, *ts).unwrap() {
+                purged += 1;
+            }
+        }
+        assert_eq!(purged, 1);
+        assert_eq!(c.get(b"doomed").unwrap(), Some(rec(9))); // fresh doc lives
+        assert_eq!(c.ttl(b"doomed").unwrap(), None);
+        assert_eq!(c.get(b"stays").unwrap(), None); // still-due key purged
+        assert_eq!(c.ttl(b"stays").unwrap(), None);
+        // A later full purge finds nothing left.
         assert_eq!(c.purge_expired(1000).unwrap(), 0);
-        assert_eq!(c.get(b"k").unwrap(), Some(rec(2)));
     }
 }

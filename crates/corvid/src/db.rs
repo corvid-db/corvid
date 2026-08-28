@@ -246,7 +246,10 @@ impl Db {
         if let Some(doc) = doc {
             self.validate_schema(collection, key, doc)?;
         }
-        let ttl_on = self.ttl_enabled(collection);
+        // Audit B2: TTL maintenance is decided INSIDE the transaction (the
+        // per-key probe in `ttl_clear_in_txn` sees committed `__ttl__` state),
+        // never from a pre-transaction read that a concurrent writer could
+        // race.
         let applied = self.store().transaction(|tx| {
             match doc {
                 Some(doc) => {
@@ -259,11 +262,7 @@ impl Db {
                     self.geo_on_insert_in_txn(tx, collection, key, doc)?;
                     match expires_at {
                         Some(ts) => self.ttl_set_in_txn(tx, collection, key, ts)?,
-                        None => {
-                            if ttl_on {
-                                self.ttl_clear_in_txn(tx, collection, key)?
-                            }
-                        }
+                        None => self.ttl_clear_in_txn(tx, collection, key)?,
                     }
                 }
                 None => {
@@ -276,9 +275,7 @@ impl Db {
                     self.scalar_on_delete_in_txn(tx, collection, key)?;
                     self.compound_on_delete_in_txn(tx, collection, key)?;
                     self.geo_on_delete_in_txn(tx, collection, key)?;
-                    if ttl_on {
-                        self.ttl_clear_in_txn(tx, collection, key)?;
-                    }
+                    self.ttl_clear_in_txn(tx, collection, key)?;
                 }
             }
             Ok(true)
@@ -297,7 +294,7 @@ impl Db {
     /// (audit B5), and change events. Never affects durability — by this
     /// point the data and all persisted indexes are committed, and no locks
     /// are held, so the compaction's `index_resume` try-lock is safe.
-    fn finish_applied(&self, collection: &str, key: &[u8], doc: Option<&Value>) {
+    pub(crate) fn finish_applied(&self, collection: &str, key: &[u8], doc: Option<&Value>) {
         match doc {
             Some(doc) => {
                 self.index_on_insert_memory(collection, key, doc);
@@ -419,7 +416,6 @@ impl Collection<'_> {
             self.db.validate_schema(self.name, key, doc)?;
         }
         let expected_bytes = expected.map(Value::encode);
-        let ttl_on = self.db.ttl_enabled(self.name);
         let applied = self.db.store().transaction(|tx| {
             let current = tx.get(self.name, key)?;
             if current != expected_bytes {
@@ -434,9 +430,7 @@ impl Collection<'_> {
                     self.db.scalar_on_insert_in_txn(tx, self.name, key, doc)?;
                     self.db.compound_on_insert_in_txn(tx, self.name, key, doc)?;
                     self.db.geo_on_insert_in_txn(tx, self.name, key, doc)?;
-                    if ttl_on {
-                        self.db.ttl_clear_in_txn(tx, self.name, key)?;
-                    }
+                    self.db.ttl_clear_in_txn(tx, self.name, key)?;
                 }
                 None => {
                     let existed = tx.delete(self.name, key)?;
@@ -448,9 +442,7 @@ impl Collection<'_> {
                     self.db.scalar_on_delete_in_txn(tx, self.name, key)?;
                     self.db.compound_on_delete_in_txn(tx, self.name, key)?;
                     self.db.geo_on_delete_in_txn(tx, self.name, key)?;
-                    if ttl_on {
-                        self.db.ttl_clear_in_txn(tx, self.name, key)?;
-                    }
+                    self.db.ttl_clear_in_txn(tx, self.name, key)?;
                 }
             }
             Ok(true)
@@ -509,7 +501,6 @@ impl Collection<'_> {
         for (key, doc) in items {
             self.db.validate_schema(self.name, key, doc)?;
         }
-        let ttl_on = self.db.ttl_enabled(self.name);
         self.db.store().transaction(|tx| {
             for (key, doc) in items {
                 self.db.validate_unique_in_txn(tx, self.name, key, doc)?;
@@ -519,9 +510,7 @@ impl Collection<'_> {
                 self.db.scalar_on_insert_in_txn(tx, self.name, key, doc)?;
                 self.db.compound_on_insert_in_txn(tx, self.name, key, doc)?;
                 self.db.geo_on_insert_in_txn(tx, self.name, key, doc)?;
-                if ttl_on {
-                    self.db.ttl_clear_in_txn(tx, self.name, key)?;
-                }
+                self.db.ttl_clear_in_txn(tx, self.name, key)?;
             }
             Ok(())
         })?;
