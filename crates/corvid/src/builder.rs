@@ -938,12 +938,18 @@ impl QueryBuilder<'_> {
     /// reader-free twin of that probe ladder's *selection* half: the same
     /// conditions in the same order (scalar comparisons, then
     /// Between/In/StartsWith windows, then compound prefix, geo, then the
-    /// FIRST top-level Or), checking index existence instead of reading
-    /// candidate keys. Kept in
-    /// lockstep with `indexed_candidates` by
-    /// `plan_shape_matches_served_path`; a probe that runs but over-runs its
-    /// 100k cap at execution time returns `None` there — an execution-time
-    /// fact this advisory check cannot see.
+    /// FIRST top-level Or), checking index registries and the constraints'
+    /// statically-knowable serviceability instead of reading candidate
+    /// keys. The scalar steps mirror `scalar::window`'s decline conditions
+    /// — a non-encodable constraint value (containers/bytes/null),
+    /// constraints mixing lanes (e.g. Int + Text on one field), or any `Ne`
+    /// among the field's comparisons — and the compound step mirrors
+    /// `encode_tuple`'s prefix encodability plus the tail's `window` check,
+    /// scoring and picking the same winning index the real probe does. Kept
+    /// in lockstep with `indexed_candidates` by
+    /// `plan_shape_matches_served_path`; the remaining divergence is
+    /// execution-time only — a probe that runs but over-runs its 100k cap
+    /// returns `None` there, a fact this advisory check cannot see.
     fn indexed_window_kind(&self) -> Option<&'static str> {
         if self.filters.is_empty() {
             return None;
@@ -951,18 +957,41 @@ impl QueryBuilder<'_> {
         let db = self.collection.db();
         let coll = self.collection.name();
 
+        // Index this query's comparisons by field path (every Compare on a
+        // field, `Ne` included — the real probes pass them all to
+        // `scalar::window`).
+        let by_field = |field: &str| -> Vec<(CmpOp, &Value)> {
+            self.filters
+                .iter()
+                .filter_map(|p| match p {
+                    Predicate::Compare { path, op, value } if path == field => Some((*op, value)),
+                    _ => None,
+                })
+                .collect()
+        };
+
         // The same disjunct serviceability `predicate_candidates` requires
         // (a geo disjunct additionally needs a real bbox: a radius that wraps
-        // the antimeridian makes the real probe decline).
+        // the antimeridian makes the real probe decline; a comparison
+        // disjunct's single-constraint window additionally needs an
+        // encodable constant).
         let disjunct_serviceable = |pred: &Predicate| match pred {
             Predicate::Compare {
                 path,
                 op: CmpOp::Eq | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge,
-                ..
-            } => db.has_scalar_index(coll, path),
-            Predicate::Between { path, .. }
-            | Predicate::In { path, .. }
-            | Predicate::StartsWith { path, .. } => db.has_scalar_index(coll, path),
+                value,
+            } => db.has_scalar_index(coll, path) && crate::scalar::encode_value(value).is_some(),
+            Predicate::Between { path, low, high } => {
+                db.has_scalar_index(coll, path)
+                    && window_serviceable(&[(CmpOp::Ge, low), (CmpOp::Le, high)])
+            }
+            Predicate::In { path, values } => {
+                db.has_scalar_index(coll, path)
+                    && values
+                        .iter()
+                        .all(|v| crate::scalar::encode_value(v).is_some())
+            }
+            Predicate::StartsWith { path, .. } => db.has_scalar_index(coll, path),
             Predicate::GeoWithin {
                 path,
                 lat,
@@ -975,7 +1004,9 @@ impl QueryBuilder<'_> {
             _ => false,
         };
 
-        // 1. Comparisons on indexed scalar fields.
+        // 1. Comparisons on indexed scalar fields — the field's combined
+        //    AND window must also pass `scalar::window`'s static decline
+        //    checks, exactly like the probe's `scalar_candidates` call.
         for pred in &self.filters {
             if let Predicate::Compare { path, op, .. } = pred
                 && matches!(
@@ -983,6 +1014,7 @@ impl QueryBuilder<'_> {
                     CmpOp::Eq | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge
                 )
                 && db.has_scalar_index(coll, path)
+                && window_serviceable(&by_field(path))
             {
                 return Some("scalar");
             }
@@ -998,17 +1030,14 @@ impl QueryBuilder<'_> {
             }
         }
         // 3. A compound index with a pinned leading field (or a constrained
-        //    tail on its first field) — the selection half of
-        //    `compound_candidate_keys`, without reading keys.
-        let by_field = |field: &str| -> Vec<(CmpOp, &Value)> {
-            self.filters
-                .iter()
-                .filter_map(|p| match p {
-                    Predicate::Compare { path, op, value } if path == field => Some((*op, value)),
-                    _ => None,
-                })
-                .collect()
-        };
+        //    tail on its next field) — the selection half of
+        //    `compound_candidate_keys`, without reading keys. The real probe
+        //    scores every registered index (longest Eq prefix, then tail)
+        //    and drives ONLY the winner, so the twin picks the same winner
+        //    before checking serviceability: a non-encodable prefix Eq
+        //    value (`encode_tuple` declines) or an unserviceable tail
+        //    window makes the winner decline, with no second-place retry.
+        let mut best: Option<(Vec<String>, usize, bool)> = None; // (fields, prefix_len, has_tail)
         for fields in db.compound_indexes(coll) {
             let mut prefix_len = 0;
             while prefix_len < fields.len()
@@ -1019,7 +1048,30 @@ impl QueryBuilder<'_> {
                 prefix_len += 1;
             }
             let has_tail = prefix_len < fields.len() && !by_field(&fields[prefix_len]).is_empty();
-            if prefix_len > 0 || has_tail {
+            if prefix_len == 0 && !has_tail {
+                continue; // leading field unconstrained → index unusable
+            }
+            let score = prefix_len + usize::from(has_tail);
+            if best
+                .as_ref()
+                .is_none_or(|(_, b, t)| score > *b + usize::from(*t))
+            {
+                best = Some((fields, prefix_len, has_tail));
+            }
+        }
+        if let Some((fields, prefix_len, _)) = best {
+            // The prefix values are the first Eq per field, exactly what
+            // `encode_tuple` must encode; the tail is the next field's
+            // combined window.
+            let prefix_ok = fields[..prefix_len].iter().all(|f| {
+                by_field(f)
+                    .into_iter()
+                    .find(|(op, _)| *op == CmpOp::Eq)
+                    .is_some_and(|(_, v)| crate::scalar::encode_value(v).is_some())
+            });
+            let tail_ok =
+                prefix_len >= fields.len() || window_serviceable(&by_field(&fields[prefix_len]));
+            if prefix_ok && tail_ok {
                 return Some("compound");
             }
         }
@@ -1478,6 +1530,31 @@ fn flatten_or<'a>(pred: &'a Predicate, out: &mut Vec<&'a Predicate>) {
     }
 }
 
+/// Statically mirror `scalar::window`'s decline conditions (scalar.rs) over
+/// one field's AND-ed comparison constraints: the window is serviceable
+/// iff every constraint value is index-encodable (`lane_of` is `Some`:
+/// bool/int/float/text — the encodability `encode_value` reports), all the
+/// constraint values share one lane (e.g. never Int + Text), and no
+/// constraint is a `Ne`. Used by `indexed_window_kind` so the advisory
+/// twin declines exactly where the real probe's `scalar_candidates` call
+/// would — the over-cap decline stays execution-time only.
+fn window_serviceable(constraints: &[(CmpOp, &Value)]) -> bool {
+    let mut lane: Option<u8> = None;
+    for &(op, value) in constraints {
+        let Some(enc) = crate::scalar::encode_value(value) else {
+            return false; // non-encodable: lane_of is None
+        };
+        match lane {
+            Some(existing) if existing != enc[0] => return false, // mixed lanes
+            _ => lane = Some(enc[0]),
+        }
+        if op == CmpOp::Ne {
+            return false; // a Ne never forms a window
+        }
+    }
+    true
+}
+
 /// A value as `f64` for numeric aggregation (int or float), else `None`.
 fn as_number(v: &Value) -> Option<f64> {
     match v {
@@ -1502,11 +1579,26 @@ fn order_class(v: Option<&Value>) -> u8 {
     }
 }
 
+/// The kind tag ordering the comparable class (audit C4): numbers
+/// (Int/Float, compared numerically together) sort before texts — the
+/// documented tie rule for cross-kind pairs within class 0. Class 0 never
+/// holds bools, containers, or NaN (those are class 1), so the tag is
+/// total on the class; ordering by it first — instead of the old
+/// cross-kind key-order fallback — makes the comparator a total order.
+fn comparable_kind_tag(v: &Value) -> u8 {
+    match v {
+        Value::Int(_) | Value::Float(_) => 0,
+        _ => 1, // Text: the only other kind inside the comparable class
+    }
+}
+
 /// The order_by comparator shared by [`QueryBuilder::run_with`] and
 /// [`sort_by_field`] (audit C4): class first (`order_class` — fixed under
 /// `descending`), then the value comparison within the comparable class
-/// (reversed by `descending`; pairwise-incomparable kinds inside the class,
-/// e.g. an Int against a Text, fall back to key order), then key.
+/// (reversed by `descending`; cross-kind pairs order by the kind tag —
+/// numbers before texts — so the class-0 comparison is a total order:
+/// the old cross-kind key-order fallback admitted intransitive cycles, on
+/// which a sort may panic), then key.
 fn compare_by_field_class(
     va: Option<&Value>,
     vb: Option<&Value>,
@@ -1518,7 +1610,12 @@ fn compare_by_field_class(
         .cmp(&order_class(vb))
         .then_with(|| match (va, vb) {
             (Some(a), Some(b)) => {
-                let base = crate::filter::value_order(a, b).unwrap_or(Ordering::Equal);
+                // Kind tag first (numbers before texts), then value — the
+                // whole within-class order reverses under `descending`,
+                // while the class order itself stays fixed.
+                let base = comparable_kind_tag(a)
+                    .cmp(&comparable_kind_tag(b))
+                    .then_with(|| crate::filter::value_order(a, b).unwrap_or(Ordering::Equal));
                 let base = if descending { base.reverse() } else { base };
                 base.then_with(|| ka.cmp(kb))
             }
@@ -1529,9 +1626,10 @@ fn compare_by_field_class(
 }
 
 /// Sort `(key, doc)` pairs by a scalar field using the order_by class rule
-/// (audit C4): comparable values in value order, then pairwise-incomparable
-/// values in key order, then rows missing the field; ties by key.
-/// `descending` reverses the value order within the comparable class only.
+/// (audit C4): comparable values in value order (cross-kind pairs by the
+/// kind tag — numbers before texts), then pairwise-incomparable values in
+/// key order, then rows missing the field; ties by key. `descending`
+/// reverses the value order within the comparable class only.
 fn sort_by_field(buf: &mut [(Vec<u8>, Value)], field: &str, descending: bool) {
     buf.sort_by(|(ka, da), (kb, db)| {
         compare_by_field_class(da.get_path(field), db.get_path(field), descending, ka, kb)
@@ -2479,6 +2577,32 @@ mod tests {
             assert!(!rows.is_empty(), "fixture row sanity: {label}");
         }
 
+        // The same prediction-vs-reality check for rows whose filters are
+        // ALSO unsatisfiable at evaluation time — an AND'd comparison with a
+        // non-encodable or wrong-lane constant is false for every document,
+        // so the scan they must take returns nothing. The serve counters,
+        // not row presence, carry the parity signal.
+        fn parity_empty(q: QueryBuilder<'_>, expected: PlanShape, label: &str) {
+            assert_eq!(q.plan_shape(), expected, "plan_shape lied: {label}");
+            test_probe::reset();
+            let rows = q.run().unwrap();
+            let served = test_probe::read();
+            match expected {
+                PlanShape::IndexedWindow { .. } => assert_eq!(
+                    (served.ann, served.text, served.indexed),
+                    (0, 0, 1),
+                    "indexed shape but served {served:?}: {label}"
+                ),
+                PlanShape::StreamingTopK | PlanShape::Scan { .. } => assert_eq!(
+                    (served.ann, served.text, served.indexed),
+                    (0, 0, 0),
+                    "no-index shape but served {served:?}: {label}"
+                ),
+                _ => unreachable!("window/scan shapes only: {label}"),
+            }
+            assert!(rows.is_empty(), "fixture row sanity: {label}");
+        }
+
         // Review round 1, OR divergence 1: the real OR probe
         // (`or_candidate_keys`) declines on the FIRST top-level Or — an
         // unserviceable disjunct there must not be rescued by a later,
@@ -2556,6 +2680,122 @@ mod tests {
             ),
             PlanShape::IndexedWindow { kind: "or" },
             "or window",
+        );
+
+        // Review round 2, serviceability mirroring: the real probes decline
+        // on conditions the twin CAN see statically — a Ne among the field's
+        // comparisons, a non-encodable constraint value (containers/bytes/
+        // null), constraints mixing lanes (Int + Text on one field), an In
+        // list holding a non-encodable member, an OR disjunct comparing
+        // against a non-encodable constant, and (compound) a non-encodable
+        // prefix Eq value or an unserviceable tail. Prediction and execution
+        // must both decline to Scan for those, and keep the window for clean
+        // constraints.
+        let sdb = Db::open_in_memory().unwrap();
+        let sc = sdb.collection("docs");
+        for i in 0..10i64 {
+            let mut m = BTreeMap::new();
+            m.insert("n".to_owned(), Value::Int(i));
+            sc.insert(&[i as u8], &Value::Map(m)).unwrap();
+        }
+        sc.create_scalar_index("n").unwrap();
+        let scan_shape = || PlanShape::Scan {
+            collection: "docs".to_owned(),
+        };
+
+        // ne + range on an indexed field: `scalar::window` declines the Ne.
+        parity(
+            sdb.collection("docs")
+                .query()
+                .filter(field("n").ne(Value::Int(5)))
+                .filter(field("n").ge(Value::Int(1))),
+            scan_shape(),
+            "ne+range on an indexed field",
+        );
+        // Mixed lanes (Int + Text bounds on one field): `window` declines.
+        parity_empty(
+            sdb.collection("docs")
+                .query()
+                .filter(field("n").ge(Value::Int(1)))
+                .filter(field("n").le(Value::Text("z".into()))),
+            scan_shape(),
+            "mixed-lane constraints on an indexed field",
+        );
+        // Non-encodable constraint value (an Array): `lane_of` is None.
+        parity_empty(
+            sdb.collection("docs")
+                .query()
+                .filter(field("n").ge(Value::Array(vec![Value::Int(1)]))),
+            scan_shape(),
+            "non-encodable constraint value on an indexed field",
+        );
+        // A Between whose bounds mix lanes: same decline via
+        // `predicate_candidates`'s [Ge, Le] window.
+        parity_empty(
+            sdb.collection("docs")
+                .query()
+                .filter(field("n").between(Value::Int(1), Value::Text("z".into()))),
+            scan_shape(),
+            "between with mixed-lane bounds on an indexed field",
+        );
+        // An In list with a non-encodable member: that member's Eq window
+        // declines, so the whole In probe declines.
+        parity(
+            sdb.collection("docs")
+                .query()
+                .filter(field("n").is_in([Value::Int(3), Value::Map(BTreeMap::new())])),
+            scan_shape(),
+            "in list with a non-encodable member",
+        );
+        // An OR disjunct comparing against a non-encodable constant: the
+        // disjunct's probe declines, so the whole OR declines.
+        parity(
+            sdb.collection("docs").query().filter(
+                field("n")
+                    .eq(Value::Int(3))
+                    .or(field("n").eq(Value::Array(vec![Value::Int(1)]))),
+            ),
+            scan_shape(),
+            "or disjunct with a non-encodable constant",
+        );
+        // The clean counterpart still predicts and takes the window.
+        parity(
+            sdb.collection("docs")
+                .query()
+                .filter(field("n").ge(Value::Int(1)))
+                .filter(field("n").le(Value::Int(5))),
+            PlanShape::IndexedWindow { kind: "scalar" },
+            "clean range on an indexed field",
+        );
+
+        // Compound twins: no scalar index anywhere, so the ladder reaches
+        // step 3 only.
+        let cdb = Db::open_in_memory().unwrap();
+        let cc = cdb.collection("docs");
+        for i in 0..10i64 {
+            let mut m = BTreeMap::new();
+            m.insert("tag".to_owned(), Value::Text("t".into()));
+            m.insert("n".to_owned(), Value::Int(i));
+            cc.insert(&[i as u8], &Value::Map(m)).unwrap();
+        }
+        cc.create_compound_index(&["tag", "n"]).unwrap();
+        // Eq on a container value in the prefix: `encode_tuple` declines.
+        parity_empty(
+            cdb.collection("docs")
+                .query()
+                .filter(field("tag").eq(Value::Array(vec![Value::Int(1)]))),
+            scan_shape(),
+            "compound prefix Eq on a container value",
+        );
+        // Ne in the tail: the tail's `window` declines, and the real probe
+        // does not retry any other shape for the winner index.
+        parity(
+            cdb.collection("docs")
+                .query()
+                .filter(field("tag").eq(Value::Text("t".into())))
+                .filter(field("n").ne(Value::Int(5))),
+            scan_shape(),
+            "compound tail with a Ne",
         );
 
         // Building on-disk vector def (review round 1 coverage): consultable
@@ -2905,6 +3145,70 @@ mod tests {
             .map(|r| r.key)
             .collect();
         check(&keys);
+    }
+
+    /// Review round 3 (class-0 total order): within the comparable class,
+    /// cross-kind pairs (Int vs Text) used to fall back to key order while
+    /// same-kind pairs compared by value — not a total order. The cycle
+    /// `Int(2)@kA < Text@kM < Int(1)@kZ < Int(2)@kA` (keys `kA < kM < kZ`)
+    /// is constructible whenever kinds interleave by key, and Rust's sort
+    /// may panic when it detects such a violation. The fix orders class 0
+    /// by a kind tag first — numbers, then texts — so this fixture (kinds
+    /// interleaving by key) must sort without panicking, deterministically.
+    #[test]
+    fn order_by_mixed_int_text_field_sorts_deterministically() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        // Keys a < b < c < d < e, values alternating kinds so the old
+        // cross-kind-by-key rule and the kind-tagged order disagree (the
+        // old comparator says Text@b sorts before Int@c, the tag says the
+        // number comes first).
+        let rows = [
+            (b"a".as_slice(), Value::Int(5)),
+            (b"b".as_slice(), Value::Text("a".into())),
+            (b"c".as_slice(), Value::Int(1)),
+            (b"d".as_slice(), Value::Text("b".into())),
+            (b"e".as_slice(), Value::Int(3)),
+        ];
+        for (k, v) in rows {
+            let mut m = BTreeMap::new();
+            m.insert("v".to_owned(), v);
+            c.insert(k, &Value::Map(m)).unwrap();
+        }
+        let keys = |desc: bool| {
+            c.query()
+                .order_by("v", desc)
+                .run()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>()
+        };
+        // Ascending: numbers in value order, then texts in lexical order.
+        assert_eq!(
+            keys(false),
+            vec![
+                b"c".to_vec(),
+                b"e".to_vec(),
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"d".to_vec()
+            ],
+            "ascending: numbers (1, 3, 5) before texts (a, b)"
+        );
+        // Descending reverses the whole within-class order — texts first,
+        // each kind reversed — while the class order itself stays fixed.
+        assert_eq!(
+            keys(true),
+            vec![
+                b"d".to_vec(),
+                b"b".to_vec(),
+                b"a".to_vec(),
+                b"e".to_vec(),
+                b"c".to_vec()
+            ],
+            "descending: texts reversed, then numbers reversed"
+        );
     }
 
     /// Audit C4 parity: the scalar-index fast path (which sorts via

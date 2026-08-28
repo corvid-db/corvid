@@ -7,6 +7,8 @@ format and API may change without backward-compatibility guarantees.
 ## [Unreleased]
 
 ### Changed
+- New public API: `QueryBuilder::plan_shape()` / `PlanShape` — the plan
+  shape a query will take (what `explain()` prints); advisory.
 - Release workflow hardening: the GitHub release is created only after every
   matrix build succeeds, the tag is checked against the workspace version,
   sha256 checksums are attached alongside the binaries, and `contents:write`
@@ -21,12 +23,18 @@ format and API may change without backward-compatibility guarantees.
   types, containers) last, stable by key — previously incomparable values
   interleaved by key. Descending reverses value order within the comparable
   class only; the class order (comparable < incomparable < missing) is
-  fixed. (audit C4)
+  fixed. Within the comparable class, cross-kind pairs (an Int against a
+  Text) now order by a kind tag — numbers before texts — instead of
+  falling back to key order: the fallback was not a total order, so a
+  mixed-kind field could construct sort cycles (and a sort panic).
+  (audit C4)
 - `geo_within_bbox` with `min_lon > max_lon` now treats the box as wrapping
   the antimeridian and matches BOTH longitude ranges — previously it
   silently matched nothing. All four bounds are validated at entry
   (latitude in `[-90, 90]`, longitude in `[-180, 180]`, NaN rejected) with
-  `Error::InvalidArgument`. (audit C2)
+  `Error::InvalidArgument`, and an inverted latitude box
+  (`min_lat > max_lat`) is rejected too — latitude cannot wrap, so it used
+  to match nothing silently. (audit C2)
 - Argument validation (audit C6): `fuse_rrf(k)` rejects `k <= 0` and NaN;
   `rerank_mmr(lambda)` rejects λ outside `[0, 1]` and NaN; `Bm25Params`
   construction rejects `b` outside `[0, 1]` or negative/NaN `k1`. All with

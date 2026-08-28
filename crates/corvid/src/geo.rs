@@ -162,9 +162,10 @@ impl Collection<'_> {
     /// to 170°W. The wrapped window is not index-accelerated (the spatial
     /// index refuses it and the query falls back to a scan) but stays exact.
     /// All four bounds are validated at entry — latitude in `[-90, 90]`,
-    /// longitude in `[-180, 180]`, NaN rejected — yielding
-    /// [`crate::Error::InvalidArgument`] instead of silently matching
-    /// nothing.
+    /// longitude in `[-180, 180]`, NaN rejected, and `min_lat > max_lat`
+    /// rejected too (latitude cannot wrap the way longitude wraps the
+    /// antimeridian) — yielding [`crate::Error::InvalidArgument`] instead
+    /// of silently matching nothing.
     pub fn geo_within_bbox(
         &self,
         field: &str,
@@ -197,6 +198,9 @@ impl Collection<'_> {
 /// Reject bounding-box bounds outside their domains (audit C2): latitude in
 /// `[-90, 90]`, longitude in `[-180, 180]`. NaN fails every range test, so
 /// it is rejected here rather than silently matching nothing downstream.
+/// An inverted latitude box (`min_lat > max_lat`) is rejected too: unlike
+/// longitude, latitude cannot wrap the antimeridian, so such a box can only
+/// be the silent-empty `(min..=max)` range it used to become.
 fn validate_bbox(min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> Result<()> {
     for (name, v, lo, hi) in [
         ("min_lat", min_lat, -90.0, 90.0),
@@ -209,6 +213,12 @@ fn validate_bbox(min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> Resu
                 "geo_within_bbox: {name} = {v} is outside [{lo}, {hi}]"
             )));
         }
+    }
+    if min_lat > max_lat {
+        return Err(crate::Error::InvalidArgument(format!(
+            "geo_within_bbox: min_lat = {min_lat} is greater than max_lat = {max_lat} \
+             (latitude cannot wrap; only longitude does)"
+        )));
     }
     Ok(())
 }
@@ -430,6 +440,24 @@ mod tests {
         }
         // The domain boundaries themselves are accepted.
         assert!(c.geo_within_bbox("loc", -90.0, -180.0, 90.0, 180.0).is_ok());
+    }
+
+    /// Latitude cannot wrap the way longitude wraps the antimeridian: an
+    /// inverted latitude box (`min_lat > max_lat`) used to pass validation
+    /// and silently match nothing (`(min_lat..=max_lat)` is empty); it is
+    /// now rejected with `Error::InvalidArgument` naming the bounds.
+    #[test]
+    fn bbox_rejects_inverted_latitude() {
+        let db = seed();
+        let c = db.collection("places");
+        let got = c.geo_within_bbox("loc", 10.0, -1.0, 5.0, 1.0);
+        assert!(
+            matches!(&got, Err(crate::Error::InvalidArgument(msg))
+                if msg.contains("min_lat") && msg.contains("max_lat")),
+            "inverted latitude must be rejected naming the bounds, got {got:?}"
+        );
+        // Equal bounds are a (degenerate but valid) box, not an inversion.
+        assert!(c.geo_within_bbox("loc", 51.0, -1.0, 51.0, 1.0).is_ok());
     }
 
     #[test]
