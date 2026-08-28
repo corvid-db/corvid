@@ -651,6 +651,96 @@ impl ReadBatch<'_> {
         collect_collection(&records, id)
     }
 
+    /// Return up to `limit` `(key, value)` pairs in `collection` whose key is
+    /// `>= start`, in key order, from this batch's snapshot. For cursor
+    /// pagination: pass an empty `start`, then resume from `last_key` with a
+    /// trailing `0` byte appended. An unknown collection yields an empty
+    /// vector. Mirrors [`Store::scan_from`] on the shared snapshot.
+    pub fn scan_from(
+        &self,
+        collection: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let Some(id) = self.lookup_id(collection)? else {
+            return Ok(Vec::new());
+        };
+        let records = self.txn.open_table(RECORDS)?;
+        let lower = physical_key(id, start);
+        let upper = id.checked_add(1).map(|n| n.to_be_bytes().to_vec());
+        let bounds: (Bound<&[u8]>, Bound<&[u8]>) = match &upper {
+            Some(u) => (
+                Bound::Included(lower.as_slice()),
+                Bound::Excluded(u.as_slice()),
+            ),
+            None => (Bound::Included(lower.as_slice()), Bound::Unbounded),
+        };
+        let mut out = Vec::new();
+        for entry in records.range::<&[u8]>(bounds)? {
+            if out.len() >= limit {
+                break;
+            }
+            let (k, v) = entry?;
+            out.push((user_key(k.value()), v.value().to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Return all `(key, value)` pairs in `collection` whose key starts with
+    /// `prefix`, in key order, from this batch's snapshot. An unknown
+    /// collection yields an empty vector. Mirrors [`Store::scan_prefix`].
+    pub fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let Some(id) = self.lookup_id(collection)? else {
+            return Ok(Vec::new());
+        };
+        let records = self.txn.open_table(RECORDS)?;
+        let lower = physical_key(id, prefix);
+        let upper = next_key(&lower);
+        let lower_slice: &[u8] = &lower;
+        let bounds: (Bound<&[u8]>, Bound<&[u8]>) = match &upper {
+            Some(u) => (Bound::Included(lower_slice), Bound::Excluded(u.as_slice())),
+            None => (Bound::Included(lower_slice), Bound::Unbounded),
+        };
+        let mut out = Vec::new();
+        for entry in records.range::<&[u8]>(bounds)? {
+            let (k, v) = entry?;
+            out.push((user_key(k.value()), v.value().to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Stream every `(user_key, value)` in `collection` to `f`, in key order,
+    /// from this batch's snapshot, without materializing the collection.
+    /// Constant memory regardless of collection size. `f` returns `false` to
+    /// stop early. `f`'s slices are valid only for the duration of the call.
+    /// Mirrors [`Store::for_each`].
+    #[allow(clippy::type_complexity)]
+    pub fn for_each(
+        &self,
+        collection: &str,
+        f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        let Some(id) = self.lookup_id(collection)? else {
+            return Ok(());
+        };
+        let records = self.txn.open_table(RECORDS)?;
+        let lower = id.to_be_bytes().to_vec();
+        let upper = id.checked_add(1).map(|n| n.to_be_bytes().to_vec());
+        let lower_slice: &[u8] = &lower;
+        let bounds: (Bound<&[u8]>, Bound<&[u8]>) = match &upper {
+            Some(u) => (Bound::Included(lower_slice), Bound::Excluded(u.as_slice())),
+            None => (Bound::Included(lower_slice), Bound::Unbounded),
+        };
+        for entry in records.range::<&[u8]>(bounds)? {
+            let (k, v) = entry?;
+            let key = k.value();
+            if !f(key.get(8..).unwrap_or(&[]), v.value())? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve a collection id without creating the collection. A read
     /// transaction never creates tables, so a missing catalog table means
     /// nothing has ever been written.
@@ -661,6 +751,103 @@ impl ReadBatch<'_> {
             Err(e) => return Err(e.into()),
         };
         Ok(catalog.get(collection)?.map(|g| g.value()))
+    }
+}
+
+/// The read operations the query layer needs, abstracted over "own
+/// transaction per op" ([`Store`]) and "one shared snapshot"
+/// ([`ReadBatch`]). Dispatch is via `&dyn`, so an execution path runs
+/// unchanged against either backing.
+// Unused outside tests until wave-4 Tasks 2-3 thread it through the query
+// builder and the index candidate paths (impls alone don't count as a use).
+#[allow(dead_code)]
+pub(crate) trait SnapshotReader {
+    /// Fetch the value at `key` within `collection`, if present.
+    fn get(&self, collection: &str, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    /// Return all `(key, value)` pairs in `collection`, in key order.
+    fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// Return up to `limit` pairs whose key is `>= start`, in key order.
+    fn scan_from(
+        &self,
+        collection: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// Return all pairs whose key starts with `prefix`, in key order.
+    fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// Stream every pair in `collection` to `f` in key order; `f` returns
+    /// `false` to stop early. Its slices are valid only for the call.
+    #[allow(clippy::type_complexity)]
+    fn for_each(
+        &self,
+        collection: &str,
+        f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>,
+    ) -> Result<()>;
+}
+
+/// Per-op read transactions: byte-identical to calling the [`Store`]
+/// methods directly.
+impl SnapshotReader for Store {
+    fn get(&self, collection: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Store::get(self, collection, key)
+    }
+
+    fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Store::scan(self, collection)
+    }
+
+    fn scan_from(
+        &self,
+        collection: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Store::scan_from(self, collection, start, limit)
+    }
+
+    fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Store::scan_prefix(self, collection, prefix)
+    }
+
+    fn for_each(
+        &self,
+        collection: &str,
+        f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        Store::for_each(self, collection, f)
+    }
+}
+
+/// One shared MVCC snapshot: every op reads the same [`ReadBatch`]
+/// transaction.
+impl SnapshotReader for ReadBatch<'_> {
+    fn get(&self, collection: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        ReadBatch::get(self, collection, key)
+    }
+
+    fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        ReadBatch::scan(self, collection)
+    }
+
+    fn scan_from(
+        &self,
+        collection: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        ReadBatch::scan_from(self, collection, start, limit)
+    }
+
+    fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        ReadBatch::scan_prefix(self, collection, prefix)
+    }
+
+    fn for_each(
+        &self,
+        collection: &str,
+        f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        ReadBatch::for_each(self, collection, f)
     }
 }
 
@@ -1169,5 +1356,163 @@ mod tests {
         let s = mem();
         s.transaction(|tx| clear_in_txn(tx, "ghost")).unwrap();
         assert_eq!(s.count("ghost").unwrap(), 0);
+    }
+
+    /// Every read op on `ReadBatch` behaves exactly like the `Store` version,
+    /// key for key — including resume-with-appended-0x00 paging, the
+    /// all-0xFF prefix edge, `for_each` early stop, and the
+    /// unknown-collection-empty contract. Both sides go through
+    /// `&dyn SnapshotReader`, which also pins object safety and both impls.
+    #[test]
+    fn read_batch_ops_match_store_versions() {
+        let s = mem();
+        s.put("docs", b"a1", b"v1").unwrap();
+        s.put("docs", b"a2", b"v2").unwrap();
+        s.put("docs", b"b1", b"v3").unwrap();
+        s.put("docs", &[0xff, 0x00], b"v4").unwrap();
+        s.put("docs", &[0xff, 0xff], b"v5").unwrap();
+        s.put("other", b"a1", b"other").unwrap();
+
+        // Store-side expectations, dispatched through the trait.
+        let store: &dyn SnapshotReader = &s;
+        let page1 = store.scan_from("docs", b"", 2).unwrap();
+        let mut resume = page1.last().unwrap().0.clone();
+        resume.push(0);
+        let page2 = store.scan_from("docs", &resume, 2).unwrap();
+        let prefix = store.scan_prefix("docs", &[0xff]).unwrap();
+        let prefix_ff = store.scan_prefix("docs", &[0xff, 0xff]).unwrap();
+        let mut all = Vec::new();
+        store
+            .for_each("docs", &mut |k, v| {
+                all.push((k.to_vec(), v.to_vec()));
+                Ok(true)
+            })
+            .unwrap();
+        let mut stopped = Vec::new();
+        store
+            .for_each("docs", &mut |k, v| {
+                stopped.push((k.to_vec(), v.to_vec()));
+                Ok(stopped.len() < 2)
+            })
+            .unwrap();
+        let ghost_from = store.scan_from("ghost", b"", 5).unwrap();
+        let ghost_prefix = store.scan_prefix("ghost", b"x").unwrap();
+        let mut ghost_calls = 0usize;
+        store
+            .for_each("ghost", &mut |_, _| {
+                ghost_calls += 1;
+                Ok(true)
+            })
+            .unwrap();
+
+        assert_eq!(page1.len(), 2);
+        assert_eq!(stopped.len(), 2, "early stop must halt at two entries");
+        assert_eq!(stopped, all[..2]);
+        assert!(ghost_from.is_empty() && ghost_prefix.is_empty() && ghost_calls == 0);
+
+        // The same ops inside ONE read closure must match key for key.
+        s.read(|r| {
+            let rb: &dyn SnapshotReader = r;
+            assert_eq!(rb.get("docs", b"a1").unwrap(), Some(b"v1".to_vec()));
+            assert_eq!(
+                rb.scan("other").unwrap(),
+                vec![(b"a1".to_vec(), b"other".to_vec())]
+            );
+
+            assert_eq!(rb.scan_from("docs", b"", 2).unwrap(), page1);
+            assert_eq!(rb.scan_from("docs", &resume, 2).unwrap(), page2);
+            // Resume paging (last key + trailing 0x00) walks the whole
+            // collection exactly once, in order.
+            let mut start = Vec::new();
+            let mut paged = Vec::new();
+            loop {
+                let page = rb.scan_from("docs", &start, 2).unwrap();
+                let Some((last, _)) = page.last().cloned() else {
+                    break;
+                };
+                paged.extend(page);
+                start = last;
+                start.push(0);
+            }
+            assert_eq!(paged, all);
+
+            assert_eq!(rb.scan_prefix("docs", &[0xff]).unwrap(), prefix);
+            assert_eq!(rb.scan_prefix("docs", &[0xff, 0xff]).unwrap(), prefix_ff);
+
+            let mut rb_all = Vec::new();
+            rb.for_each("docs", &mut |k, v| {
+                rb_all.push((k.to_vec(), v.to_vec()));
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(rb_all, all);
+            let mut rb_stopped = Vec::new();
+            rb.for_each("docs", &mut |k, v| {
+                rb_stopped.push((k.to_vec(), v.to_vec()));
+                Ok(rb_stopped.len() < 2)
+            })
+            .unwrap();
+            assert_eq!(rb_stopped, stopped);
+
+            assert_eq!(rb.scan_from("ghost", b"", 5).unwrap(), ghost_from);
+            assert_eq!(rb.scan_prefix("ghost", b"x").unwrap(), ghost_prefix);
+            let mut rb_ghost_calls = 0usize;
+            rb.for_each("ghost", &mut |_, _| {
+                rb_ghost_calls += 1;
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(rb_ghost_calls, ghost_calls);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// The pin the whole B3 wave rests on: one `ReadBatch` is one MVCC
+    /// snapshot. A writer thread commits doc2 after the reader's first `get`
+    /// inside the `read(|r| ...)` closure (synchronized via channels, so the
+    /// commit happens-before the reader continues); the same batch's
+    /// subsequent reads never see doc2, while a fresh read afterwards does.
+    #[test]
+    fn read_batch_is_an_mvcc_snapshot() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+
+        let s = Arc::new(mem());
+        s.put("docs", b"doc1", b"v1").unwrap();
+
+        let (reader_pinned, writer_go) = mpsc::channel::<()>();
+        let (writer_done, writer_committed) = mpsc::channel::<()>();
+        let writer = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || {
+                writer_go.recv().expect("reader is alive");
+                s.put("docs", b"doc2", b"v2").unwrap(); // commits
+                writer_done.send(()).expect("reader is alive");
+            })
+        };
+
+        s.read(|r| {
+            // First read in this snapshot.
+            assert_eq!(r.get("docs", b"doc1").unwrap(), Some(b"v1".to_vec()));
+            reader_pinned.send(()).unwrap();
+            // Channel happens-before: doc2 is committed by this point.
+            writer_committed.recv().unwrap();
+
+            assert_eq!(
+                r.get("docs", b"doc2").unwrap(),
+                None,
+                "same ReadBatch must not see a commit made after its first read"
+            );
+            assert_eq!(r.scan("docs").unwrap().len(), 1);
+            assert_eq!(r.scan_from("docs", b"", 10).unwrap().len(), 1);
+            Ok(())
+        })
+        .unwrap();
+        writer.join().unwrap();
+
+        // Outside the closure, a fresh read transaction sees the commit.
+        assert_eq!(s.get("docs", b"doc2").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(s.scan("docs").unwrap().len(), 2);
     }
 }
