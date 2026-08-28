@@ -71,6 +71,7 @@ dropped silently:
 | tracing / observability | No structured logging in the engine today; the Observability section is marked specified-not-implemented. Corrupt/unknown state surfaces as typed errors (`CorruptIndex`) rather than logs. |
 | `a__b` migration tooling | Dumps from pre-wave-4 databases with `__`-containing names fail at load's index/schema replay (`InvalidName`); no automated rename tool — rename collections or re-create indexes after load (DESIGN.md deferred notes). |
 | >4 GiB dump sections | The dump format's length prefixes are u32; a single value/count beyond 4 GiB cannot be represented. A future format version widens to u64 when a workload needs it. |
+| Compound prefix-only windows scan | Declined for soundness after the missing-trailing-field omission bug (fixed `fabfe6e`): the compound index skips docs missing any indexed field, so a query leaving a field unconstrained can match unindexed docs. Sound re-enable needs per-def all-docs-indexed metadata. |
 
 ---
 

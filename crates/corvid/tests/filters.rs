@@ -48,9 +48,12 @@ fn matching_keys(c: &Collection<'_>, p: &Predicate) -> Vec<Vec<u8>> {
     keys(&c.query().filter(p.clone()).run().unwrap())
 }
 
-/// Expected key sets by document name (must be listed in byte order).
+/// Expected key sets by document name. Sorted HERE so call sites may list
+/// names in any order — set assertions never depend on caller discipline.
 fn ks(names: &[&str]) -> Vec<Vec<u8>> {
-    names.iter().map(|n| n.as_bytes().to_vec()).collect()
+    let mut names: Vec<&str> = names.to_vec();
+    names.sort_unstable();
+    names.into_iter().map(|n| n.as_bytes().to_vec()).collect()
 }
 
 fn seed<'a>(db: &'a Db, name: &'a str, docs: &[(&[u8], Value)]) -> Collection<'a> {

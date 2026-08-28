@@ -793,17 +793,19 @@ impl QueryBuilder<'_> {
         Ok(None)
     }
 
-    /// If a compound index's leading fields are pinned by equality filters
-    /// (optionally with a range on the next field), the candidate keys for that
-    /// prefix window (a verified superset), read from `reader`'s snapshot,
-    /// else `None`. Picks the index that matches the longest equality prefix.
+    /// If a compound index's fields are fully covered by the query's
+    /// constraints — equality on a leading prefix of the fields, with
+    /// optionally a range/eq on the next field exhausting the list — the
+    /// candidate keys for that prefix window (a verified superset), read
+    /// from `reader`'s snapshot, else `None`. Picks the index that matches
+    /// the longest equality prefix.
     ///
     /// Soundness gate: the window is a verified superset only when the
-    /// constraints cover EVERY field of the index (equality on a leading
-    /// prefix, plus at most one range/eq tail, exhausting the field list).
-    /// The compound index skips documents missing any indexed field, so a
-    /// query leaving a field unconstrained can match such documents while
-    /// the window cannot contain them — that shape must scan instead.
+    /// constraints cover EVERY field of the index. The compound index skips
+    /// documents missing any indexed field, so a query leaving a field
+    /// unconstrained — a prefix-only equality, or a tail-only range on the
+    /// leading field — can match such documents while the window cannot
+    /// contain them; those shapes decline to the scan path instead.
     fn compound_candidate_keys(&self, reader: &dyn SnapshotReader) -> Result<Option<Vec<Vec<u8>>>> {
         const CANDIDATE_CAP: usize = 100_000;
         let db = self.collection.db();
@@ -1039,8 +1041,10 @@ impl QueryBuilder<'_> {
                 return Some("scalar");
             }
         }
-        // 3. A compound index with a pinned leading field (or a constrained
-        //    tail on its next field) — the selection half of
+        // 3. A compound index whose EVERY field is covered by the query's
+        //    constraints — a full-equality prefix over the fields, or a
+        //    prefix plus a tail constraint on the next (last) field; a
+        //    prefix-only query declines to scan — the selection half of
         //    `compound_candidate_keys`, without reading keys. The real probe
         //    scores every registered index (longest Eq prefix, then tail)
         //    and drives ONLY the winner, so the twin picks the same winner
