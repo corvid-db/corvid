@@ -522,6 +522,23 @@ fn aggregations_min_max_numbers_interop_and_text_is_lexicographic() {
         infs.query().max("x").unwrap(),
         Some(Value::Float(f64::INFINITY))
     );
+
+    // A filter narrows the extremum set like every other aggregate:
+    // gt(1) over {3, 1, 2} keeps {3, 2}.
+    assert_eq!(
+        ints.query()
+            .filter(field("n").gt(Value::Int(1)))
+            .min("n")
+            .unwrap(),
+        Some(Value::Int(2))
+    );
+    assert_eq!(
+        ints.query()
+            .filter(field("n").gt(Value::Int(1)))
+            .max("n")
+            .unwrap(),
+        Some(Value::Int(3))
+    );
 }
 
 #[test]
@@ -1220,6 +1237,8 @@ fn aggregations_validate_ranking_args_before_aggregating() {
     );
     let err = c.query().rerank_mmr(-0.5).min("n").unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+    let err = c.query().rerank_mmr(-0.5).max("n").unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
     let err = c
         .query()
         .rerank_mmr(f32::NAN)
@@ -1253,7 +1272,7 @@ fn aggregations_indexed_vs_scan_equivalent_for_every_aggregate() {
         (b"a", map(&[("cat", text("x")), ("n", Value::Int(1))])),
         (b"b", map(&[("cat", text("x")), ("n", Value::Int(2))])),
         (b"c", map(&[("cat", text("y")), ("n", Value::Float(2.5))])),
-        (b"d", map(&[("cat", text("y")), ("n", Value::Int(4))])),
+        (b"d", map(&[("cat", text("y")), ("n", Value::Float(4.5))])),
         (b"e", map(&[("cat", text("x"))])), // n missing
     ];
     let scan_db = Db::open_in_memory().unwrap();
@@ -1293,12 +1312,13 @@ fn aggregations_indexed_vs_scan_equivalent_for_every_aggregate() {
     );
 
     // And the concrete expected values (so equality is not vacuous):
-    // members are n = 2, 2.5, 4 over cats x, y, y.
+    // members are n = 2, 2.5, 4.5 over cats x, y, y — sum 9.0, mean an
+    // exact literal 3.0.
     assert_eq!(iq().count().unwrap(), 3);
-    assert_eq!(iq().sum("n").unwrap(), 8.5);
-    assert_eq!(iq().avg("n").unwrap(), Some(8.5 / 3.0));
+    assert_eq!(iq().sum("n").unwrap(), 9.0);
+    assert_eq!(iq().avg("n").unwrap(), Some(3.0));
     assert_eq!(iq().min("n").unwrap(), Some(Value::Int(2)));
-    assert_eq!(iq().max("n").unwrap(), Some(Value::Int(4)));
+    assert_eq!(iq().max("n").unwrap(), Some(Value::Float(4.5)));
     assert_eq!(iq().count_distinct("n").unwrap(), 3);
     assert_eq!(
         iq().group_count("cat").unwrap(),
@@ -1306,6 +1326,6 @@ fn aggregations_indexed_vs_scan_equivalent_for_every_aggregate() {
     );
     assert_eq!(
         iq().group_sum("cat", "n").unwrap(),
-        sums(&[("x", 2.0), ("y", 6.5)])
+        sums(&[("x", 2.0), ("y", 7.0)])
     );
 }

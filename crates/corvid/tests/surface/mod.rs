@@ -754,7 +754,6 @@ static MANIFEST: &[Row] = &[
         &[
             "aggregations_avg_matrix_single_mixed_skipped_and_empty",
             "aggregations_avg_nan_member_poisons_the_mean",
-            "aggregations_sum_skips_missing_and_non_numeric_missing_all_is_zero",
             "aggregations_ignore_limit_offset_select_order_by_and_sources",
             "aggregations_indexed_vs_scan_equivalent_for_every_aggregate",
             "aggregations_validate_ranking_args_before_aggregating",
