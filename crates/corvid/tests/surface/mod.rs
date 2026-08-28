@@ -38,10 +38,52 @@ pub struct Row {
     pub covering_tests: &'static [&'static str],
 }
 
-/// When `true`, a manifest row with empty `covering_tests` fails the radar.
-/// `false` while the conformance waves (Tasks 3–13) fill the suite; Task 15
-/// deletes the flag entirely, making strict mode permanent.
-const STRICT_COVERING: bool = false;
+/// The ONLY rows excused from the strict covering requirement, each with its
+/// one-line justification. All seven are redb-passthrough `Error` variants:
+/// redb internal fault paths with no trigger from the public API (and fault
+/// injection would need test hooks in production code, forbidden by
+/// conformance Ruling 3). Growing this list requires a controller-reviewed
+/// commit; the strict test asserts every entry names a real row, carries NO
+/// covering tests (fake citations are worse than none), and that nothing
+/// else is uncovered.
+const EXEMPT_FROM_STRICT: &[(&str, &str)] = &[
+    (
+        "corvid::Error::Transaction",
+        "redb passthrough: transaction failure requires a redb-internal fault; no \
+         public-API path reaches it (fault-injection hooks are forbidden, Ruling 3)",
+    ),
+    (
+        "corvid::Error::Table",
+        "redb passthrough: table-open failure requires corruption inside redb's \
+         private table format, which public engine calls cannot produce",
+    ),
+    (
+        "corvid::Error::Storage",
+        "redb passthrough: storage-level I/O errors surface only from redb \
+         internals (disk fault mid-operation), not from any public call",
+    ),
+    (
+        "corvid::Error::Commit",
+        "redb passthrough: commit failure is a redb-internal disk fault \
+         mid-commit; unreachable without fault injection (Ruling 3)",
+    ),
+    (
+        "corvid::Error::SetDurability",
+        "redb passthrough: the durability-mode switch fails only inside redb's \
+         own set_durability, on conditions public inputs cannot produce",
+    ),
+    (
+        "corvid::Error::Compaction",
+        "redb passthrough: compaction failure needs an I/O fault during redb's \
+         compaction pass inside `Db::compact` internals",
+    ),
+    (
+        "corvid::Error::IncompatibleFormat",
+        "redb's format-version marker lives in its META pages, not the public \
+         byte layer the engine writes; an engine-level version mismatch is \
+         refused earlier by the engine's own on-disk format marker",
+    ),
+];
 
 /// The statement-class names, exactly as the conformance plan's taxonomy
 /// table spells them. Every row's `class` must be one of these.
@@ -2501,7 +2543,7 @@ fn citable_test_fns() -> BTreeMap<&'static str, Vec<PathBuf>> {
 }
 
 #[test]
-fn manifest_rows_are_classified_unique_and_strict_covered() {
+fn manifest_rows_are_classified_and_unique() {
     let mut seen = BTreeSet::new();
     for r in MANIFEST {
         assert!(
@@ -2512,14 +2554,49 @@ fn manifest_rows_are_classified_unique_and_strict_covered() {
             r.class
         );
         assert!(seen.insert(r.item), "duplicate manifest row for {}", r.item);
-        if STRICT_COVERING {
-            assert!(
-                !r.covering_tests.is_empty(),
-                "STRICT_COVERING is on and manifest row {} has no covering tests",
-                r.item
-            );
-        }
     }
+}
+
+/// Strict mode (Task 15, unconditional since the conformance waves filled
+/// the suite): every manifest row cites at least one covering test — except
+/// the rows on [`EXEMPT_FROM_STRICT`], which must instead cite NONE (a fake
+/// citation on an undrivable row would launder the exemption). Each entry on
+/// the exemption list must name a real row, so a renamed or deleted variant
+/// cannot silently keep its exemption.
+#[test]
+fn every_row_is_strict_covered_except_explicit_exemptions() {
+    let exempt: BTreeSet<&str> = EXEMPT_FROM_STRICT.iter().map(|(item, _)| *item).collect();
+
+    let uncovered: Vec<&str> = MANIFEST
+        .iter()
+        .filter(|r| !exempt.contains(r.item) && r.covering_tests.is_empty())
+        .map(|r| r.item)
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "strict mode: manifest rows with no covering tests ({uncovered:?}) — \
+         write the conformance test or, if the row is genuinely undrivable \
+         from the public API, add it to EXEMPT_FROM_STRICT with a \
+         justification (controller-reviewed commit)"
+    );
+
+    let fake_citations: Vec<&str> = MANIFEST
+        .iter()
+        .filter(|r| exempt.contains(r.item) && !r.covering_tests.is_empty())
+        .map(|r| r.item)
+        .collect();
+    assert!(
+        fake_citations.is_empty(),
+        "exempt rows must have EMPTY covering_tests (no fake citations): \
+         {fake_citations:?}"
+    );
+
+    let items: BTreeSet<&str> = MANIFEST.iter().map(|r| r.item).collect();
+    let unknown: Vec<&str> = exempt.difference(&items).copied().collect();
+    assert!(
+        unknown.is_empty(),
+        "EXEMPT_FROM_STRICT entries that are not real manifest rows: {unknown:?}"
+    );
 }
 
 // ===========================================================================

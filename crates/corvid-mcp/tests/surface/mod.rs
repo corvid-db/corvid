@@ -49,11 +49,15 @@ pub struct Row {
     pub covering_tests: &'static [&'static str],
 }
 
-/// When `true`, a manifest row with empty `covering_tests` fails the radar.
-/// `false` while the conformance waves populate the suite; Task 14 has now
-/// filled every row — Task 15 deletes the flag entirely, making strict mode
-/// permanent.
-const STRICT_COVERING: bool = false;
+/// Rows excused from the strict covering requirement. EMPTY by design and
+/// asserted so below: every MCP surface row — Rust items and wire syntax
+/// alike — is drivable in-process over the duplex-I/O harness, because the
+/// sidecar's whole error surface is what public engine calls can raise
+/// (`ToolError::Engine` wraps `corvid::Error`) plus the sidecar's own
+/// param/protocol errors. The engine's seven redb-passthrough fault rows
+/// have no MCP surface to mirror: no tool can raise an error the engine
+/// itself cannot. Growing this list requires a controller-reviewed commit.
+const EXEMPT_FROM_STRICT: &[(&str, &str)] = &[];
 
 /// The statement-class names, exactly as the conformance plan's taxonomy
 /// table spells them. The sidecar's whole surface is one class: "MCP wire".
@@ -656,7 +660,7 @@ fn citable_test_fns() -> BTreeMap<&'static str, Vec<PathBuf>> {
 }
 
 #[test]
-fn manifest_rows_are_classified_unique_and_strict_covered() {
+fn manifest_rows_are_classified_and_unique() {
     let mut seen = BTreeSet::new();
     for r in MANIFEST {
         assert!(
@@ -667,13 +671,46 @@ fn manifest_rows_are_classified_unique_and_strict_covered() {
             r.class
         );
         assert!(seen.insert(r.item), "duplicate manifest row for {}", r.item);
-        if STRICT_COVERING {
-            assert!(
-                !r.covering_tests.is_empty(),
-                "STRICT_COVERING is on and manifest row {} has no covering tests",
-                r.item
-            );
-        }
+    }
+}
+
+/// Strict mode (Task 15, unconditional since Task 14 filled every row):
+/// every manifest row cites at least one covering test — except rows on
+/// [`EXEMPT_FROM_STRICT`], which must instead cite NONE (a fake citation on
+/// an undrivable row would launder the exemption). Each exemption entry
+/// must name a real row, so renames and deletions cannot strand one.
+#[test]
+fn every_row_is_strict_covered_except_explicit_exemptions() {
+    // The sidecar's exemption list is empty by design (see its comment);
+    // pin that so an accidental addition at least has to touch this test.
+    // (const_is_empty: yes, clippy, it is const-observably empty — that is
+    // exactly the fact being pinned.)
+    #[allow(clippy::const_is_empty)]
+    let exempt_is_empty = EXEMPT_FROM_STRICT.is_empty();
+    assert!(
+        exempt_is_empty,
+        "the MCP exemption list is empty by design (every row is drivable \
+         in-process); adding an entry is a controller-reviewed change"
+    );
+
+    let uncovered: Vec<&str> = MANIFEST
+        .iter()
+        .filter(|r| r.covering_tests.is_empty())
+        .map(|r| r.item)
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "strict mode: manifest rows with no covering tests ({uncovered:?}) — \
+         write the conformance test or, if the row is genuinely undrivable, \
+         add it to EXEMPT_FROM_STRICT with a justification"
+    );
+
+    let items: BTreeSet<&str> = MANIFEST.iter().map(|r| r.item).collect();
+    for (item, _) in EXEMPT_FROM_STRICT {
+        assert!(
+            items.contains(item),
+            "EXEMPT_FROM_STRICT entry {item} is not a real manifest row"
+        );
     }
 }
 
