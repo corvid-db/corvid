@@ -235,6 +235,12 @@ some docs (excluded deterministically).
 
 ### Task 9: Text + hybrid conformance
 
+Prepend (Task 8 review nits, binding): in tests/search_vector.rs fix three
+comment-precision points — (1) the ef over-fetch comment: in-memory formula
+is want=k+dead, ef=max(4*want,64) (the max(4k,64) form is the on-disk path
+only); (2) make the k1-binary tie-winner proof self-contained by
+cross-referencing that lazy builds scan keys in order so ids are key order;
+(3) soften the PQ top-1 comment to what the assertion needs.
 Fill `search_text.rs`: BM25 ranking on fixed corpus (order asserted),
 tokenization (case, punctuation, unicode, s_stem irregulars), phrase_search
 (order-sensitive match/non-match, repeated terms, cross-field non-match),
