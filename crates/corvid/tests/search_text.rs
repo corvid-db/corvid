@@ -160,8 +160,8 @@ fn text_s_stem_pins_conservative_plural_algorithm() {
     assert_eq!(s_stem("is"), "is"); // len 2 guard
     assert_eq!(s_stem("press"), "press"); // ...ss
     assert_eq!(s_stem("class"), "class"); // ...ss
-    assert_eq!(s_stem("bus"), "bus"); // ...us
-    assert_eq!(s_stem("genus"), "genus"); // ...us
+    assert_eq!(s_stem("bus"), "bus"); // len<=3 guard, never reaches the ...us rule
+    assert_eq!(s_stem("genus"), "genus"); // ...us (len 5: the real ...us case)
     assert_eq!(s_stem(""), "");
     // Pinned imperfections of the conservative algorithm.
     assert_eq!(s_stem("always"), "alway"); // plain-s rule over-stems
@@ -229,13 +229,13 @@ fn text_bm25_params_new_and_validate_error_variants() {
     }
 
     // Invalid k1: negative, NaN, +inf, -inf — all Error::InvalidArgument
-    // naming k1's domain rule.
+    // naming k1's domain rule (message pinned as a prefix, hybrid style).
     for bad in [-0.1f32, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         match Bm25Params::new(bad, 0.75) {
             Ok(p) => panic!("k1={bad} must be rejected, got {p:?}"),
             Err(corvid::Error::InvalidArgument(msg)) => {
                 assert!(
-                    msg.contains("k1 must be >= 0"),
+                    msg.starts_with("Bm25Params: k1 must be >= 0"),
                     "k1={bad}: message names the parameter's rule: {msg}"
                 );
             }
@@ -248,7 +248,7 @@ fn text_bm25_params_new_and_validate_error_variants() {
             Ok(p) => panic!("b={bad} must be rejected, got {p:?}"),
             Err(corvid::Error::InvalidArgument(msg)) => {
                 assert!(
-                    msg.contains("b must be in [0, 1]"),
+                    msg.starts_with("Bm25Params: b must be in [0, 1]"),
                     "b={bad}: message names the parameter's rule: {msg}"
                 );
             }

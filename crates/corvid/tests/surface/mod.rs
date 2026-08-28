@@ -326,6 +326,7 @@ static MANIFEST: &[Row] = &[
         &[
             "filters_geo_within_point_formats_and_boundary",
             "filters_indexed_vs_scan_geo_window",
+            "geo_predicate_deep_dateline_poles_invalid_centers",
         ],
     ),
     row(
@@ -491,6 +492,7 @@ static MANIFEST: &[Row] = &[
         &[
             "filters_geo_within_point_formats_and_boundary",
             "filters_indexed_vs_scan_geo_window",
+            "geo_predicate_deep_dateline_poles_invalid_centers",
         ],
     ),
     // ===== distance.rs — vector metrics =====
@@ -631,14 +633,16 @@ static MANIFEST: &[Row] = &[
         "Hybrid",
         // Shared variant (conformance convention 1): raised by the hybrid
         // ranking params (fuse_rrf k, rerank_mmr lambda) at every execution
-        // entry point, by the text-side Bm25Params domain checks, and by the
-        // aggregate entry points, which validate the fluent args before
-        // touching the store.
+        // entry point, by the text-side Bm25Params domain checks, by the geo
+        // bbox bound validation (the only validating geo entry point), and
+        // by the aggregate entry points, which validate the fluent args
+        // before touching the store.
         &[
             "aggregations_validate_ranking_args_before_aggregating",
             "hybrid_fuse_rrf_rejects_invalid_k_at_run",
             "hybrid_rerank_mmr_rejects_out_of_range_and_nan_at_run",
             "text_bm25_params_new_and_validate_error_variants",
+            "geo_bbox_validation_exact_error_variants",
         ],
     ),
     row("corvid::Error::IncompatibleFormat", "Lifecycle", &[]),
@@ -1322,24 +1326,49 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::haversine_km",
         "Geo",
-        &["search_geo_smoke_within_radius_and_nearest"],
+        &[
+            "search_geo_smoke_within_radius_and_nearest",
+            "geo_haversine_known_distances_symmetry_poles_antipodal",
+        ],
     ),
     row(
         "corvid::GeoHit",
         "Geo",
-        &["search_geo_smoke_within_radius_and_nearest"],
+        &[
+            "search_geo_smoke_within_radius_and_nearest",
+            "geo_nearest_k_zero_one_n_beyond_and_hit_fields",
+        ],
     ),
     row(
         "corvid::Collection::geo_within_radius",
         "Geo",
-        &["search_geo_smoke_within_radius_and_nearest"],
+        &[
+            "search_geo_smoke_within_radius_and_nearest",
+            "geo_within_radius_boundary_inclusive_and_ordering",
+            "geo_within_radius_zero_tiny_and_full_globe_radii",
+            "geo_within_radius_no_input_validation_mathematical_semantics",
+        ],
     ),
     row(
         "corvid::Collection::geo_nearest",
         "Geo",
-        &["search_geo_smoke_within_radius_and_nearest"],
+        &[
+            "search_geo_smoke_within_radius_and_nearest",
+            "geo_nearest_k_zero_one_n_beyond_and_hit_fields",
+            "geo_nearest_equidistant_ties_break_by_key",
+            "geo_nearest_skips_non_points_empty_and_finds_antipodal",
+        ],
     ),
-    row("corvid::Collection::geo_within_bbox", "Geo", &[]),
+    row(
+        "corvid::Collection::geo_within_bbox",
+        "Geo",
+        &[
+            "geo_within_bbox_normal_inclusive_edges_and_key_order",
+            "geo_within_bbox_degenerate_point_line_pole_and_globe",
+            "geo_bbox_antimeridian_wrap_matches_both_sides",
+            "geo_bbox_result_order_scan_keys_vs_index_cells",
+        ],
+    ),
     // ===== geo_index.rs =====
     row(
         "corvid::Collection::create_geo_index",
@@ -1347,6 +1376,8 @@ static MANIFEST: &[Row] = &[
         &[
             "filters_indexed_vs_scan_geo_window",
             "queries_plan_shape_indexed_window_kinds_and_explain_families",
+            "geo_index_twins_equivalence_and_live_mutations",
+            "geo_index_plan_shape_serviceable_and_declined",
         ],
     ),
     // ===== graph.rs — edges =====

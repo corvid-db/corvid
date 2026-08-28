@@ -207,7 +207,9 @@ fn hybrid_mmr_direct_lambda_zero_one_diversity_and_k() {
 
     // lambda = 0.1: relevance picks the query copy first, then the diversity
     // term (weight 0.9) sends the orthogonal candidate ahead of the
-    // near-duplicate: |−0.1·1| ≪ |−0.9·0.99995 + −0.1·0.00005| ≈ 0.9.
+    // near-duplicate: `diverse` scores 0.1·(−1) − 0.9·(−1) = 0.8 while `dup2`
+    // scores ≈ 0.1·(−0.00005) − 0.9·(−0.00005) ≈ 0.00004 — a decision margin
+    // of ~0.8.
     let dup1 = (b"dup1".to_vec(), vec![1.0, 0.0]);
     let dup2 = (b"dup2".to_vec(), vec![0.99, 0.01]);
     let diverse = (b"diverse".to_vec(), vec![0.0, 1.0]);
