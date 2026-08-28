@@ -83,40 +83,73 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Value",
         "WHERE",
-        &["mutations_smoke_insert_roundtrips"],
+        &[
+            "mutations_smoke_insert_roundtrips",
+            "mutations_insert_roundtrips_every_value_variant",
+        ],
     ),
-    row("corvid::Value::Null", "WHERE", &[]),
-    row("corvid::Value::Bool", "WHERE", &[]),
+    row(
+        "corvid::Value::Null",
+        "WHERE",
+        &["mutations_insert_roundtrips_every_value_variant"],
+    ),
+    row(
+        "corvid::Value::Bool",
+        "WHERE",
+        &["mutations_insert_roundtrips_every_value_variant"],
+    ),
     row(
         "corvid::Value::Int",
         "WHERE",
-        &["mutations_smoke_insert_roundtrips"],
+        &[
+            "mutations_smoke_insert_roundtrips",
+            "mutations_insert_roundtrips_every_value_variant",
+        ],
     ),
     row(
         "corvid::Value::Float",
         "WHERE",
-        &["search_geo_smoke_within_radius_and_nearest"],
+        &[
+            "search_geo_smoke_within_radius_and_nearest",
+            "mutations_insert_roundtrips_every_value_variant",
+        ],
     ),
     row(
         "corvid::Value::Text",
         "WHERE",
-        &["mutations_smoke_insert_roundtrips"],
+        &[
+            "mutations_smoke_insert_roundtrips",
+            "mutations_insert_roundtrips_every_value_variant",
+        ],
     ),
-    row("corvid::Value::Bytes", "WHERE", &[]),
+    row(
+        "corvid::Value::Bytes",
+        "WHERE",
+        &["mutations_insert_roundtrips_every_value_variant"],
+    ),
     row(
         "corvid::Value::Array",
         "WHERE",
-        &["search_geo_smoke_within_radius_and_nearest"],
+        &[
+            "search_geo_smoke_within_radius_and_nearest",
+            "mutations_insert_roundtrips_every_value_variant",
+        ],
     ),
     row(
         "corvid::Value::Map",
         "WHERE",
-        &["mutations_smoke_insert_roundtrips"],
+        &[
+            "mutations_smoke_insert_roundtrips",
+            "mutations_insert_roundtrips_every_value_variant",
+        ],
     ),
     row(
         "corvid::Value::Vector",
         "WHERE",
-        &["search_vector_smoke_ranks_nearest_first_exact"],
+        &[
+            "search_vector_smoke_ranks_nearest_first_exact",
+            "mutations_insert_roundtrips_every_value_variant",
+        ],
     ),
     row("corvid::value::MAX_NESTING", "Lifecycle", &[]),
     row("corvid::Value::encode", "Lifecycle", &[]),
@@ -138,17 +171,27 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::CmpOp::Eq",
         "WHERE",
-        &["filters_smoke_field_eq_selects_matching_rows"],
+        &[
+            "filters_smoke_field_eq_selects_matching_rows",
+            "mutations_update_maintains_scalar_index",
+        ],
     ),
     row("corvid::CmpOp::Ne", "WHERE", &[]),
     row("corvid::CmpOp::Lt", "WHERE", &[]),
     row("corvid::CmpOp::Le", "WHERE", &[]),
     row("corvid::CmpOp::Gt", "WHERE", &[]),
-    row("corvid::CmpOp::Ge", "WHERE", &[]),
+    row(
+        "corvid::CmpOp::Ge",
+        "WHERE",
+        &["mutations_delete_where_counts_zero_partial_and_full"],
+    ),
     row(
         "corvid::Predicate",
         "WHERE",
-        &["filters_smoke_field_eq_selects_matching_rows"],
+        &[
+            "filters_smoke_field_eq_selects_matching_rows",
+            "mutations_delete_where_counts_zero_partial_and_full",
+        ],
     ),
     row(
         "corvid::Predicate::Compare",
@@ -170,7 +213,10 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::field",
         "WHERE",
-        &["filters_smoke_field_eq_selects_matching_rows"],
+        &[
+            "filters_smoke_field_eq_selects_matching_rows",
+            "mutations_delete_where_counts_zero_partial_and_full",
+        ],
     ),
     row(
         "corvid::filter::FieldRef",
@@ -180,13 +226,20 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::filter::FieldRef::eq",
         "WHERE",
-        &["filters_smoke_field_eq_selects_matching_rows"],
+        &[
+            "filters_smoke_field_eq_selects_matching_rows",
+            "mutations_update_maintains_scalar_index",
+        ],
     ),
     row("corvid::filter::FieldRef::ne", "WHERE", &[]),
     row("corvid::filter::FieldRef::lt", "WHERE", &[]),
     row("corvid::filter::FieldRef::le", "WHERE", &[]),
     row("corvid::filter::FieldRef::gt", "WHERE", &[]),
-    row("corvid::filter::FieldRef::ge", "WHERE", &[]),
+    row(
+        "corvid::filter::FieldRef::ge",
+        "WHERE",
+        &["mutations_delete_where_counts_zero_partial_and_full"],
+    ),
     row("corvid::filter::FieldRef::exists", "WHERE", &[]),
     row("corvid::filter::FieldRef::is_in", "WHERE", &[]),
     row("corvid::filter::FieldRef::between", "WHERE", &[]),
@@ -220,7 +273,10 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Error",
         "Lifecycle",
-        &["schema_smoke_set_schema_rejects_bad_documents"],
+        &[
+            "schema_smoke_set_schema_rejects_bad_documents",
+            "mutations_insert_rejects_reserved_and_invalid_collection_names",
+        ],
     ),
     row("corvid::Error::Database", "Lifecycle", &[]),
     row("corvid::Error::Transaction", "Lifecycle", &[]),
@@ -231,15 +287,34 @@ static MANIFEST: &[Row] = &[
     row("corvid::Error::Compaction", "Lifecycle", &[]),
     row("corvid::Error::Decode", "Lifecycle", &[]),
     row("corvid::Error::CorruptIndex", "Schema (ALTER)", &[]),
-    row("corvid::Error::ReservedCollection", "Schema (ALTER)", &[]),
-    row("corvid::Error::InvalidName", "Schema (ALTER)", &[]),
+    row(
+        "corvid::Error::ReservedCollection",
+        "Schema (ALTER)",
+        &[
+            "mutations_insert_rejects_reserved_and_invalid_collection_names",
+            "mutations_write_paths_reject_reserved_and_invalid_collection_names",
+        ],
+    ),
+    row(
+        "corvid::Error::InvalidName",
+        "Schema (ALTER)",
+        &[
+            "mutations_insert_rejects_reserved_and_invalid_collection_names",
+            "mutations_write_paths_reject_reserved_and_invalid_collection_names",
+        ],
+    ),
     row("corvid::Error::InvalidArgument", "Hybrid", &[]),
     row("corvid::Error::IncompatibleFormat", "Lifecycle", &[]),
     row("corvid::Error::EmptyIndexTraining", "Schema (ALTER)", &[]),
     row(
         "corvid::Error::SchemaViolation",
         "Schema (ALTER)",
-        &["schema_smoke_set_schema_rejects_bad_documents"],
+        &[
+            "schema_smoke_set_schema_rejects_bad_documents",
+            "mutations_insert_batch_schema_violation_rolls_back_whole_batch",
+            "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
+            "mutations_insert_auto_failure_does_not_burn_an_id",
+        ],
     ),
     row("corvid::Error::InvalidDump", "Lifecycle", &[]),
     row("corvid::Error::BackupTargetExists", "Lifecycle", &[]),
@@ -269,7 +344,10 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::QueryBuilder::filter",
         "WHERE",
-        &["filters_smoke_field_eq_selects_matching_rows"],
+        &[
+            "filters_smoke_field_eq_selects_matching_rows",
+            "mutations_update_maintains_scalar_index",
+        ],
     ),
     row(
         "corvid::QueryBuilder::vector",
@@ -303,7 +381,10 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::QueryBuilder::count",
         "Aggregations",
-        &["aggregations_smoke_sum_group_count_and_count"],
+        &[
+            "aggregations_smoke_sum_group_count_and_count",
+            "mutations_delete_removes_state_from_get_scan_and_count",
+        ],
     ),
     row(
         "corvid::QueryBuilder::group_count",
@@ -327,7 +408,10 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::QueryBuilder::run",
         "SELECT shaping",
-        &["filters_smoke_field_eq_selects_matching_rows"],
+        &[
+            "filters_smoke_field_eq_selects_matching_rows",
+            "mutations_update_maintains_scalar_index",
+        ],
     ),
     // ===== db.rs — database and collection handles =====
     row(
@@ -358,41 +442,107 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Collection::insert",
         "Mutations",
-        &["mutations_smoke_insert_roundtrips"],
+        &[
+            "mutations_smoke_insert_roundtrips",
+            "mutations_insert_roundtrips_every_value_variant",
+            "mutations_insert_overwrites_and_accepts_empty_key_and_empty_map",
+            "mutations_insert_rejects_reserved_and_invalid_collection_names",
+        ],
     ),
-    row("corvid::Collection::update", "Mutations", &[]),
-    row("corvid::Collection::patch", "Mutations", &[]),
-    row("corvid::Collection::compare_and_set", "Mutations", &[]),
+    row(
+        "corvid::Collection::update",
+        "Mutations",
+        &[
+            "mutations_update_rewrites_document_to_every_value_kind",
+            "mutations_update_on_missing_key_creates_or_stays_absent",
+            "mutations_update_maintains_scalar_index",
+        ],
+    ),
+    row(
+        "corvid::Collection::patch",
+        "Mutations",
+        &["mutations_patch_merges_top_level_and_replaces_non_maps"],
+    ),
+    row(
+        "corvid::Collection::compare_and_set",
+        "Mutations",
+        &[
+            "mutations_compare_and_set_swap_noop_delete_and_bitwise_float_equality",
+            "mutations_compare_and_set_maintains_scalar_index",
+        ],
+    ),
     row("corvid::Collection::for_each_doc", "SELECT shaping", &[]),
     row(
         "corvid::Collection::len",
         "SELECT shaping",
-        &["mutations_smoke_insert_roundtrips"],
+        &[
+            "mutations_smoke_insert_roundtrips",
+            "mutations_insert_roundtrips_every_value_variant",
+        ],
     ),
     row(
         "corvid::Collection::is_empty",
         "SELECT shaping",
-        &["mutations_smoke_insert_roundtrips"],
+        &[
+            "mutations_smoke_insert_roundtrips",
+            "mutations_insert_roundtrips_every_value_variant",
+        ],
     ),
-    row("corvid::Collection::insert_batch", "Mutations", &[]),
+    row(
+        "corvid::Collection::insert_batch",
+        "Mutations",
+        &[
+            "mutations_insert_batch_happy_empty_overwrite_and_duplicates",
+            "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
+            "mutations_insert_batch_schema_violation_rolls_back_whole_batch",
+        ],
+    ),
     row(
         "corvid::Collection::insert_auto",
         "Mutations",
-        &["mutations_smoke_insert_roundtrips"],
+        &[
+            "mutations_smoke_insert_roundtrips",
+            "mutations_insert_auto_keys_are_unique_zero_padded_and_monotonic_per_collection",
+            "mutations_insert_auto_failure_does_not_burn_an_id",
+        ],
     ),
     row(
         "corvid::Collection::get",
         "SELECT shaping",
-        &["mutations_smoke_insert_roundtrips"],
+        &[
+            "mutations_smoke_insert_roundtrips",
+            "mutations_insert_roundtrips_every_value_variant",
+        ],
     ),
     row(
         "corvid::Collection::delete",
         "Mutations",
-        &["mutations_smoke_insert_roundtrips"],
+        &[
+            "mutations_smoke_insert_roundtrips",
+            "mutations_delete_removes_state_from_get_scan_and_count",
+        ],
     ),
-    row("corvid::Collection::delete_where", "Mutations", &[]),
-    row("corvid::Collection::delete_batch", "Mutations", &[]),
-    row("corvid::Collection::scan", "SELECT shaping", &[]),
+    row(
+        "corvid::Collection::delete_where",
+        "Mutations",
+        &[
+            "mutations_delete_where_counts_zero_partial_and_full",
+            "mutations_delete_where_exact_with_scalar_index_present",
+        ],
+    ),
+    row(
+        "corvid::Collection::delete_batch",
+        "Mutations",
+        &["mutations_delete_batch_counts_existing_only_and_accepts_empty"],
+    ),
+    row(
+        "corvid::Collection::scan",
+        "SELECT shaping",
+        &[
+            "mutations_delete_removes_state_from_get_scan_and_count",
+            "mutations_insert_overwrites_and_accepts_empty_key_and_empty_map",
+        ],
+    ),
     row("corvid::Collection::page", "SELECT shaping", &[]),
     row("corvid::Collection::page_where", "SELECT shaping", &[]),
     row("corvid::db::Page", "SELECT shaping", &[]),
@@ -598,7 +748,12 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Collection::create_scalar_index",
         "Schema (ALTER)",
-        &[],
+        &[
+            "mutations_update_maintains_scalar_index",
+            "mutations_compare_and_set_maintains_scalar_index",
+            "mutations_delete_where_exact_with_scalar_index_present",
+            "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
+        ],
     ),
     row(
         "corvid::Collection::create_compound_index",
@@ -616,13 +771,19 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::schema::FieldType::Int",
         "Schema (ALTER)",
-        &["schema_smoke_set_schema_rejects_bad_documents"],
+        &[
+            "schema_smoke_set_schema_rejects_bad_documents",
+            "mutations_insert_batch_schema_violation_rolls_back_whole_batch",
+        ],
     ),
     row("corvid::schema::FieldType::Float", "Schema (ALTER)", &[]),
     row(
         "corvid::schema::FieldType::Text",
         "Schema (ALTER)",
-        &["schema_smoke_set_schema_rejects_bad_documents"],
+        &[
+            "schema_smoke_set_schema_rejects_bad_documents",
+            "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
+        ],
     ),
     row("corvid::schema::FieldType::Bytes", "Schema (ALTER)", &[]),
     row("corvid::schema::FieldType::Vector", "Schema (ALTER)", &[]),
@@ -631,60 +792,95 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::schema::Field",
         "Schema (ALTER)",
-        &["schema_smoke_set_schema_rejects_bad_documents"],
+        &[
+            "schema_smoke_set_schema_rejects_bad_documents",
+            "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
+        ],
     ),
     row(
         "corvid::schema::Field::new",
         "Schema (ALTER)",
-        &["schema_smoke_set_schema_rejects_bad_documents"],
+        &[
+            "schema_smoke_set_schema_rejects_bad_documents",
+            "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
+        ],
     ),
     row(
         "corvid::schema::Field::required",
         "Schema (ALTER)",
         &["schema_smoke_set_schema_rejects_bad_documents"],
     ),
-    row("corvid::schema::Field::unique", "Schema (ALTER)", &[]),
+    row(
+        "corvid::schema::Field::unique",
+        "Schema (ALTER)",
+        &["mutations_insert_batch_unique_conflict_rolls_back_whole_batch"],
+    ),
     row(
         "corvid::schema::Schema",
         "Schema (ALTER)",
-        &["schema_smoke_set_schema_rejects_bad_documents"],
+        &[
+            "schema_smoke_set_schema_rejects_bad_documents",
+            "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
+        ],
     ),
     row(
         "corvid::schema::Schema::new",
         "Schema (ALTER)",
-        &["schema_smoke_set_schema_rejects_bad_documents"],
+        &[
+            "schema_smoke_set_schema_rejects_bad_documents",
+            "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
+        ],
     ),
     row(
         "corvid::schema::Schema::field",
         "Schema (ALTER)",
-        &["schema_smoke_set_schema_rejects_bad_documents"],
+        &[
+            "schema_smoke_set_schema_rejects_bad_documents",
+            "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
+        ],
     ),
     row("corvid::schema::Schema::fields", "Schema (ALTER)", &[]),
     row(
         "corvid::Collection::set_schema",
         "Schema (ALTER)",
-        &["schema_smoke_set_schema_rejects_bad_documents"],
+        &[
+            "schema_smoke_set_schema_rejects_bad_documents",
+            "mutations_insert_batch_schema_violation_rolls_back_whole_batch",
+            "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
+        ],
     ),
     // ===== reactive.rs — change feeds =====
     row(
         "corvid::ChangeKind",
         "Lifecycle",
-        &["events_smoke_subscribe_records_insert_and_delete"],
+        &[
+            "events_smoke_subscribe_records_insert_and_delete",
+            "mutations_emit_change_events_per_mutation_kind",
+        ],
     ),
     row(
         "corvid::ChangeKind::Insert",
         "Lifecycle",
-        &["events_smoke_subscribe_records_insert_and_delete"],
+        &[
+            "events_smoke_subscribe_records_insert_and_delete",
+            "mutations_emit_change_events_per_mutation_kind",
+        ],
     ),
     row(
         "corvid::ChangeKind::Delete",
         "Lifecycle",
-        &["events_smoke_subscribe_records_insert_and_delete"],
+        &[
+            "events_smoke_subscribe_records_insert_and_delete",
+            "mutations_emit_change_events_per_mutation_kind",
+        ],
     ),
     row(
         "corvid::ChangeEvent",
         "Lifecycle",
-        &["events_smoke_subscribe_records_insert_and_delete"],
+        &[
+            "events_smoke_subscribe_records_insert_and_delete",
+            "mutations_emit_change_events_per_mutation_kind",
+        ],
     ),
     row(
         "corvid::SubscriptionId",
@@ -694,7 +890,10 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Db::subscribe",
         "Lifecycle",
-        &["events_smoke_subscribe_records_insert_and_delete"],
+        &[
+            "events_smoke_subscribe_records_insert_and_delete",
+            "mutations_emit_change_events_per_mutation_kind",
+        ],
     ),
     row(
         "corvid::Db::unsubscribe",
@@ -722,18 +921,27 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Collection::insert_with_ttl",
         "TTL",
-        &["ttl_smoke_insert_with_ttl_purges_at_boundary"],
+        &[
+            "ttl_smoke_insert_with_ttl_purges_at_boundary",
+            "mutations_insert_with_ttl_sets_and_purges_expiry",
+        ],
     ),
     row("corvid::Collection::set_ttl", "TTL", &[]),
     row(
         "corvid::Collection::ttl",
         "TTL",
-        &["ttl_smoke_insert_with_ttl_purges_at_boundary"],
+        &[
+            "ttl_smoke_insert_with_ttl_purges_at_boundary",
+            "mutations_insert_with_ttl_sets_and_purges_expiry",
+        ],
     ),
     row(
         "corvid::Collection::purge_expired",
         "TTL",
-        &["ttl_smoke_insert_with_ttl_purges_at_boundary"],
+        &[
+            "ttl_smoke_insert_with_ttl_purges_at_boundary",
+            "mutations_insert_with_ttl_sets_and_purges_expiry",
+        ],
     ),
     // ===== migrate.rs — dump/load =====
     row(
