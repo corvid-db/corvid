@@ -16,9 +16,11 @@
 //!   its Insert event on EVERY call, while `unlink` is silent when it removed
 //!   nothing (`Ok(false)`, no event) — a documented asymmetry (PINNED);
 //! * endpoints do NOT have to exist as documents, and linking creates no
-//!   documents; deleting a document that exists removes every edge touching
-//!   it in EITHER role (source or target) in the delete's own transaction,
-//!   while a delete that removes nothing (missing key) does NOT cascade;
+//!   documents; deleting a key removes every edge touching it in EITHER role
+//!   (source or target) in the delete's own transaction — including edges
+//!   dangling on a key that never existed as a document, so a delete
+//!   returning `false` still purges the key's edges (the return value says
+//!   whether a DOCUMENT was removed, and no event fires for it);
 //! * `link`/`unlink` events use the USER collection name (never the edge
 //!   namespace) and are keyed by the `from` key, kind Insert/Delete;
 //! * relation names are unvalidated byte strings carried length-prefixed in
@@ -84,7 +86,7 @@ fn graph_smoke_link_neighbors_traverse_unlink() {
 /// A new edge is immediately resolvable in both directions: `neighbors` from
 /// the source, `in_neighbors` from the target.
 #[test]
-fn graph_link_new_edge_resolves_in_neighbors_and_in_neighbors() {
+fn graph_link_new_edge_resolves_neighbors_and_in_neighbors() {
     let db = Db::open_in_memory().unwrap();
     let c = db.collection("nodes");
     c.link(b"a", "knows", b"b").unwrap();
@@ -744,26 +746,55 @@ fn graph_delete_cascades_edges_in_both_namespaces() {
     }
 }
 
-/// The cascade runs only for a document that was actually removed: a delete
-/// of a missing key returns `false` and leaves dangling edges alone, while
-/// deleting the endpoint once it exists cleans them up.
+/// The edge cascade is NOT conditional on a document row existing: a delete
+/// of a key that was never inserted still returns `false` (no document was
+/// removed) and emits no event, but it PURGES every edge dangling on that
+/// key — otherwise edges linked against absent endpoints would be uncleanable.
+/// The conditional-delete path (`compare_and_set` to `None`) purges the same
+/// way.
 #[test]
-fn graph_delete_missing_document_does_not_cascade() {
+fn graph_delete_missing_document_still_purges_dangling_edges() {
     let db = Db::open_in_memory().unwrap();
     let c = db.collection("nodes");
-    c.link(b"a", "r", b"ghost").unwrap();
+    // ghost is a source (ghost→x) and a target (y→ghost), with no document.
+    c.link(b"ghost", "r", b"x").unwrap();
+    c.link(b"y", "r", b"ghost").unwrap();
 
-    // ghost is not a document: the delete removes nothing and cascades
-    // nothing.
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    db.subscribe(move |e: &ChangeEvent| sink.lock().unwrap().push(e.clone()));
+
+    // No document exists: false (nothing deleted), no event...
     assert!(!c.delete(b"ghost").unwrap());
-    assert_eq!(c.neighbors(b"a", "r").unwrap(), vec![b"ghost".to_vec()]);
+    assert!(events.lock().unwrap().is_empty());
+    // ...but every edge touching ghost is gone, in both namespaces and from
+    // the OTHER endpoints' views too.
+    assert!(c.neighbors(b"ghost", "r").unwrap().is_empty());
+    assert!(c.in_neighbors(b"ghost", "r").unwrap().is_empty());
+    assert!(c.neighbors(b"y", "r").unwrap().is_empty());
+    assert!(c.in_neighbors(b"x", "r").unwrap().is_empty());
 
-    // Once ghost exists as a document, deleting it takes the edge along.
+    // Re-deleting stays a silent, idempotent no-op.
+    assert!(!c.delete(b"ghost").unwrap());
+    assert!(events.lock().unwrap().is_empty());
+
+    // The conditional-delete branch purges identically: no document exists,
+    // the compare (absent == expected None) matches, the delete removes
+    // nothing (return value false = no document deleted), and the dangling
+    // edges still go.
+    c.link(b"ghost", "r", b"x").unwrap();
+    c.link(b"y", "r", b"ghost").unwrap();
+    assert!(!c.compare_and_set(b"ghost", None, None).unwrap());
+    assert!(c.neighbors(b"ghost", "r").unwrap().is_empty());
+    assert!(c.in_neighbors(b"ghost", "r").unwrap().is_empty());
+    assert!(c.neighbors(b"y", "r").unwrap().is_empty());
+
+    // And once the document DOES exist, the plain delete still reports true
+    // and cascades as before.
+    c.link(b"a", "r", b"ghost").unwrap();
     c.insert(b"ghost", &Value::Int(1)).unwrap();
     assert!(c.delete(b"ghost").unwrap());
     assert!(c.neighbors(b"a", "r").unwrap().is_empty());
-    // Re-deleting is a no-op again.
-    assert!(!c.delete(b"ghost").unwrap());
 }
 
 /// The batch delete paths cascade exactly like the single-key path:
@@ -829,10 +860,9 @@ fn graph_edge_namespaces_hidden_from_collections_and_scan() {
     nodes.link_weighted(b"a", "w", b"c", 0.5).unwrap();
     docs.link(b"x", "r", b"a").unwrap();
 
-    assert_eq!(
-        db.collections().unwrap(),
-        vec!["docs".to_owned(), "nodes".to_owned()]
-    );
+    let mut listed = db.collections().unwrap();
+    listed.sort();
+    assert_eq!(listed, vec!["docs".to_owned(), "nodes".to_owned()]);
     assert_eq!(nodes.scan().unwrap(), vec![(b"a".to_vec(), Value::Int(1))]);
     assert_eq!(docs.scan().unwrap(), vec![(b"x".to_vec(), Value::Int(2))]);
     assert_eq!(nodes.len().unwrap(), 1);

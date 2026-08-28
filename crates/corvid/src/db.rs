@@ -271,6 +271,12 @@ impl Db {
                 None => {
                     let existed = tx.delete(collection, key)?;
                     if !existed {
+                        // No document row — but the key may still carry
+                        // DANGLING edges (`link` allows absent endpoints).
+                        // Purge them so a delete is always a full cleanup
+                        // of the key; the call still reports that no
+                        // document was removed and fires no event.
+                        self.edges_on_delete_in_txn(tx, collection, key)?;
                         return Ok(false);
                     }
                     self.index_on_delete_in_txn(tx, collection, key)?;
@@ -501,6 +507,11 @@ impl Collection<'_> {
                 None => {
                     let existed = tx.delete(self.name, key)?;
                     if !existed {
+                        // Same dangling-edge purge as the plain delete
+                        // path: the compare matched, no document was
+                        // removed (return false), but edges linked against
+                        // the absent key still go.
+                        self.db.edges_on_delete_in_txn(tx, self.name, key)?;
                         return Ok(false);
                     }
                     self.db.index_on_delete_in_txn(tx, self.name, key)?;
@@ -624,7 +635,10 @@ impl Collection<'_> {
     ///
     /// Atomic: the row deletion and every persisted index's cleanup commit in
     /// one transaction. In-memory index state and change events follow a
-    /// successful commit.
+    /// successful commit. Every graph edge touching `key` is removed in the
+    /// same transaction — including edges dangling on a key that never
+    /// existed as a document, so a delete returning `false` still cleans the
+    /// key's edges.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
         self.ensure_writable()?;
         self.db.write_document(self.name, key, None, None)

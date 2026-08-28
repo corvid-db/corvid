@@ -1143,7 +1143,7 @@ static MANIFEST: &[Row] = &[
         "Graph",
         &[
             "graph_smoke_link_neighbors_traverse_unlink",
-            "graph_link_new_edge_resolves_in_neighbors_and_in_neighbors",
+            "graph_link_new_edge_resolves_neighbors_and_in_neighbors",
             "graph_link_duplicate_is_idempotent_and_reemits_insert_event",
             "graph_link_self_loop_lists_self_but_traverse_excludes_start",
             "graph_link_missing_endpoints_allowed_without_documents",
@@ -1194,7 +1194,7 @@ static MANIFEST: &[Row] = &[
         "corvid::Collection::in_neighbors",
         "Graph",
         &[
-            "graph_link_new_edge_resolves_in_neighbors_and_in_neighbors",
+            "graph_link_new_edge_resolves_neighbors_and_in_neighbors",
             "graph_in_neighbors_mirror_target_only_and_mixed",
             "graph_delete_cascades_edges_in_both_namespaces",
         ],

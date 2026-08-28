@@ -23,18 +23,23 @@ use crate::reactive::{ChangeEvent, ChangeKind};
 use crate::store::WriteBatch;
 
 impl Collection<'_> {
-    /// Add a directed edge `from --relation--> to`. Idempotent. A reverse edge
-    /// is stored too, so [`Collection::in_neighbors`] can answer "who links to
-    /// `to`?".
+    /// Add a directed edge `from --relation--> to`. Idempotent (re-linking
+    /// an existing edge is not an error). A reverse edge is stored too, so
+    /// [`Collection::in_neighbors`] can answer "who links to `to`?".
+    ///
+    /// The edge carries the default weight `1.0`: a plain `link` overwrites
+    /// any prior [`Collection::link_weighted`] value for the same edge.
     ///
     /// Endpoints do not have to exist as documents: an edge to an absent key
-    /// is allowed and is cleaned up automatically when that endpoint document
-    /// is later deleted (by the same cascade `Db::edges_on_delete_in_txn`
-    /// runs for every delete path).
+    /// is allowed and is cleaned up automatically when [`Collection::delete`]
+    /// runs on that endpoint — even if it never existed as a document (the
+    /// same cascade `Db::edges_on_delete_in_txn` runs for every delete path).
     ///
     /// Emits a [`ChangeEvent`] (kind [`ChangeKind::Insert`], keyed by `from`)
     /// after the transaction commits — never before, so subscribers only ever
-    /// observe committed edges.
+    /// observe committed edges. Re-linking an existing edge re-emits the
+    /// event: like an overwriting `insert`, the data write is idempotent but
+    /// the notification is not skipped.
     pub fn link(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<()> {
         self.ensure_writable()?;
         let (forward, reverse) = (self.edges_name(), self.redges_name());
@@ -56,7 +61,9 @@ impl Collection<'_> {
     /// Add a directed edge carrying a `weight` (e.g. confidence or cost). Like
     /// [`Collection::link`] but the weight is stored on the edge and readable
     /// via [`Collection::neighbors_weighted`]. Emits the same post-commit
-    /// [`ChangeEvent`] as [`Collection::link`].
+    /// [`ChangeEvent`] as [`Collection::link`]. A later plain
+    /// [`Collection::link`] of the same edge overwrites the weight with the
+    /// default `1.0`.
     pub fn link_weighted(&self, from: &[u8], relation: &str, to: &[u8], weight: f64) -> Result<()> {
         self.ensure_writable()?;
         let (forward, reverse) = (self.edges_name(), self.redges_name());
@@ -254,7 +261,9 @@ impl Db {
     /// dangling edges). Called by every document-delete path —
     /// [`crate::Db::write_document`], [`Collection::compare_and_set`], and the
     /// TTL purge — so the two edge namespaces can never disagree with the
-    /// documents.
+    /// documents. The delete paths call it even when the document row is
+    /// absent, so edges linked against a never-inserted (or already-deleted)
+    /// key are purgeable through [`Collection::delete`] as well.
     ///
     /// Edge keys are `len(relation) ‖ relation ‖ len(node) ‖ node ‖ other`, so
     /// an endpoint is *not* a byte prefix of the key: each namespace is paged
