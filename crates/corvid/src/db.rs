@@ -275,6 +275,9 @@ impl Db {
                     self.scalar_on_delete_in_txn(tx, collection, key)?;
                     self.compound_on_delete_in_txn(tx, collection, key)?;
                     self.geo_on_delete_in_txn(tx, collection, key)?;
+                    // Audit B4: a deleted document takes its edges with it —
+                    // both directions, in this same transaction.
+                    self.edges_on_delete_in_txn(tx, collection, key)?;
                     self.ttl_clear_in_txn(tx, collection, key)?;
                 }
             }
@@ -442,6 +445,8 @@ impl Collection<'_> {
                     self.db.scalar_on_delete_in_txn(tx, self.name, key)?;
                     self.db.compound_on_delete_in_txn(tx, self.name, key)?;
                     self.db.geo_on_delete_in_txn(tx, self.name, key)?;
+                    // Audit B4: same in-transaction edge cascade as a plain delete.
+                    self.db.edges_on_delete_in_txn(tx, self.name, key)?;
                     self.db.ttl_clear_in_txn(tx, self.name, key)?;
                 }
             }

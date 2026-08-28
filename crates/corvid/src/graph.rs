@@ -6,6 +6,11 @@
 //! `relation ‖ from ‖ to`, which lets [`Collection::neighbors`] resolve all
 //! targets of a `(from, relation)` pair with a single prefix scan.
 //!
+//! Deleting a document cascades (in the delete's own transaction) to every
+//! edge attached to it — see [`Db::edges_on_delete_in_txn`] — and
+//! linking/unlinking emits change events after the commit, like every other
+//! write path.
+//!
 //! This is the traversal core for the agent-memory use case (entity/relation
 //! graphs). Graph algorithms beyond neighbor lookup and bounded BFS traversal
 //! are intentionally out of scope for now.
@@ -14,11 +19,21 @@ use std::collections::HashSet;
 
 use crate::db::{Collection, Db};
 use crate::error::Result;
+use crate::reactive::{ChangeEvent, ChangeKind};
+use crate::store::WriteBatch;
 
 impl Collection<'_> {
     /// Add a directed edge `from --relation--> to`. Idempotent. A reverse edge
     /// is stored too, so [`Collection::in_neighbors`] can answer "who links to
     /// `to`?".
+    ///
+    /// Endpoints do not have to exist as documents: an edge to an absent key
+    /// is allowed and is cleaned up automatically when that endpoint document
+    /// is later deleted (see [`Db::edges_on_delete_in_txn`]).
+    ///
+    /// Emits a [`ChangeEvent`] (kind [`ChangeKind::Insert`], keyed by `from`)
+    /// after the transaction commits — never before, so subscribers only ever
+    /// observe committed edges.
     pub fn link(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<()> {
         self.ensure_writable()?;
         let (forward, reverse) = (self.edges_name(), self.redges_name());
@@ -28,12 +43,19 @@ impl Collection<'_> {
             tx.put(&forward, &fwd_key, b"")?;
             tx.put(&reverse, &rev_key, b"")?;
             Ok(())
-        })
+        })?;
+        self.db().notify(ChangeEvent {
+            collection: self.name().to_owned(),
+            key: from.to_vec(),
+            kind: ChangeKind::Insert,
+        });
+        Ok(())
     }
 
     /// Add a directed edge carrying a `weight` (e.g. confidence or cost). Like
     /// [`Collection::link`] but the weight is stored on the edge and readable
-    /// via [`Collection::neighbors_weighted`].
+    /// via [`Collection::neighbors_weighted`]. Emits the same post-commit
+    /// [`ChangeEvent`] as [`Collection::link`].
     pub fn link_weighted(&self, from: &[u8], relation: &str, to: &[u8], weight: f64) -> Result<()> {
         self.ensure_writable()?;
         let (forward, reverse) = (self.edges_name(), self.redges_name());
@@ -43,7 +65,13 @@ impl Collection<'_> {
             tx.put(&forward, &fwd_key, &value)?;
             tx.put(&reverse, &rev_key, &value)?;
             Ok(())
-        })
+        })?;
+        self.db().notify(ChangeEvent {
+            collection: self.name().to_owned(),
+            key: from.to_vec(),
+            kind: ChangeKind::Insert,
+        });
+        Ok(())
     }
 
     /// Return `(target, weight)` for every `from --relation--> ?` edge.
@@ -62,15 +90,27 @@ impl Collection<'_> {
 
     /// Remove the edge `from --relation--> to` (and its reverse), atomically.
     /// Returns whether the forward edge existed.
+    ///
+    /// Emits a [`ChangeEvent`] (kind [`ChangeKind::Delete`], keyed by `from`)
+    /// after the commit, and only when an edge was actually removed — a failed
+    /// unlink is silent, like a delete of a missing document.
     pub fn unlink(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<bool> {
         self.ensure_writable()?;
         let (forward, reverse) = (self.edges_name(), self.redges_name());
         let (fwd_key, rev_key) = (edge_key(relation, from, to), edge_key(relation, to, from));
-        self.db().store().transaction(|tx| {
+        let removed = self.db().store().transaction(|tx| {
             let removed = tx.delete(&forward, &fwd_key)?;
             tx.delete(&reverse, &rev_key)?;
             Ok(removed)
-        })
+        })?;
+        if removed {
+            self.db().notify(ChangeEvent {
+                collection: self.name().to_owned(),
+                key: from.to_vec(),
+                kind: ChangeKind::Delete,
+            });
+        }
+        Ok(removed)
     }
 
     /// Return the targets of every `from --relation--> ?` edge, in key order.
@@ -208,6 +248,32 @@ pub(crate) fn decode_edge_key(key: &[u8]) -> Option<(String, Vec<u8>, Vec<u8>)> 
 }
 
 impl Db {
+    /// Remove every edge that has `key` as an endpoint, inside the caller's
+    /// write transaction (audit B4: a deleted document must never leave
+    /// dangling edges). Called by every document-delete path —
+    /// [`crate::Db::write_document`], [`Collection::compare_and_set`], and the
+    /// TTL purge — so the two edge namespaces can never disagree with the
+    /// documents.
+    ///
+    /// Edge keys are `len(relation) ‖ relation ‖ len(node) ‖ node ‖ other`, so
+    /// an endpoint is *not* a byte prefix of the key: each namespace is paged
+    /// through with [`WriteBatch::scan_from`] (the batch sees its own deletes,
+    /// so the pages keep advancing) and every row decoded. A forward row whose
+    /// source is `key` also removes its reverse twin, and a reverse row whose
+    /// target is `key` also removes its forward twin, keeping the namespaces
+    /// exact mirrors. Memory stays bounded by the page size; work is
+    /// proportional to the collection's edge count, a no-op when there are
+    /// none.
+    pub(crate) fn edges_on_delete_in_txn(
+        &self,
+        tx: &mut WriteBatch<'_>,
+        collection: &str,
+        key: &[u8],
+    ) -> Result<()> {
+        cascade_edges_of(tx, collection, key, true)?;
+        cascade_edges_of(tx, collection, key, false)
+    }
+
     /// Every edge in the database as
     /// `(collection, relation, from, to, weight)`, for dump/migrate. Edges of
     /// reserved collections are engine-internal and excluded.
@@ -232,6 +298,53 @@ impl Db {
     }
 }
 
+/// One namespace pass of the delete cascade (audit B4): page through `ns` and
+/// drop every row whose first node is `key`, along with its twin (the same
+/// edge stored with the nodes swapped) in the sibling namespace. With
+/// `forward = true` the first node is the edge's source and the twin lives in
+/// `__redges__`; with `false` it is the target and the twin lives in
+/// `__edges__`.
+fn cascade_edges_of(
+    tx: &mut WriteBatch<'_>,
+    collection: &str,
+    key: &[u8],
+    forward: bool,
+) -> Result<()> {
+    const PAGE: usize = 1024;
+    let ns = if forward {
+        format!("__edges__{collection}")
+    } else {
+        format!("__redges__{collection}")
+    };
+    let twin_ns = if forward {
+        format!("__redges__{collection}")
+    } else {
+        format!("__edges__{collection}")
+    };
+    let mut start: Vec<u8> = Vec::new();
+    loop {
+        let page = tx.scan_from(&ns, &start, PAGE)?;
+        let Some((last, _)) = page.last().cloned() else {
+            break;
+        };
+        for (row, _) in &page {
+            // Keep only rows whose first node is `key`.
+            if let Some((rel, first, second)) =
+                decode_edge_key(row).filter(|(_, from, _)| from.as_slice() == key)
+            {
+                // The row itself, plus its twin (nodes swapped).
+                tx.delete(&ns, row)?;
+                tx.delete(&twin_ns, &edge_key(&rel, &second, &first))?;
+            }
+        }
+        // Resume strictly past everything examined above (the documented
+        // cursor-pagination convention: `last_key` + trailing `0` byte).
+        start = last;
+        start.push(0);
+    }
+    Ok(())
+}
+
 /// One graph edge in portable form (dump/migrate).
 pub(crate) struct EdgeRecord {
     pub collection: String,
@@ -243,7 +356,8 @@ pub(crate) struct EdgeRecord {
 
 #[cfg(test)]
 mod tests {
-    use crate::Db;
+    use super::neighbor_prefix;
+    use crate::{Db, Value};
 
     #[test]
     fn link_and_neighbors() {
@@ -392,5 +506,142 @@ mod tests {
         assert!(two.contains(&b"c".to_vec()));
         assert!(two.contains(&b"d".to_vec()));
         assert_eq!(two.len(), 3);
+    }
+
+    /// Audit B4: deleting a document removes every edge that has it as an
+    /// endpoint — both directions, forward AND reverse rows, across every
+    /// relation — while edges and documents it never touched survive. The
+    /// delete itself still emits its own document Delete event.
+    #[test]
+    fn document_delete_cascades_edges() {
+        use crate::reactive::{ChangeEvent, ChangeKind};
+        use std::sync::{Arc, Mutex};
+
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("nodes");
+        for k in [&b"a"[..], &b"b"[..], &b"c"[..], &b"d"[..]] {
+            c.insert(k, &Value::Int(1)).unwrap();
+        }
+        // a is the source of edges under two relations, the target of d's
+        // edge, and b->c is a bystander that must survive.
+        c.link(b"a", "knows", b"b").unwrap();
+        c.link(b"a", "likes", b"c").unwrap();
+        c.link(b"d", "knows", b"a").unwrap();
+        c.link(b"b", "knows", b"c").unwrap();
+
+        // Subscribe after linking: the only event left to see is the delete's.
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        db.subscribe(move |e: &ChangeEvent| sink.lock().unwrap().push(e.clone()));
+
+        assert!(c.delete(b"a").unwrap());
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![ChangeEvent {
+                collection: "nodes".to_owned(),
+                key: b"a".to_vec(),
+                kind: ChangeKind::Delete,
+            }]
+        );
+
+        // Outgoing edges (every relation) and incoming edges are gone.
+        assert!(c.neighbors(b"a", "knows").unwrap().is_empty());
+        assert!(c.neighbors(b"a", "likes").unwrap().is_empty());
+        assert!(c.in_neighbors(b"a", "knows").unwrap().is_empty());
+        // d's only edge pointed at a; traversing from d reaches nothing.
+        assert!(c.neighbors(b"d", "knows").unwrap().is_empty());
+        assert!(c.traverse(b"d", "knows", 5).unwrap().is_empty());
+        // Edge rows are absent in BOTH namespaces (a's key ranges scan empty).
+        for (rel, ns) in [
+            ("knows", "__edges__nodes"),
+            ("likes", "__edges__nodes"),
+            ("knows", "__redges__nodes"),
+        ] {
+            assert!(
+                db.store()
+                    .scan_prefix(ns, &neighbor_prefix(rel, b"a"))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        // The bystander edge and the b/c/d documents are unaffected.
+        assert_eq!(c.neighbors(b"b", "knows").unwrap(), vec![b"c".to_vec()]);
+        assert_eq!(c.in_neighbors(b"c", "knows").unwrap(), vec![b"b".to_vec()]);
+        for k in [&b"b"[..], &b"c"[..], &b"d"[..]] {
+            assert_eq!(c.get(k).unwrap(), Some(Value::Int(1)));
+        }
+    }
+
+    /// The conditional-delete path cascades edges just like a plain delete.
+    #[test]
+    fn conditional_delete_cascades_edges() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("nodes");
+        c.insert(b"a", &Value::Int(1)).unwrap();
+        c.insert(b"b", &Value::Int(2)).unwrap();
+        c.link(b"a", "r", b"b").unwrap();
+        assert!(c.compare_and_set(b"a", Some(&Value::Int(1)), None).unwrap());
+        assert!(c.neighbors(b"a", "r").unwrap().is_empty());
+        assert!(c.in_neighbors(b"b", "r").unwrap().is_empty());
+    }
+
+    /// Audit B4: link/link_weighted emit an Insert change event (keyed by the
+    /// from-key) after the commit; unlink emits Delete, and only when an edge
+    /// was actually removed.
+    #[test]
+    fn link_and_unlink_emit_change_events() {
+        use crate::reactive::{ChangeEvent, ChangeKind};
+        use std::sync::{Arc, Mutex};
+
+        let db = Db::open_in_memory().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        db.subscribe(move |e: &ChangeEvent| sink.lock().unwrap().push(e.clone()));
+
+        let c = db.collection("nodes");
+        c.link(b"a", "knows", b"b").unwrap();
+        {
+            let evs = events.lock().unwrap();
+            assert_eq!(
+                *evs,
+                vec![ChangeEvent {
+                    collection: "nodes".to_owned(),
+                    key: b"a".to_vec(),
+                    kind: ChangeKind::Insert,
+                }]
+            );
+        }
+
+        c.link_weighted(b"a", "trusts", b"c", 0.5).unwrap();
+        {
+            let evs = events.lock().unwrap();
+            assert_eq!(evs.len(), 2);
+            assert_eq!(
+                evs[1],
+                ChangeEvent {
+                    collection: "nodes".to_owned(),
+                    key: b"a".to_vec(),
+                    kind: ChangeKind::Insert,
+                }
+            );
+        }
+
+        assert!(c.unlink(b"a", "knows", b"b").unwrap());
+        {
+            let evs = events.lock().unwrap();
+            assert_eq!(evs.len(), 3);
+            assert_eq!(
+                evs[2],
+                ChangeEvent {
+                    collection: "nodes".to_owned(),
+                    key: b"a".to_vec(),
+                    kind: ChangeKind::Delete,
+                }
+            );
+        }
+
+        // A failed unlink (no such edge) emits nothing.
+        assert!(!c.unlink(b"a", "knows", b"b").unwrap());
+        assert_eq!(events.lock().unwrap().len(), 3);
     }
 }

@@ -212,13 +212,15 @@ impl Db {
             }
             let existed = tx.delete(collection, key)?;
             if existed {
-                // The same in-transaction cascade a normal delete performs
+                // The same in-transaction cascade a normal delete performs,
+                // including the graph edge cascade (audit B4)
                 // (TTL entries are removed explicitly below instead).
                 self.index_on_delete_in_txn(tx, collection, key)?;
                 self.fts_on_delete_in_txn(tx, collection, key)?;
                 self.scalar_on_delete_in_txn(tx, collection, key)?;
                 self.compound_on_delete_in_txn(tx, collection, key)?;
                 self.geo_on_delete_in_txn(tx, collection, key)?;
+                self.edges_on_delete_in_txn(tx, collection, key)?;
             }
             // Drop both TTL entries. The forward entry was verified above,
             // inside this same transaction, so these are exactly the
@@ -321,6 +323,27 @@ mod tests {
         assert_eq!(c.get(b"b").unwrap(), None);
         assert_eq!(c.get(b"c").unwrap(), Some(rec(3)));
         assert_eq!(c.get(b"keep").unwrap(), Some(rec(4)));
+    }
+
+    /// Audit B4: an expired record's purge cascades its graph edges exactly
+    /// like a plain delete (the purge path performs its own in-transaction
+    /// maintenance instead of going through `write_document`).
+    #[test]
+    fn purge_cascades_edges() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert_with_ttl(b"doomed", &rec(1), 100).unwrap();
+        c.insert(b"stays", &rec(2)).unwrap();
+        c.link(b"doomed", "knows", b"stays").unwrap();
+        c.link(b"stays", "knows", b"doomed").unwrap();
+
+        assert_eq!(c.purge_expired(100).unwrap(), 1);
+        assert_eq!(c.get(b"doomed").unwrap(), None);
+        // Both directions of both edges are gone; the survivor keeps its doc.
+        assert!(c.neighbors(b"doomed", "knows").unwrap().is_empty());
+        assert!(c.neighbors(b"stays", "knows").unwrap().is_empty());
+        assert!(c.in_neighbors(b"stays", "knows").unwrap().is_empty());
+        assert_eq!(c.get(b"stays").unwrap(), Some(rec(2)));
     }
 
     #[test]
