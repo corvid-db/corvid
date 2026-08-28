@@ -252,6 +252,11 @@ fuse_rrf on empty rankings, reciprocal_rank_fusion/mmr direct fn behavior.
 
 ### Task 10: Geo conformance
 
+Prepend (Task 9 review nits, binding — comment fixes only): in
+tests/search_text.rs fix the s_stem "bus" comment (len<=3 guard, not the
+...us rule; "genus" is the ...us case); in tests/search_hybrid.rs fix the
+garbled λ=0.1 margin notation (actual decision margin 0.8); make
+Bm25Params message pinning consistent with hybrid's starts_with style.
 Fill `search_geo.rs`: haversine_km known distances, geo_within_radius
 (boundary inclusion at ==radius, tiny/large radius, center on doc),
 geo_nearest (k=0/1/N, farther-than-all), geo_within_bbox (normal, inverted
