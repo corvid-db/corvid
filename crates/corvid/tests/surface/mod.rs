@@ -1412,6 +1412,9 @@ static MANIFEST: &[Row] = &[
             "graph_link_relation_isolation_empty_unicode_and_byte_prefix",
             "graph_link_endpoint_keys_empty_and_unicode_in_byte_order",
             "graph_link_unlink_reject_reserved_and_invalid_collection_names",
+            // Task 12 events completeness: linking to absent endpoints
+            // still emits the Insert event keyed by `from`.
+            "events_link_to_missing_endpoints_still_emits_insert_keyed_by_from",
         ],
     ),
     row(
@@ -1794,6 +1797,10 @@ static MANIFEST: &[Row] = &[
         &[
             "events_smoke_subscribe_records_insert_and_delete",
             "mutations_emit_change_events_per_mutation_kind",
+            "events_insert_paths_emit_exact_insert_vectors_in_order",
+            "events_update_and_patch_emit_exact_vectors_for_both_branches",
+            "events_compare_and_set_emit_exact_vectors_per_branch",
+            "events_delete_paths_emit_exact_delete_vectors_in_order",
         ],
     ),
     row(
@@ -1802,6 +1809,10 @@ static MANIFEST: &[Row] = &[
         &[
             "events_smoke_subscribe_records_insert_and_delete",
             "mutations_emit_change_events_per_mutation_kind",
+            "events_insert_paths_emit_exact_insert_vectors_in_order",
+            "events_update_and_patch_emit_exact_vectors_for_both_branches",
+            "events_compare_and_set_emit_exact_vectors_per_branch",
+            "events_link_to_missing_endpoints_still_emits_insert_keyed_by_from",
         ],
     ),
     row(
@@ -1810,6 +1821,9 @@ static MANIFEST: &[Row] = &[
         &[
             "events_smoke_subscribe_records_insert_and_delete",
             "mutations_emit_change_events_per_mutation_kind",
+            "events_delete_paths_emit_exact_delete_vectors_in_order",
+            "events_compare_and_set_emit_exact_vectors_per_branch",
+            "events_ttl_purge_cascade_is_silent_and_stranded_purge_emits_nothing",
         ],
     ),
     row(
@@ -1818,12 +1832,18 @@ static MANIFEST: &[Row] = &[
         &[
             "events_smoke_subscribe_records_insert_and_delete",
             "mutations_emit_change_events_per_mutation_kind",
+            "events_multiple_subscribers_all_receive_identical_exact_vectors",
+            "events_cross_collection_tagging_each_event_names_its_collection",
+            "events_dispatch_is_synchronous_post_commit_and_in_mutation_order",
         ],
     ),
     row(
         "corvid::SubscriptionId",
         "Lifecycle",
-        &["events_smoke_subscribe_records_insert_and_delete"],
+        &[
+            "events_smoke_subscribe_records_insert_and_delete",
+            "events_subscribe_returns_distinct_ids_and_unsubscribe_reports_existence",
+        ],
     ),
     row(
         "corvid::Db::subscribe",
@@ -1831,12 +1851,18 @@ static MANIFEST: &[Row] = &[
         &[
             "events_smoke_subscribe_records_insert_and_delete",
             "mutations_emit_change_events_per_mutation_kind",
+            "events_subscribe_returns_distinct_ids_and_unsubscribe_reports_existence",
+            "events_multiple_subscribers_all_receive_identical_exact_vectors",
+            "events_cross_collection_tagging_each_event_names_its_collection",
         ],
     ),
     row(
         "corvid::Db::unsubscribe",
         "Lifecycle",
-        &["events_smoke_subscribe_records_insert_and_delete"],
+        &[
+            "events_smoke_subscribe_records_insert_and_delete",
+            "events_subscribe_returns_distinct_ids_and_unsubscribe_reports_existence",
+        ],
     ),
     // ===== semantic_cache.rs =====
     row("corvid::SemanticCache", "Lifecycle", &[]),
@@ -1870,15 +1896,33 @@ static MANIFEST: &[Row] = &[
         &[
             "ttl_smoke_insert_with_ttl_purges_at_boundary",
             "mutations_insert_with_ttl_sets_and_purges_expiry",
+            "ttl_roundtrip_set_on_insert_after_plain_insert_and_overwrite",
+            "ttl_timestamps_accept_i64_extremes_and_order_correctly",
+            "ttl_plain_write_paths_clear_expiry",
+            "ttl_purge_removes_doc_from_scalar_unique_vector_and_text_indexes",
+            "ttl_purge_cascades_edges_of_expired_document_both_namespaces",
+            "ttl_write_paths_reject_reserved_and_invalid_collection_names",
         ],
     ),
-    row("corvid::Collection::set_ttl", "TTL", &[]),
+    row(
+        "corvid::Collection::set_ttl",
+        "TTL",
+        &[
+            "ttl_roundtrip_set_on_insert_after_plain_insert_and_overwrite",
+            "ttl_set_ttl_on_missing_doc_is_ok_and_purges_without_counting",
+            "ttl_plain_write_paths_clear_expiry",
+            "ttl_write_paths_reject_reserved_and_invalid_collection_names",
+        ],
+    ),
     row(
         "corvid::Collection::ttl",
         "TTL",
         &[
             "ttl_smoke_insert_with_ttl_purges_at_boundary",
             "mutations_insert_with_ttl_sets_and_purges_expiry",
+            "ttl_roundtrip_set_on_insert_after_plain_insert_and_overwrite",
+            "ttl_on_missing_doc_and_doc_without_expiry_both_none",
+            "ttl_set_ttl_on_missing_doc_is_ok_and_purges_without_counting",
         ],
     ),
     row(
@@ -1887,6 +1931,17 @@ static MANIFEST: &[Row] = &[
         &[
             "ttl_smoke_insert_with_ttl_purges_at_boundary",
             "mutations_insert_with_ttl_sets_and_purges_expiry",
+            "ttl_purge_boundary_one_before_exactly_at_one_after_and_idempotence",
+            "ttl_expired_doc_visible_until_purged_hidden_from_all_reads_after",
+            "ttl_timestamps_accept_i64_extremes_and_order_correctly",
+            "ttl_purge_removes_doc_from_scalar_unique_vector_and_text_indexes",
+            "ttl_set_ttl_on_missing_doc_is_ok_and_purges_without_counting",
+            // W3 wave-review ruling: the purge's edge cascade runs even for
+            // a stranded entry (no document row) — same contract as delete.
+            "ttl_purge_cascades_edges_of_expired_document_both_namespaces",
+            "ttl_purge_cascades_edges_of_stranded_entry_without_document",
+            "events_delete_paths_emit_exact_delete_vectors_in_order",
+            "events_ttl_purge_cascade_is_silent_and_stranded_purge_emits_nothing",
         ],
     ),
     // ===== migrate.rs — dump/load =====

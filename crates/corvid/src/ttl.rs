@@ -185,7 +185,9 @@ impl Db {
     /// vanished (the record was rewritten, re-expired, or deleted since the
     /// scan), nothing happens: the purge can never remove a legitimately
     /// rewritten record. A stranded expiry entry (no document behind it) is
-    /// dropped without counting. Returns whether a document was removed.
+    /// dropped without counting — but still through the edge cascade, like
+    /// every delete path (W3 ruling: a stranded TTL entry must not leave
+    /// dangling edges). Returns whether a document was removed.
     pub(crate) fn purge_due_key(&self, collection: &str, key: &[u8], ts: i64) -> Result<bool> {
         let ns = namespace(collection);
         let removed = self.store().transaction(|tx| {
@@ -197,16 +199,19 @@ impl Db {
             }
             let existed = tx.delete(collection, key)?;
             if existed {
-                // The same in-transaction cascade a normal delete performs,
-                // including the graph edge cascade (audit B4)
+                // The same in-transaction cascade a normal delete performs
                 // (TTL entries are removed explicitly below instead).
                 self.index_on_delete_in_txn(tx, collection, key)?;
                 self.fts_on_delete_in_txn(tx, collection, key)?;
                 self.scalar_on_delete_in_txn(tx, collection, key)?;
                 self.compound_on_delete_in_txn(tx, collection, key)?;
                 self.geo_on_delete_in_txn(tx, collection, key)?;
-                self.edges_on_delete_in_txn(tx, collection, key)?;
             }
+            // The edge cascade runs REGARDLESS of `existed` (W3 ruling):
+            // same contract as delete — a stranded expiry entry on a key
+            // that never was (or no longer is) a document must not leave
+            // dangling edges behind.
+            self.edges_on_delete_in_txn(tx, collection, key)?;
             // Drop both TTL entries. The forward entry was verified above,
             // inside this same transaction, so these are exactly the
             // collected entries.
