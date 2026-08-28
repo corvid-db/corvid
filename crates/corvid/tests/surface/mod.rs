@@ -2297,19 +2297,89 @@ static MANIFEST: &[Row] = &[
             "lifecycle_dump_of_empty_db_loads_empty_and_io_errors_surface",
         ],
     ),
-    // ===== pq.rs — product quantization =====
-    row("corvid::pq::Pq", "Vector search", &[]),
-    row("corvid::pq::Pq::code_len", "Vector search", &[]),
-    row("corvid::pq::Pq::dim", "Vector search", &[]),
-    row("corvid::pq::Pq::params", "Vector search", &[]),
-    row("corvid::pq::Pq::train", "Vector search", &[]),
-    row("corvid::pq::Pq::encode", "Vector search", &[]),
-    row("corvid::pq::Pq::decode", "Vector search", &[]),
-    row("corvid::pq::Pq::distance", "Vector search", &[]),
-    row("corvid::pq::Pq::l2_table", "Vector search", &[]),
-    row("corvid::pq::Pq::adc_l2", "Vector search", &[]),
-    row("corvid::pq::Pq::to_bytes", "Vector search", &[]),
-    row("corvid::pq::Pq::from_bytes", "Vector search", &[]),
+    // ===== pq.rs — product quantization (Task 13.5 rows, filled in Task 15) =====
+    row(
+        "corvid::pq::Pq",
+        "Vector search",
+        &[
+            "pq_train_rejects_unusable_params_and_sample",
+            "pq_train_is_deterministic_and_codebook_size_math_holds",
+            "pq_adc_recall_bound_on_fixed_corpus",
+        ],
+    ),
+    row(
+        "corvid::pq::Pq::code_len",
+        "Vector search",
+        &[
+            "pq_train_is_deterministic_and_codebook_size_math_holds",
+            "pq_encode_is_deterministic_compact_and_dimension_guarded",
+        ],
+    ),
+    row(
+        "corvid::pq::Pq::dim",
+        "Vector search",
+        &[
+            "pq_train_is_deterministic_and_codebook_size_math_holds",
+            "pq_decode_reconstructs_and_guards_malformed_codes",
+        ],
+    ),
+    row(
+        "corvid::pq::Pq::params",
+        "Vector search",
+        &[
+            "pq_train_is_deterministic_and_codebook_size_math_holds",
+            "pq_adc_l2_fast_path_matches_reconstruction_and_guards",
+        ],
+    ),
+    row(
+        "corvid::pq::Pq::train",
+        "Vector search",
+        &[
+            "pq_train_rejects_unusable_params_and_sample",
+            "pq_train_is_deterministic_and_codebook_size_math_holds",
+        ],
+    ),
+    row(
+        "corvid::pq::Pq::encode",
+        "Vector search",
+        &["pq_encode_is_deterministic_compact_and_dimension_guarded"],
+    ),
+    row(
+        "corvid::pq::Pq::decode",
+        "Vector search",
+        &["pq_decode_reconstructs_and_guards_malformed_codes"],
+    ),
+    row(
+        "corvid::pq::Pq::distance",
+        "Vector search",
+        &["pq_distance_is_reconstruction_distance_for_every_metric"],
+    ),
+    row(
+        "corvid::pq::Pq::l2_table",
+        "Vector search",
+        &["pq_adc_l2_fast_path_matches_reconstruction_and_guards"],
+    ),
+    row(
+        "corvid::pq::Pq::adc_l2",
+        "Vector search",
+        &[
+            "pq_adc_l2_fast_path_matches_reconstruction_and_guards",
+            "pq_adc_recall_bound_on_fixed_corpus",
+        ],
+    ),
+    row(
+        "corvid::pq::Pq::to_bytes",
+        "Vector search",
+        &[
+            "pq_train_is_deterministic_and_codebook_size_math_holds",
+            "pq_codebook_roundtrips_bytes_and_rejects_malformed",
+        ],
+    ),
+    row(
+        "corvid::pq::Pq::from_bytes",
+        "Vector search",
+        &["pq_codebook_roundtrips_bytes_and_rejects_malformed"],
+    ),
     // ===== plan.rs — plan identity and cache =====
     row(
         "corvid::QueryPlan",
