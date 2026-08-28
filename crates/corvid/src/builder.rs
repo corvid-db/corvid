@@ -112,7 +112,9 @@ pub enum PlanShape {
     /// single-source index paths declined.
     IndexedWindow {
         /// Which index family drives: `"scalar"`, `"compound"`, `"geo"`,
-        /// or `"or"`.
+        /// or `"or"` — attributed by probe order (the first serviceable
+        /// family in the ladder), not by smallest-window selectivity;
+        /// advisory only.
         kind: &'static str,
     },
     /// Single vector source with no usable ANN index: bounded streaming
@@ -935,8 +937,9 @@ impl QueryBuilder<'_> {
     /// filters, or `None` when no registered index is serviceable. A
     /// reader-free twin of that probe ladder's *selection* half: the same
     /// conditions in the same order (scalar comparisons, then
-    /// Between/In/StartsWith windows, then compound prefix, geo, OR union),
-    /// checking index existence instead of reading candidate keys. Kept in
+    /// Between/In/StartsWith windows, then compound prefix, geo, then the
+    /// FIRST top-level Or), checking index existence instead of reading
+    /// candidate keys. Kept in
     /// lockstep with `indexed_candidates` by
     /// `plan_shape_matches_served_path`; a probe that runs but over-runs its
     /// 100k cap at execution time returns `None` there — an execution-time
@@ -948,7 +951,9 @@ impl QueryBuilder<'_> {
         let db = self.collection.db();
         let coll = self.collection.name();
 
-        // The same disjunct serviceability `predicate_candidates` requires.
+        // The same disjunct serviceability `predicate_candidates` requires
+        // (a geo disjunct additionally needs a real bbox: a radius that wraps
+        // the antimeridian makes the real probe decline).
         let disjunct_serviceable = |pred: &Predicate| match pred {
             Predicate::Compare {
                 path,
@@ -958,7 +963,15 @@ impl QueryBuilder<'_> {
             Predicate::Between { path, .. }
             | Predicate::In { path, .. }
             | Predicate::StartsWith { path, .. } => db.has_scalar_index(coll, path),
-            Predicate::GeoWithin { path, .. } => db.has_geo_index(coll, path),
+            Predicate::GeoWithin {
+                path,
+                lat,
+                lon,
+                radius_km,
+            } => {
+                db.has_geo_index(coll, path)
+                    && crate::geo_index::radius_bbox(*lat, *lon, *radius_km).is_some()
+            }
             _ => false,
         };
 
@@ -1024,14 +1037,17 @@ impl QueryBuilder<'_> {
                 return Some("geo");
             }
         }
-        // 5. A top-level OR whose every disjunct is itself serviceable.
+        // 5. The FIRST top-level OR only, exactly like `or_candidate_keys`:
+        //    serviceable when every disjunct is — one unserviceable
+        //    disjunct declines the whole probe and is never rescued by a
+        //    later Or (review round 1).
         for pred in &self.filters {
             if matches!(pred, Predicate::Or(..)) {
                 let mut disjuncts = Vec::new();
                 flatten_or(pred, &mut disjuncts);
-                if !disjuncts.is_empty() && disjuncts.iter().all(|d| disjunct_serviceable(d)) {
-                    return Some("or");
-                }
+                let serviceable =
+                    !disjuncts.is_empty() && disjuncts.iter().all(|d| disjunct_serviceable(d));
+                return serviceable.then_some("or");
             }
         }
         None
@@ -1892,8 +1908,8 @@ mod tests {
     ///         x = 1/67 + 1/61 = 0.03132  y1 = 2/63 = 0.03175    (all < b)
     ///
     /// (Large k orders by rank sum — a sums to 5, b to 4 — while small k
-    /// amplifies a's single rank-1 enough to win; the crossover is at
-    /// k = 2 + 2·√6 ≈ 6.9.)
+    /// amplifies a's single rank-1 enough to win; the a-vs-b crossover
+    /// solves 1/(k+1) + 1/(k+4) = 2/(k+2), i.e. k = 2.)
     #[test]
     fn custom_rrf_constant_is_accepted() {
         let db = Db::open_in_memory().unwrap();
@@ -2248,6 +2264,27 @@ mod tests {
         db
     }
 
+    /// Three docs with a "home" `[lat, lon]` point (a = London, b = Paris,
+    /// c = Tokyo) and a geo index on "home" — the fixture for geo kind rows.
+    fn geo_seeded() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for (key, (lat, lon)) in [
+            (b"a".as_slice(), (51.5, -0.13)),
+            (b"b".as_slice(), (48.85, 2.35)),
+            (b"c".as_slice(), (35.68, 139.69)),
+        ] {
+            let mut m = BTreeMap::new();
+            m.insert(
+                "home".to_owned(),
+                Value::Array(vec![Value::Float(lat), Value::Float(lon)]),
+            );
+            c.insert(key, &Value::Map(m)).unwrap();
+        }
+        c.create_geo_index("home").unwrap();
+        db
+    }
+
     /// Audit C3: every PlanShape renders as its own explain head, with the
     /// decorations (filters/sources/limit) still attached after it.
     #[test]
@@ -2398,6 +2435,8 @@ mod tests {
                             (0, 0, 0),
                             "no-index shape but served {served:?}: {label}"
                         ),
+                        // (Disclosed limit: the counters cannot distinguish
+                        // StreamingTopK from Scan — both serve all-zero.)
                     }
                     assert!(!rows.is_empty(), "fixture row sanity: {label}");
                 }
@@ -2416,6 +2455,136 @@ mod tests {
         test_probe::reset();
         assert!(!q.run().unwrap().is_empty());
         assert_eq!(test_probe::read(), test_probe::Served::default());
+
+        // One prediction-vs-reality row: plan_shape first, then run, then the
+        // serve counters must match the predicted arm.
+        fn parity(q: QueryBuilder<'_>, expected: PlanShape, label: &str) {
+            assert_eq!(q.plan_shape(), expected, "plan_shape lied: {label}");
+            test_probe::reset();
+            let rows = q.run().unwrap();
+            let served = test_probe::read();
+            match expected {
+                PlanShape::IndexedWindow { .. } => assert_eq!(
+                    (served.ann, served.text, served.indexed),
+                    (0, 0, 1),
+                    "indexed shape but served {served:?}: {label}"
+                ),
+                PlanShape::StreamingTopK | PlanShape::Scan { .. } => assert_eq!(
+                    (served.ann, served.text, served.indexed),
+                    (0, 0, 0),
+                    "no-index shape but served {served:?}: {label}"
+                ),
+                _ => unreachable!("window/scan shapes only: {label}"),
+            }
+            assert!(!rows.is_empty(), "fixture row sanity: {label}");
+        }
+
+        // Review round 1, OR divergence 1: the real OR probe
+        // (`or_candidate_keys`) declines on the FIRST top-level Or — an
+        // unserviceable disjunct there must not be rescued by a later,
+        // serviceable Or.
+        let or_db = seed();
+        or_db
+            .collection("docs")
+            .create_scalar_index("category")
+            .unwrap();
+        parity(
+            or_db
+                .collection("docs")
+                .query()
+                .filter(
+                    field("body")
+                        .starts_with("rust")
+                        .or(field("body").starts_with("python")),
+                )
+                .filter(
+                    field("category")
+                        .eq(Value::Text("blog".into()))
+                        .or(field("category").eq(Value::Text("news".into()))),
+                ),
+            PlanShape::Scan {
+                collection: "docs".to_owned(),
+            },
+            "first Or unserviceable, second serviceable",
+        );
+
+        // Review round 1, OR divergence 2: a geo disjunct whose radius wraps
+        // the antimeridian is NOT serviceable (`radius_bbox` -> None), so the
+        // real OR declines even with a geo index registered.
+        let geo = geo_seeded();
+        parity(
+            geo.collection("docs").query().filter(
+                field("home")
+                    .within_km(0.0, 179.0, 500.0)
+                    .or(field("home").within_km(51.5, -0.13, 50.0)),
+            ),
+            PlanShape::Scan {
+                collection: "docs".to_owned(),
+            },
+            "geo disjunct with wrapping radius",
+        );
+
+        // Compound kind: equality on the leading field of a compound index
+        // (no scalar index on that field, so the ladder reaches step 3).
+        let comp = seed();
+        comp.collection("docs")
+            .create_compound_index(&["category", "body"])
+            .unwrap();
+        parity(
+            comp.collection("docs")
+                .query()
+                .filter(field("category").eq(Value::Text("blog".into()))),
+            PlanShape::IndexedWindow { kind: "compound" },
+            "compound window",
+        );
+
+        // Geo kind: a top-level GeoWithin over a geo index with a real bbox.
+        parity(
+            geo.collection("docs")
+                .query()
+                .filter(field("home").within_km(51.5, -0.13, 50.0)),
+            PlanShape::IndexedWindow { kind: "geo" },
+            "geo window",
+        );
+
+        // OR kind: the single top-level Or has only serviceable disjuncts.
+        parity(
+            or_db.collection("docs").query().filter(
+                field("category")
+                    .eq(Value::Text("blog".into()))
+                    .or(field("category").eq(Value::Text("news".into()))),
+            ),
+            PlanShape::IndexedWindow { kind: "or" },
+            "or window",
+        );
+
+        // Building on-disk vector def (review round 1 coverage): consultable
+        // is false — mid-build defs never serve — so prediction and reality
+        // both decline to the streaming arm. Reality is driven through
+        // `run_with` on a fresh snapshot because `run()` would first
+        // resume-and-complete the build, which is a different (no longer
+        // stuck) fixture.
+        let building = seed();
+        building
+            .register_vector_index(
+                "docs",
+                "embedding",
+                Metric::Cosine,
+                crate::quant::Quantization::None,
+                crate::index::IndexKind::OnDisk,
+            )
+            .unwrap();
+        let q = building.collection("docs").query().vector(
+            "embedding",
+            vec![1.0, 0.0],
+            10,
+            Metric::Cosine,
+        );
+        assert_eq!(q.plan_shape(), PlanShape::StreamingTopK);
+        test_probe::reset();
+        let rows = building.store().read(|r| q.run_with(r)).unwrap();
+        assert_eq!(test_probe::read(), test_probe::Served::default());
+        assert!(!rows.is_empty());
 
         // And one explain-vs-path cross-check through the instrumentation:
         // the shape explain prints is the arm that actually served.
