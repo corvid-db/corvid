@@ -108,6 +108,13 @@ fn bench_distance(c: &mut Criterion) {
 /// measured routine (fine for a relative before/after baseline; absolute
 /// numbers overstate creation cost). Sample size is kept low to bound wall
 /// time given multi-second iterations.
+///
+/// Literal invocation (audit C10, recorded so before/after numbers are
+/// reproducible):
+///
+/// ```text
+/// cargo bench -p corvid --bench engine -- index_creation_ondisk
+/// ```
 fn bench_creation_ondisk(c: &mut Criterion) {
     const N_TEXT: usize = 5_000; // 3 backfill pages (PAGE = 2048)
     // One doc past the 2048-page boundary: exercises the multi-page cursor

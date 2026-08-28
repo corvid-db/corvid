@@ -90,6 +90,41 @@ enum Source {
     },
 }
 
+/// The candidate-source arm the planner will drive for a query (audit C3):
+/// the shape [`QueryBuilder::explain`] reports and
+/// [`QueryBuilder::plan_shape`] predicts. An *advisory* prediction factored
+/// from the same conditions the execution core's candidate ladder (`run_with`)
+/// tests — see `plan_shape` for the exact correspondence and its limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanShape {
+    /// Single vector source served by its ANN index (`ann_candidates`).
+    AnnIndex {
+        /// The indexed vector field.
+        field: String,
+    },
+    /// Single text source served by its text index (`text_candidates`).
+    TextIndex {
+        /// The indexed text field.
+        field: String,
+    },
+    /// Filters drive a scalar/compound/geo/OR index window
+    /// (`indexed_candidates`), with no retrieval sources or after the
+    /// single-source index paths declined.
+    IndexedWindow {
+        /// Which index family drives: `"scalar"`, `"compound"`, `"geo"`,
+        /// or `"or"`.
+        kind: &'static str,
+    },
+    /// Single vector source with no usable ANN index: bounded streaming
+    /// top-k (`streaming_vector_candidates`).
+    StreamingTopK,
+    /// Full collection scan + filter (the fallback arm).
+    Scan {
+        /// The scanned collection.
+        collection: String,
+    },
+}
+
 /// A composable multi-modal query over one collection. Built fluently and
 /// executed with [`QueryBuilder::run`].
 pub struct QueryBuilder<'c> {
@@ -467,6 +502,9 @@ impl QueryBuilder<'_> {
         else {
             return Ok(None);
         };
+        // Audit C10: the ANN index actually served this query's candidates.
+        #[cfg(test)]
+        test_probe::bump_ann();
         let mut out = Vec::new();
         for (key, _dist) in ranked {
             if let Some(doc) = self.collection.get_in(reader, &key)?
@@ -502,6 +540,9 @@ impl QueryBuilder<'_> {
         else {
             return Ok(None);
         };
+        // Audit C10: the text index actually served this query's candidates.
+        #[cfg(test)]
+        test_probe::bump_text();
         let mut out = Vec::new();
         for (key, _score) in ranked {
             if let Some(doc) = self.collection.get_in(reader, &key)?
@@ -636,7 +677,13 @@ impl QueryBuilder<'_> {
         keep_smaller(&mut best, self.or_candidate_keys(reader)?);
 
         match best {
-            Some(keys) => self.verify_candidates(reader, keys),
+            // Audit C10: an index window actually drove this query's
+            // candidates (some probe family returned serviceable keys).
+            Some(keys) => {
+                #[cfg(test)]
+                test_probe::bump_indexed();
+                self.verify_candidates(reader, keys)
+            }
             None => Ok(None),
         }
     }
@@ -884,11 +931,194 @@ impl QueryBuilder<'_> {
         crate::plan::QueryPlan(s)
     }
 
+    /// Which index family would drive [`Self::indexed_candidates`] for these
+    /// filters, or `None` when no registered index is serviceable. A
+    /// reader-free twin of that probe ladder's *selection* half: the same
+    /// conditions in the same order (scalar comparisons, then
+    /// Between/In/StartsWith windows, then compound prefix, geo, OR union),
+    /// checking index existence instead of reading candidate keys. Kept in
+    /// lockstep with `indexed_candidates` by
+    /// `plan_shape_matches_served_path`; a probe that runs but over-runs its
+    /// 100k cap at execution time returns `None` there — an execution-time
+    /// fact this advisory check cannot see.
+    fn indexed_window_kind(&self) -> Option<&'static str> {
+        if self.filters.is_empty() {
+            return None;
+        }
+        let db = self.collection.db();
+        let coll = self.collection.name();
+
+        // The same disjunct serviceability `predicate_candidates` requires.
+        let disjunct_serviceable = |pred: &Predicate| match pred {
+            Predicate::Compare {
+                path,
+                op: CmpOp::Eq | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge,
+                ..
+            } => db.has_scalar_index(coll, path),
+            Predicate::Between { path, .. }
+            | Predicate::In { path, .. }
+            | Predicate::StartsWith { path, .. } => db.has_scalar_index(coll, path),
+            Predicate::GeoWithin { path, .. } => db.has_geo_index(coll, path),
+            _ => false,
+        };
+
+        // 1. Comparisons on indexed scalar fields.
+        for pred in &self.filters {
+            if let Predicate::Compare { path, op, .. } = pred
+                && matches!(
+                    op,
+                    CmpOp::Eq | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge
+                )
+                && db.has_scalar_index(coll, path)
+            {
+                return Some("scalar");
+            }
+        }
+        // 2. Between / In / StartsWith windows on indexed scalar fields.
+        for pred in &self.filters {
+            if matches!(
+                pred,
+                Predicate::Between { .. } | Predicate::In { .. } | Predicate::StartsWith { .. }
+            ) && disjunct_serviceable(pred)
+            {
+                return Some("scalar");
+            }
+        }
+        // 3. A compound index with a pinned leading field (or a constrained
+        //    tail on its first field) — the selection half of
+        //    `compound_candidate_keys`, without reading keys.
+        let by_field = |field: &str| -> Vec<(CmpOp, &Value)> {
+            self.filters
+                .iter()
+                .filter_map(|p| match p {
+                    Predicate::Compare { path, op, value } if path == field => Some((*op, value)),
+                    _ => None,
+                })
+                .collect()
+        };
+        for fields in db.compound_indexes(coll) {
+            let mut prefix_len = 0;
+            while prefix_len < fields.len()
+                && by_field(&fields[prefix_len])
+                    .iter()
+                    .any(|(op, _)| *op == CmpOp::Eq)
+            {
+                prefix_len += 1;
+            }
+            let has_tail = prefix_len < fields.len() && !by_field(&fields[prefix_len]).is_empty();
+            if prefix_len > 0 || has_tail {
+                return Some("compound");
+            }
+        }
+        // 4. A GeoWithin filter on a geo-indexed field with a real bbox.
+        for pred in &self.filters {
+            if let Predicate::GeoWithin {
+                path,
+                lat,
+                lon,
+                radius_km,
+            } = pred
+                && db.has_geo_index(coll, path)
+                && crate::geo_index::radius_bbox(*lat, *lon, *radius_km).is_some()
+            {
+                return Some("geo");
+            }
+        }
+        // 5. A top-level OR whose every disjunct is itself serviceable.
+        for pred in &self.filters {
+            if matches!(pred, Predicate::Or(..)) {
+                let mut disjuncts = Vec::new();
+                flatten_or(pred, &mut disjuncts);
+                if !disjuncts.is_empty() && disjuncts.iter().all(|d| disjunct_serviceable(d)) {
+                    return Some("or");
+                }
+            }
+        }
+        None
+    }
+
+    /// Predict which candidate-source arm the execution core (`run_with`)
+    /// will drive
+    /// (audit C3): an advisory, execution-free probe mirroring its ladder
+    /// arm for arm —
+    ///
+    /// * no sources → `indexed_candidates`' window if a filter index is
+    ///   serviceable, else the streaming filter scan (`Scan`),
+    /// * a single vector source with filters only under `approx`, and a
+    ///   consultable ANN index (`vector_index_consultable`) → `AnnIndex`,
+    /// * a single text source under the same filter rule with a consultable
+    ///   text index (`text_index_consultable`) → `TextIndex`,
+    /// * filters with a serviceable index → `IndexedWindow`,
+    /// * a single vector source with no usable index → `StreamingTopK`,
+    /// * anything else (multi-source scans) → `Scan`.
+    ///
+    /// The consultable checks read only the index registries (no lazy
+    /// builds, no snapshot). Two execution-time facts stay beyond an
+    /// execution-free prediction: an index whose graph cannot accept the
+    /// query's dimension falls back to exact at run time, and a probe that
+    /// over-runs its 100k candidate cap declines. `run_with` itself is
+    /// untouched by this — explain never executes. The parity test
+    /// `plan_shape_matches_served_path` pins prediction to reality.
+    pub fn plan_shape(&self) -> PlanShape {
+        let coll = self.collection.name().to_owned();
+        if self.sources.is_empty() {
+            return match self.indexed_window_kind() {
+                Some(kind) => PlanShape::IndexedWindow { kind },
+                None => PlanShape::Scan { collection: coll },
+            };
+        }
+        // The single-source index arms decline filtered queries unless
+        // `approx` is set — the same gate `ann_candidates`/`text_candidates`
+        // test before consulting their index.
+        let filtered_ok = self.filters.is_empty() || self.approx;
+        if self.sources.len() == 1 {
+            match &self.sources[0] {
+                Source::Vector { field, metric, .. }
+                    if filtered_ok
+                        && self
+                            .collection
+                            .db()
+                            .vector_index_consultable(&coll, field, *metric) =>
+                {
+                    return PlanShape::AnnIndex {
+                        field: field.clone(),
+                    };
+                }
+                Source::Text { field, .. }
+                    if filtered_ok && self.collection.db().text_index_consultable(&coll, field) =>
+                {
+                    return PlanShape::TextIndex {
+                        field: field.clone(),
+                    };
+                }
+                _ => {}
+            }
+        }
+        if let Some(kind) = self.indexed_window_kind() {
+            return PlanShape::IndexedWindow { kind };
+        }
+        if self.sources.len() == 1 && matches!(self.sources[0], Source::Vector { .. }) {
+            return PlanShape::StreamingTopK;
+        }
+        PlanShape::Scan { collection: coll }
+    }
+
     /// Describe the query plan as a human-readable string (for debugging). Does
     /// not execute the query, so it may be called before [`Self::run`].
+    ///
+    /// The head names the candidate source the planner will actually drive
+    /// (audit C3: it used to print an unconditional `scan(collection)`
+    /// regardless of the arm taken); the remaining parts decorate the query
+    /// itself.
     pub fn explain(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
-        parts.push(format!("scan({})", self.collection.name()));
+        parts.push(match self.plan_shape() {
+            PlanShape::AnnIndex { field } => format!("ann({field})"),
+            PlanShape::TextIndex { field } => format!("text-index({field})"),
+            PlanShape::IndexedWindow { kind } => format!("indexed-window({kind})"),
+            PlanShape::StreamingTopK => "streaming-topk".to_owned(),
+            PlanShape::Scan { collection } => format!("scan({collection})"),
+        });
         if !self.filters.is_empty() {
             parts.push(format!("filter x{}", self.filters.len()));
         }
@@ -1393,6 +1623,58 @@ fn rerank_mmr(
     out
 }
 
+/// Test-only observation of which candidate source actually SERVED a query
+/// (audit C10): an index path is only proven used when its non-fallback arm
+/// returned `Some`, not when a query merely *could* take it. The planner
+/// bumps the matching counter at each serve point; tests reset, run, and
+/// read. `thread_local` (not a static): each test runs on its own thread,
+/// so concurrently-running tests cannot pollute each other's counts.
+#[cfg(test)]
+pub(crate) mod test_probe {
+    use std::cell::Cell;
+
+    /// Serve counts since the last [`reset`]: how many times the ANN, text,
+    /// and filter-index candidate sources each served a query.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Served {
+        pub ann: usize,
+        pub text: usize,
+        pub indexed: usize,
+    }
+
+    thread_local! {
+        static ANN: Cell<usize> = const { Cell::new(0) };
+        static TEXT: Cell<usize> = const { Cell::new(0) };
+        static INDEXED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump_ann() {
+        ANN.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn bump_text() {
+        TEXT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn bump_indexed() {
+        INDEXED.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn reset() {
+        ANN.with(|c| c.set(0));
+        TEXT.with(|c| c.set(0));
+        INDEXED.with(|c| c.set(0));
+    }
+
+    pub(crate) fn read() -> Served {
+        Served {
+            ann: ANN.with(Cell::get),
+            text: TEXT.with(Cell::get),
+            indexed: INDEXED.with(Cell::get),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1586,18 +1868,70 @@ mod tests {
         assert_eq!(rows.len(), 2);
     }
 
+    /// Audit C10: the custom RRF constant is *observed*, not just accepted —
+    /// two sources whose fused order differs between k=1 and k=60 must
+    /// produce different orders for the two constants.
+    ///
+    /// Seven 1-D docs, two L2 vector sources (query [0.0] for both, so each
+    /// source's ranking is just its field's value ascending). Designed ranks:
+    ///
+    /// | doc | rank in e1 | rank in e2 |
+    /// |-----|-----------:|-----------:|
+    /// | a   | 1          | 4          |
+    /// | b   | 2          | 2          |
+    /// | y1  | 3          | 3          |
+    /// | y2  | 4          | 5          |
+    /// | y3  | 5          | 6          |
+    /// | y4  | 6          | 7          |
+    /// | x   | 7          | 1          |
+    ///
+    /// RRF score = sum of 1/(k + rank), so with f32-exact headroom:
+    ///   k=1:  a = 1/2 + 1/5 = 0.7000   b = 1/3 + 1/3 = 0.6667   → a first
+    ///         x = 1/8 + 1/2 = 0.6250   y1 = 1/4 + 1/4 = 0.5000 (all < a)
+    ///   k=60: a = 1/61 + 1/64 = 0.03202  b = 2/62 = 0.03226     → b first
+    ///         x = 1/67 + 1/61 = 0.03132  y1 = 2/63 = 0.03175    (all < b)
+    ///
+    /// (Large k orders by rank sum — a sums to 5, b to 4 — while small k
+    /// amplifies a's single rank-1 enough to win; the crossover is at
+    /// k = 2 + 2·√6 ≈ 6.9.)
     #[test]
     fn custom_rrf_constant_is_accepted() {
-        let db = seed();
-        let rows = db
-            .collection("docs")
-            .query()
-            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
-            .text("body", "rust", 10)
-            .fuse_rrf(10.0)
-            .run()
-            .unwrap();
-        assert_eq!(rows[0].key, b"a".to_vec());
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        // (doc, e1 value, e2 value): e1 asc is source 1's ranking
+        // (a,b,y1,y2,y3,y4,x), e2 asc is source 2's (x,b,y1,a,y2,y3,y4).
+        let docs: &[(&[u8], f32, f32)] = &[
+            (b"a", 0.1, 0.4),
+            (b"b", 0.2, 0.2),
+            (b"y1", 0.3, 0.3),
+            (b"y2", 0.4, 0.5),
+            (b"y3", 0.5, 0.6),
+            (b"y4", 0.6, 0.7),
+            (b"x", 0.7, 0.1),
+        ];
+        for &(key, v1, v2) in docs {
+            let mut m = BTreeMap::new();
+            m.insert("e1".to_owned(), Value::Vector(vec![v1]));
+            m.insert("e2".to_owned(), Value::Vector(vec![v2]));
+            c.insert(key, &Value::Map(m)).unwrap();
+        }
+        let run = |rrf_k: f32| {
+            c.query()
+                .vector("e1", vec![0.0], 10, Metric::L2)
+                .vector("e2", vec![0.0], 10, Metric::L2)
+                .fuse_rrf(rrf_k)
+                .run()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.key.clone())
+                .collect::<Vec<_>>()
+        };
+        let small = run(1.0);
+        let large = run(60.0);
+        // The constant is observed: the two orders genuinely differ...
+        assert_eq!(small[0], b"a".to_vec(), "k=1 amplifies a's rank-1");
+        assert_eq!(large[0], b"b".to_vec(), "k=60 orders by rank sum");
+        assert_ne!(small, large, "RRF k must change this fusion's order");
     }
 
     /// Audit C6: `fuse_rrf` is validated at execution entry (the builder
@@ -1736,7 +2070,10 @@ mod tests {
             .order_by("category", true)
             .limit(5);
         let plan = q.explain();
-        assert!(plan.contains("scan(docs)"));
+        // Audit C3: the head reports the real shape — seed() registers no
+        // indexes, so a filtered exact single-vector query streams.
+        assert!(plan.contains("streaming-topk"));
+        assert!(!plan.contains("scan(docs)"), "plan must not claim a scan");
         assert!(plan.contains("filter x1"));
         assert!(plan.contains("vector(embedding"));
         assert!(plan.contains("order_by(category desc)"));
@@ -1774,13 +2111,23 @@ mod tests {
         let db = seed();
         let c = db.collection("docs");
         c.create_vector_index("embedding", Metric::Cosine).unwrap();
+        test_probe::reset();
         let rows = c
             .query()
             .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
             .run()
             .unwrap();
-        // Same top result as the exact path, now served via the index.
+        // Same top result as the exact path, now served via the index —
+        // and provably so: the ANN arm served, nothing else did (C10).
         assert_eq!(rows[0].key, b"a".to_vec());
+        assert_eq!(
+            test_probe::read(),
+            test_probe::Served {
+                ann: 1,
+                text: 0,
+                indexed: 0
+            }
+        );
     }
 
     #[test]
@@ -1788,6 +2135,7 @@ mod tests {
         let db = seed();
         let c = db.collection("docs");
         c.create_vector_index("embedding", Metric::Cosine).unwrap();
+        test_probe::reset();
         let rows = c
             .query()
             .filter(field("category").eq(Value::Text("blog".into())))
@@ -1801,6 +2149,15 @@ mod tests {
                 .all(|r| r.document.get("category") == Some(&Value::Text("blog".into())))
         );
         assert_eq!(rows[0].key, b"a".to_vec());
+        // approx is what admits the filtered query onto the index path (C10).
+        assert_eq!(
+            test_probe::read(),
+            test_probe::Served {
+                ann: 1,
+                text: 0,
+                indexed: 0
+            }
+        );
     }
 
     #[test]
@@ -1808,6 +2165,7 @@ mod tests {
         let db = seed();
         let c = db.collection("docs");
         c.create_vector_index("embedding", Metric::Cosine).unwrap();
+        test_probe::reset();
         // No .approx(): exact path, still correct, still filtered.
         let rows = c
             .query()
@@ -1817,6 +2175,16 @@ mod tests {
             .unwrap();
         assert_eq!(rows[0].key, b"a".to_vec());
         assert!(!rows.iter().any(|r| r.key == b"c".to_vec()));
+        // "Exact" means the ANN index did NOT serve (C10): seed() has no
+        // scalar index, so the streaming top-k arm drove instead.
+        assert_eq!(
+            test_probe::read(),
+            test_probe::Served {
+                ann: 0,
+                text: 0,
+                indexed: 0
+            }
+        );
     }
 
     #[test]
@@ -1851,12 +2219,216 @@ mod tests {
         let db = seed();
         let c = db.collection("docs");
         c.create_text_index("body").unwrap();
+        test_probe::reset();
         // "rust" appears in a (blog) and c (news); indexed text path ranks them.
         let rows = c.query().text("body", "rust", 10).run().unwrap();
         let keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
         assert!(keys.contains(&b"a".to_vec()));
         assert!(keys.contains(&b"c".to_vec()));
         assert!(!keys.contains(&b"b".to_vec())); // "python web framework"
+        // Provably the text index served, and only it (C10).
+        assert_eq!(
+            test_probe::read(),
+            test_probe::Served {
+                ann: 0,
+                text: 1,
+                indexed: 0
+            }
+        );
+    }
+
+    /// seed() plus every index registered: vector (embedding), text (body),
+    /// scalar (category) — the fixture for plan-shape tests.
+    fn seeded_and_indexed() -> Db {
+        let db = seed();
+        let c = db.collection("docs");
+        c.create_vector_index("embedding", Metric::Cosine).unwrap();
+        c.create_text_index("body").unwrap();
+        c.create_scalar_index("category").unwrap();
+        db
+    }
+
+    /// Audit C3: every PlanShape renders as its own explain head, with the
+    /// decorations (filters/sources/limit) still attached after it.
+    #[test]
+    fn explain_reports_each_plan_shape() {
+        let db = seeded_and_indexed();
+        let c = db.collection("docs");
+
+        let ann = c
+            .query()
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .limit(2)
+            .explain();
+        assert!(ann.starts_with("ann(embedding)"), "{ann}");
+        assert!(ann.contains("vector(embedding"), "{ann}");
+        assert!(ann.contains("limit 2"), "{ann}");
+
+        let text = c.query().text("body", "rust", 10).explain();
+        assert!(text.starts_with("text-index(body)"), "{text}");
+        assert!(text.contains("text(body, k=10)"), "{text}");
+
+        let indexed = c
+            .query()
+            .filter(field("category").eq(Value::Text("blog".into())))
+            .explain();
+        assert!(indexed.starts_with("indexed-window(scalar)"), "{indexed}");
+        assert!(indexed.contains("filter x1"), "{indexed}");
+
+        // No vector index on this one → the single vector source streams.
+        let plain = Db::open_in_memory().unwrap();
+        let pc = plain.collection("docs");
+        pc.insert(b"a", &doc("blog", "rust embedded database", vec![1.0, 0.0]))
+            .unwrap();
+        let streaming = pc
+            .query()
+            .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+            .explain();
+        assert!(streaming.starts_with("streaming-topk"), "{streaming}");
+        assert!(streaming.contains("vector(embedding"), "{streaming}");
+
+        let scan = c.query().explain();
+        assert!(scan.starts_with("scan(docs)"), "{scan}");
+    }
+
+    /// Audit C3 parity net: for a matrix of query shapes (filtered/unfiltered
+    /// × single-vector/single-text/multi-source/none × approx on/off, indexes
+    /// registered), `plan_shape()` must predict the arm `run_with` actually
+    /// drove — observed through the C10 serve counters, not through
+    /// `explain`'s own claim about itself.
+    #[test]
+    fn plan_shape_matches_served_path() {
+        let db = seeded_and_indexed();
+        let c = db.collection("docs");
+
+        #[derive(Debug, Clone, Copy)]
+        enum Src {
+            Vector,
+            Text,
+            Both,
+            None,
+        }
+        let ann = || PlanShape::AnnIndex {
+            field: "embedding".to_owned(),
+        };
+        let text_shape = || PlanShape::TextIndex {
+            field: "body".to_owned(),
+        };
+        let indexed = || PlanShape::IndexedWindow { kind: "scalar" };
+        let scan = || PlanShape::Scan {
+            collection: "docs".to_owned(),
+        };
+
+        for filtered in [false, true] {
+            for approx in [false, true] {
+                for src in [Src::Vector, Src::Text, Src::Both, Src::None] {
+                    let label = format!("{:?} filtered={} approx={:?}", src, filtered, approx);
+                    let mut q = c.query();
+                    if filtered {
+                        q = q.filter(field("category").eq(Value::Text("blog".into())));
+                    }
+                    match src {
+                        Src::Vector => {
+                            q = q.vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine);
+                        }
+                        Src::Text => {
+                            q = q.text("body", "rust", 10);
+                        }
+                        Src::Both => {
+                            q = q
+                                .vector("embedding", vec![1.0, 0.0], 10, Metric::Cosine)
+                                .text("body", "rust", 10);
+                        }
+                        Src::None => {}
+                    }
+                    if approx {
+                        q = q.approx();
+                    }
+
+                    // The planner's ladder, written out: the single-source
+                    // index arms take filtered queries only under approx;
+                    // otherwise a serviceable filter index drives; multi or
+                    // no-source unfiltered queries scan.
+                    let expected = match src {
+                        Src::None | Src::Both => {
+                            if filtered {
+                                indexed()
+                            } else {
+                                scan()
+                            }
+                        }
+                        Src::Vector => {
+                            if !filtered || approx {
+                                ann()
+                            } else {
+                                indexed()
+                            }
+                        }
+                        Src::Text => {
+                            if !filtered || approx {
+                                text_shape()
+                            } else {
+                                indexed()
+                            }
+                        }
+                    };
+
+                    assert_eq!(q.plan_shape(), expected, "plan_shape lied: {label}");
+                    test_probe::reset();
+                    let rows = q.run().unwrap();
+                    let served = test_probe::read();
+                    match &expected {
+                        PlanShape::AnnIndex { .. } => assert_eq!(
+                            (served.ann, served.text, served.indexed),
+                            (1, 0, 0),
+                            "ANN shape but served {served:?}: {label}"
+                        ),
+                        PlanShape::TextIndex { .. } => assert_eq!(
+                            (served.ann, served.text, served.indexed),
+                            (0, 1, 0),
+                            "text shape but served {served:?}: {label}"
+                        ),
+                        PlanShape::IndexedWindow { .. } => assert_eq!(
+                            (served.ann, served.text, served.indexed),
+                            (0, 0, 1),
+                            "indexed shape but served {served:?}: {label}"
+                        ),
+                        PlanShape::StreamingTopK | PlanShape::Scan { .. } => assert_eq!(
+                            (served.ann, served.text, served.indexed),
+                            (0, 0, 0),
+                            "no-index shape but served {served:?}: {label}"
+                        ),
+                    }
+                    assert!(!rows.is_empty(), "fixture row sanity: {label}");
+                }
+            }
+        }
+
+        // The streaming arm needs a collection with NO vector index.
+        let plain = seed();
+        let q = plain.collection("docs").query().vector(
+            "embedding",
+            vec![1.0, 0.0],
+            10,
+            Metric::Cosine,
+        );
+        assert_eq!(q.plan_shape(), PlanShape::StreamingTopK);
+        test_probe::reset();
+        assert!(!q.run().unwrap().is_empty());
+        assert_eq!(test_probe::read(), test_probe::Served::default());
+
+        // And one explain-vs-path cross-check through the instrumentation:
+        // the shape explain prints is the arm that actually served.
+        let q = db
+            .collection("docs")
+            .query()
+            .filter(field("category").eq(Value::Text("blog".into())))
+            .text("body", "rust", 10)
+            .approx();
+        assert!(q.explain().starts_with("text-index(body)"));
+        test_probe::reset();
+        assert!(!q.run().unwrap().is_empty());
+        assert_eq!(test_probe::read().text, 1);
     }
 
     #[test]

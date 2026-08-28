@@ -49,7 +49,7 @@ pub mod text;
 pub mod ttl;
 pub mod value;
 
-pub use builder::{QueryBuilder, ResultRow};
+pub use builder::{PlanShape, QueryBuilder, ResultRow};
 pub use db::{Collection, Db};
 pub use distance::Metric;
 pub use error::{Error, Result};

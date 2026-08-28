@@ -422,6 +422,20 @@ impl Db {
         self.fts_search_in(collection, field, query, k, self.store())
     }
 
+    /// Audit C3: cheap, execution-free probe for `plan_shape`/`explain` —
+    /// would [`Db::fts_search_in`] find a def it could serve? Mirrors that
+    /// function's registry gate exactly (a def is registered for
+    /// `(collection, field)` and is not an on-disk index mid-build —
+    /// in-memory defs are never building) without doing any of its work: no
+    /// lazy build, no postings scan, no snapshot.
+    pub(crate) fn text_index_consultable(&self, collection: &str, field: &str) -> bool {
+        let state = self.fts().lock().expect("fts lock");
+        matches!(
+            state.defs.get(&(collection.to_owned(), field.to_owned())),
+            Some((TextKind::InMemory, _)) | Some((TextKind::OnDisk, false))
+        )
+    }
+
     /// Snapshot-scoped twin of [`Db::fts_search`] (audit B3) for the reads
     /// that were ALWAYS query-snapshot reads: on-disk postings, corpus
     /// stats, and the caller's document fetches all read `reader`, so the

@@ -448,6 +448,29 @@ impl Db {
         self.ann_search_in(collection, field, query, k, metric, self.store())
     }
 
+    /// Audit C3: cheap, execution-free probe for `plan_shape`/`explain` —
+    /// would [`Db::ann_search_in`] find a def it could serve? Mirrors that
+    /// function's registry gate exactly (a def is registered for
+    /// `(collection, field)`, its metric matches, and it is not mid-build —
+    /// in-memory defs are never building, on-disk ones never serve while
+    /// building) without doing any of its work: no lazy build, no graph
+    /// search, no snapshot. What it cannot see is the run-time dimension
+    /// acceptance check (a graph that cannot accept the query's dimension
+    /// makes the search fall back to exact), so callers treat a `true` as
+    /// the advisory "the ANN arm will drive".
+    pub(crate) fn vector_index_consultable(
+        &self,
+        collection: &str,
+        field: &str,
+        metric: Metric,
+    ) -> bool {
+        let state = self.indexes().lock().expect("index lock");
+        matches!(
+            state.defs.get(&(collection.to_owned(), field.to_owned())),
+            Some(d) if d.metric == metric && !d.building
+        )
+    }
+
     /// Snapshot-scoped twin of [`Db::ann_search`] for the reads that were
     /// ALWAYS query-snapshot reads: the on-disk graph search, its def
     /// re-check, and the caller's document fetch/verify all read `reader`,
