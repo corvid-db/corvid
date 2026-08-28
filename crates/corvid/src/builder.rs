@@ -233,7 +233,9 @@ impl QueryBuilder<'_> {
     /// three classes (audit C4): values present and comparable (int/float
     /// numerically, text lexically) come first, in value order; values
     /// present but pairwise incomparable (bools, containers, NaN) come after
-    /// them, in key order; rows missing the field come last. Ties within a
+    /// them — ordered by the same kind tag first, so NaN (a numeric kind)
+    /// precedes the other incomparable kinds, which then fall to key order;
+    /// rows missing the field come last. Ties within a
     /// class break by key. `descending` reverses the value order WITHIN the
     /// comparable class only — the class order itself is fixed, so
     /// incomparable and missing values always sort last.
@@ -1610,11 +1612,13 @@ fn comparable_kind_tag(v: &Value) -> u8 {
 
 /// The order_by comparator shared by [`QueryBuilder::run_with`] and
 /// [`sort_by_field`] (audit C4): class first (`order_class` — fixed under
-/// `descending`), then the value comparison within the comparable class
-/// (reversed by `descending`; cross-kind pairs order by the kind tag —
-/// numbers before texts — so the class-0 comparison is a total order:
+/// `descending`), then the value comparison within the present-value branch
+/// (reversed by `descending`; pairs order by the kind tag — numbers before
+/// texts — before their value comparison, so cross-kind pairs are total:
 /// the old cross-kind key-order fallback admitted intransitive cycles, on
-/// which a sort may panic), then key.
+/// which a sort may panic; within the incomparable class the same tag puts
+/// NaN ahead of the mutually-unordered kinds, which fall to key order),
+/// then key.
 fn compare_by_field_class(
     va: Option<&Value>,
     vb: Option<&Value>,

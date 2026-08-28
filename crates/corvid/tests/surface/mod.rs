@@ -570,23 +570,67 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::ResultRow",
         "SELECT shaping",
-        &["filters_smoke_field_eq_selects_matching_rows"],
+        &[
+            "filters_smoke_field_eq_selects_matching_rows",
+            "queries_result_row_fields_per_query_shape",
+            "queries_run_select_only_returns_all_in_key_order",
+            "queries_select_preserves_rank_scores_and_filter_visibility",
+        ],
     ),
-    row("corvid::PlanShape", "Lifecycle", &[]),
-    row("corvid::PlanShape::AnnIndex", "Lifecycle", &[]),
-    row("corvid::PlanShape::TextIndex", "Lifecycle", &[]),
-    row("corvid::PlanShape::IndexedWindow", "Lifecycle", &[]),
-    row("corvid::PlanShape::StreamingTopK", "Lifecycle", &[]),
-    row("corvid::PlanShape::Scan", "Lifecycle", &[]),
+    row(
+        "corvid::PlanShape",
+        "Lifecycle",
+        &[
+            "filters_indexed_vs_scan_scalar_predicates",
+            "queries_plan_shape_indexed_window_kinds_and_explain_families",
+        ],
+    ),
+    row(
+        "corvid::PlanShape::AnnIndex",
+        "Lifecycle",
+        &["queries_plan_shape_ann_index_for_single_vector_source"],
+    ),
+    row(
+        "corvid::PlanShape::TextIndex",
+        "Lifecycle",
+        &["queries_plan_shape_text_index_for_single_text_source"],
+    ),
+    row(
+        "corvid::PlanShape::IndexedWindow",
+        "Lifecycle",
+        &[
+            "filters_indexed_vs_scan_scalar_predicates",
+            "queries_plan_shape_indexed_window_kinds_and_explain_families",
+        ],
+    ),
+    row(
+        "corvid::PlanShape::StreamingTopK",
+        "Lifecycle",
+        &["queries_plan_shape_streaming_topk_without_index"],
+    ),
+    row(
+        "corvid::PlanShape::Scan",
+        "Lifecycle",
+        &[
+            "filters_indexed_vs_scan_scalar_predicates",
+            "queries_plan_shape_indexed_window_kinds_and_explain_families",
+        ],
+    ),
     row(
         "corvid::QueryBuilder",
         "SELECT shaping",
-        &["filters_smoke_field_eq_selects_matching_rows"],
+        &[
+            "filters_smoke_field_eq_selects_matching_rows",
+            "queries_run_select_only_returns_all_in_key_order",
+        ],
     ),
     row(
         "corvid::Collection::query",
         "SELECT shaping",
-        &["filters_smoke_field_eq_selects_matching_rows"],
+        &[
+            "filters_smoke_field_eq_selects_matching_rows",
+            "queries_run_select_only_returns_all_in_key_order",
+        ],
     ),
     row(
         "corvid::QueryBuilder::filter",
@@ -611,19 +655,48 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::QueryBuilder::limit",
         "SELECT shaping",
-        &["queries_smoke_order_by_limit_select_shapes_rows"],
+        &[
+            "queries_smoke_order_by_limit_select_shapes_rows",
+            "queries_limit_zero_one_exact_and_over_match_count",
+            "queries_order_by_limit_offset_window_after_ordering",
+            "queries_limit_offset_on_empty_collection",
+        ],
     ),
-    row("corvid::QueryBuilder::offset", "SELECT shaping", &[]),
+    row(
+        "corvid::QueryBuilder::offset",
+        "SELECT shaping",
+        &[
+            "filters_filter_then_limit_offset_pagination",
+            "queries_offset_boundaries_and_full_range_pagination_loop",
+            "queries_order_by_limit_offset_window_after_ordering",
+            "queries_limit_offset_on_empty_collection",
+        ],
+    ),
     row(
         "corvid::QueryBuilder::order_by",
         "SELECT shaping",
-        &["queries_smoke_order_by_limit_select_shapes_rows"],
+        &[
+            "queries_smoke_order_by_limit_select_shapes_rows",
+            "queries_order_by_asc_desc_over_int_float_and_text",
+            "queries_order_by_class_rule_incomparable_then_missing_last_both_directions",
+            "queries_order_by_mixed_kind_field_groups_numbers_before_texts",
+            "queries_order_by_limit_offset_window_after_ordering",
+            "queries_order_by_with_filters_orders_only_matches",
+            "queries_order_by_indexed_vs_scan_equivalent",
+        ],
     ),
     row("corvid::QueryBuilder::approx", "Vector search", &[]),
     row(
         "corvid::QueryBuilder::select",
         "SELECT shaping",
-        &["queries_smoke_order_by_limit_select_shapes_rows"],
+        &[
+            "queries_smoke_order_by_limit_select_shapes_rows",
+            "queries_select_single_multiple_and_nested_dotted_paths",
+            "queries_select_missing_fields_omitted_and_duplicates_collapse",
+            "queries_select_empty_field_list_yields_empty_map_for_map_docs",
+            "queries_select_non_map_documents_pass_through_unchanged",
+            "queries_select_preserves_rank_scores_and_filter_visibility",
+        ],
     ),
     row(
         "corvid::QueryBuilder::count",
@@ -631,6 +704,7 @@ static MANIFEST: &[Row] = &[
         &[
             "aggregations_smoke_sum_group_count_and_count",
             "mutations_delete_removes_state_from_get_scan_and_count",
+            "queries_count_with_filter_and_after_mutations",
         ],
     ),
     row(
@@ -650,14 +724,36 @@ static MANIFEST: &[Row] = &[
     row("corvid::QueryBuilder::group_sum", "Aggregations", &[]),
     row("corvid::QueryBuilder::group_avg", "Aggregations", &[]),
     row("corvid::QueryBuilder::plan", "Lifecycle", &[]),
-    row("corvid::QueryBuilder::plan_shape", "Lifecycle", &[]),
-    row("corvid::QueryBuilder::explain", "Lifecycle", &[]),
+    row(
+        "corvid::QueryBuilder::plan_shape",
+        "Lifecycle",
+        &[
+            "filters_indexed_vs_scan_scalar_predicates",
+            "queries_plan_shape_ann_index_for_single_vector_source",
+            "queries_plan_shape_text_index_for_single_text_source",
+            "queries_plan_shape_indexed_window_kinds_and_explain_families",
+            "queries_plan_shape_streaming_topk_without_index",
+            "queries_order_by_indexed_vs_scan_equivalent",
+        ],
+    ),
+    row(
+        "corvid::QueryBuilder::explain",
+        "Lifecycle",
+        &[
+            "queries_plan_shape_ann_index_for_single_vector_source",
+            "queries_plan_shape_text_index_for_single_text_source",
+            "queries_plan_shape_indexed_window_kinds_and_explain_families",
+            "queries_plan_shape_streaming_topk_without_index",
+        ],
+    ),
     row(
         "corvid::QueryBuilder::run",
         "SELECT shaping",
         &[
             "filters_smoke_field_eq_selects_matching_rows",
             "mutations_update_maintains_scalar_index",
+            "queries_run_on_empty_collection_returns_empty_vec",
+            "queries_run_select_only_returns_all_in_key_order",
         ],
     ),
     // ===== db.rs — database and collection handles =====
@@ -719,13 +815,21 @@ static MANIFEST: &[Row] = &[
             "mutations_compare_and_set_maintains_scalar_index",
         ],
     ),
-    row("corvid::Collection::for_each_doc", "SELECT shaping", &[]),
+    row(
+        "corvid::Collection::for_each_doc",
+        "SELECT shaping",
+        &[
+            "queries_for_each_doc_visits_key_order_and_early_stops_on_false",
+            "queries_for_each_doc_on_empty_collection_visits_nothing",
+        ],
+    ),
     row(
         "corvid::Collection::len",
         "SELECT shaping",
         &[
             "mutations_smoke_insert_roundtrips",
             "mutations_insert_roundtrips_every_value_variant",
+            "queries_len_and_is_empty_boundaries",
         ],
     ),
     row(
@@ -734,6 +838,7 @@ static MANIFEST: &[Row] = &[
         &[
             "mutations_smoke_insert_roundtrips",
             "mutations_insert_roundtrips_every_value_variant",
+            "queries_len_and_is_empty_boundaries",
         ],
     ),
     row(
@@ -789,11 +894,34 @@ static MANIFEST: &[Row] = &[
         &[
             "mutations_delete_removes_state_from_get_scan_and_count",
             "mutations_insert_overwrites_and_accepts_empty_key_and_empty_map",
+            "queries_scan_returns_pairs_in_key_order",
         ],
     ),
-    row("corvid::Collection::page", "SELECT shaping", &[]),
-    row("corvid::Collection::page_where", "SELECT shaping", &[]),
-    row("corvid::db::Page", "SELECT shaping", &[]),
+    row(
+        "corvid::Collection::page",
+        "SELECT shaping",
+        &[
+            "queries_page_cursor_semantics",
+            "queries_page_after_empty_bytes_skips_only_the_empty_key",
+            "queries_page_over_empty_collection_yields_empty_page_with_no_cursor",
+        ],
+    ),
+    row(
+        "corvid::Collection::page_where",
+        "SELECT shaping",
+        &[
+            "queries_page_where_predicate_and_full_walk",
+            "queries_page_over_empty_collection_yields_empty_page_with_no_cursor",
+        ],
+    ),
+    row(
+        "corvid::db::Page",
+        "SELECT shaping",
+        &[
+            "queries_page_cursor_semantics",
+            "queries_page_where_predicate_and_full_walk",
+        ],
+    ),
     // ===== store.rs — the byte KV layer =====
     row("corvid::Store", "Lifecycle", &[]),
     row("corvid::Store::open", "Lifecycle", &[]),
@@ -903,7 +1031,10 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Collection::create_geo_index",
         "Schema (ALTER)",
-        &[],
+        &[
+            "filters_indexed_vs_scan_geo_window",
+            "queries_plan_shape_indexed_window_kinds_and_explain_families",
+        ],
     ),
     // ===== graph.rs — edges =====
     row(
@@ -959,7 +1090,7 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Collection::create_vector_index",
         "Schema (ALTER)",
-        &[],
+        &["queries_plan_shape_ann_index_for_single_vector_source"],
     ),
     row(
         "corvid::Collection::create_vector_index_quantized",
@@ -985,7 +1116,7 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Collection::create_text_index",
         "Schema (ALTER)",
-        &[],
+        &["queries_plan_shape_text_index_for_single_text_source"],
     ),
     row(
         "corvid::Collection::create_text_index_ondisk",
@@ -1001,12 +1132,16 @@ static MANIFEST: &[Row] = &[
             "mutations_compare_and_set_maintains_scalar_index",
             "mutations_delete_where_exact_with_scalar_index_present",
             "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
+            "queries_order_by_indexed_vs_scan_equivalent",
         ],
     ),
     row(
         "corvid::Collection::create_compound_index",
         "Schema (ALTER)",
-        &[],
+        &[
+            "filters_indexed_vs_scan_compound_prefix",
+            "queries_plan_shape_indexed_window_kinds_and_explain_families",
+        ],
     ),
     // ===== schema.rs — declared schemas =====
     row(
