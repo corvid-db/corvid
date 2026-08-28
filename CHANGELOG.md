@@ -71,6 +71,15 @@ format and API may change without backward-compatibility guarantees.
   third of the index (`dead * 2 > live`), checked on the write path after the
   commit: expect a synchronous rebuild burst (write amplification) when a
   write crosses the threshold. (audit B5)
+- The on-disk vector search's over-fetch is now scaled by the tombstone count
+  (`ef_search.max(k) + dead`, mirroring the in-memory rule) instead of a
+  fixed 2×: between compactions, recall no longer decays as tombstones
+  accumulate — a tombstone-heavy graph widens its search frontier
+  accordingly. (audit B5)
+- `Db::dump`'s TTL section enumerates the persisted `__ttl__*` namespaces
+  from the dump snapshot itself (catalog walk) instead of the in-memory
+  session marker, so a marker lagging a concurrent TTL commit can no longer
+  omit persisted entries from the dump.
 - Re-registering an on-disk vector index — for any parameter change or none —
   now always rebuilds from scratch in one transactional reset; same-parameter
   re-creation no longer resumes a partial backfill. (audit A5)

@@ -687,14 +687,13 @@ impl Db {
     /// Audit B5: compact an on-disk HNSW index when tombstones dominate.
     ///
     /// On-disk HNSW never rewrites graph topology on delete — nodes are
-    /// tombstoned and search merely filters them, with a fixed 2× over-fetch
-    /// — so a large dead fraction progressively crowds live results out of
-    /// the search frontier (recall degrades; results stay *correct*). The
-    /// trigger is `dead * 2 > live` with `live = count − dead` — i.e. dead
-    /// exceeds one third of total nodes — deliberately EARLIER than the
-    /// in-memory graph's dead-majority (>50%) rule, because the disk search's
-    /// over-fetch is fixed (not dead-scaled) and recall decays long before
-    /// tombstones reach a majority. Crossing it runs the compaction cycle: the Task-2 registration
+    /// tombstoned and search merely filters them, over-fetching its frontier
+    /// by the dead count — so results stay *correct* at any dead fraction,
+    /// but each search's frontier (and the IO it touches) grows with `dead`.
+    /// The trigger is `dead * 2 > live` with `live = count − dead` — i.e. dead
+    /// exceeds one third of total nodes — EARLIER than the in-memory graph's
+    /// dead-majority (>50%) rule, bounding that per-search cost before it
+    /// rivals a rebuild. Crossing it runs the compaction cycle: the Task-2 registration
     /// shape on the same def (one transaction: clear the namespace, re-persist
     /// the PQ codebook, install `Building { cursor: [] }`) followed by the
     /// atomic-backfill driver re-reading the documents, then completion.
@@ -972,15 +971,12 @@ impl Collection<'_> {
         self.db()
             .register_vector_index(self.name(), field, metric, quant, IndexKind::OnDisk)?;
         // Registration always installs a fresh Building cursor over a reset
-        // namespace (audit A5), so the backfill below always starts at the
-        // beginning; read_building_cursor simply recovers that fresh cursor.
-        let cursor = crate::index_build::read_building_cursor(
-            self.db().store(),
-            INDEX_DEFS,
-            &def_key(self.name(), field),
-        )?;
-        self.db()
-            .resume_vector(self.name(), field, &cursor.unwrap_or_default())
+        // namespace (audit A5), so the backfill always starts from the
+        // beginning — no need to re-read the def row for a cursor this
+        // transaction just wrote (`vec![]` IS the fresh cursor; a crash
+        // between registration and backfill resumes from scratch, same
+        // semantics).
+        self.db().resume_vector(self.name(), field, &[])
     }
 
     /// Create an on-disk HNSW index storing **product-quantized** vectors: a
@@ -1038,7 +1034,9 @@ impl Collection<'_> {
         let _guard = self.db().index_resume().lock().expect("index resume lock");
         // Register Building with the trained codebook, then run the atomic
         // backfill through the shared driver from the fresh cursor the
-        // registration just installed (over a reset namespace, audit A5).
+        // registration just installed (over a reset namespace, audit A5) —
+        // `vec![]` is that cursor; re-reading the def row would only
+        // recover what this transaction just wrote.
         self.db().register_vector_index_inner(
             self.name(),
             field,
@@ -1047,13 +1045,7 @@ impl Collection<'_> {
             IndexKind::OnDiskPq,
             Some(pq),
         )?;
-        let cursor = crate::index_build::read_building_cursor(
-            self.db().store(),
-            INDEX_DEFS,
-            &def_key(self.name(), field),
-        )?;
-        self.db()
-            .resume_vector(self.name(), field, &cursor.unwrap_or_default())
+        self.db().resume_vector(self.name(), field, &[])
     }
 }
 
@@ -2168,8 +2160,9 @@ mod tests {
     /// compaction — the dead-fraction trigger resets the namespace and the
     /// driver re-backfills only the survivors — so the graph ends freshly
     /// compacted (node rows == live docs) and search sits at parity with an
-    /// unindexed twin, instead of the uncompacted behavior where tombstones
-    /// crowd live results out of the fixed-over-fetch frontier.
+    /// unindexed twin, instead of the uncompacted behavior where the
+    /// dead-scaled frontier carries ~10× its live width (and the stale
+    /// topology still misses neighbours).
     #[test]
     fn mass_delete_compacts_and_restores_recall() {
         let db = Db::open_in_memory().unwrap();
@@ -2273,6 +2266,137 @@ mod tests {
             "compaction must leave one node per live doc"
         );
         assert_eq!(vector_def_building(&db, "docs", "embedding"), Some(false));
+    }
+
+    /// A deterministic 8-dim corpus of 34 well-separated clusters: cluster 0
+    /// is the "hole" (660 docs), the rest are 40-doc fillers. Deleting 640 of
+    /// the hole's docs leaves each survivor's true neighbourhood ~97% dead
+    /// while the global fraction stays BELOW the compaction trigger — the
+    /// rest state between crossings (dead ≈ live/2, tombstones persist).
+    fn holed_corpus() -> (Vec<Vec<f32>>, Vec<usize>, Vec<usize>) {
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f32 / (1u64 << 53) as f32
+        };
+        const DIM: usize = 8;
+        let centers: Vec<Vec<f32>> = (0..34)
+            .map(|_| (0..DIM).map(|_| next() * 100.0).collect())
+            .collect();
+        let mut data: Vec<Vec<f32>> = Vec::new();
+        let mut hole: Vec<usize> = Vec::new();
+        for (ci, center) in centers.iter().enumerate() {
+            let count = if ci == 0 { 660 } else { 40 };
+            for _ in 0..count {
+                let v: Vec<f32> = (0..DIM).map(|d| center[d] + (next() - 0.5) * 6.0).collect();
+                if ci == 0 {
+                    hole.push(data.len());
+                }
+                data.push(v);
+            }
+        }
+        // Keep every 33rd hole doc (20 survivors); the other 640 get deleted.
+        let survivors: Vec<usize> = hole
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| j % 33 == 0)
+            .map(|(_, &idx)| idx)
+            .collect();
+        let doomed: Vec<usize> = hole
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| j % 33 != 0)
+            .map(|(_, &idx)| idx)
+            .collect();
+        (data, survivors, doomed)
+    }
+
+    /// Audit B5 recall completion: between compaction crossings the disk
+    /// search's over-fetch is dead-scaled (`ef_search.max(k) + dead`,
+    /// mirroring the in-memory `BuiltIndex::search`'s `k + dead`), so a
+    /// rest-state graph whose queries' neighbourhoods are tombstone-heavy
+    /// (dead ≈ live/2 globally, just under the `dead * 2 > live` trigger)
+    /// still returns a FULL k live results with recall ≥ 0.75 against
+    /// exact. Under the fixed 2× over-fetch the same state measures ≈0.49
+    /// with short result lists on every probe: the frontier physically
+    /// cannot hold k live nodes when hundreds of dead ones rank ahead.
+    #[test]
+    fn dead_scaled_overfetch_holds_recall_between_crossings() {
+        let (data, survivors, doomed) = holed_corpus();
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for (i, v) in data.iter().enumerate() {
+            c.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                .unwrap();
+        }
+        c.create_vector_index_ondisk("embedding", Metric::L2)
+            .unwrap();
+        for &i in &doomed {
+            c.delete(format!("k{i}").as_bytes()).unwrap();
+        }
+        let ns = disk_hnsw::namespace("docs", "embedding");
+        // Precondition: no compaction ran — every node row survives as a
+        // tombstone, and the dead/live counts are exactly doomed/remaining.
+        let (dead, live) = disk_hnsw::dead_fraction(db.store(), &ns).unwrap().unwrap();
+        assert_eq!(dead as usize, doomed.len());
+        assert_eq!(live as usize, data.len() - doomed.len());
+        assert!(
+            (dead as u64) * 2 <= live,
+            "test shape must stay below the compaction trigger"
+        );
+        let node_rows = db
+            .store()
+            .scan(&ns)
+            .unwrap()
+            .into_iter()
+            .filter(|(key, _)| key.first() == Some(&b'n'))
+            .count();
+        assert_eq!(
+            node_rows,
+            data.len(),
+            "tombstones must persist below the trigger"
+        );
+
+        // Recall vs exact over the survivors (exact computed straight from
+        // the corpus, across every live doc), k = 10 like the wave-3
+        // compaction corpus.
+        let live_idx: Vec<usize> = {
+            let doomed_set: std::collections::HashSet<usize> = doomed.iter().copied().collect();
+            (0..data.len())
+                .filter(|i| !doomed_set.contains(i))
+                .collect()
+        };
+        let k = 10usize;
+        let mut overlap_sum = 0.0f64;
+        for &i in &survivors {
+            let q = &data[i];
+            let mut exact: Vec<(f32, usize)> = live_idx
+                .iter()
+                .map(|&j| (Metric::L2.distance(q, &data[j]), j))
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let want: std::collections::HashSet<usize> =
+                exact.into_iter().take(k).map(|(_, j)| j).collect();
+            let got = c.vector_search("embedding", q, k, Metric::L2).unwrap();
+            assert_eq!(got.len(), k, "short result list for query k{i}");
+            let hits = got
+                .iter()
+                .filter(|h| {
+                    let idx = String::from_utf8(h.key.clone()).unwrap()[1..]
+                        .parse::<usize>()
+                        .unwrap();
+                    want.contains(&idx)
+                })
+                .count();
+            overlap_sum += hits as f64 / k as f64;
+        }
+        let overlap = overlap_sum / survivors.len() as f64;
+        assert!(
+            overlap >= 0.75,
+            "between-crossings recall {overlap} too low (dead-scaled over-fetch)"
+        );
     }
 
     /// Audit B5 pin: a single delete stays far below the dead-fraction

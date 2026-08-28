@@ -694,8 +694,13 @@ pub(crate) fn search(
             cur = c.id;
         }
     }
-    // Over-fetch so tombstoned hits don't crowd out live ones.
-    let want = ef_search.max(k) * 2;
+    // Over-fetch so tombstoned hits don't crowd out live ones: DEAD-SCALED
+    // (audit B5), mirroring the in-memory rule (`k + dead`). The frontier
+    // holds `ef_search.max(k) + dead` entries, so even if every dead node
+    // ranks ahead of the live ones, `k` live nodes remain among the
+    // candidates — recall no longer decays as tombstones accumulate (the
+    // compaction trigger instead bounds the cost this width adds).
+    let want = ef_search.max(k) + meta.dead as usize;
     let w = search_layer_r(reader, ns, p, &mut cache, query, &[cur], want, 0)?;
 
     let mut out = Vec::new();

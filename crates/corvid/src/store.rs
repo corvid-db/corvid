@@ -453,6 +453,10 @@ impl Store {
 /// its own deletes, and each page's resume point sits strictly past the keys
 /// just removed, so nothing is materialized and no key survives. An unknown
 /// or already-empty collection is a no-op.
+///
+/// The maintained count is adjusted once per PAGE (delta = the page's length,
+/// captured before the page's keys are deleted) instead of once per key, so
+/// clearing N keys costs ⌈N/PAGE⌉ META read-modify-writes, not N.
 pub(crate) fn clear_in_txn(tx: &mut WriteBatch<'_>, collection: &str) -> Result<()> {
     const PAGE: usize = 2048;
     let mut start: Vec<u8> = Vec::new();
@@ -461,8 +465,9 @@ pub(crate) fn clear_in_txn(tx: &mut WriteBatch<'_>, collection: &str) -> Result<
         let Some((last, _)) = page.last().cloned() else {
             break;
         };
+        tx.adjust_count(collection, -(page.len() as i64))?;
         for (key, _) in &page {
-            tx.delete(collection, key)?;
+            tx.delete_uncounted(collection, key)?;
         }
         // Resume strictly past everything deleted above (the documented
         // cursor-pagination convention: `last_key` + trailing `0` byte).
@@ -511,18 +516,23 @@ impl WriteBatch<'_> {
 
     /// Remove `key` from `collection`. Returns whether a value was removed.
     pub fn delete(&mut self, collection: &str, key: &[u8]) -> Result<bool> {
-        // Resolve without creating: deleting from an unknown collection is a no-op.
-        let Some(id) = self.lookup_id(collection)? else {
-            return Ok(false);
-        };
-        let removed = {
-            let mut records = self.txn.open_table(RECORDS)?;
-            records.remove(physical_key(id, key).as_slice())?.is_some()
-        };
+        let removed = self.delete_uncounted(collection, key)?;
         if removed {
             self.adjust_count(collection, -1)?;
         }
         Ok(removed)
+    }
+
+    /// Remove `key` without touching the maintained count, for callers that
+    /// adjust the count themselves in batch ([`clear_in_txn`]). Returns
+    /// whether a value was removed.
+    fn delete_uncounted(&mut self, collection: &str, key: &[u8]) -> Result<bool> {
+        // Resolve without creating: deleting from an unknown collection is a no-op.
+        let Some(id) = self.lookup_id(collection)? else {
+            return Ok(false);
+        };
+        let mut records = self.txn.open_table(RECORDS)?;
+        Ok(records.remove(physical_key(id, key).as_slice())?.is_some())
     }
 
     /// Adjust the maintained record count for `collection` by `delta`.
@@ -1380,6 +1390,9 @@ mod tests {
 
     /// The clear pages through large collections (more than one page) and
     /// leaves nothing behind, including keys sorting past the page boundary.
+    /// The maintained count must land exactly on 0 — the per-PAGE batched
+    /// adjustment (delta = page length) replaces the per-key one — and stay
+    /// exact for writes after the clear.
     #[test]
     fn clear_in_txn_pages_large_collections() {
         let s = mem();
@@ -1394,6 +1407,11 @@ mod tests {
         s.transaction(|tx| clear_in_txn(tx, "docs")).unwrap();
         assert!(s.scan("docs").unwrap().is_empty());
         assert_eq!(s.count("docs").unwrap(), 0);
+        // The count stays honest for writes after a batched clear.
+        s.put("docs", b"x", b"1").unwrap();
+        s.put("docs", b"y", b"2").unwrap();
+        s.put("docs", b"z", b"3").unwrap();
+        assert_eq!(s.count("docs").unwrap(), 3);
     }
 
     /// Clearing an unknown or empty collection is a no-op, so registering an

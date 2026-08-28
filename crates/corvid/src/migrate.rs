@@ -276,8 +276,9 @@ impl Db {
             }
             w.write_all(&buf)?;
 
-            // TTLs (same snapshot: through `r`).
-            let ttls = self.ttl_specs_in(r)?;
+            // TTLs (same snapshot: through `r`, enumerating the persisted
+            // `__ttl__*` namespaces from the catalog on that snapshot).
+            let ttls = crate::ttl::ttl_specs_in(r)?;
             let mut buf = Vec::new();
             put_u64(&mut buf, ttls.len());
             for (coll, key, expiry) in &ttls {
@@ -570,6 +571,37 @@ mod tests {
         // Reopen the freshly loaded DB: data and index defs persisted.
         let dst = Db::open(&dst_path).unwrap();
         assert_eq!(dst.collection("docs").len().unwrap(), 21);
+    }
+
+    /// A dump in a FRESH session (reopened, no TTL-touching write since
+    /// open) must capture the persisted TTL entries: reopen → dump → load
+    /// into a fresh db, and the expiry survives — `ttl()` round-trips and a
+    /// purge at the timestamp removes the doc. Pins the enumeration over
+    /// persisted `__ttl__*` namespaces end to end.
+    #[test]
+    fn fresh_session_dump_carries_persisted_ttls() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("src.db");
+        {
+            let db = Db::open(&src_path).unwrap();
+            db.collection("docs")
+                .insert_with_ttl(b"k", &doc(7), 4242)
+                .unwrap();
+        }
+        // Fresh session: reopen, then dump with no TTL write in between.
+        let db = Db::open(&src_path).unwrap();
+        let mut bytes = Vec::new();
+        db.dump(&mut bytes).unwrap();
+
+        let dst = Db::open_in_memory().unwrap();
+        dst.load(&bytes[..]).unwrap();
+        let c = dst.collection("docs");
+        assert_eq!(c.get(b"k").unwrap(), Some(doc(7)));
+        assert_eq!(c.ttl(b"k").unwrap(), Some(4242));
+        // The restored expiry is honored: a purge at the timestamp removes
+        // exactly the one doc.
+        assert_eq!(c.purge_expired(4242).unwrap(), 1);
+        assert_eq!(c.get(b"k").unwrap(), None);
     }
 
     #[test]

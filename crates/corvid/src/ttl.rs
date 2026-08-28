@@ -24,8 +24,12 @@ const TAG_IDX: u8 = 0x01;
 /// correctness (audit B2): plain writes decide expiry maintenance inside
 /// their transaction by probing the `__ttl__<collection>` namespace itself,
 /// so a marker that lags a concurrent commit cannot skip a needed clear.
-/// The marker remains a session cache (e.g. for [`Db::ttl_specs_in`]); the
-/// persistent form is always the namespace, rebuilt on open.
+/// No read path consults it either: dump enumerates the persisted
+/// `__ttl__*` namespaces on its own snapshot ([`ttl_specs_in`]), so the
+/// durable namespaces are the only source of truth. The marker remains a
+/// session-local bookkeeping record (maintained on every TTL-writing commit
+/// and rebuilt on open), retained so future session-scoped fast paths have
+/// a cache to consult.
 #[derive(Default)]
 pub(crate) struct TtlState {
     collections: HashSet<String>,
@@ -136,30 +140,6 @@ impl Db {
             .insert(collection.to_owned());
     }
 
-    /// All per-record expiries as `(collection, doc_key, expires_at)` (dump).
-    /// Reads the TTL namespaces through `reader`, so a dump enumerates them
-    /// on the same snapshot as its records (audit B8).
-    pub(crate) fn ttl_specs_in(
-        &self,
-        reader: &dyn crate::store::SnapshotReader,
-    ) -> Result<Vec<(String, Vec<u8>, i64)>> {
-        let collections: Vec<String> = {
-            let state = self.ttl().lock().expect("ttl lock");
-            state.collections.iter().cloned().collect()
-        };
-        let mut out = Vec::new();
-        for coll in collections {
-            let ns = namespace(&coll);
-            // Forward entries: [0x00] ‖ doc_key -> enc_ts.
-            for (key, value) in reader.scan_prefix(&ns, &[TAG_FWD])? {
-                if key.len() > 1 && value.len() == 8 {
-                    out.push((coll.clone(), key[1..].to_vec(), dec_ts(&value)));
-                }
-            }
-        }
-        Ok(out)
-    }
-
     /// `key`'s expiry timestamp, if one is set.
     pub(crate) fn ttl_of(&self, collection: &str, key: &[u8]) -> Result<Option<i64>> {
         let ns = namespace(collection);
@@ -257,6 +237,33 @@ impl Db {
         }
         Ok(purged)
     }
+}
+
+/// All per-record expiries as `(collection, doc_key, expires_at)` (dump).
+///
+/// Enumerates the TTL collections from the READER's catalog — stripping the
+/// `__ttl__` prefixes, mirroring [`Db::load_ttl_collections`] — and reads
+/// each namespace's forward entries through the same reader, so the whole
+/// enumeration shares the caller's snapshot (audit B8). The in-memory
+/// session marker is deliberately not consulted: it is a cache that can lag
+/// a concurrent commit (the mark lands after the transaction), so deriving
+/// the collection list from it could silently omit persisted entries.
+pub(crate) fn ttl_specs_in(
+    reader: &dyn crate::store::SnapshotReader,
+) -> Result<Vec<(String, Vec<u8>, i64)>> {
+    let mut out = Vec::new();
+    for name in reader.collections()? {
+        let Some(coll) = name.strip_prefix("__ttl__") else {
+            continue;
+        };
+        // Forward entries: [0x00] ‖ doc_key -> enc_ts.
+        for (key, value) in reader.scan_prefix(&name, &[TAG_FWD])? {
+            if key.len() > 1 && value.len() == 8 {
+                out.push((coll.to_owned(), key[1..].to_vec(), dec_ts(&value)));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn remove_in_txn(tx: &mut crate::store::WriteBatch<'_>, ns: &str, doc_key: &[u8]) -> Result<()> {
@@ -476,6 +483,30 @@ mod tests {
         // A purge at the old timestamp finds nothing due and keeps the doc.
         assert_eq!(c.purge_expired(1000).unwrap(), 0);
         assert_eq!(c.get(b"k").unwrap(), Some(rec(2)));
+    }
+
+    /// `ttl_specs_in` enumerates the persisted `__ttl__*` namespaces from the
+    /// reader's catalog — NOT the in-memory session marker. With the marker
+    /// emptied (the lagged/raced state: entries committed, marker not yet
+    /// updated), the dump enumeration must still see every persisted expiry.
+    #[test]
+    fn ttl_specs_enumerate_persisted_namespaces_not_the_marker() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert_with_ttl(b"a", &rec(1), 100).unwrap();
+        c.insert_with_ttl(b"b", &rec(2), 200).unwrap();
+        c.insert(b"plain", &rec(3)).unwrap(); // no TTL on this one
+        // Forge the lagged marker: committed TTL entries, empty marker.
+        db.ttl().lock().unwrap().collections.clear();
+        let mut specs = db.store().read(|r| ttl_specs_in(r)).unwrap();
+        specs.sort();
+        assert_eq!(
+            specs,
+            vec![
+                ("docs".to_owned(), b"a".to_vec(), 100),
+                ("docs".to_owned(), b"b".to_vec(), 200),
+            ]
+        );
     }
 
     /// A purge must never delete a record whose expiry changed after the
