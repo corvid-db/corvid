@@ -364,7 +364,26 @@ impl Db {
                             }
                             let doc_key = &k[enc.len()..];
                             if doc_key != key {
-                                return Err(conflict_msg());
+                                // The bucket key is the order-preserving f64
+                                // encoding, which collapses numerically-equal
+                                // but distinct stored values (Int(7) vs
+                                // Float(7.0); f64-rounded huge ints) that the
+                                // engine-wide storage equality keeps apart —
+                                // re-check the actual stored value before
+                                // rejecting, so this index path agrees with the
+                                // scan path (and with compare_and_set).
+                                let conflict = match tx.get(collection, doc_key)? {
+                                    Some(bytes) => Value::decode(&bytes)?
+                                        .get_path(&f.name)
+                                        .is_some_and(|v| unique_value_eq(v, value)),
+                                    // No document behind the entry (a row
+                                    // deleted earlier in this same
+                                    // transaction): not a conflict.
+                                    None => false,
+                                };
+                                if conflict {
+                                    return Err(conflict_msg());
+                                }
                             }
                             next = Some(k.clone());
                         }

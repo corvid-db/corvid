@@ -491,14 +491,31 @@ fn insert_node_in_txn(
     // dimension is not indexed (matching the exact-search paths, which skip
     // mismatched documents). If an existing key's vector changes shape, its
     // old node is tombstoned so nothing stale competes in searches.
+    //
+    // The tombstone is applied INLINE against the in-flight `meta`/`cache`:
+    // `delete_in_txn` re-reads the PERSISTED meta row to bump `dead`, and a
+    // backfill page only persists meta at its end — mid-page that row is
+    // stale (or absent), so re-syncing from it would clobber the batch's
+    // accumulated `count`/`entry`/`dim` (node-id reuse, dimension re-pinning:
+    // a page holding mixed dimensions corrupted the whole index).
     match meta.dim {
         None => meta.dim = Some(vector.len() as u32),
         Some(d) if d as usize != vector.len() => {
-            delete_in_txn(tx, ns, p, doc_key)?;
-            // delete_in_txn just did its own meta read-modify-write (dead
-            // increment); re-sync so the caller's final meta put doesn't
-            // clobber it with this stale copy.
-            *meta = read_meta(tx, ns)?;
+            // Same semantics as `delete_in_txn`: a keymap hit tombstones the
+            // node and counts one dead (saturating); a corrupt keymap value
+            // is dropped without touching a node or counting dead.
+            if let Some(old_bytes) = tx.get(ns, &keymap_key(doc_key))?
+                && let Some(old_id) = decode_keymap(&old_bytes)
+            {
+                if load(tx, ns, cache, p, old_id)?.is_some()
+                    && let Some(node) = cache.nodes.get_mut(&old_id)
+                {
+                    Rc::make_mut(node).deleted = true;
+                    cache.dirty.insert(old_id);
+                }
+                meta.dead = meta.dead.saturating_add(1);
+            }
+            tx.delete(ns, &keymap_key(doc_key))?;
             return Ok(());
         }
         _ => {}

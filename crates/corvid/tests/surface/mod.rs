@@ -591,7 +591,7 @@ static MANIFEST: &[Row] = &[
         "corvid::Error",
         "Lifecycle",
         &[
-            "schema_smoke_set_schema_rejects_bad_documents",
+            "schema_unique_insert_conflict_rejects_with_exact_variant_and_stores_nothing",
             "mutations_insert_rejects_reserved_and_invalid_collection_names",
         ],
     ),
@@ -609,11 +609,13 @@ static MANIFEST: &[Row] = &[
         "Schema (ALTER)",
         // Shared variant (conformance convention 1): raised by every write
         // path's writability gate — the mutation tests cover the document
-        // paths, the graph test covers link/link_weighted/unlink.
+        // paths, the graph test covers link/link_weighted/unlink, and the
+        // schema test covers every index-creation family.
         &[
             "mutations_insert_rejects_reserved_and_invalid_collection_names",
             "mutations_write_paths_reject_reserved_and_invalid_collection_names",
             "graph_link_unlink_reject_reserved_and_invalid_collection_names",
+            "schema_index_creation_validates_names_across_families",
         ],
     ),
     row(
@@ -621,11 +623,13 @@ static MANIFEST: &[Row] = &[
         "Schema (ALTER)",
         // Shared variant (conformance convention 1): document writes and
         // graph writes (link/unlink) raise it through the same
-        // `ensure_writable` gate.
+        // `ensure_writable` gate, and the schema test drives it through every
+        // index-creation API's field-name validation (plus set_schema).
         &[
             "mutations_insert_rejects_reserved_and_invalid_collection_names",
             "mutations_write_paths_reject_reserved_and_invalid_collection_names",
             "graph_link_unlink_reject_reserved_and_invalid_collection_names",
+            "schema_index_creation_validates_names_across_families",
         ],
     ),
     row(
@@ -649,13 +653,24 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Error::EmptyIndexTraining",
         "Schema (ALTER)",
-        &["vector_create_index_overloads_inmemory_ondisk_and_pq"],
+        &[
+            "vector_create_index_overloads_inmemory_ondisk_and_pq",
+            "schema_vector_pq_creation_training_error_variants_and_success",
+        ],
     ),
     row(
         "corvid::Error::SchemaViolation",
         "Schema (ALTER)",
         &[
-            "schema_smoke_set_schema_rejects_bad_documents",
+            "schema_field_type_matrix_and_fields_accessor",
+            "schema_unique_insert_conflict_rejects_with_exact_variant_and_stores_nothing",
+            "schema_unique_update_conflict_rejects_whole_write",
+            "schema_unique_nan_equals_nan_rejects_second_document",
+            "schema_unique_containers_bytes_text_vector_and_null_rule",
+            "schema_unique_delete_then_reinsert_same_value_allowed",
+            "schema_unique_batch_conflict_rolls_back_whole_batch",
+            "schema_unique_with_scalar_index_stays_enforced_and_moves_with_values",
+            "schema_unique_numeric_kind_equality_same_with_and_without_index",
             "mutations_insert_batch_schema_violation_rolls_back_whole_batch",
             "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
             "mutations_insert_auto_failure_does_not_burn_an_id",
@@ -1379,6 +1394,8 @@ static MANIFEST: &[Row] = &[
             "queries_plan_shape_indexed_window_kinds_and_explain_families",
             "geo_index_twins_equivalence_and_live_mutations",
             "geo_index_plan_shape_serviceable_and_declined",
+            "schema_geo_index_duplicate_creation_and_non_point_docs_skipped",
+            "schema_geo_index_point_move_and_delete_maintained",
         ],
     ),
     // ===== graph.rs — edges =====
@@ -1547,27 +1564,48 @@ static MANIFEST: &[Row] = &[
             "vector_indexed_none_matches_unindexed_twin_for_all_k",
             "vector_index_dispatch_approximate_flag_and_metric_mismatch_fallback",
             "vector_dimension_mismatch_skips_docs_and_index_falls_back",
+            "schema_vector_index_duplicate_creation_replaces_previous_params",
+            "schema_vector_index_over_empty_field_then_insert_immediately_searchable",
+            "schema_vector_index_mixed_dimensions_match_scan_twin",
+            "schema_vector_dimension_change_on_update_leaves_index",
+            "schema_vector_index_compaction_after_deletes_keeps_results_exact",
         ],
     ),
     row(
         "corvid::Collection::create_vector_index_quantized",
         "Schema (ALTER)",
-        &["vector_metric_quantization_cross_orders_and_exact_distances"],
+        &[
+            "vector_metric_quantization_cross_orders_and_exact_distances",
+            "schema_vector_index_duplicate_creation_replaces_previous_params",
+        ],
     ),
     row(
         "corvid::Collection::create_vector_index_ondisk",
         "Schema (ALTER)",
-        &["vector_create_index_overloads_inmemory_ondisk_and_pq"],
+        &[
+            "vector_create_index_overloads_inmemory_ondisk_and_pq",
+            "schema_vector_index_duplicate_creation_replaces_previous_params",
+            "schema_vector_index_over_empty_field_then_insert_immediately_searchable",
+            "schema_vector_index_mixed_dimensions_match_scan_twin",
+            "schema_vector_dimension_change_on_update_leaves_index",
+            "schema_vector_index_compaction_after_deletes_keeps_results_exact",
+        ],
     ),
     row(
         "corvid::Collection::create_vector_index_ondisk_quantized",
         "Schema (ALTER)",
-        &["vector_create_index_overloads_inmemory_ondisk_and_pq"],
+        &[
+            "vector_create_index_overloads_inmemory_ondisk_and_pq",
+            "schema_vector_index_duplicate_creation_replaces_previous_params",
+        ],
     ),
     row(
         "corvid::Collection::create_vector_index_ondisk_pq",
         "Schema (ALTER)",
-        &["vector_create_index_overloads_inmemory_ondisk_and_pq"],
+        &[
+            "vector_create_index_overloads_inmemory_ondisk_and_pq",
+            "schema_vector_pq_creation_training_error_variants_and_success",
+        ],
     ),
     // ===== fts.rs — text index creation =====
     row(
@@ -1578,6 +1616,8 @@ static MANIFEST: &[Row] = &[
             "text_search_index_inmemory_ondisk_match_scan_twin",
             "text_builder_text_index_arm_matches_scan_arm",
             "text_phrase_k_boundaries_empty_phrase_and_index_arms",
+            "schema_text_index_duplicate_and_non_text_values_excluded",
+            "schema_text_index_mutations_keep_search_correct",
         ],
     ),
     row(
@@ -1586,6 +1626,7 @@ static MANIFEST: &[Row] = &[
         &[
             "text_search_index_inmemory_ondisk_match_scan_twin",
             "text_phrase_k_boundaries_empty_phrase_and_index_arms",
+            "schema_text_index_mutations_keep_search_correct",
         ],
     ),
     // ===== scalar.rs — scalar/compound index creation =====
@@ -1598,6 +1639,11 @@ static MANIFEST: &[Row] = &[
             "mutations_delete_where_exact_with_scalar_index_present",
             "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
             "queries_order_by_indexed_vs_scan_equivalent",
+            "schema_scalar_index_empty_collection_creates_and_serves_later",
+            "schema_scalar_index_backfill_makes_populated_collection_immediately_queryable",
+            "schema_scalar_index_duplicate_creation_replaces_without_stale_entries",
+            "schema_scalar_index_mixed_type_field_lanes_and_missing_docs_match_scan",
+            "schema_scalar_index_maintenance_contract_under_every_mutation_kind",
         ],
     ),
     row(
@@ -1606,42 +1652,77 @@ static MANIFEST: &[Row] = &[
         &[
             "filters_indexed_vs_scan_compound_prefix",
             "queries_plan_shape_indexed_window_kinds_and_explain_families",
+            "schema_compound_index_field_order_determines_serviceability",
+            "schema_compound_index_single_and_three_field_arities",
+            "schema_compound_index_duplicate_and_reverse_order_coexist",
+            "schema_compound_trailing_field_mutations_never_surface_stale_entries",
         ],
     ),
     // ===== schema.rs — declared schemas =====
     row(
         "corvid::schema::FieldType",
         "Schema (ALTER)",
-        &["schema_smoke_set_schema_rejects_bad_documents"],
+        &["schema_field_type_matrix_and_fields_accessor"],
     ),
-    row("corvid::schema::FieldType::Any", "Schema (ALTER)", &[]),
-    row("corvid::schema::FieldType::Bool", "Schema (ALTER)", &[]),
+    row(
+        "corvid::schema::FieldType::Any",
+        "Schema (ALTER)",
+        &["schema_field_type_matrix_and_fields_accessor"],
+    ),
+    row(
+        "corvid::schema::FieldType::Bool",
+        "Schema (ALTER)",
+        &["schema_field_type_matrix_and_fields_accessor"],
+    ),
     row(
         "corvid::schema::FieldType::Int",
         "Schema (ALTER)",
         &[
-            "schema_smoke_set_schema_rejects_bad_documents",
+            "schema_field_type_matrix_and_fields_accessor",
             "mutations_insert_batch_schema_violation_rolls_back_whole_batch",
         ],
     ),
-    row("corvid::schema::FieldType::Float", "Schema (ALTER)", &[]),
+    row(
+        "corvid::schema::FieldType::Float",
+        "Schema (ALTER)",
+        &[
+            "schema_field_type_matrix_and_fields_accessor",
+            "schema_unique_nan_equals_nan_rejects_second_document",
+        ],
+    ),
     row(
         "corvid::schema::FieldType::Text",
         "Schema (ALTER)",
         &[
-            "schema_smoke_set_schema_rejects_bad_documents",
+            "schema_field_type_matrix_and_fields_accessor",
             "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
         ],
     ),
-    row("corvid::schema::FieldType::Bytes", "Schema (ALTER)", &[]),
-    row("corvid::schema::FieldType::Vector", "Schema (ALTER)", &[]),
-    row("corvid::schema::FieldType::Array", "Schema (ALTER)", &[]),
-    row("corvid::schema::FieldType::Map", "Schema (ALTER)", &[]),
+    row(
+        "corvid::schema::FieldType::Bytes",
+        "Schema (ALTER)",
+        &["schema_unique_containers_bytes_text_vector_and_null_rule"],
+    ),
+    row(
+        "corvid::schema::FieldType::Vector",
+        "Schema (ALTER)",
+        &["schema_unique_containers_bytes_text_vector_and_null_rule"],
+    ),
+    row(
+        "corvid::schema::FieldType::Array",
+        "Schema (ALTER)",
+        &["schema_field_type_matrix_and_fields_accessor"],
+    ),
+    row(
+        "corvid::schema::FieldType::Map",
+        "Schema (ALTER)",
+        &["schema_field_type_matrix_and_fields_accessor"],
+    ),
     row(
         "corvid::schema::Field",
         "Schema (ALTER)",
         &[
-            "schema_smoke_set_schema_rejects_bad_documents",
+            "schema_field_type_matrix_and_fields_accessor",
             "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
         ],
     ),
@@ -1649,25 +1730,29 @@ static MANIFEST: &[Row] = &[
         "corvid::schema::Field::new",
         "Schema (ALTER)",
         &[
-            "schema_smoke_set_schema_rejects_bad_documents",
+            "schema_field_type_matrix_and_fields_accessor",
             "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
         ],
     ),
     row(
         "corvid::schema::Field::required",
         "Schema (ALTER)",
-        &["schema_smoke_set_schema_rejects_bad_documents"],
+        &["schema_field_type_matrix_and_fields_accessor"],
     ),
     row(
         "corvid::schema::Field::unique",
         "Schema (ALTER)",
-        &["mutations_insert_batch_unique_conflict_rolls_back_whole_batch"],
+        &[
+            "schema_field_type_matrix_and_fields_accessor",
+            "schema_unique_insert_conflict_rejects_with_exact_variant_and_stores_nothing",
+            "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
+        ],
     ),
     row(
         "corvid::schema::Schema",
         "Schema (ALTER)",
         &[
-            "schema_smoke_set_schema_rejects_bad_documents",
+            "schema_field_type_matrix_and_fields_accessor",
             "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
         ],
     ),
@@ -1675,7 +1760,7 @@ static MANIFEST: &[Row] = &[
         "corvid::schema::Schema::new",
         "Schema (ALTER)",
         &[
-            "schema_smoke_set_schema_rejects_bad_documents",
+            "schema_field_type_matrix_and_fields_accessor",
             "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
         ],
     ),
@@ -1683,16 +1768,20 @@ static MANIFEST: &[Row] = &[
         "corvid::schema::Schema::field",
         "Schema (ALTER)",
         &[
-            "schema_smoke_set_schema_rejects_bad_documents",
+            "schema_field_type_matrix_and_fields_accessor",
             "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
         ],
     ),
-    row("corvid::schema::Schema::fields", "Schema (ALTER)", &[]),
+    row(
+        "corvid::schema::Schema::fields",
+        "Schema (ALTER)",
+        &["schema_field_type_matrix_and_fields_accessor"],
+    ),
     row(
         "corvid::Collection::set_schema",
         "Schema (ALTER)",
         &[
-            "schema_smoke_set_schema_rejects_bad_documents",
+            "schema_field_type_matrix_and_fields_accessor",
             "mutations_insert_batch_schema_violation_rolls_back_whole_batch",
             "mutations_insert_batch_unique_conflict_rolls_back_whole_batch",
         ],

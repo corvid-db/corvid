@@ -258,11 +258,13 @@ impl FieldRef {
 
 /// Resolve a dotted path through nested maps.
 fn resolve<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
-    let mut current = doc;
-    for segment in path.split('.') {
-        current = current.get(segment)?;
-    }
-    Some(current)
+    // The uniform field accessor (value.rs): identical segment traversal,
+    // plus its documented empty-path rule — `""` resolves no field. Task 11
+    // fix: this hand-rolled twin DID resolve `""` to a top-level `""` key,
+    // so an unindexed collection matched a document holding that key while
+    // an indexed one (whose maintenance and windows go through `get_path`)
+    // served nothing — an index-vs-scan divergence on one exotic name.
+    doc.get_path(path)
 }
 
 /// Apply a comparison operator between a found value and a constant.
