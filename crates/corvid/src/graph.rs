@@ -261,9 +261,13 @@ impl Db {
     /// dangling edges). Called by every document-delete path —
     /// [`crate::Db::write_document`], [`Collection::compare_and_set`], and the
     /// TTL purge — so the two edge namespaces can never disagree with the
-    /// documents. The delete paths call it even when the document row is
-    /// absent, so edges linked against a never-inserted (or already-deleted)
-    /// key are purgeable through [`Collection::delete`] as well.
+    /// documents. The *unconditional* delete paths call it even when the
+    /// document row is absent, so edges linked against a never-inserted (or
+    /// already-deleted) key are purgeable through [`Collection::delete`] as
+    /// well. The TTL purge is not one of those: `purge_due_key` invokes the
+    /// cascade only when the document row was actually removed, so a stranded
+    /// expiry entry (no document behind it) drops its TTL rows without
+    /// touching edges.
     ///
     /// Edge keys are `len(relation) ‖ relation ‖ len(node) ‖ node ‖ other`, so
     /// an endpoint is *not* a byte prefix of the key: each namespace is paged

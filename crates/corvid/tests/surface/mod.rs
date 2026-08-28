@@ -497,24 +497,92 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Metric",
         "Vector search",
-        &["search_vector_smoke_ranks_nearest_first_exact"],
+        &[
+            "search_vector_smoke_ranks_nearest_first_exact",
+            "vector_metric_quantization_cross_orders_and_exact_distances",
+        ],
     ),
     row(
         "corvid::Metric::Cosine",
         "Vector search",
-        &["search_vector_smoke_ranks_nearest_first_exact"],
+        &[
+            "search_vector_smoke_ranks_nearest_first_exact",
+            "vector_metric_quantization_cross_orders_and_exact_distances",
+            "vector_zero_norm_cosine_dot_l2_ranking",
+        ],
     ),
-    row("corvid::Metric::Dot", "Vector search", &[]),
-    row("corvid::Metric::L2", "Vector search", &[]),
-    row("corvid::Metric::distance", "Vector search", &[]),
-    row("corvid::distance::dot", "Vector search", &[]),
-    row("corvid::distance::l2_squared", "Vector search", &[]),
-    row("corvid::distance::cosine_distance", "Vector search", &[]),
+    row(
+        "corvid::Metric::Dot",
+        "Vector search",
+        &[
+            "vector_metric_quantization_cross_orders_and_exact_distances",
+            "vector_exact_path_scores_match_hand_computed_formulas",
+            "vector_zero_norm_cosine_dot_l2_ranking",
+        ],
+    ),
+    row(
+        "corvid::Metric::L2",
+        "Vector search",
+        &[
+            "vector_metric_quantization_cross_orders_and_exact_distances",
+            "vector_exact_path_scores_match_hand_computed_formulas",
+            "vector_hnsw_direct_api_extreme_params_and_determinism",
+        ],
+    ),
+    row(
+        "corvid::Metric::distance",
+        "Vector search",
+        &["vector_exact_path_scores_match_hand_computed_formulas"],
+    ),
+    row(
+        "corvid::distance::dot",
+        "Vector search",
+        &["vector_exact_path_scores_match_hand_computed_formulas"],
+    ),
+    row(
+        "corvid::distance::l2_squared",
+        "Vector search",
+        &["vector_exact_path_scores_match_hand_computed_formulas"],
+    ),
+    row(
+        "corvid::distance::cosine_distance",
+        "Vector search",
+        &[
+            "vector_exact_path_scores_match_hand_computed_formulas",
+            "vector_zero_norm_cosine_dot_l2_ranking",
+        ],
+    ),
     // ===== quant.rs — vector quantization =====
-    row("corvid::Quantization", "Vector search", &[]),
-    row("corvid::Quantization::None", "Vector search", &[]),
-    row("corvid::Quantization::Binary", "Vector search", &[]),
-    row("corvid::Quantization::Scalar", "Vector search", &[]),
+    row(
+        "corvid::Quantization",
+        "Vector search",
+        &["vector_metric_quantization_cross_orders_and_exact_distances"],
+    ),
+    row(
+        "corvid::Quantization::None",
+        "Vector search",
+        &[
+            "vector_metric_quantization_cross_orders_and_exact_distances",
+            "vector_indexed_none_matches_unindexed_twin_for_all_k",
+        ],
+    ),
+    row(
+        "corvid::Quantization::Binary",
+        "Vector search",
+        &[
+            "vector_metric_quantization_cross_orders_and_exact_distances",
+            "vector_quantization_k1_binary_diverges_scalar_matches_exact",
+            "vector_create_index_overloads_inmemory_ondisk_and_pq",
+        ],
+    ),
+    row(
+        "corvid::Quantization::Scalar",
+        "Vector search",
+        &[
+            "vector_metric_quantization_cross_orders_and_exact_distances",
+            "vector_quantization_k1_binary_diverges_scalar_matches_exact",
+        ],
+    ),
     // ===== error.rs — error vocabulary =====
     row("corvid::Result", "Lifecycle", &[]),
     row(
@@ -567,7 +635,11 @@ static MANIFEST: &[Row] = &[
         &["aggregations_validate_ranking_args_before_aggregating"],
     ),
     row("corvid::Error::IncompatibleFormat", "Lifecycle", &[]),
-    row("corvid::Error::EmptyIndexTraining", "Schema (ALTER)", &[]),
+    row(
+        "corvid::Error::EmptyIndexTraining",
+        "Schema (ALTER)",
+        &["vector_create_index_overloads_inmemory_ondisk_and_pq"],
+    ),
     row(
         "corvid::Error::SchemaViolation",
         "Schema (ALTER)",
@@ -658,7 +730,13 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::QueryBuilder::vector",
         "Vector search",
-        &["search_hybrid_smoke_rrf_fuses_vector_and_text"],
+        &[
+            "search_hybrid_smoke_rrf_fuses_vector_and_text",
+            "vector_builder_approx_prefilters_exact_vs_postfilters_approx",
+            "vector_k_boundaries_zero_one_n_and_beyond",
+            "vector_empty_collection_single_doc_and_missing_field",
+            "vector_builder_select_order_limit_offset_interplay",
+        ],
     ),
     row(
         "corvid::QueryBuilder::text",
@@ -700,7 +778,11 @@ static MANIFEST: &[Row] = &[
             "queries_order_by_indexed_vs_scan_equivalent",
         ],
     ),
-    row("corvid::QueryBuilder::approx", "Vector search", &[]),
+    row(
+        "corvid::QueryBuilder::approx",
+        "Vector search",
+        &["vector_builder_approx_prefilters_exact_vs_postfilters_approx"],
+    ),
     row(
         "corvid::QueryBuilder::select",
         "SELECT shaping",
@@ -974,6 +1056,9 @@ static MANIFEST: &[Row] = &[
         &[
             "mutations_smoke_insert_roundtrips",
             "mutations_delete_removes_state_from_get_scan_and_count",
+            // W3 wave-review citation: the delete path also cascades graph
+            // edges (and does so even on an absent document row).
+            "graph_delete_missing_document_still_purges_dangling_edges",
         ],
     ),
     row(
@@ -982,12 +1067,18 @@ static MANIFEST: &[Row] = &[
         &[
             "mutations_delete_where_counts_zero_partial_and_full",
             "mutations_delete_where_exact_with_scalar_index_present",
+            // W3 wave-review citation: the cascade is shared with delete.
+            "graph_delete_where_and_delete_batch_cascade_edges",
         ],
     ),
     row(
         "corvid::Collection::delete_batch",
         "Mutations",
-        &["mutations_delete_batch_counts_existing_only_and_accepts_empty"],
+        &[
+            "mutations_delete_batch_counts_existing_only_and_accepts_empty",
+            // W3 wave-review citation: the cascade is shared with delete.
+            "graph_delete_where_and_delete_batch_cascade_edges",
+        ],
     ),
     row(
         "corvid::Collection::scan",
@@ -1064,7 +1155,11 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Hit",
         "Vector search",
-        &["search_vector_smoke_ranks_nearest_first_exact"],
+        &[
+            "search_vector_smoke_ranks_nearest_first_exact",
+            "vector_index_dispatch_approximate_flag_and_metric_mismatch_fallback",
+            "vector_metric_quantization_cross_orders_and_exact_distances",
+        ],
     ),
     row(
         "corvid::TextHit",
@@ -1080,7 +1175,17 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Collection::vector_search",
         "Vector search",
-        &["search_vector_smoke_ranks_nearest_first_exact"],
+        &[
+            "search_vector_smoke_ranks_nearest_first_exact",
+            "vector_metric_quantization_cross_orders_and_exact_distances",
+            "vector_exact_path_scores_match_hand_computed_formulas",
+            "vector_indexed_none_matches_unindexed_twin_for_all_k",
+            "vector_index_dispatch_approximate_flag_and_metric_mismatch_fallback",
+            "vector_k_boundaries_zero_one_n_and_beyond",
+            "vector_dimension_mismatch_skips_docs_and_index_falls_back",
+            "vector_zero_norm_cosine_dot_l2_ranking",
+            "vector_empty_collection_single_doc_and_missing_field",
+        ],
     ),
     // ===== text.rs — tokenization and BM25 =====
     row("corvid::text::Bm25Params", "Text search", &[]),
@@ -1244,45 +1349,86 @@ static MANIFEST: &[Row] = &[
         ],
     ),
     // ===== hnsw.rs — in-memory ANN =====
-    row("corvid::hnsw::DEFAULT_M", "Vector search", &[]),
+    row(
+        "corvid::hnsw::DEFAULT_M",
+        "Vector search",
+        &["vector_hnsw_direct_api_extreme_params_and_determinism"],
+    ),
     row(
         "corvid::hnsw::DEFAULT_EF_CONSTRUCTION",
         "Vector search",
-        &[],
+        &["vector_hnsw_direct_api_extreme_params_and_determinism"],
     ),
-    row("corvid::Hnsw", "Vector search", &[]),
-    row("corvid::Hnsw::new", "Vector search", &[]),
-    row("corvid::Hnsw::with_params", "Vector search", &[]),
-    row("corvid::Hnsw::with_quant", "Vector search", &[]),
-    row("corvid::Hnsw::len", "Vector search", &[]),
-    row("corvid::Hnsw::is_empty", "Vector search", &[]),
-    row("corvid::Hnsw::insert", "Vector search", &[]),
-    row("corvid::Hnsw::search", "Vector search", &[]),
+    row(
+        "corvid::Hnsw",
+        "Vector search",
+        &["vector_hnsw_direct_api_extreme_params_and_determinism"],
+    ),
+    row(
+        "corvid::Hnsw::new",
+        "Vector search",
+        &["vector_hnsw_direct_api_extreme_params_and_determinism"],
+    ),
+    row(
+        "corvid::Hnsw::with_params",
+        "Vector search",
+        &["vector_hnsw_direct_api_extreme_params_and_determinism"],
+    ),
+    row(
+        "corvid::Hnsw::with_quant",
+        "Vector search",
+        &["vector_hnsw_direct_api_extreme_params_and_determinism"],
+    ),
+    row(
+        "corvid::Hnsw::len",
+        "Vector search",
+        &["vector_hnsw_direct_api_extreme_params_and_determinism"],
+    ),
+    row(
+        "corvid::Hnsw::is_empty",
+        "Vector search",
+        &["vector_hnsw_direct_api_extreme_params_and_determinism"],
+    ),
+    row(
+        "corvid::Hnsw::insert",
+        "Vector search",
+        &["vector_hnsw_direct_api_extreme_params_and_determinism"],
+    ),
+    row(
+        "corvid::Hnsw::search",
+        "Vector search",
+        &["vector_hnsw_direct_api_extreme_params_and_determinism"],
+    ),
     // ===== index.rs — vector index creation =====
     row(
         "corvid::Collection::create_vector_index",
         "Schema (ALTER)",
-        &["queries_plan_shape_ann_index_for_single_vector_source"],
+        &[
+            "queries_plan_shape_ann_index_for_single_vector_source",
+            "vector_indexed_none_matches_unindexed_twin_for_all_k",
+            "vector_index_dispatch_approximate_flag_and_metric_mismatch_fallback",
+            "vector_dimension_mismatch_skips_docs_and_index_falls_back",
+        ],
     ),
     row(
         "corvid::Collection::create_vector_index_quantized",
         "Schema (ALTER)",
-        &[],
+        &["vector_metric_quantization_cross_orders_and_exact_distances"],
     ),
     row(
         "corvid::Collection::create_vector_index_ondisk",
         "Schema (ALTER)",
-        &[],
+        &["vector_create_index_overloads_inmemory_ondisk_and_pq"],
     ),
     row(
         "corvid::Collection::create_vector_index_ondisk_quantized",
         "Schema (ALTER)",
-        &[],
+        &["vector_create_index_overloads_inmemory_ondisk_and_pq"],
     ),
     row(
         "corvid::Collection::create_vector_index_ondisk_pq",
         "Schema (ALTER)",
-        &[],
+        &["vector_create_index_overloads_inmemory_ondisk_and_pq"],
     ),
     // ===== fts.rs — text index creation =====
     row(
