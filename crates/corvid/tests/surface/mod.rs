@@ -3684,3 +3684,279 @@ fn radar_index_excludes_surface_and_tracks_duplicate_locations() {
     );
     assert!(duplicate_test_names(&fns).is_empty());
 }
+
+// ===========================================================================
+// docs/SYNTAX.md generation (Task 15, conformance Ruling 6: the document is
+// generated from the manifests, never hand-maintained).
+// ===========================================================================
+
+/// The committed document this generator owns.
+fn syntax_md_path() -> PathBuf {
+    crate_dir().join("../../docs/SYNTAX.md")
+}
+
+/// The statement class of a conformance-suite file (by stem) — the basis for
+/// the shared-across-classes annotation (conformance convention 1: a shared
+/// row like `Error::InvalidArgument` keeps one primary class but is driven
+/// by tests from every raiser's class). Radar tests (`surface/`) are not
+/// citable, so every cited test lives in one of these suites; `None` for
+/// anything else (no annotation is derived from unknown files).
+fn suite_class_of(file: &Path) -> Option<&'static str> {
+    Some(match file.file_stem()?.to_str()? {
+        "mutations" => "Mutations",
+        "filters" => "WHERE",
+        "queries" => "SELECT shaping",
+        "aggregations" => "Aggregations",
+        "search_vector" | "pq" => "Vector search",
+        "search_text" => "Text search",
+        "search_hybrid" => "Hybrid",
+        "search_geo" => "Geo",
+        "schema" => "Schema (ALTER)",
+        "ttl" => "TTL",
+        "graph" => "Graph",
+        "joins" => "Joins",
+        "lifecycle" | "events" => "Lifecycle",
+        _ => return None,
+    })
+}
+
+/// The `(item, covering_tests)` rows of the sidecar's manifest, parsed from
+/// its radar source — the two radars live in different crates' test trees,
+/// so the engine-side generator reads the file instead of linking it. Only
+/// calls that begin a line as `row(` are matched (which excludes the
+/// `const fn row(` definition); inside a call the first string is the item,
+/// the second the class (the sidecar's own radar asserts it is "MCP wire"),
+/// and the rest are the covering tests.
+fn mcp_manifest_rows() -> Vec<(String, Vec<String>)> {
+    let path = crate_dir().join("../../crates/corvid-mcp/tests/surface/mod.rs");
+    let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let chars: Vec<char> = src.chars().collect();
+    let begins_line = |i: usize| {
+        let mut j = i;
+        while j > 0 && chars[j - 1] != '\n' {
+            if !chars[j - 1].is_whitespace() {
+                return false;
+            }
+            j -= 1;
+        }
+        true
+    };
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i + 4 < chars.len() {
+        if chars[i..].starts_with(&['r', 'o', 'w', '(']) && begins_line(i) {
+            let (strings, end) = scan_call_strings(&chars, i + 3);
+            assert!(
+                strings.len() >= 3,
+                "sidecar manifest row with too few strings at {path:?}: {strings:?}"
+            );
+            assert_eq!(
+                strings[1], "MCP wire",
+                "sidecar manifest row {strings:?} is not class MCP wire"
+            );
+            rows.push((strings[0].clone(), strings[2..].to_vec()));
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    assert!(!rows.is_empty(), "no rows parsed from {path:?}");
+    rows
+}
+
+/// Scan the balanced `(...)` call whose `(` is at `open`: every string
+/// literal inside it, and the index just past the matching `)`. Bracket
+/// groups need no depth tracking (they carry no unbalanced parens in these
+/// calls); string literals are skipped with escape handling.
+fn scan_call_strings(chars: &[char], open: usize) -> (Vec<String>, usize) {
+    let mut depth = 0usize;
+    let mut strings = Vec::new();
+    let mut i = open;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => {
+                let mut s = String::new();
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        s.push(chars[i]);
+                    }
+                    i += 1;
+                }
+                i += 1; // closing quote
+                strings.push(s);
+                continue;
+            }
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (strings, i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (strings, i)
+}
+
+/// Render docs/SYNTAX.md whole: a header with the regeneration command, one
+/// section per statement class (taxonomy order) listing every construct with
+/// its covering tests (shared-across-classes rows annotated, exempt rows
+/// marked with their justification), the MCP wire section from the sidecar
+/// manifest, and the four mandated semantics notes.
+fn render_syntax_md() -> String {
+    let exempt: BTreeMap<&str, &str> = EXEMPT_FROM_STRICT.iter().copied().collect();
+    let fns = citable_test_fns();
+    let mcp_rows = mcp_manifest_rows();
+
+    // The distinct suite classes a row's covering tests live in.
+    let classes_of = |r: &Row| -> Vec<&'static str> {
+        let mut cs: Vec<&'static str> = Vec::new();
+        for name in r.covering_tests {
+            for file in fns.get(*name).into_iter().flatten() {
+                if let Some(c) = suite_class_of(file)
+                    && !cs.contains(&c)
+                {
+                    cs.push(c);
+                }
+            }
+        }
+        cs
+    };
+
+    let mut out = String::new();
+    out.push_str(
+        "# The corvid language — syntax reference\n\n\
+         <!-- GENERATED FILE — do not edit by hand. Source of truth: the surface\n\
+         manifests (crates/corvid/tests/surface/mod.rs and\n\
+         crates/corvid-mcp/tests/surface/mod.rs), which the radar tests keep\n\
+         honest against the sources. Regenerate with:\n\
+         CORVID_GEN_SYNTAX=1 cargo test -p corvid --test surface syntax_md\n\
+         Every ordinary `cargo test` run re-renders and diffs this file, so the\n\
+         committed copy cannot drift from the manifests. -->\n\n\
+         This is the complete writable surface of `corvid` and `corvid-mcp`: every\n\
+         public construct, grouped by statement class (the SQL analogue is a\n\
+         guide, not a promise), each with the integration tests that pin its\n\
+         happy/edge/error/corner behavior. Construct paths are canonical Rust\n\
+         paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.\n\n",
+    );
+
+    for class in CLASSES {
+        let rows: Vec<&Row> = MANIFEST.iter().filter(|r| r.class == *class).collect();
+        out.push_str(&format!("\n## {class} — {} construct(s)\n\n", rows.len()));
+        for r in rows {
+            out.push_str("- `");
+            out.push_str(r.item);
+            out.push('`');
+            if let Some(why) = exempt.get(r.item) {
+                out.push_str(&format!(" — *exempt from strict coverage: {why}*"));
+            } else {
+                let cs = classes_of(r);
+                if cs.len() > 1 {
+                    out.push_str(&format!(" *(shared across classes: {})*", cs.join(", ")));
+                }
+                let tests: Vec<String> =
+                    r.covering_tests.iter().map(|t| format!("`{t}`")).collect();
+                out.push_str(&format!(" — {}", tests.join(", ")));
+            }
+            out.push('\n');
+        }
+    }
+
+    out.push_str(&format!(
+        "\n## MCP wire — {} construct(s)\n\n\
+         The sidecar's whole surface is one class: the JSON-RPC envelopes, every\n\
+         tool name, and the Rust items a client's bytes flow through. Covered by\n\
+         the in-process duplex-I/O suite in `crates/corvid-mcp/tests/tools/`.\n\n",
+        mcp_rows.len()
+    ));
+    for (item, tests) in &mcp_rows {
+        let tests: Vec<String> = tests.iter().map(|t| format!("`{t}`")).collect();
+        out.push_str(&format!("- `{item}` — {}\n", tests.join(", ")));
+    }
+
+    let cited: BTreeSet<&&str> = MANIFEST
+        .iter()
+        .flat_map(|r| r.covering_tests.iter())
+        .collect();
+    out.push_str(&format!(
+        "\n{} engine construct(s) across {} statement classes, {} wire construct(s),\n\
+         {} distinct covering tests (existence and uniqueness enforced by the\n\
+         radars; the {} exempt row(s) above are the only uncovered ones, each\n\
+         with its justification).\n",
+        MANIFEST.len(),
+        CLASSES.len(),
+        mcp_rows.len(),
+        cited.len(),
+        exempt.len()
+    ));
+
+    out.push_str(
+        "\n## Semantics notes\n\n\
+         Cross-class contracts the conformance program pins; each note names the\n\
+         suite that owns it.\n\n\
+         ### Pre-ranking predicates and BM25 (Text search)\n\n\
+         A builder text query with a filter ranks the *filtered* candidate set:\n\
+         the predicate runs first (index window or scan), and the BM25\n\
+         statistics — document frequencies, average document length — are\n\
+         computed over exactly those candidates, not the whole collection.\n\
+         The same query without a filter scores against full-corpus stats, so\n\
+         a score always means \"relevance within the candidate set the filter\n\
+         admits\". Owned by `tests/search_text.rs`.\n\n\
+         ### geo_within_bbox returns key order, portably (Geo)\n\n\
+         `geo_within_bbox` materializes its result sorted by key on every path:\n\
+         the indexed window and the scan are byte-identical, documents\n\
+         included. Key order is the contract — never cell or insertion order.\n\
+         Owned by `tests/search_geo.rs`.\n\n\
+         ### NaN duality: comparisons vs storage equality\n\n\
+         Two rules coexist by design:\n\n\
+         - *Predicate comparisons* (`eq`/`ne`, every ordered operator, `is_in`,\n\
+         `between`): NaN matches nothing, not even NaN — a NaN filter value\n\
+         selects an empty set (`ne` selects everything else).\n\
+         - *Storage equality* (`compare_and_set` expected values, unique\n\
+         constraints): NaN equals NaN regardless of payload, and `-0.0` equals\n\
+         `0.0` — the shared semantic rule (owned by `tests/mutations.rs` and\n\
+         `tests/schema.rs`).\n\n\
+         ### Equality is per-construct\n\n\
+         | Construct | Equality rule |\n\
+         |---|---|\n\
+         | `compare_and_set` expected value | Semantic value equality: NaN==NaN across payloads, -0.0==0.0, containers element-wise |\n\
+         | Predicates (`eq`/`ne`, ordered ops) | Typed total-order comparison: NaN never equals anything; `Int(2)` equals `Float(2.0)` numerically (mixed comparisons convert the integer through f64, exact up to 2^53) |\n\
+         | Unique constraints | Storage-level semantic equality (NaN==NaN), enforced per field value on write |\n\
+         | Joins | An `Int` foreign key matches a `Text` key via its decimal-string encoding: `Int(7)` joins to the key `\"7\"` |\n\
+         | Group keys (`group_count`/`group_sum`/`group_avg`, `count_distinct`) | Type-tagged canonical keys: bare for text (`blog`), `i:`/`f:`/`b:` tags for non-text, `t:` escape for text that would look tagged — distinct types stay distinct |\n\n",
+    );
+    out
+}
+
+/// docs/SYNTAX.md is generated from the manifests, never hand-maintained
+/// (conformance Ruling 6). This test re-renders the document and diffs it
+/// against the committed copy, so the two cannot drift in either direction.
+/// With `CORVID_GEN_SYNTAX=1` in the environment it (re)writes the file —
+/// the command is in the document's own header.
+#[test]
+fn syntax_md_stays_generated_from_the_manifests() {
+    let rendered = render_syntax_md();
+    let path = syntax_md_path();
+    if std::env::var_os("CORVID_GEN_SYNTAX").is_some() {
+        fs::write(&path, &rendered).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        return;
+    }
+    let committed = fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "read {}: {e} — generate it with CORVID_GEN_SYNTAX=1 cargo test \
+             -p corvid --test surface syntax_md",
+            path.display()
+        )
+    });
+    assert_eq!(
+        committed, rendered,
+        "docs/SYNTAX.md is out of sync with the surface manifests — regenerate \
+         with CORVID_GEN_SYNTAX=1 cargo test -p corvid --test surface syntax_md"
+    );
+}
