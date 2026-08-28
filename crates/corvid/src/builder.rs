@@ -235,10 +235,11 @@ impl QueryBuilder<'_> {
     /// present but pairwise incomparable (bools, containers, NaN) come after
     /// them — ordered by the same kind tag first, so NaN (a numeric kind)
     /// precedes the other incomparable kinds, which then fall to key order;
-    /// rows missing the field come last. Ties within a
-    /// class break by key. `descending` reverses the value order WITHIN the
-    /// comparable class only — the class order itself is fixed, so
-    /// incomparable and missing values always sort last.
+    /// rows missing the field come last. Ties within a class break by key.
+    /// `descending` reverses the within-class order — kind tag and value
+    /// together — in both the comparable and the incomparable class; the
+    /// class order itself and the key tiebreak are fixed, so incomparable
+    /// and missing values always sort last.
     pub fn order_by(mut self, field: impl Into<String>, descending: bool) -> Self {
         self.order_by = Some((field.into(), descending));
         self
@@ -1647,9 +1648,13 @@ fn compare_by_field_class(
 
 /// Sort `(key, doc)` pairs by a scalar field using the order_by class rule
 /// (audit C4): comparable values in value order (cross-kind pairs by the
-/// kind tag — numbers before texts), then pairwise-incomparable values in
-/// key order, then rows missing the field; ties by key. `descending`
-/// reverses the value order within the comparable class only.
+/// kind tag — numbers before texts), then pairwise-incomparable values —
+/// ordered by the same kind tag, so numerics (NaN) precede the other
+/// incomparable kinds ascending, which are mutually unordered and fall to
+/// key order — then rows missing the field; ties by key. `descending`
+/// reverses the within-class kind-tag-and-value order in BOTH the
+/// comparable and the incomparable class; the class order itself and the
+/// key tiebreak are fixed.
 fn sort_by_field(buf: &mut [(Vec<u8>, Value)], field: &str, descending: bool) {
     buf.sort_by(|(ka, da), (kb, db)| {
         compare_by_field_class(da.get_path(field), db.get_path(field), descending, ka, kb)

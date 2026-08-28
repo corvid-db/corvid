@@ -227,9 +227,10 @@ fn queries_select_non_map_documents_pass_through_unchanged() {
 
 #[test]
 fn queries_select_preserves_rank_scores_and_filter_visibility() {
-    // Projection narrows only the RETURNED document: ranking still sees the
-    // full document (the filter below matches on a field that is projected
-    // away), and the fused `score` is untouched by `select`.
+    // Projection narrows only the RETURNED document: the FILTER still sees
+    // the full document (below it matches on `kind`, which the projection
+    // drops), the ranked field survives the projection intact, and the
+    // fused `score` is untouched by `select`.
     let db = Db::open_in_memory().unwrap();
     let c = seed(
         &db,
