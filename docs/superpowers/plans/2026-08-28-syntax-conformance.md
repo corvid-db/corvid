@@ -338,6 +338,12 @@ Controller rulings at W5 exit (bind Task 15):
 - The 12 `corvid::pq::Pq*` rows are publicly drivable and MUST gain real
   conformance tests (drive Pq directly: train/encode/search determinism,
   codebook sizes, recall sanity on fixed corpus) before strict mode.
+- From Task 14 fix re-review: (a) set_schema's `required`/`unique` flags
+  silently coerce non-bool JSON to false (server.rs:524,527) — same
+  silent-default class the round purged; make them BadParams errors, and
+  audit the pre-existing `on_disk` pattern for the same treatment;
+  (b) pin the `fields: []` declared-empty-schema vs undeclared(null)
+  distinction through the wire.
 - Minor from Task 13: add the HLL bound-fragility note (std-upgrade could
   shift DefaultHasher; bounds safe per-toolchain) to the test comment.
 
