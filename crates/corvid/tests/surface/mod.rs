@@ -630,9 +630,16 @@ static MANIFEST: &[Row] = &[
         "corvid::Error::InvalidArgument",
         "Hybrid",
         // Shared variant (conformance convention 1): raised by the hybrid
-        // ranking params AND by every aggregate entry point, which validates
-        // the fluent args before touching the store.
-        &["aggregations_validate_ranking_args_before_aggregating"],
+        // ranking params (fuse_rrf k, rerank_mmr lambda) at every execution
+        // entry point, by the text-side Bm25Params domain checks, and by the
+        // aggregate entry points, which validate the fluent args before
+        // touching the store.
+        &[
+            "aggregations_validate_ranking_args_before_aggregating",
+            "hybrid_fuse_rrf_rejects_invalid_k_at_run",
+            "hybrid_rerank_mmr_rejects_out_of_range_and_nan_at_run",
+            "text_bm25_params_new_and_validate_error_variants",
+        ],
     ),
     row("corvid::Error::IncompatibleFormat", "Lifecycle", &[]),
     row(
@@ -741,10 +748,32 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::QueryBuilder::text",
         "Text search",
-        &["search_hybrid_smoke_rrf_fuses_vector_and_text"],
+        &[
+            "search_hybrid_smoke_rrf_fuses_vector_and_text",
+            "text_builder_text_k_bounds_empty_and_stopword_queries",
+            "text_builder_text_ranking_scores_select_limit_and_missing_fields",
+            "text_builder_text_index_arm_matches_scan_arm",
+        ],
     ),
-    row("corvid::QueryBuilder::fuse_rrf", "Hybrid", &[]),
-    row("corvid::QueryBuilder::rerank_mmr", "Hybrid", &[]),
+    row(
+        "corvid::QueryBuilder::fuse_rrf",
+        "Hybrid",
+        &[
+            "hybrid_fuse_rrf_rejects_invalid_k_at_run",
+            "hybrid_fusion_rrf_boost_beats_single_source",
+        ],
+    ),
+    row(
+        "corvid::QueryBuilder::rerank_mmr",
+        "Hybrid",
+        &[
+            "hybrid_rerank_mmr_rejects_out_of_range_and_nan_at_run",
+            "hybrid_rerank_mmr_noop_without_vector_source",
+            "hybrid_rerank_mmr_lambda_one_reorders_by_relevance",
+            "hybrid_rerank_mmr_lambda_zero_diversifies",
+            "hybrid_rerank_mmr_docs_without_embeddings_survive",
+        ],
+    ),
     row(
         "corvid::QueryBuilder::limit",
         "SELECT shaping",
@@ -1164,14 +1193,35 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::TextHit",
         "Text search",
-        &["search_text_smoke_ranks_most_relevant_first"],
+        &[
+            "search_text_smoke_ranks_most_relevant_first",
+            "text_search_bm25_ranking_tf_length_and_ties",
+            "text_phrase_order_sensitive_match_and_scores",
+        ],
     ),
     row(
         "corvid::Collection::text_search",
         "Text search",
-        &["search_text_smoke_ranks_most_relevant_first"],
+        &[
+            "search_text_smoke_ranks_most_relevant_first",
+            "text_search_bm25_ranking_tf_length_and_ties",
+            "text_search_rare_term_outscores_common_via_idf",
+            "text_search_index_inmemory_ondisk_match_scan_twin",
+            "text_search_k_boundaries_and_corpus_edges",
+            "text_phrase_single_term_equals_term_search",
+        ],
     ),
-    row("corvid::Collection::phrase_search", "Text search", &[]),
+    row(
+        "corvid::Collection::phrase_search",
+        "Text search",
+        &[
+            "text_phrase_order_sensitive_match_and_scores",
+            "text_phrase_repeated_terms_and_non_adjacent_non_match",
+            "text_phrase_single_term_equals_term_search",
+            "text_phrase_stopword_collapse_and_sentence_boundary",
+            "text_phrase_k_boundaries_empty_phrase_and_index_arms",
+        ],
+    ),
     row(
         "corvid::Collection::vector_search",
         "Vector search",
@@ -1188,29 +1238,86 @@ static MANIFEST: &[Row] = &[
         ],
     ),
     // ===== text.rs — tokenization and BM25 =====
-    row("corvid::text::Bm25Params", "Text search", &[]),
-    row("corvid::text::Bm25Params::new", "Text search", &[]),
-    row("corvid::text::Bm25Params::validate", "Text search", &[]),
-    row("corvid::text::tokenize", "Text search", &[]),
-    row("corvid::text::s_stem", "Text search", &[]),
-    row("corvid::text::Analyzer", "Text search", &[]),
-    row("corvid::text::Analyzer::raw", "Text search", &[]),
-    row("corvid::text::Analyzer::analyze", "Text search", &[]),
-    row("corvid::text::analyze", "Text search", &[]),
-    row("corvid::text::idf", "Text search", &[]),
-    row("corvid::text::term_score", "Text search", &[]),
+    row(
+        "corvid::text::Bm25Params",
+        "Text search",
+        &[
+            "text_bm25_params_new_and_validate_error_variants",
+            "text_term_score_zero_saturation_length_and_b_zero",
+        ],
+    ),
+    row(
+        "corvid::text::Bm25Params::new",
+        "Text search",
+        &["text_bm25_params_new_and_validate_error_variants"],
+    ),
+    row(
+        "corvid::text::Bm25Params::validate",
+        "Text search",
+        &["text_bm25_params_new_and_validate_error_variants"],
+    ),
+    row(
+        "corvid::text::tokenize",
+        "Text search",
+        &["text_tokenize_case_punct_unicode_numbers_and_empties"],
+    ),
+    row(
+        "corvid::text::s_stem",
+        "Text search",
+        &["text_s_stem_pins_conservative_plural_algorithm"],
+    ),
+    row(
+        "corvid::text::Analyzer",
+        "Text search",
+        &["text_analyzer_default_raw_and_flag_combinations"],
+    ),
+    row(
+        "corvid::text::Analyzer::raw",
+        "Text search",
+        &["text_analyzer_default_raw_and_flag_combinations"],
+    ),
+    row(
+        "corvid::text::Analyzer::analyze",
+        "Text search",
+        &["text_analyzer_default_raw_and_flag_combinations"],
+    ),
+    row(
+        "corvid::text::analyze",
+        "Text search",
+        &["text_analyzer_default_raw_and_flag_combinations"],
+    ),
+    row(
+        "corvid::text::idf",
+        "Text search",
+        &["text_idf_values_monotonicity_and_nonnegativity"],
+    ),
+    row(
+        "corvid::text::term_score",
+        "Text search",
+        &["text_term_score_zero_saturation_length_and_b_zero"],
+    ),
     // ===== fusion.rs — rank fusion and diversification =====
     row(
         "corvid::DEFAULT_RRF_K",
         "Hybrid",
-        &["search_hybrid_smoke_rrf_fuses_vector_and_text"],
+        &[
+            "search_hybrid_smoke_rrf_fuses_vector_and_text",
+            "hybrid_rrf_direct_formula_exact_scores_and_edges",
+        ],
     ),
     row(
         "corvid::reciprocal_rank_fusion",
         "Hybrid",
-        &["search_hybrid_smoke_rrf_fuses_vector_and_text"],
+        &[
+            "search_hybrid_smoke_rrf_fuses_vector_and_text",
+            "hybrid_rrf_direct_formula_exact_scores_and_edges",
+        ],
     ),
-    row("corvid::mmr", "Hybrid", &[]),
+    row(
+        "corvid::mmr",
+        "Hybrid",
+        &["hybrid_mmr_direct_lambda_zero_one_diversity_and_k"],
+    ),
     // ===== geo.rs — spatial queries =====
     row(
         "corvid::haversine_km",
@@ -1434,12 +1541,20 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::Collection::create_text_index",
         "Schema (ALTER)",
-        &["queries_plan_shape_text_index_for_single_text_source"],
+        &[
+            "queries_plan_shape_text_index_for_single_text_source",
+            "text_search_index_inmemory_ondisk_match_scan_twin",
+            "text_builder_text_index_arm_matches_scan_arm",
+            "text_phrase_k_boundaries_empty_phrase_and_index_arms",
+        ],
     ),
     row(
         "corvid::Collection::create_text_index_ondisk",
         "Schema (ALTER)",
-        &[],
+        &[
+            "text_search_index_inmemory_ondisk_match_scan_twin",
+            "text_phrase_k_boundaries_empty_phrase_and_index_arms",
+        ],
     ),
     // ===== scalar.rs — scalar/compound index creation =====
     row(

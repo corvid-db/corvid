@@ -169,9 +169,11 @@ fn search_vector_smoke_ranks_nearest_first_exact() {
 /// every quantization: the collection-level index is built with
 /// `DEFAULT_M`/`DEFAULT_EF_CONSTRUCTION` (m0 = 2·16 = 32), so a 5-node graph
 /// is complete on layer 0 (every insert links to all existing nodes), and
-/// `BuiltIndex::search` over-fetches with `ef = max(4k, 64) >= 64 > 5` — the
-/// beam provably reaches every node, so the candidate set is all live keys
-/// regardless of quantization (quantization perturbs distances, not
+/// `BuiltIndex::search` over-fetches with `want = k + dead` (dead = 0 here —
+/// nothing is ever deleted) and `ef = max(4·want, 64) >= 64 > 5` — the
+/// on-disk path's `ef = max(4k, 64)` form is not what runs here. Either way
+/// the beam provably reaches every node, so the candidate set is all live
+/// keys regardless of quantization (quantization perturbs distances, not
 /// reachability). The exact rerank then sorts by (exact distance, key),
 /// reproducing the exact-path order with bitwise-exact distances.
 #[test]
@@ -219,10 +221,16 @@ fn vector_metric_quantization_cross_orders_and_exact_distances() {
 /// winner equals the exact winner for every metric. Binary quantization
 /// keeps only sign bits: `[1,0]`, `[0,1]`, `[2,0]`, `[1,0]` all encode to
 /// the same 2-bit pattern (a 0.0 component has sign ">= 0" and sets its
-/// bit) and `[-1,0]` differs in one bit, so the graph's Hamming-tie winner
-/// is node 0 (`a`) under EVERY metric — including Dot, where the exact
-/// winner is `d`. That pinned divergence is the documented recall cost of
-/// binary quantization (and `approximate = true` records it).
+/// bit) and `[-1,0]` differs in one bit, so four nodes tie at Hamming
+/// distance 0. Self-contained proof that the tie winner is `a` (so k=1
+/// returns it under EVERY metric — including Dot, where the exact winner
+/// is `d`; that pinned divergence is the documented recall cost of binary
+/// quantization, and `approximate = true` records it): the lazily built
+/// in-memory graph (`build_index` in index.rs) scans the collection in
+/// ascending key order and assigns sequential HNSW ids, so ids ARE key
+/// order — a=0, b=1, c=2, d=3, e=4 — and `Hnsw`'s candidate ordering
+/// (the `Cand` heap and the final sort in search_layer) breaks distance
+/// ties by smaller id. The Hamming-0 group therefore yields node 0 = `a`.
 #[test]
 fn vector_quantization_k1_binary_diverges_scalar_matches_exact() {
     // Scalar: matches the exact k=1 winner for every metric.
@@ -755,12 +763,16 @@ fn vector_create_index_overloads_inmemory_ondisk_and_pq() {
 
     // PQ: dim 8, m=4 subspaces (8 % 4 == 0), 16 centroids. Five bitwise
     // duplicates of the query vector [3,0,...] plus 8 axis variants at
-    // magnitude 2: the duplicates' exact distances are all 0.0 (ties break
-    // by key -> "p0"), every axis sits at squared distance >= 1.0 in exact
-    // space (axis0: (3-2)^2; the rest: 3^2+2^2), and the PQ reconstruction
-    // error on coordinates drawn from {0, 2, 3} is far below that gap — so
-    // the duplicates provably outrank every axis in the graph, and the
-    // exact rerank puts "p0" first.
+    // magnitude 2. What the assertions below need is only: (i) the
+    // candidate set contains every live node — the on-disk search
+    // over-fetches with ef = max(4k, 64) = 64 > 13 over a complete small
+    // graph (m0 = 32 links every node), and quantization perturbs
+    // distances, not reachability — and (ii) nothing can beat the five
+    // duplicates at exact L2 distance 0.0 (they are bitwise copies of the
+    // query; every axis is at squared distance >= 1.0: axis0 (3-2)^2, the
+    // rest 3^2+2^2). The exact rerank therefore returns exactly the five
+    // duplicates with p0 first (0.0 ties break by key); no claim about
+    // where PQ places the axes is needed.
     let db = Db::open_in_memory().unwrap();
     let c = db.collection("ov-pq");
     let axis = |i: usize| {
