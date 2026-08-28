@@ -116,3 +116,188 @@ commit: `cargo fmt --all`; `cargo clippy --all-targets --workspace --
    first, and noted in the task report.
 6. The manifest is the single source of truth for what "everything" means;
    `docs/SYNTAX.md` is generated from it in W6, not hand-maintained.
+
+## Tasks
+
+Every task: read this whole plan first (taxonomy + rulings bind you); work
+only through the public API in `tests/`; per commit run fmt, clippy
+`-D warnings`, `cargo test --workspace`, `cargo doc -D warnings`; update
+manifest `covering_tests` for every row you satisfy; append your report.
+
+### Task 1: Engine surface manifest, radar, and suite skeleton
+
+- Create `crates/corvid/tests/surface/mod.rs`: `MANIFEST: &[Row]` covering
+  EVERY public item of the engine (use
+  `docs/superpowers/plans/2026-08-28-surface-raw-inventory.txt` as the
+  mechanical seed, then deep-read every module to classify: item, class,
+  covering_tests). Enum variants are separate rows (predicates, operators,
+  metrics, quantizations, change kinds, error variants, PlanShape variants).
+- Source-parsing tests: (a) manifest items == extracted public surface
+  (set equality, both directions named in the failure), (b) every non-empty
+  `covering_tests` entry names an existing `fn` in `crates/corvid/tests/`.
+  Parsing must honor `pub(crate)` (excluded), `#[cfg(test)]` (excluded),
+  impl blocks, and trait impls (pub fns in inherent impls of pub types).
+- `const STRICT_COVERING: bool = false;` for now; when true, empty
+  `covering_tests` fails. Task 15 deletes the flag (always strict).
+- Skeleton files (each with one real smoke test so the tree compiles and
+  the radar's test-existence check has anchors): `mutations.rs`, `filters.rs`,
+  `queries.rs`, `aggregations.rs`, `joins.rs`, `graph.rs`,
+  `search_vector.rs`, `search_text.rs`, `search_hybrid.rs`, `search_geo.rs`,
+  `schema.rs`, `ttl.rs`, `events.rs`, `lifecycle.rs`.
+- Exit: radar green; manifest classified 100%; no row has covering_tests
+  pointing at unit tests inside `src/`.
+
+### Task 2: MCP surface manifest and radar
+
+- `crates/corvid-mcp/tests/surface/mod.rs`: manifest of every public item
+  (Server methods, ToolError variants, convert fns, protocol surfaces) PLUS
+  one row per MCP tool name and per JSON-RPC envelope kind (initialize,
+  ping, tools/list, tools/call, error), with a `tools.rs` skeleton.
+- Same source-parsing completeness + test-existence checks as Task 1.
+
+### Task 3: Mutation conformance
+
+Fill `mutations.rs` to the case standard: insert (new key, overwrite,
+empty key, empty doc kinds — every Value variant as document), insert_batch
+(empty slice, duplicate key inside batch rolls back whole batch),
+insert_auto (sequence across collections, failed insert does not burn an
+id), update (missing doc, transform to every Value kind, index maintenance
+observed), patch (deep merge semantics, missing doc, non-map doc),
+compare_and_set (expected match/mismatch, index maintenance), delete
+(existing/missing), delete_batch, delete_where (0/N matches, predicate
+interaction with indexes), insert_with_ttl basics here if public through
+Collection (deep TTL cases are Task 12). Assert event emission per kind
+where publicly observable. Every error case asserts the exact variant.
+
+### Task 4: WHERE/filter conformance
+
+Fill `filters.rs`: for EACH Predicate form × applicable CmpOp × Value kind:
+Int/Float (incl. NaN, ±inf, -0.0, int-vs-float compare), Text (unicode,
+empty), Bool, Bytes, Vector, Array, Map, Null; missing path, wrong-type
+path, nested dotted paths, deep nesting; In (empty values, duplicate,
+mixed types), Between (inclusivity both ends, low>high, equal bounds),
+StartsWith/Contains (empty prefix/substr, non-text field), GeoWithin happy
+path (deep geo cases are Task 10), And/Or/Not nesting and precedence via
+composition, `.and()`/`.or()` builders, indexed vs scan equivalence for
+every serviceable predicate (scalar index present vs absent must return
+identical sets), OR-union path. filter-only queries with limit/offset.
+
+### Task 5: SELECT shaping conformance
+
+Fill `queries.rs`: select (projection, nested paths, missing fields,
+non-map docs, empty list), order_by asc/desc × comparable kinds × missing
+× mixed-type total order (class rule), limit (0, 1, n>matches), offset
+(0, =len, >len), pagination with page/page_where (after=None, first/last
+key, after past end, limit 0/1/N, filtered), scan, for_each_doc (early
+return behavior, empty), len/is_empty/count with filters, run() on empty
+collection, ResultRow shape. explain()/plan_shape() observable behavior
+per shape class (string mentions index family; PlanShape variant match).
+
+### Task 6: Aggregation + join conformance
+
+Fill `aggregations.rs`: count/sum/avg/min/max over Int/Float (NaN, inf,
+empty, missing-all, mixed, non-numeric error), count_distinct (+BloomFilter
+approx_distinct bound), group_count/group_sum/group_avg (typed group keys
+i:/f:/b:/t: escape so distinct types stay distinct, missing skip, container
+skip, empty result map), filters respected everywhere.
+Fill `joins.rs`: join happy, dotted foreign key path, missing FK field,
+dangling reference (row omitted), self-join, empty sides, JoinRow shape.
+
+### Task 7: Graph conformance
+
+Fill `graph.rs`: link (new, duplicate, self-loop, missing endpoints
+error/allowed per API), unlink (existing/missing), neighbors outgoing,
+in_neighbors, traverse (depth 0/1/N, cycles terminate, relation filtering,
+missing start), delete cascade (doc delete removes edges both directions,
+observed via neighbors), events on link/unlink where observable, edge
+weight if public.
+
+### Task 8: Vector search conformance
+
+Fill `search_vector.rs`: Metric × Quantization full cross (None/Binary/
+Scalar × Cosine/Dot/L2) on a fixed corpus with known geometry: ranking
+order asserted, exact vs approx (approx=true uses index and returns
+`Hit.approximate` correctly; with filter; recall sanity ≥ threshold for
+the fixed corpus), zero-norm vectors, dimension mismatch error, k=0/1/N,
+k> corpus, ef/param variants exposed publicly (Hnsw::with_params/
+with_quant via create path), empty collection, single doc, query through
+builder vector() with select/order interplay, vector field missing from
+some docs (excluded deterministically).
+
+### Task 9: Text + hybrid conformance
+
+Fill `search_text.rs`: BM25 ranking on fixed corpus (order asserted),
+tokenization (case, punctuation, unicode, s_stem irregulars), phrase_search
+(order-sensitive match/non-match, repeated terms, cross-field non-match),
+empty query, no hits, k bounds, analyzer raw() vs default.
+Fill `search_hybrid.rs`: vector+text fusion ordering (RRF k default/
+custom/invalid — error variants), mmr diversification (λ 0/1/out-of-range/
+NaN errors), single-source noop, docs without embeddings survive rerank,
+fuse_rrf on empty rankings, reciprocal_rank_fusion/mmr direct fn behavior.
+
+### Task 10: Geo conformance
+
+Fill `search_geo.rs`: haversine_km known distances, geo_within_radius
+(boundary inclusion at ==radius, tiny/large radius, center on doc),
+geo_nearest (k=0/1/N, farther-than-all), geo_within_bbox (normal, inverted
+corners error, degenerate bbox, antimeridian-crossing if supported —
+assert actual behavior), GeoWithin predicate deep cases (poles, invalid
+lat/lon), point formats ([lat,lon] array vs lat/lon map), geo index
+present vs absent equivalence, GeoHit fields.
+
+### Task 11: Schema/index conformance
+
+Fill `schema.rs`: create_scalar_index (dedupe, mixed types, re-create),
+create_compound_index (order of fields matters, prefix behavior),
+create_text_index, create_vector_index variants, create_geo_index; unique
+constraints (violation error variant, NaN==NaN rule, Vector equality,
+null uniqueness); name validation (interior `__`, NUL, reserved, empty);
+index-vs-scan result equivalence for every family; index observably used
+via plan_shape/explain; behavior when index exists on field then docs
+mutate (insert/update/delete keep results correct).
+
+### Task 12: TTL + events conformance
+
+Fill `ttl.rs`: insert_with_ttl/set_ttl/ttl roundtrip, purge_expired at
+boundary (now == expires_at included/excluded per contract), purge
+idempotence, expired docs hidden from queries/get/count, TTL + index
+maintenance (expired leaves index), set_ttl overwrite/clear semantics,
+errors (missing doc).
+Fill `events.rs`: subscribe returns id, Insert/Delete events per mutation
+path (insert, update, patch, compare_and_set, delete, delete_where,
+insert_auto, batch ops, TTL purge), unsubscribe (true/false), events after
+unsubscribe stop, cross-collection isolation.
+
+### Task 13: Lifecycle conformance
+
+Fill `lifecycle.rs`: Db::open real file (create/reopen persistence across
+handles), open_in_memory, backup (restores identical state; error on bad
+path), bulk (atomicity on panic-free failure, !Send scope respected,
+nested rejection if any), compact (returns bool, data intact), collections
+(user namespaces only), set_relaxed_durability + flush, Store::{transaction
+commit/rollback-on-Err, read isolation, put/get/delete/scan/scan_from/
+scan_prefix/count/for_each/next_auto_id}, dump→load round-trip exercising
+EVERY Value variant, vector indexes (each Metric × Quantization), text
+indexes, geo indexes, TTL entries, graph edges, auto-ids; load rejects
+reserved names; dump of empty db; SemanticCache put/get (threshold hit/
+miss), HyperLogLog (new/with_precision/add_bytes/add_hash/estimate bounds,
+precision bounds), BloomFilter (new fp bounds, add/contains, no false
+negatives), PlanCache (get miss/hit, get_or_insert_with, len/is_empty).
+
+### Task 14: MCP wire conformance
+
+Fill `crates/corvid-mcp/tests/tools.rs` driving the server IN-PROCESS over
+duplex in-memory I/O (no child processes — they evade coverage and flake):
+initialize/ping/tools/list envelopes; EVERY tool happy + each error path
+(bad params shape, unknown tool, engine error surfacing); $vector/$bytes
+convert conventions both directions; result caps and bounded limits
+(search/page limits clamp); tools/call error envelope codes; large
+payload behavior. Assert result JSON shapes exactly.
+
+### Task 15: SYNTAX.md, strict radar, changelog, final sweep
+
+Generate `docs/SYNTAX.md` from the manifest (statement-class sections,
+every construct with its covering test names); DELETE `STRICT_COVERING`
+(radar always requires non-empty covering_tests) and make the manifest
+green under strict mode; CHANGELOG entry; verify no manifest row cites a
+test that does not exist; full gates + coverage report attached to report.
