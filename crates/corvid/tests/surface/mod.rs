@@ -797,16 +797,16 @@ fn manifest_matches_extracted_public_surface() {
 
 #[test]
 fn covering_tests_name_existing_integration_tests() {
-    let fns = collect_test_fns(&tests_dir());
+    let fns = citable_test_fns();
     assert!(
         !fns.is_empty(),
-        "no test fns found under {}",
+        "no citable test fns found under {}",
         tests_dir().display()
     );
     for r in MANIFEST {
         for name in r.covering_tests {
             assert!(
-                fns.contains(*name),
+                fns.contains_key(*name),
                 "manifest row {} cites covering test `{name}`, but no fn with \
                  that name exists under {} (rows must cite integration tests, \
                  never unit tests inside src/)",
@@ -815,6 +815,32 @@ fn covering_tests_name_existing_integration_tests() {
             );
         }
     }
+}
+
+/// Conformance-plan convention: covering-test names are globally unique
+/// across the `tests/` tree — citations are bare fn names, so one name
+/// identifying two tests makes every citation of it ambiguous. A duplicate
+/// anywhere (outside the radar's own excluded `surface/` directory) fails,
+/// with both defining files named.
+#[test]
+fn cited_test_names_are_globally_unique() {
+    let fns = citable_test_fns();
+    let dups = duplicate_test_names(&fns);
+    assert!(
+        dups.is_empty(),
+        "duplicate #[test] fn names under {} (each name must identify exactly \
+         one test — rename one of them): {dups:#?}",
+        tests_dir().display()
+    );
+}
+
+/// The citable covering-test index: every `#[test]` fn under `tests/`,
+/// EXCLUDING the radar's own `surface/` directory (conformance-plan
+/// convention: radar self-tests are not citable). Maps each fn name to the
+/// files defining it (more than one file is a duplicate; see
+/// [`duplicate_test_names`]).
+fn citable_test_fns() -> BTreeMap<&'static str, Vec<PathBuf>> {
+    collect_test_fns(&tests_dir())
 }
 
 #[test]
@@ -945,20 +971,41 @@ fn extract_public_surface() -> BTreeSet<&'static str> {
     out
 }
 
-/// All test fns defined anywhere under `dir`: only fns carrying a `#[test]`
-/// attribute (optionally among other attributes and behind visibility /
-/// qualifier prefixes) are indexed — helper fns never qualify.
-fn collect_test_fns(dir: &Path) -> BTreeSet<&'static str> {
-    let mut out = BTreeSet::new();
+/// The citable covering-test index over `dir`: every `#[test]` fn name,
+/// mapped to the files defining it. The radar's own `surface/` subdirectory
+/// is excluded (conformance-plan convention: radar self-tests are not
+/// citable — a manifest row must cite a conformance test, never the radar
+/// that checks it). Only fns carrying a `#[test]` attribute (optionally
+/// among other attributes and behind visibility / qualifier prefixes) are
+/// indexed — helper fns never qualify.
+fn collect_test_fns(dir: &Path) -> BTreeMap<&'static str, Vec<PathBuf>> {
+    let surface = dir.join("surface");
+    let mut out: BTreeMap<&'static str, Vec<PathBuf>> = BTreeMap::new();
     for file in rust_files(dir) {
+        if file.starts_with(&surface) {
+            continue; // radar self-tests are not citable
+        }
         let src =
             fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
         for name in test_fn_names(&tokenize(&src)) {
             let leaked: &'static str = Box::leak(name.into_boxed_str());
-            out.insert(leaked);
+            out.entry(leaked).or_default().push(file.clone());
         }
     }
     out
+}
+
+/// The entries of the covering-test index whose name is defined in more
+/// than one file — the ambiguous citations [`cited_test_names_are_globally_unique`]
+/// rejects. Each duplicate is `(name, files)` so the failure can name every
+/// location.
+fn duplicate_test_names<'a>(
+    fns: &'a BTreeMap<&'static str, Vec<PathBuf>>,
+) -> Vec<(&'static str, &'a [PathBuf])> {
+    fns.iter()
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(name, files)| (*name, files.as_slice()))
+        .collect()
 }
 
 /// The names of the `fn`s in `toks` that directly carry a `#[test]`
@@ -1840,4 +1887,66 @@ fn radar_rejects_glob_and_nested_reexports() {
     let mut aliases = BTreeSet::new();
     parse_root_use(&mut c, &mut aliases);
     assert_eq!(aliases, BTreeSet::from(["A".to_owned(), "C".to_owned()]));
+}
+
+/// The covering-test index excludes the radar's own `surface/` directory and
+/// maps each name to its defining file(s), so duplicates anywhere in the
+/// tree are detectable with both locations named (conformance-plan
+/// conventions 2 and 3; Task 3 housekeeping). Verified against a synthetic
+/// `tests/` tree.
+#[test]
+fn radar_index_excludes_surface_and_tracks_duplicate_locations() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("tests");
+    fs::create_dir_all(root.join("surface")).unwrap();
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(
+        root.join("a.rs"),
+        "#[test] fn dup() {}\n#[test] fn solo() {}\nfn helper() {}\n",
+    )
+    .unwrap();
+    fs::write(root.join("sub").join("b.rs"), "#[test] fn dup() {}\n").unwrap();
+    fs::write(
+        root.join("surface").join("mod.rs"),
+        "#[test] fn dup() {}\n#[test] fn radar_only() {}\n",
+    )
+    .unwrap();
+
+    let fns = collect_test_fns(&root);
+
+    // The radar's own tests are not citable: neither of surface/mod.rs's
+    // names is indexed, even the one duplicated elsewhere.
+    assert!(!fns.contains_key("radar_only"));
+    assert_eq!(
+        fns.get("dup").map(|v| v.as_slice()),
+        Some(vec![root.join("a.rs"), root.join("sub").join("b.rs")].as_slice()),
+        "dup's locations must be both non-surface files, in walk order"
+    );
+    // A name defined once carries exactly one location; helpers are absent.
+    assert_eq!(
+        fns.get("solo").map(|v| v.as_slice()),
+        Some(vec![root.join("a.rs")].as_slice())
+    );
+    assert!(!fns.contains_key("helper"));
+
+    // The uniqueness check reports the duplicate with both locations, and
+    // nothing else.
+    let dups = duplicate_test_names(&fns);
+    assert_eq!(dups.len(), 1);
+    assert_eq!(dups[0].0, "dup");
+    assert_eq!(
+        dups[0].1,
+        &vec![root.join("a.rs"), root.join("sub").join("b.rs")]
+    );
+
+    // A tree with no surface/ directory at all indexes normally.
+    let bare = tempfile::tempdir().unwrap();
+    fs::create_dir_all(bare.path()).unwrap();
+    fs::write(bare.path().join("only.rs"), "#[test] fn one() {}\n").unwrap();
+    let fns = collect_test_fns(bare.path());
+    assert_eq!(
+        fns.get("one").map(|v| v.as_slice()),
+        Some(vec![bare.path().join("only.rs")].as_slice())
+    );
+    assert!(duplicate_test_names(&fns).is_empty());
 }
