@@ -1,0 +1,303 @@
+crates/corvid/src/hnsw.rs:21:pub const DEFAULT_M: usize = 16;
+crates/corvid/src/hnsw.rs:23:pub const DEFAULT_EF_CONSTRUCTION: usize = 128;
+crates/corvid/src/hnsw.rs:58:pub struct Hnsw {
+crates/corvid/src/hnsw.rs:76:    pub fn new(metric: Metric) -> Self {
+crates/corvid/src/hnsw.rs:82:    pub fn with_params(metric: Metric, m: usize, ef_construction: usize) -> Self {
+crates/corvid/src/hnsw.rs:87:    pub fn with_quant(
+crates/corvid/src/hnsw.rs:110:    pub fn len(&self) -> usize {
+crates/corvid/src/hnsw.rs:115:    pub fn is_empty(&self) -> bool {
+crates/corvid/src/hnsw.rs:120:    pub fn insert(&mut self, vector: Vec<f32>) -> usize {
+crates/corvid/src/hnsw.rs:189:    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(usize, f32)> {
+crates/corvid-mcp/src/protocol.rs:22:pub const PROTOCOL_VERSION: &str = "2024-11-05";
+crates/corvid-mcp/src/protocol.rs:26:pub const MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
+crates/corvid-mcp/src/protocol.rs:29:pub fn open_server(path: Option<&str>) -> Result<Server, corvid::Error> {
+crates/corvid-mcp/src/protocol.rs:44:pub fn run<R: BufRead, W: Write>(server: &Server, reader: R, writer: W) -> std::io::Result<()> {
+crates/corvid-mcp/src/protocol.rs:49:pub fn run_with_limit<R: BufRead, W: Write>(
+crates/corvid-mcp/src/protocol.rs:139:pub fn handle_request(server: &Server, req: &Json) -> Option<Json> {
+crates/corvid-mcp/src/server.rs:29:pub struct Server {
+crates/corvid-mcp/src/server.rs:35:    pub fn new(db: Db) -> Self {
+crates/corvid-mcp/src/server.rs:40:    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, corvid::Error> {
+crates/corvid-mcp/src/server.rs:45:    pub fn open_in_memory() -> Result<Self, corvid::Error> {
+crates/corvid-mcp/src/server.rs:50:    pub fn handle(&self, tool: &str, params: &Json) -> Result<Json, ToolError> {
+crates/corvid/src/scalar.rs:174:    pub op: CmpOp,
+crates/corvid/src/scalar.rs:175:    pub value: &'v Value,
+crates/corvid/src/scalar.rs:957:    pub fn create_scalar_index(&self, field: &str) -> Result<()> {
+crates/corvid/src/scalar.rs:983:    pub fn create_compound_index(&self, fields: &[&str]) -> Result<()> {
+crates/corvid/src/filter.rs:16:pub enum CmpOp {
+crates/corvid/src/filter.rs:33:pub enum Predicate {
+crates/corvid/src/filter.rs:97:    pub fn and(self, other: Predicate) -> Predicate {
+crates/corvid/src/filter.rs:102:    pub fn or(self, other: Predicate) -> Predicate {
+crates/corvid/src/filter.rs:116:    pub fn eval(&self, doc: &Value) -> bool {
+crates/corvid/src/filter.rs:167:pub fn field(path: impl Into<String>) -> FieldRef {
+crates/corvid/src/filter.rs:172:pub struct FieldRef {
+crates/corvid/src/filter.rs:178:    pub fn eq(self, value: Value) -> Predicate {
+crates/corvid/src/filter.rs:182:    pub fn ne(self, value: Value) -> Predicate {
+crates/corvid/src/filter.rs:186:    pub fn lt(self, value: Value) -> Predicate {
+crates/corvid/src/filter.rs:190:    pub fn le(self, value: Value) -> Predicate {
+crates/corvid/src/filter.rs:194:    pub fn gt(self, value: Value) -> Predicate {
+crates/corvid/src/filter.rs:198:    pub fn ge(self, value: Value) -> Predicate {
+crates/corvid/src/filter.rs:202:    pub fn exists(self) -> Predicate {
+crates/corvid/src/filter.rs:207:    pub fn is_in(self, values: impl IntoIterator<Item = Value>) -> Predicate {
+crates/corvid/src/filter.rs:215:    pub fn between(self, low: Value, high: Value) -> Predicate {
+crates/corvid/src/filter.rs:224:    pub fn starts_with(self, prefix: impl Into<String>) -> Predicate {
+crates/corvid/src/filter.rs:232:    pub fn contains(self, substr: impl Into<String>) -> Predicate {
+crates/corvid/src/filter.rs:241:    pub fn within_km(self, lat: f64, lon: f64, radius_km: f64) -> Predicate {
+crates/corvid/src/graph.rs:38:    pub fn link(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<()> {
+crates/corvid/src/graph.rs:60:    pub fn link_weighted(&self, from: &[u8], relation: &str, to: &[u8], weight: f64) -> Result<()> {
+crates/corvid/src/graph.rs:80:    pub fn neighbors_weighted(&self, from: &[u8], relation: &str) -> Result<Vec<(Vec<u8>, f64)>> {
+crates/corvid/src/graph.rs:98:    pub fn unlink(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<bool> {
+crates/corvid/src/graph.rs:118:    pub fn neighbors(&self, from: &[u8], relation: &str) -> Result<Vec<Vec<u8>>> {
+crates/corvid/src/graph.rs:129:    pub fn in_neighbors(&self, to: &[u8], relation: &str) -> Result<Vec<Vec<u8>>> {
+crates/corvid/src/graph.rs:149:    pub fn traverse(&self, start: &[u8], relation: &str, hops: usize) -> Result<Vec<Vec<u8>>> {
+crates/corvid/src/graph.rs:360:    pub collection: String,
+crates/corvid/src/graph.rs:361:    pub relation: String,
+crates/corvid/src/graph.rs:362:    pub from: Vec<u8>,
+crates/corvid/src/graph.rs:363:    pub to: Vec<u8>,
+crates/corvid/src/graph.rs:364:    pub weight: f64,
+crates/corvid/src/text.rs:10:pub struct Bm25Params {
+crates/corvid/src/text.rs:15:    pub b: f32,
+crates/corvid/src/text.rs:31:    pub fn new(k1: f32, b: f32) -> crate::error::Result<Self> {
+crates/corvid/src/text.rs:39:    pub fn validate(&self) -> crate::error::Result<()> {
+crates/corvid/src/text.rs:62:pub fn tokenize(text: &str) -> Vec<String> {
+crates/corvid/src/text.rs:88:pub fn s_stem(word: &str) -> String {
+crates/corvid/src/text.rs:118:pub struct Analyzer {
+crates/corvid/src/text.rs:120:    pub remove_stop_words: bool,
+crates/corvid/src/text.rs:122:    pub stem: bool,
+crates/corvid/src/text.rs:137:    pub fn raw() -> Self {
+crates/corvid/src/text.rs:145:    pub fn analyze(&self, text: &str) -> Vec<String> {
+crates/corvid/src/text.rs:157:pub fn analyze(text: &str) -> Vec<String> {
+crates/corvid/src/text.rs:165:pub fn idf(n_docs: usize, doc_freq: usize) -> f32 {
+crates/corvid/src/text.rs:173:pub fn term_score(tf: u32, doc_len: usize, avg_len: f32, idf: f32, params: Bm25Params) -> f32 {
+crates/corvid-mcp/src/error.rs:7:pub enum ToolError {
+crates/corvid/src/distance.rs:12:pub enum Metric {
+crates/corvid/src/distance.rs:30:    pub fn distance(self, a: &[f32], b: &[f32]) -> f32 {
+crates/corvid/src/distance.rs:46:pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+crates/corvid/src/distance.rs:65:pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
+crates/corvid/src/distance.rs:85:pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+crates/corvid/src/value.rs:19:pub enum Value {
+crates/corvid/src/value.rs:62:pub const MAX_NESTING: usize = 128;
+crates/corvid/src/value.rs:66:    pub fn encode(&self) -> Vec<u8> {
+crates/corvid/src/value.rs:73:    pub fn get(&self, key: &str) -> Option<&Value> {
+crates/corvid/src/value.rs:85:    pub fn get_path(&self, path: &str) -> Option<&Value> {
+crates/corvid/src/value.rs:97:    pub fn as_bool(&self) -> Option<bool> {
+crates/corvid/src/value.rs:105:    pub fn as_int(&self) -> Option<i64> {
+crates/corvid/src/value.rs:113:    pub fn as_float(&self) -> Option<f64> {
+crates/corvid/src/value.rs:121:    pub fn as_text(&self) -> Option<&str> {
+crates/corvid/src/value.rs:129:    pub fn as_bytes(&self) -> Option<&[u8]> {
+crates/corvid/src/value.rs:137:    pub fn as_vector(&self) -> Option<&[f32]> {
+crates/corvid/src/value.rs:150:    pub fn decode(bytes: &[u8]) -> Result<Value> {
+crates/corvid/src/reactive.rs:16:pub enum ChangeKind {
+crates/corvid/src/reactive.rs:25:pub struct ChangeEvent {
+crates/corvid/src/reactive.rs:27:    pub collection: String,
+crates/corvid/src/reactive.rs:29:    pub key: Vec<u8>,
+crates/corvid/src/reactive.rs:31:    pub kind: ChangeKind,
+crates/corvid/src/reactive.rs:45:pub struct SubscriptionId(u64);
+crates/corvid/src/reactive.rs:50:    pub fn subscribe(
+crates/corvid/src/reactive.rs:62:    pub fn unsubscribe(&self, id: SubscriptionId) -> bool {
+crates/corvid/src/disk_hnsw.rs:36:    pub metric: Metric,
+crates/corvid/src/disk_hnsw.rs:37:    pub quant: Quantization,
+crates/corvid/src/disk_hnsw.rs:40:    pub pq: Option<Arc<Pq>>,
+crates/corvid/src/disk_hnsw.rs:41:    pub m: usize,
+crates/corvid/src/disk_hnsw.rs:43:    pub ef_construction: usize,
+crates/corvid/src/disk_hnsw.rs:44:    pub ml: f64,
+crates/corvid/src/disk_hnsw.rs:48:    pub fn with_quant(
+crates/corvid/src/disk_hnsw.rs:67:    pub fn with_pq(mut self, pq: Arc<Pq>) -> Self {
+crates/corvid/src/builder.rs:68:pub struct ResultRow {
+crates/corvid/src/builder.rs:70:    pub key: Vec<u8>,
+crates/corvid/src/builder.rs:72:    pub score: f32,
+crates/corvid/src/builder.rs:74:    pub document: Value,
+crates/corvid/src/builder.rs:99:pub enum PlanShape {
+crates/corvid/src/builder.rs:132:pub struct QueryBuilder<'c> {
+crates/corvid/src/builder.rs:147:    pub fn query(&self) -> QueryBuilder<'c> {
+crates/corvid/src/builder.rs:166:    pub fn filter(mut self, predicate: Predicate) -> Self {
+crates/corvid/src/builder.rs:173:    pub fn vector(
+crates/corvid/src/builder.rs:191:    pub fn text(mut self, field: impl Into<String>, query: impl Into<String>, k: usize) -> Self {
+crates/corvid/src/builder.rs:204:    pub fn fuse_rrf(mut self, k: f32) -> Self {
+crates/corvid/src/builder.rs:214:    pub fn rerank_mmr(mut self, lambda: f32) -> Self {
+crates/corvid/src/builder.rs:220:    pub fn limit(mut self, n: usize) -> Self {
+crates/corvid/src/builder.rs:227:    pub fn offset(mut self, n: usize) -> Self {
+crates/corvid/src/builder.rs:240:    pub fn order_by(mut self, field: impl Into<String>, descending: bool) -> Self {
+crates/corvid/src/builder.rs:249:    pub fn approx(mut self) -> Self {
+crates/corvid/src/builder.rs:260:    pub fn select<I, S>(mut self, fields: I) -> Self
+crates/corvid/src/builder.rs:275:    pub fn count(self) -> Result<usize> {
+crates/corvid/src/builder.rs:308:    pub fn group_count(self, field: &str) -> Result<BTreeMap<String, usize>> {
+crates/corvid/src/builder.rs:343:    pub fn sum(self, field: &str) -> Result<f64> {
+crates/corvid/src/builder.rs:354:    pub fn avg(self, field: &str) -> Result<Option<f64>> {
+crates/corvid/src/builder.rs:366:    pub fn min(self, field: &str) -> Result<Option<Value>> {
+crates/corvid/src/builder.rs:371:    pub fn max(self, field: &str) -> Result<Option<Value>> {
+crates/corvid/src/builder.rs:396:    pub fn count_distinct(self, field: &str) -> Result<usize> {
+crates/corvid/src/builder.rs:412:    pub fn group_sum(self, group_field: &str, value_field: &str) -> Result<BTreeMap<String, f64>> {
+crates/corvid/src/builder.rs:431:    pub fn group_avg(self, group_field: &str, value_field: &str) -> Result<BTreeMap<String, f64>> {
+crates/corvid/src/builder.rs:914:    pub fn plan(&self) -> crate::plan::QueryPlan {
+crates/corvid/src/builder.rs:1130:    pub fn plan_shape(&self) -> PlanShape {
+crates/corvid/src/builder.rs:1181:    pub fn explain(&self) -> String {
+crates/corvid/src/builder.rs:1237:    pub fn run(self) -> Result<Vec<ResultRow>> {
+crates/corvid/src/builder.rs:1754:        pub ann: usize,
+crates/corvid/src/builder.rs:1755:        pub text: usize,
+crates/corvid/src/builder.rs:1756:        pub indexed: usize,
+crates/corvid/src/error.rs:10:pub type Result<T> = std::result::Result<T, Error>;
+crates/corvid/src/error.rs:15:pub enum Error {
+crates/corvid/src/pq.rs:22:pub struct Pq {
+crates/corvid/src/pq.rs:37:    pub fn code_len(&self) -> usize {
+crates/corvid/src/pq.rs:42:    pub fn dim(&self) -> usize {
+crates/corvid/src/pq.rs:47:    pub fn params(&self) -> (usize, usize) {
+crates/corvid/src/pq.rs:54:    pub fn train(sample: &[Vec<f32>], m: usize, k: usize) -> Option<Pq> {
+crates/corvid/src/pq.rs:84:    pub fn encode(&self, v: &[f32]) -> Vec<u8> {
+crates/corvid/src/pq.rs:98:    pub fn decode(&self, code: &[u8]) -> Vec<f32> {
+crates/corvid/src/pq.rs:115:    pub fn distance(&self, metric: Metric, query: &[f32], code: &[u8]) -> f32 {
+crates/corvid/src/pq.rs:125:    pub fn l2_table(&self, query: &[f32]) -> Option<Vec<f32>> {
+crates/corvid/src/pq.rs:151:    pub fn adc_l2(&self, table: &[f32], code: &[u8]) -> f32 {
+crates/corvid/src/pq.rs:164:    pub fn to_bytes(&self) -> Vec<u8> {
+crates/corvid/src/pq.rs:178:    pub fn from_bytes(b: &[u8]) -> Option<Pq> {
+crates/corvid/src/ttl.rs:285:    pub fn insert_with_ttl(&self, key: &[u8], doc: &crate::Value, expires_at: i64) -> Result<()> {
+crates/corvid/src/ttl.rs:295:    pub fn set_ttl(&self, key: &[u8], expires_at: i64) -> Result<()> {
+crates/corvid/src/ttl.rs:301:    pub fn ttl(&self, key: &[u8]) -> Result<Option<i64>> {
+crates/corvid/src/ttl.rs:307:    pub fn purge_expired(&self, now: i64) -> Result<usize> {
+crates/corvid/src/store.rs:52:pub struct Store {
+crates/corvid/src/store.rs:77:pub struct BulkScope(PhantomData<*const ()>);
+crates/corvid/src/store.rs:87:    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+crates/corvid/src/store.rs:97:    pub fn open_in_memory() -> Result<Self> {
+crates/corvid/src/store.rs:107:    pub fn set_relaxed_durability(&self, on: bool) {
+crates/corvid/src/store.rs:115:    pub fn begin_bulk(&self) -> BulkScope {
+crates/corvid/src/store.rs:127:    pub fn flush(&self) -> Result<()> {
+crates/corvid/src/store.rs:136:    pub fn compact(&mut self) -> Result<bool> {
+crates/corvid/src/store.rs:189:    pub fn next_auto_id(&self, collection: &str) -> Result<u64> {
+crates/corvid/src/store.rs:241:    pub fn backup(&self, path: impl AsRef<Path>) -> Result<()> {
+crates/corvid/src/store.rs:295:    pub fn transaction<F, T>(&self, f: F) -> Result<T>
+crates/corvid/src/store.rs:313:    pub fn read<F, T>(&self, f: F) -> Result<T>
+crates/corvid/src/store.rs:323:    pub fn put(&self, collection: &str, key: &[u8], value: &[u8]) -> Result<()> {
+crates/corvid/src/store.rs:328:    pub fn get(&self, collection: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+crates/corvid/src/store.rs:333:    pub fn delete(&self, collection: &str, key: &[u8]) -> Result<bool> {
+crates/corvid/src/store.rs:338:    pub fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+crates/corvid/src/store.rs:343:    pub fn collections(&self) -> Result<Vec<String>> {
+crates/corvid/src/store.rs:362:    pub fn scan_from(
+crates/corvid/src/store.rs:400:    pub fn count(&self, collection: &str) -> Result<u64> {
+crates/corvid/src/store.rs:417:    pub fn for_each<F>(&self, collection: &str, mut f: F) -> Result<()>
+crates/corvid/src/store.rs:452:    pub fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+crates/corvid/src/store.rs:516:pub struct WriteBatch<'txn> {
+crates/corvid/src/store.rs:523:    pub fn put(&mut self, collection: &str, key: &[u8], value: &[u8]) -> Result<()> {
+crates/corvid/src/store.rs:539:    pub fn get(&self, collection: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+crates/corvid/src/store.rs:550:    pub fn delete(&mut self, collection: &str, key: &[u8]) -> Result<bool> {
+crates/corvid/src/store.rs:581:    pub fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+crates/corvid/src/store.rs:593:    pub fn scan_from(
+crates/corvid/src/store.rs:656:    pub fn next_auto_id(&mut self, collection: &str) -> Result<u64> {
+crates/corvid/src/store.rs:668:pub struct ReadBatch<'txn> {
+crates/corvid/src/store.rs:677:    pub fn collections(&self) -> Result<Vec<String>> {
+crates/corvid/src/store.rs:696:    pub fn auto_ids(&self) -> Result<Vec<(String, u64)>> {
+crates/corvid/src/store.rs:713:    pub fn get(&self, collection: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+crates/corvid/src/store.rs:724:    pub fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+crates/corvid/src/store.rs:737:    pub fn scan_from(
+crates/corvid/src/store.rs:770:    pub fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+crates/corvid/src/store.rs:796:    pub fn for_each(
+crates/corvid/src/join.rs:15:pub struct JoinRow {
+crates/corvid/src/join.rs:17:    pub key: Vec<u8>,
+crates/corvid/src/join.rs:19:    pub left: Value,
+crates/corvid/src/join.rs:21:    pub right: Option<Value>,
+crates/corvid/src/join.rs:34:    pub fn join(&self, other: &str, foreign_key_field: &str) -> Result<Vec<JoinRow>> {
+crates/corvid/src/index.rs:172:    pub collection: String,
+crates/corvid/src/index.rs:173:    pub field: String,
+crates/corvid/src/index.rs:174:    pub metric: Metric,
+crates/corvid/src/index.rs:175:    pub quant: Quantization,
+crates/corvid/src/index.rs:176:    pub mode: VectorMode,
+crates/corvid/src/index.rs:949:    pub fn create_vector_index(&self, field: &str, metric: Metric) -> Result<()> {
+crates/corvid/src/index.rs:964:    pub fn create_vector_index_quantized(
+crates/corvid/src/index.rs:989:    pub fn create_vector_index_ondisk(&self, field: &str, metric: Metric) -> Result<()> {
+crates/corvid/src/index.rs:997:    pub fn create_vector_index_ondisk_quantized(
+crates/corvid/src/index.rs:1038:    pub fn create_vector_index_ondisk_pq(
+crates/corvid/src/plan.rs:23:pub struct QueryPlan(pub(crate) String);
+crates/corvid/src/plan.rs:27:    pub fn key(&self) -> &str {
+crates/corvid/src/plan.rs:35:pub struct PlanCache<V> {
+crates/corvid/src/plan.rs:41:    pub fn new() -> Self {
+crates/corvid/src/plan.rs:48:    pub fn get(&self, plan: &QueryPlan) -> Option<&V> {
+crates/corvid/src/plan.rs:53:    pub fn insert(&mut self, plan: QueryPlan, value: V) {
+crates/corvid/src/plan.rs:59:    pub fn get_or_insert_with<F>(&mut self, plan: QueryPlan, f: F) -> &V
+crates/corvid/src/plan.rs:67:    pub fn len(&self) -> usize {
+crates/corvid/src/plan.rs:72:    pub fn is_empty(&self) -> bool {
+crates/corvid/src/migrate.rs:175:    pub fn dump<W: Write>(&self, w: W) -> Result<()> {
+crates/corvid/src/migrate.rs:327:    pub fn load<R: Read>(&self, r: R) -> Result<()> {
+crates/corvid/src/geo_index.rs:441:    pub fn create_geo_index(&self, field: &str) -> Result<()> {
+crates/corvid/src/db.rs:26:pub struct Db {
+crates/corvid/src/db.rs:42:    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+crates/corvid/src/db.rs:65:    pub fn open_in_memory() -> Result<Self> {
+crates/corvid/src/db.rs:89:    pub fn collection<'a>(&'a self, name: &'a str) -> Collection<'a> {
+crates/corvid/src/db.rs:97:    pub fn backup(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+crates/corvid/src/db.rs:110:    pub fn bulk<F, T>(&self, f: F) -> Result<T>
+crates/corvid/src/db.rs:129:    pub fn compact(&mut self) -> Result<bool> {
+crates/corvid/src/db.rs:135:    pub fn collections(&self) -> Result<Vec<String>> {
+crates/corvid/src/db.rs:386:pub struct Collection<'a> {
+crates/corvid/src/db.rs:417:    pub fn insert(&self, key: &[u8], doc: &Value) -> Result<()> {
+crates/corvid/src/db.rs:428:    pub fn update<F>(&self, key: &[u8], f: F) -> Result<()>
+crates/corvid/src/db.rs:446:    pub fn patch(&self, key: &[u8], patch: &Value) -> Result<()> {
+crates/corvid/src/db.rs:463:    pub fn compare_and_set(
+crates/corvid/src/db.rs:516:    pub fn for_each_doc<F>(&self, mut f: F) -> Result<()>
+crates/corvid/src/db.rs:541:    pub fn len(&self) -> Result<usize> {
+crates/corvid/src/db.rs:546:    pub fn is_empty(&self) -> Result<bool> {
+crates/corvid/src/db.rs:555:    pub fn insert_batch(&self, items: &[(&[u8], &Value)]) -> Result<()> {
+crates/corvid/src/db.rs:585:    pub fn insert_auto(&self, doc: &Value) -> Result<Vec<u8>> {
+crates/corvid/src/db.rs:591:    pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+crates/corvid/src/db.rs:614:    pub fn delete(&self, key: &[u8]) -> Result<bool> {
+crates/corvid/src/db.rs:623:    pub fn delete_where(&self, predicate: crate::filter::Predicate) -> Result<usize> {
+crates/corvid/src/db.rs:642:    pub fn delete_batch(&self, keys: &[&[u8]]) -> Result<usize> {
+crates/corvid/src/db.rs:654:    pub fn scan(&self) -> Result<Vec<(Vec<u8>, Value)>> {
+crates/corvid/src/db.rs:676:    pub fn page(&self, after: Option<&[u8]>, limit: usize) -> Result<Page> {
+crates/corvid/src/db.rs:683:    pub fn page_where(
+crates/corvid/src/db.rs:749:pub struct Page {
+crates/corvid/src/db.rs:751:    pub rows: Vec<(Vec<u8>, Value)>,
+crates/corvid/src/db.rs:753:    pub next: Option<Vec<u8>>,
+crates/corvid/src/semantic_cache.rs:20:pub struct SemanticCache<'a> {
+crates/corvid/src/semantic_cache.rs:32:    pub fn semantic_cache(
+crates/corvid/src/semantic_cache.rs:51:    pub fn put(&self, key: &[u8], embedding: Vec<f32>, value: Value) -> Result<()> {
+crates/corvid/src/semantic_cache.rs:66:    pub fn get(&self, query: &[f32]) -> Result<Option<Value>> {
+crates/corvid/src/schema.rs:23:pub enum FieldType {
+crates/corvid/src/schema.rs:84:pub struct Field {
+crates/corvid/src/schema.rs:86:    pub name: String,
+crates/corvid/src/schema.rs:88:    pub ty: FieldType,
+crates/corvid/src/schema.rs:90:    pub required: bool,
+crates/corvid/src/schema.rs:92:    pub unique: bool,
+crates/corvid/src/schema.rs:97:    pub fn new(name: impl Into<String>, ty: FieldType) -> Self {
+crates/corvid/src/schema.rs:107:    pub fn required(mut self) -> Self {
+crates/corvid/src/schema.rs:113:    pub fn unique(mut self) -> Self {
+crates/corvid/src/schema.rs:121:pub struct Schema {
+crates/corvid/src/schema.rs:127:    pub fn new() -> Self {
+crates/corvid/src/schema.rs:132:    pub fn field(mut self, field: Field) -> Self {
+crates/corvid/src/schema.rs:138:    pub fn fields(&self) -> &[Field] {
+crates/corvid/src/schema.rs:389:    pub fn set_schema(&self, schema: &Schema) -> Result<()> {
+crates/corvid/src/geo.rs:21:pub fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+crates/corvid/src/geo.rs:47:pub struct GeoHit {
+crates/corvid/src/geo.rs:49:    pub key: Vec<u8>,
+crates/corvid/src/geo.rs:51:    pub distance_km: f64,
+crates/corvid/src/geo.rs:53:    pub document: Value,
+crates/corvid/src/geo.rs:60:    pub fn geo_within_radius(
+crates/corvid/src/geo.rs:138:    pub fn geo_nearest(&self, field: &str, lat: f64, lon: f64, k: usize) -> Result<Vec<GeoHit>> {
+crates/corvid/src/geo.rs:169:    pub fn geo_within_bbox(
+crates/corvid-mcp/src/convert.rs:25:pub fn json_to_value(json: &Json) -> Value {
+crates/corvid-mcp/src/convert.rs:58:pub fn value_to_json(value: &Value) -> Json {
+crates/corvid/src/fusion.rs:11:pub const DEFAULT_RRF_K: f32 = 60.0;
+crates/corvid/src/fusion.rs:21:pub fn reciprocal_rank_fusion(rankings: &[&[Vec<u8>]], k: f32) -> Vec<(Vec<u8>, f32)> {
+crates/corvid/src/fusion.rs:50:pub fn mmr(
+crates/corvid/src/query.rs:21:pub struct Hit {
+crates/corvid/src/query.rs:23:    pub key: Vec<u8>,
+crates/corvid/src/query.rs:27:    pub distance: f32,
+crates/corvid/src/query.rs:29:    pub document: Value,
+crates/corvid/src/query.rs:33:    pub approximate: bool,
+crates/corvid/src/query.rs:39:pub struct TextHit {
+crates/corvid/src/query.rs:41:    pub key: Vec<u8>,
+crates/corvid/src/query.rs:43:    pub score: f32,
+crates/corvid/src/query.rs:45:    pub document: Value,
+crates/corvid/src/query.rs:59:    pub fn text_search(&self, field: &str, query: &str, k: usize) -> Result<Vec<TextHit>> {
+crates/corvid/src/query.rs:111:    pub fn phrase_search(&self, field: &str, phrase: &str, k: usize) -> Result<Vec<TextHit>> {
+crates/corvid/src/query.rs:240:    pub fn vector_search(
+crates/corvid/src/fts.rs:686:    pub fn create_text_index(&self, field: &str) -> Result<()> {
+crates/corvid/src/fts.rs:705:    pub fn create_text_index_ondisk(&self, field: &str) -> Result<()> {
+crates/corvid/src/quant.rs:12:pub enum Quantization {
+crates/corvid/src/sketch.rs:23:pub struct HyperLogLog {
+crates/corvid/src/sketch.rs:37:    pub fn new() -> Self {
+crates/corvid/src/sketch.rs:43:    pub fn with_precision(p: u32) -> Self {
+crates/corvid/src/sketch.rs:52:    pub fn add_bytes(&mut self, bytes: &[u8]) {
+crates/corvid/src/sketch.rs:57:    pub fn add_hash(&mut self, hash: u64) {
+crates/corvid/src/sketch.rs:68:    pub fn estimate(&self) -> u64 {
+crates/corvid/src/sketch.rs:91:pub struct BloomFilter {
+crates/corvid/src/sketch.rs:99:    pub fn new(expected_items: usize, fp_rate: f64) -> Self {
+crates/corvid/src/sketch.rs:113:    pub fn add_bytes(&mut self, bytes: &[u8]) {
+crates/corvid/src/sketch.rs:121:    pub fn contains_bytes(&self, bytes: &[u8]) -> bool {
+crates/corvid/src/sketch.rs:139:    pub fn approx_distinct(&self, field: &str) -> Result<u64> {
