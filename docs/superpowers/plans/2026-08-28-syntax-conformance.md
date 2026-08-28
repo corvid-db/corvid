@@ -299,6 +299,10 @@ unsubscribe stop, cross-collection isolation.
 
 ### Task 13: Lifecycle conformance
 
+Prepend (Task 11 routing, binding): drive `Error::CorruptIndex` through
+the public API (write a real db file with a vector index, corrupt index
+bytes on disk, reopen, query -> exact variant) so the manifest row gets a
+covering test before strict mode.
 Fill `lifecycle.rs`: Db::open real file (create/reopen persistence across
 handles), open_in_memory, backup (restores identical state; error on bad
 path), bulk (atomicity on panic-free failure, !Send scope respected,
