@@ -50,8 +50,9 @@ pub struct Row {
 }
 
 /// When `true`, a manifest row with empty `covering_tests` fails the radar.
-/// `false` while the conformance waves (Task 14 fills `tools.rs`) populate the
-/// suite; Task 15 deletes the flag entirely, making strict mode permanent.
+/// `false` while the conformance waves populate the suite; Task 14 has now
+/// filled every row — Task 15 deletes the flag entirely, making strict mode
+/// permanent.
 const STRICT_COVERING: bool = false;
 
 /// The statement-class names, exactly as the conformance plan's taxonomy
@@ -77,105 +78,365 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid_mcp::Server",
         "MCP wire",
-        &["tools_smoke_in_process_wire_roundtrip"],
+        &[
+            "server_new_wraps_an_engine_db",
+            "tools_smoke_in_process_wire_roundtrip",
+        ],
     ),
-    row("corvid_mcp::Server::new", "MCP wire", &[]),
-    row("corvid_mcp::Server::open", "MCP wire", &[]),
+    row(
+        "corvid_mcp::Server::new",
+        "MCP wire",
+        &["server_new_wraps_an_engine_db"],
+    ),
+    row(
+        "corvid_mcp::Server::open",
+        "MCP wire",
+        &[
+            "backup_reopens_as_a_live_database",
+            "open_server_memory_and_file_backed",
+        ],
+    ),
     row(
         "corvid_mcp::Server::open_in_memory",
         "MCP wire",
-        &["tools_smoke_in_process_wire_roundtrip"],
+        &[
+            "envelope_initialize_result_shape",
+            "tools_smoke_in_process_wire_roundtrip",
+        ],
     ),
     row(
         "corvid_mcp::Server::handle",
         "MCP wire",
-        &["tools_smoke_in_process_wire_roundtrip"],
+        &[
+            "envelope_error_taxonomy_three_surfaces",
+            "store_then_get_roundtrips_and_overwrites",
+        ],
     ),
     // ===== error.rs — the tool error vocabulary =====
-    row("corvid_mcp::ToolError", "MCP wire", &[]),
-    row("corvid_mcp::ToolError::UnknownTool", "MCP wire", &[]),
-    row("corvid_mcp::ToolError::BadParams", "MCP wire", &[]),
-    row("corvid_mcp::ToolError::Engine", "MCP wire", &[]),
+    row(
+        "corvid_mcp::ToolError",
+        "MCP wire",
+        &["envelope_error_taxonomy_three_surfaces"],
+    ),
+    row(
+        "corvid_mcp::ToolError::UnknownTool",
+        "MCP wire",
+        &["envelope_error_taxonomy_three_surfaces"],
+    ),
+    row(
+        "corvid_mcp::ToolError::BadParams",
+        "MCP wire",
+        &[
+            "envelope_error_taxonomy_three_surfaces",
+            "store_and_get_param_errors",
+        ],
+    ),
+    row(
+        "corvid_mcp::ToolError::Engine",
+        "MCP wire",
+        &[
+            "envelope_error_taxonomy_three_surfaces",
+            "store_engine_name_errors_surface",
+        ],
+    ),
     // ===== convert.rs — the JSON <-> engine value conventions =====
-    row("corvid_mcp::convert::json_to_value", "MCP wire", &[]),
-    row("corvid_mcp::convert::value_to_json", "MCP wire", &[]),
+    row(
+        "corvid_mcp::convert::json_to_value",
+        "MCP wire",
+        &[
+            "vector_wrapper_roundtrips_through_the_wire",
+            "convert_malformed_wrappers_fall_back_to_maps",
+            "convert_int_float_distinction_survives",
+            "convert_u64_beyond_i64_is_lossy_float",
+        ],
+    ),
+    row(
+        "corvid_mcp::convert::value_to_json",
+        "MCP wire",
+        &[
+            "bytes_wrapper_roundtrips_through_the_wire",
+            "convert_wrappers_nested_and_multi_key",
+            "convert_vector_components_are_f32_precision",
+            "convert_unicode_text_survives",
+        ],
+    ),
     // ===== protocol.rs — the transport =====
     row(
         "corvid_mcp::protocol::PROTOCOL_VERSION",
         "MCP wire",
-        &["tools_smoke_in_process_wire_roundtrip"],
+        &[
+            "envelope_initialize_result_shape",
+            "tools_smoke_in_process_wire_roundtrip",
+        ],
     ),
-    row("corvid_mcp::protocol::MAX_FRAME_SIZE", "MCP wire", &[]),
-    row("corvid_mcp::protocol::open_server", "MCP wire", &[]),
+    row(
+        "corvid_mcp::protocol::MAX_FRAME_SIZE",
+        "MCP wire",
+        &["frame_over_default_max_frame_size_is_refused"],
+    ),
+    row(
+        "corvid_mcp::protocol::open_server",
+        "MCP wire",
+        &["open_server_memory_and_file_backed"],
+    ),
     row(
         "corvid_mcp::protocol::run",
         "MCP wire",
-        &["tools_smoke_in_process_wire_roundtrip"],
+        &[
+            "envelope_session_multiple_requests_in_order",
+            "frame_over_default_max_frame_size_is_refused",
+            "tools_smoke_in_process_wire_roundtrip",
+        ],
     ),
-    row("corvid_mcp::protocol::run_with_limit", "MCP wire", &[]),
-    row("corvid_mcp::protocol::handle_request", "MCP wire", &[]),
+    row(
+        "corvid_mcp::protocol::run_with_limit",
+        "MCP wire",
+        &["frame_size_boundary_exact_and_one_over"],
+    ),
+    row(
+        "corvid_mcp::protocol::handle_request",
+        "MCP wire",
+        &[
+            "envelope_initialize_result_shape",
+            "envelope_notifications_produce_no_response",
+        ],
+    ),
     // ===== JSON-RPC envelope kinds (wire syntax, not Rust items) =====
     row(
         "mcp::envelope::initialize",
         "MCP wire",
-        &["tools_smoke_in_process_wire_roundtrip"],
+        &[
+            "envelope_initialize_result_shape",
+            "tools_smoke_in_process_wire_roundtrip",
+        ],
     ),
     row(
         "mcp::envelope::ping",
         "MCP wire",
-        &["tools_smoke_in_process_wire_roundtrip"],
+        &[
+            "envelope_ping_empty_result",
+            "envelope_blank_and_crlf_frames_are_ignored",
+        ],
     ),
     row(
         "mcp::envelope::tools/list",
         "MCP wire",
-        &["tools_smoke_in_process_wire_roundtrip"],
+        &["envelope_tools_list_all_27_with_schemas"],
     ),
     row(
         "mcp::envelope::tools/call",
         "MCP wire",
-        &["tools_smoke_in_process_wire_roundtrip"],
+        &[
+            "envelope_tools_call_content_shape",
+            "envelope_tools_call_malformed_request_is_invalid_params",
+        ],
     ),
     row(
         "mcp::envelope::error_response",
         "MCP wire",
-        &["tools_smoke_in_process_wire_roundtrip"],
+        &[
+            "envelope_unknown_and_missing_method_codes",
+            "envelope_malformed_line_is_parse_error_and_loop_survives",
+        ],
     ),
     // ===== MCP tool names (wire syntax, not Rust items), in tools/list order =====
     row(
         "mcp::tool::store",
         "MCP wire",
-        &["tools_smoke_in_process_wire_roundtrip"],
+        &[
+            "store_then_get_roundtrips_and_overwrites",
+            "store_accepts_every_json_document_kind",
+            "store_and_get_param_errors",
+            "store_engine_name_errors_surface",
+        ],
     ),
-    row("mcp::tool::patch", "MCP wire", &[]),
-    row("mcp::tool::compare_and_set", "MCP wire", &[]),
+    row(
+        "mcp::tool::patch",
+        "MCP wire",
+        &["patch_merges_top_level_and_creates_missing"],
+    ),
+    row(
+        "mcp::tool::compare_and_set",
+        "MCP wire",
+        &[
+            "compare_and_set_absent_expected_and_mismatch",
+            "compare_and_set_new_omitted_deletes",
+        ],
+    ),
     row(
         "mcp::tool::get",
         "MCP wire",
-        &["tools_smoke_in_process_wire_roundtrip"],
+        &[
+            "store_then_get_roundtrips_and_overwrites",
+            "get_missing_key_and_unknown_collection_are_null",
+        ],
     ),
-    row("mcp::tool::delete", "MCP wire", &[]),
-    row("mcp::tool::delete_where", "MCP wire", &[]),
-    row("mcp::tool::search", "MCP wire", &[]),
-    row("mcp::tool::create_index", "MCP wire", &[]),
-    row("mcp::tool::link", "MCP wire", &[]),
-    row("mcp::tool::unlink", "MCP wire", &[]),
-    row("mcp::tool::neighbors", "MCP wire", &[]),
-    row("mcp::tool::traverse", "MCP wire", &[]),
-    row("mcp::tool::geo", "MCP wire", &[]),
-    row("mcp::tool::join", "MCP wire", &[]),
-    row("mcp::tool::in_neighbors", "MCP wire", &[]),
-    row("mcp::tool::page", "MCP wire", &[]),
-    row("mcp::tool::phrase_search", "MCP wire", &[]),
-    row("mcp::tool::create_text_index", "MCP wire", &[]),
-    row("mcp::tool::create_scalar_index", "MCP wire", &[]),
-    row("mcp::tool::create_geo_index", "MCP wire", &[]),
-    row("mcp::tool::create_compound_index", "MCP wire", &[]),
-    row("mcp::tool::backup", "MCP wire", &[]),
-    row("mcp::tool::dump", "MCP wire", &[]),
-    row("mcp::tool::load", "MCP wire", &[]),
-    row("mcp::tool::list_collections", "MCP wire", &[]),
-    row("mcp::tool::count", "MCP wire", &[]),
-    row("mcp::tool::insert_auto", "MCP wire", &[]),
+    row(
+        "mcp::tool::delete",
+        "MCP wire",
+        &["delete_reports_outcome_and_param_errors"],
+    ),
+    row(
+        "mcp::tool::delete_where",
+        "MCP wire",
+        &["delete_where_counts_and_filter_errors"],
+    ),
+    row(
+        "mcp::tool::search",
+        "MCP wire",
+        &[
+            "search_vector_orders_by_similarity",
+            "search_filter_op_matrix",
+            "search_limit_validation_matrix",
+            "search_engine_invalid_argument_mmr_and_rrf",
+        ],
+    ),
+    row(
+        "mcp::tool::create_index",
+        "MCP wire",
+        &[
+            "create_index_variants_then_search",
+            "create_index_param_and_training_errors",
+        ],
+    ),
+    row(
+        "mcp::tool::link",
+        "MCP wire",
+        &[
+            "link_without_docs_and_duplicate_is_idempotent",
+            "graph_param_errors",
+        ],
+    ),
+    row(
+        "mcp::tool::unlink",
+        "MCP wire",
+        &["unlink_reports_removed_true_then_false"],
+    ),
+    row(
+        "mcp::tool::neighbors",
+        "MCP wire",
+        &[
+            "neighbors_and_in_neighbors_directions",
+            "list_tools_clamp_oversized_limit_instead_of_erroring",
+        ],
+    ),
+    row(
+        "mcp::tool::traverse",
+        "MCP wire",
+        &[
+            "traverse_hops_cycles_and_empty_starts",
+            "graph_param_errors",
+        ],
+    ),
+    row(
+        "mcp::tool::geo",
+        "MCP wire",
+        &["geo_radius_nearest_and_limit", "geo_param_errors"],
+    ),
+    row(
+        "mcp::tool::join",
+        "MCP wire",
+        &[
+            "join_left_outer_rows_and_missing_references",
+            "join_int_foreign_key_matches_decimal_text_key",
+            "list_tools_clamp_oversized_limit_instead_of_erroring",
+        ],
+    ),
+    row(
+        "mcp::tool::in_neighbors",
+        "MCP wire",
+        &[
+            "neighbors_and_in_neighbors_directions",
+            "list_tools_clamp_oversized_limit_instead_of_erroring",
+        ],
+    ),
+    row(
+        "mcp::tool::page",
+        "MCP wire",
+        &["page_cursor_walk_default_and_boundaries"],
+    ),
+    row(
+        "mcp::tool::phrase_search",
+        "MCP wire",
+        &["phrase_search_ordered_tokens_and_k_bounds"],
+    ),
+    row(
+        "mcp::tool::create_text_index",
+        "MCP wire",
+        &[
+            "create_text_index_memory_and_ondisk",
+            "index_tools_param_and_name_errors",
+        ],
+    ),
+    row(
+        "mcp::tool::create_scalar_index",
+        "MCP wire",
+        &[
+            "create_scalar_index_exact_under_mutation",
+            "index_tools_param_and_name_errors",
+        ],
+    ),
+    row(
+        "mcp::tool::create_geo_index",
+        "MCP wire",
+        &[
+            "create_geo_index_then_radius_exact",
+            "index_tools_param_and_name_errors",
+        ],
+    ),
+    row(
+        "mcp::tool::create_compound_index",
+        "MCP wire",
+        &[
+            "create_compound_index_and_fields_errors",
+            "index_tools_param_and_name_errors",
+        ],
+    ),
+    row(
+        "mcp::tool::backup",
+        "MCP wire",
+        &[
+            "backup_reopens_as_a_live_database",
+            "backup_existing_target_and_missing_path_errors",
+        ],
+    ),
+    row(
+        "mcp::tool::dump",
+        "MCP wire",
+        &[
+            "dump_then_load_roundtrips_through_the_wire",
+            "load_missing_and_garbage_file_errors",
+        ],
+    ),
+    row(
+        "mcp::tool::load",
+        "MCP wire",
+        &[
+            "dump_then_load_roundtrips_through_the_wire",
+            "load_missing_and_garbage_file_errors",
+        ],
+    ),
+    row(
+        "mcp::tool::list_collections",
+        "MCP wire",
+        &["list_collections_lists_user_names_exactly"],
+    ),
+    row(
+        "mcp::tool::count",
+        "MCP wire",
+        &[
+            "count_exact_with_filter_and_unknown_collection",
+            "create_scalar_index_exact_under_mutation",
+        ],
+    ),
+    row(
+        "mcp::tool::insert_auto",
+        "MCP wire",
+        &[
+            "insert_auto_keys_ordered_and_distinct",
+            "dump_then_load_roundtrips_through_the_wire",
+        ],
+    ),
 ];
 
 // ===========================================================================

@@ -27,8 +27,10 @@ impl Collection<'_> {
     /// a dotted path (`"meta.author_id"`).
     ///
     /// The foreign key must be [`Value::Text`], [`Value::Bytes`], or
-    /// [`Value::Int`]; any other shape (or a missing field, or no matching
-    /// document) yields `right: None`. Rows are returned in this collection's
+    /// [`Value::Int`]; an Int foreign key matches a text key via its
+    /// decimal-string encoding (`Int(7)` joins to the key `"7"`). Any other
+    /// shape (or a missing field, or no matching document) yields
+    /// `right: None`. Rows are returned in this collection's
     /// key order. Both legs read from one consistent snapshot — the joined
     /// pair reflects a single point in time even under concurrent writes.
     pub fn join(&self, other: &str, foreign_key_field: &str) -> Result<Vec<JoinRow>> {
