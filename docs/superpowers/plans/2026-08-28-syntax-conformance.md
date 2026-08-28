@@ -184,6 +184,10 @@ identical sets), OR-union path. filter-only queries with limit/offset.
 
 ### Task 5: SELECT shaping conformance
 
+Prepend (W2 wave-review debts, binding): back-cite MANIFEST rows Wave 2
+already drives (QueryBuilder::plan_shape, PlanShape + IndexedWindow + Scan
+variants, create_compound_index, create_geo_index, QueryBuilder::offset —
+cite the filters.rs tests that drive them).
 Fill `queries.rs`: select (projection, nested paths, missing fields,
 non-map docs, empty list), order_by asc/desc × comparable kinds × missing
 × mixed-type total order (class rule), limit (0, 1, n>matches), offset
