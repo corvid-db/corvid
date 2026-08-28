@@ -758,15 +758,16 @@ impl ReadBatch<'_> {
 /// transaction per op" ([`Store`]) and "one shared snapshot"
 /// ([`ReadBatch`]). Dispatch is via `&dyn`, so an execution path runs
 /// unchanged against either backing.
-// Unused outside tests until wave-4 Tasks 2-3 thread it through the query
-// builder and the index candidate paths (impls alone don't count as a use).
-#[allow(dead_code)]
 pub(crate) trait SnapshotReader {
     /// Fetch the value at `key` within `collection`, if present.
     fn get(&self, collection: &str, key: &[u8]) -> Result<Option<Vec<u8>>>;
     /// Return all `(key, value)` pairs in `collection`, in key order.
     fn scan(&self, collection: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     /// Return up to `limit` pairs whose key is `>= start`, in key order.
+    // Unused outside tests until wave-4 Task 3 threads the reader into the
+    // index candidate paths (paged window scans) — impls alone don't count
+    // as a use for rustc's dead-code lint.
+    #[allow(dead_code)]
     fn scan_from(
         &self,
         collection: &str,
@@ -774,6 +775,8 @@ pub(crate) trait SnapshotReader {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     /// Return all pairs whose key starts with `prefix`, in key order.
+    // Same staging note as `scan_from` above (Task 3: prefix windows).
+    #[allow(dead_code)]
     fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     /// Stream every pair in `collection` to `f` in key order; `f` returns
     /// `false` to stop early. Its slices are valid only for the call.

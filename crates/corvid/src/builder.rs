@@ -39,6 +39,14 @@
 //!    source's query, field, and metric. Candidates lacking a usable embedding
 //!    keep their fused order after the reranked ones.
 //! 5. Truncate to `limit`.
+//!
+//! ## Snapshot scope
+//!
+//! One [`run`](QueryBuilder::run) — and each aggregate — executes against ONE
+//! consistent read snapshot (audit B3): every document read the query itself
+//! performs (candidate verification, ANN/text fetch loops, streaming and
+//! full scans) comes from a single read transaction, so a query's result
+//! always matches some point in time even while writers commit concurrently.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
@@ -49,6 +57,7 @@ use crate::error::Result;
 use crate::filter::{CmpOp, Predicate};
 use crate::fusion::{DEFAULT_RRF_K, mmr, reciprocal_rank_fusion};
 use crate::query::{doc_map, ranked_bm25, ranked_vector};
+use crate::store::SnapshotReader;
 use crate::value::Value;
 
 /// A set of candidate `(key, document)` pairs.
@@ -214,23 +223,30 @@ impl QueryBuilder<'_> {
     /// Count the documents matching the filters. Retrieval sources, ranking,
     /// limit, and projection are ignored — this is an aggregate over the
     /// filtered set.
+    ///
+    /// Like [`Self::run`], the whole aggregate executes on one read snapshot
+    /// (audit B3).
     pub fn count(self) -> Result<usize> {
         // No filters → use the maintained O(1) counter.
         if self.filters.is_empty() {
             return self.collection.len();
         }
-        // Scalar-index fast path: count verified candidates without a full scan.
-        if let Some(matched) = self.indexed_candidates()? {
-            return Ok(matched.len());
-        }
-        let mut n = 0usize;
-        self.collection.for_each_doc(|_, doc| {
-            if self.filters.iter().all(|p| p.eval(&doc)) {
-                n += 1;
+        self.resume_index_builds()?;
+        self.collection.db().store().read(|r| {
+            // Scalar-index fast path: count verified candidates without a
+            // full scan.
+            if let Some(matched) = self.indexed_candidates(r)? {
+                return Ok(matched.len());
             }
-            Ok(true)
-        })?;
-        Ok(n)
+            let mut n = 0usize;
+            self.collection.for_each_doc_in(r, |_, doc| {
+                if self.filters.iter().all(|p| p.eval(&doc)) {
+                    n += 1;
+                }
+                Ok(true)
+            })?;
+            Ok(n)
+        })
     }
 
     /// Count matching documents grouped by the value at `field`.
@@ -253,19 +269,24 @@ impl QueryBuilder<'_> {
     }
 
     /// Stream each document matching the filters, reusing the scalar/geo index
-    /// fast path when a filter drives one, else a bounded scan.
+    /// fast path when a filter drives one, else a bounded scan. The whole
+    /// stream observes one read snapshot (audit B3), so an aggregate built on
+    /// it never mixes states from two points in time.
     fn for_each_match(&self, mut f: impl FnMut(&Value)) -> Result<()> {
-        if let Some(cands) = self.indexed_candidates()? {
-            for (_, doc) in &cands {
-                f(doc);
+        self.resume_index_builds()?;
+        self.collection.db().store().read(|r| {
+            if let Some(cands) = self.indexed_candidates(r)? {
+                for (_, doc) in &cands {
+                    f(doc);
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        self.collection.for_each_doc(|_, doc| {
-            if self.filters.iter().all(|p| p.eval(&doc)) {
-                f(&doc);
-            }
-            Ok(true)
+            self.collection.for_each_doc_in(r, |_, doc| {
+                if self.filters.iter().all(|p| p.eval(&doc)) {
+                    f(&doc);
+                }
+                Ok(true)
+            })
         })
     }
 
@@ -380,8 +401,9 @@ impl QueryBuilder<'_> {
     /// Try the ANN fast path: a single vector source whose field/metric has a
     /// registered index. Returns the (already filtered) candidate set, or
     /// `None` to fall back to an exact scan. Filtered queries only take this
-    /// path under [`Self::approx`].
-    fn ann_candidates(&self) -> Result<Option<Candidates>> {
+    /// path under [`Self::approx`]. Document fetches read `reader`, so the
+    /// verification shares the caller's snapshot (audit B3).
+    fn ann_candidates(&self, reader: &dyn SnapshotReader) -> Result<Option<Candidates>> {
         if self.sources.len() != 1 {
             return Ok(None);
         }
@@ -406,7 +428,7 @@ impl QueryBuilder<'_> {
         };
         let mut out = Vec::new();
         for (key, _dist) in ranked {
-            if let Some(doc) = self.collection.get(&key)?
+            if let Some(doc) = self.collection.get_in(reader, &key)?
                 && self.filters.iter().all(|p| p.eval(&doc))
             {
                 out.push((key, doc));
@@ -419,8 +441,9 @@ impl QueryBuilder<'_> {
     /// straight from the index (bounded memory, no corpus rescan), then verify
     /// filters. `None` to fall back. Filtered queries take this only under
     /// [`Self::approx`] (the index ranks before filtering, so a selective
-    /// filter may leave fewer than `k`).
-    fn text_candidates(&self) -> Result<Option<Candidates>> {
+    /// filter may leave fewer than `k`). Document fetches read `reader`, so
+    /// the verification shares the caller's snapshot (audit B3).
+    fn text_candidates(&self, reader: &dyn SnapshotReader) -> Result<Option<Candidates>> {
         if self.sources.len() != 1 {
             return Ok(None);
         }
@@ -439,7 +462,7 @@ impl QueryBuilder<'_> {
         };
         let mut out = Vec::new();
         for (key, _score) in ranked {
-            if let Some(doc) = self.collection.get(&key)?
+            if let Some(doc) = self.collection.get_in(reader, &key)?
                 && self.filters.iter().all(|p| p.eval(&doc))
             {
                 out.push((key, doc));
@@ -449,10 +472,14 @@ impl QueryBuilder<'_> {
     }
 
     /// Single vector source with no usable ANN index (or an exact filtered
-    /// query): compute the top `k` by distance while *streaming* the collection,
-    /// holding only a bounded working set (~`4k`) instead of materializing every
-    /// matching document. Distance needs no corpus statistics, so this is exact.
-    fn streaming_vector_candidates(&self) -> Result<Option<Candidates>> {
+    /// query): compute the top `k` by distance while *streaming* the collection
+    /// from `reader`, holding only a bounded working set (~`4k`) instead of
+    /// materializing every matching document. Distance needs no corpus
+    /// statistics, so this is exact.
+    fn streaming_vector_candidates(
+        &self,
+        reader: &dyn SnapshotReader,
+    ) -> Result<Option<Candidates>> {
         if self.sources.len() != 1 {
             return Ok(None);
         }
@@ -475,7 +502,7 @@ impl QueryBuilder<'_> {
             buf.truncate(k);
         };
         let mut buf: Vec<(f32, Vec<u8>, Value)> = Vec::new();
-        self.collection.for_each_doc(|key, doc| {
+        self.collection.for_each_doc_in(reader, |key, doc| {
             if self.filters.iter().all(|p| p.eval(&doc))
                 && let Some(v) = doc.get_path(field).and_then(Value::as_vector)
                 && v.len() == query.len()
@@ -500,19 +527,15 @@ impl QueryBuilder<'_> {
     /// each. Returns the filtered set, or `None` to fall back to a full scan.
     ///
     /// An equality predicate is preferred (most selective); otherwise the first
-    /// range predicate is used.
-    fn indexed_candidates(&self) -> Result<Option<Candidates>> {
+    /// range predicate is used. Documents are verified against `reader` (the
+    /// caller's snapshot, audit B3). Interrupted index builds are resumed by
+    /// the caller BEFORE that snapshot opens ([`Self::resume_index_builds`]).
+    fn indexed_candidates(&self, reader: &dyn SnapshotReader) -> Result<Option<Candidates>> {
         if self.filters.is_empty() {
             return Ok(None);
         }
         let db = self.collection.db();
         let coll = self.collection.name();
-        // Before probing any index: resume interrupted builds. A `Building`
-        // def is never served, so without this a filtered query on a building
-        // index would scan forever and nothing would ever flip it Complete.
-        // Try-lock inside: a concurrent resumer means we just probe stale and
-        // fall back to the (correct) scan.
-        db.try_resume_index_builds(coll)?;
         // Cap candidates so an unselective predicate blows the cap (returns
         // None) and is skipped, instead of materialising a huge set.
         const CAP: usize = 100_000;
@@ -570,7 +593,7 @@ impl QueryBuilder<'_> {
         keep_smaller(&mut best, self.or_candidate_keys()?);
 
         match best {
-            Some(keys) => self.verify_candidates(keys),
+            Some(keys) => self.verify_candidates(reader, keys),
             None => Ok(None),
         }
     }
@@ -772,11 +795,17 @@ impl QueryBuilder<'_> {
         Ok(None)
     }
 
-    /// Fetch each candidate key's document and keep those passing every filter.
-    fn verify_candidates(&self, keys: Vec<Vec<u8>>) -> Result<Option<Candidates>> {
+    /// Fetch each candidate key's document from `reader` (the caller's
+    /// snapshot — one point in time for the whole set, audit B3) and keep
+    /// those passing every filter.
+    fn verify_candidates(
+        &self,
+        reader: &dyn SnapshotReader,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Option<Candidates>> {
         let mut out = Vec::new();
         for key in keys {
-            if let Some(doc) = self.collection.get(&key)?
+            if let Some(doc) = self.collection.get_in(reader, &key)?
                 && self.filters.iter().all(|p| p.eval(&doc))
             {
                 out.push((key, doc));
@@ -853,30 +882,74 @@ impl QueryBuilder<'_> {
     }
 
     /// Execute the query and return the ranked rows.
+    ///
+    /// ONE read snapshot covers the whole query (audit B3): every document
+    /// read — candidate verification, ANN/text fetch loops, streaming and
+    /// full scans — observes a single point in time, so the result always
+    /// matches some committed state even while writers commit concurrently.
+    /// Interrupted index builds are resumed first, before that snapshot
+    /// opens, so nothing inside query execution writes.
     pub fn run(self) -> Result<Vec<ResultRow>> {
-        // No retrieval sources → a pure filter/order/paginate query. Stream it
-        // with bounded memory instead of materializing the whole collection.
-        if self.sources.is_empty() {
-            return self.run_scan_only();
-        }
+        self.resume_index_builds()?;
+        self.collection.db().store().read(|r| self.run_with(r))
+    }
 
+    /// Resume interrupted index builds for this collection BEFORE a query
+    /// snapshot opens. Resumes take write transactions and registry locks,
+    /// so they must not run inside execution (audit B3 discipline). Gated on
+    /// filters exactly like the probe it precedes: a filterless query never
+    /// consults an index, so it never needed to resume one. Try-lock inside:
+    /// a concurrent resumer means we just probe stale and fall back to the
+    /// (correct) scan.
+    fn resume_index_builds(&self) -> Result<()> {
+        if self.filters.is_empty() {
+            return Ok(());
+        }
+        self.collection
+            .db()
+            .try_resume_index_builds(self.collection.name())
+    }
+
+    /// The execution core of [`Self::run`]: the entire query — candidate
+    /// generation, verification, ranking, fusion, rerank, ordering,
+    /// pagination, projection — reads `reader` and nothing else, so the
+    /// caller-supplied read transaction is the query's single point-in-time
+    /// view. Nothing inside writes or resumes builds. (The `Db` index
+    /// helpers consulted here still open their own transactions until the
+    /// candidate paths are threaded onto the reader; every document fetch is
+    /// already on `reader`.)
+    pub(crate) fn run_with(&self, reader: &dyn SnapshotReader) -> Result<Vec<ResultRow>> {
         // Pick the narrowest / most-bounded source for the candidate set:
-        //   1. ANN index (single indexed vector source),
-        //   2. text index (single indexed text source),
-        //   3. scalar/geo index (a filter drives a sub-linear candidate scan),
+        //   1. a filter-driven scalar/geo index; with no retrieval sources,
+        //      a streaming filter/order/paginate pass with bounded memory,
+        //   2. ANN index (single indexed vector source),
+        //   3. text index (single indexed text source),
         //   4. streaming bounded top-k (single vector source, no index),
         //   5. full scan + filter (multi-source / unindexed text).
-        let filtered: Vec<(Vec<u8>, Value)> = if let Some(c) = self.ann_candidates()? {
+        let filtered: Vec<(Vec<u8>, Value)> = if self.sources.is_empty() {
+            // No retrieval sources → a pure filter/order/paginate query.
+            // Scalar-index fast path: fetch only candidate documents instead
+            // of scanning the whole collection, then order/paginate in memory
+            // (the set is bounded by the number of matches).
+            if let Some(mut matched) = self.indexed_candidates(reader)? {
+                match &self.order_by {
+                    Some((field, descending)) => sort_by_field(&mut matched, field, *descending),
+                    None => matched.sort_by(|(ka, _), (kb, _)| ka.cmp(kb)),
+                }
+                return Ok(self.window_rows(matched));
+            }
+            self.stream_scan_only(reader)?
+        } else if let Some(c) = self.ann_candidates(reader)? {
             c
-        } else if let Some(c) = self.text_candidates()? {
+        } else if let Some(c) = self.text_candidates(reader)? {
             c
-        } else if let Some(c) = self.indexed_candidates()? {
+        } else if let Some(c) = self.indexed_candidates(reader)? {
             c
-        } else if let Some(c) = self.streaming_vector_candidates()? {
+        } else if let Some(c) = self.streaming_vector_candidates(reader)? {
             c
         } else {
             self.collection
-                .scan()?
+                .scan_in(reader)?
                 .into_iter()
                 .filter(|(_, doc)| self.filters.iter().all(|p| p.eval(doc)))
                 .collect()
@@ -949,49 +1022,20 @@ impl QueryBuilder<'_> {
             .collect())
     }
 
-    /// Streaming execution for the no-retrieval-source case (filter / order /
-    /// paginate). Memory is bounded: with `limit`, at most ~`offset + limit`
-    /// rows are held (early-stop in key order; a periodically-pruned buffer
-    /// under `order_by`). Without `limit` and with `order_by`, all matching
-    /// rows are held (an unbounded sort, as any DB without a sort index does).
-    fn run_scan_only(self) -> Result<Vec<ResultRow>> {
-        // Scalar-index fast path: fetch only candidate documents instead of
-        // scanning the whole collection, then order/paginate in memory (the set
-        // is bounded by the number of matches).
-        if let Some(mut matched) = self.indexed_candidates()? {
-            if let Some((field, descending)) = &self.order_by {
-                sort_by_field(&mut matched, field, *descending);
-            } else {
-                matched.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
-            }
-            let start = self.offset.min(matched.len());
-            let mut window = matched.split_off(start);
-            if let Some(limit) = self.limit {
-                window.truncate(limit);
-            }
-            return Ok(window
-                .into_iter()
-                .map(|(key, document)| {
-                    let document = match &self.projection {
-                        Some(fields) => project(document, fields),
-                        None => document,
-                    };
-                    ResultRow {
-                        key,
-                        score: 0.0,
-                        document,
-                    }
-                })
-                .collect());
-        }
-
+    /// Streaming candidate pass for the no-retrieval-source case (filter /
+    /// order / paginate), reading `reader`. Memory is bounded: with `limit`,
+    /// at most ~`offset + limit` rows are held (early-stop in key order; a
+    /// periodically-pruned buffer under `order_by`). Without `limit` and with
+    /// `order_by`, all matching rows are held (an unbounded sort, as any DB
+    /// without a sort index does).
+    fn stream_scan_only(&self, reader: &dyn SnapshotReader) -> Result<Vec<(Vec<u8>, Value)>> {
         let cap = self.limit.map(|l| self.offset.saturating_add(l));
         let mut buf: Vec<(Vec<u8>, Value)> = Vec::new();
 
         match &self.order_by {
             // Key order: take only the `cap` window, stopping early.
             None => {
-                self.collection.for_each_doc(|key, doc| {
+                self.collection.for_each_doc_in(reader, |key, doc| {
                     if self.filters.iter().all(|p| p.eval(&doc)) {
                         buf.push((key.to_vec(), doc));
                     }
@@ -1001,7 +1045,7 @@ impl QueryBuilder<'_> {
             // Ordered: keep the best `cap` via a periodically pruned buffer.
             Some((field, descending)) => {
                 let prune_at = cap.map(|c| c.saturating_mul(2).max(1024));
-                self.collection.for_each_doc(|key, doc| {
+                self.collection.for_each_doc_in(reader, |key, doc| {
                     if self.filters.iter().all(|p| p.eval(&doc)) {
                         buf.push((key.to_vec(), doc));
                         if let (Some(p), Some(c)) = (prune_at, cap)
@@ -1016,13 +1060,18 @@ impl QueryBuilder<'_> {
                 sort_by_field(&mut buf, field, *descending);
             }
         }
+        Ok(buf)
+    }
 
+    /// Offset + limit + projection over already-ordered `(key, document)`
+    /// rows. These rows were not ranked, so their score is `0.0`.
+    fn window_rows(&self, mut buf: Vec<(Vec<u8>, Value)>) -> Vec<ResultRow> {
         let start = self.offset.min(buf.len());
-        let mut window: Vec<(Vec<u8>, Value)> = buf.split_off(start);
+        let mut window = buf.split_off(start);
         if let Some(limit) = self.limit {
             window.truncate(limit);
         }
-        Ok(window
+        window
             .into_iter()
             .map(|(key, document)| {
                 let document = match &self.projection {
@@ -1035,7 +1084,7 @@ impl QueryBuilder<'_> {
                     document,
                 }
             })
-            .collect())
+            .collect()
     }
 
     /// The first vector source's `(field, query, metric)`, if any.
@@ -1910,6 +1959,116 @@ mod tests {
         assert_eq!(groups.get("b:true"), Some(&1));
         assert_eq!(groups.len(), 7);
         assert_eq!(c.query().count_distinct("v").unwrap(), 7);
+    }
+
+    /// Wave-4 audit B3, scenario 1 (the spec's own example): a writer flips
+    /// doc "k" between variant A (n=1) and variant B (n=2) in a tight loop
+    /// while the main thread runs a filtered query 200x. Every result set
+    /// must be one of the valid single-snapshot answers — {k} (post-A) or {}
+    /// (post-B) — never anything else. The scalar index on `tag` routes the
+    /// query through per-key document verification, the read shape this wave
+    /// makes snapshot-scoped.
+    #[test]
+    fn interleaved_flip_query_results_match_a_single_snapshot() {
+        let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
+        let c = db.collection("docs");
+        c.create_scalar_index("tag").unwrap();
+        let doc = |n: i64| {
+            let mut m = BTreeMap::new();
+            m.insert("tag".to_owned(), Value::Text("t".into()));
+            m.insert("n".to_owned(), Value::Int(n));
+            Value::Map(m)
+        };
+        // 10 docs: "k" starts at variant A (n=1); the other nine never match
+        // n==1 or n==2.
+        c.insert(b"k", &doc(1)).unwrap();
+        for i in 0..9u8 {
+            c.insert(format!("p{i}").as_bytes(), &doc(0)).unwrap();
+        }
+
+        let w = std::sync::Arc::clone(&db);
+        let writer = std::thread::spawn(move || {
+            for i in 0..1000 {
+                let n = if i % 2 == 0 { 2 } else { 1 };
+                w.collection("docs").insert(b"k", &doc(n)).unwrap();
+            }
+        });
+
+        for _ in 0..200 {
+            let keys: Vec<Vec<u8>> = db
+                .collection("docs")
+                .query()
+                .filter(field("tag").eq(Value::Text("t".into())))
+                .filter(field("n").eq(Value::Int(1)))
+                .run()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.key)
+                .collect();
+            assert!(
+                keys.is_empty() || keys == vec![b"k".to_vec()],
+                "query result {keys:?} matches no single snapshot"
+            );
+        }
+        writer.join().unwrap();
+    }
+
+    /// Wave-4 audit B3, scenario 2 (the discriminator): docs k1 ("a") and
+    /// k2 ("z") flip TOGETHER in one transaction (`insert_batch`) between
+    /// A=(n=1,n=1) and B=(n=2,n=2); eight filler docs sit between them in key
+    /// order, widening the per-key fetch window. A query for n==1 is
+    /// {k1,k2} or {} at every point in time — a result holding exactly one
+    /// of them observed k1 pre-flip and k2 post-flip, a set matching NO
+    /// point in time. The pre-wave-4 shape (one read transaction per
+    /// per-key document fetch) can produce that; single-snapshot execution
+    /// cannot.
+    #[test]
+    fn interleaved_paired_flip_never_mixes_states_from_two_snapshots() {
+        let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
+        let c = db.collection("docs");
+        c.create_scalar_index("tag").unwrap();
+        let doc = |n: i64| {
+            let mut m = BTreeMap::new();
+            m.insert("tag".to_owned(), Value::Text("t".into()));
+            m.insert("n".to_owned(), Value::Int(n));
+            Value::Map(m)
+        };
+        c.insert(b"a", &doc(1)).unwrap(); // k1
+        for i in 1..=8u8 {
+            c.insert(format!("b{i}").as_bytes(), &doc(0)).unwrap();
+        }
+        c.insert(b"z", &doc(1)).unwrap(); // k2
+
+        let w = std::sync::Arc::clone(&db);
+        let writer = std::thread::spawn(move || {
+            for i in 0..1000 {
+                let n = if i % 2 == 0 { 2 } else { 1 };
+                let d = doc(n);
+                w.collection("docs")
+                    .insert_batch(&[(b"a", &d), (b"z", &d)])
+                    .unwrap();
+            }
+        });
+
+        for _ in 0..200 {
+            let mut keys: Vec<Vec<u8>> = db
+                .collection("docs")
+                .query()
+                .filter(field("tag").eq(Value::Text("t".into())))
+                .filter(field("n").eq(Value::Int(1)))
+                .run()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.key)
+                .collect();
+            keys.sort();
+            assert!(
+                keys.is_empty() || keys == vec![b"a".to_vec(), b"z".to_vec()],
+                "query result {keys:?} mixes two snapshots \
+                 (k1 observed in A-state, k2 in B-state)"
+            );
+        }
+        writer.join().unwrap();
     }
 
     #[test]

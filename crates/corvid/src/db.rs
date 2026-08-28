@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use crate::error::Result;
 use crate::index::IndexState;
 use crate::reactive::{ChangeEvent, ChangeKind, Subscribers};
-use crate::store::Store;
+use crate::store::{SnapshotReader, Store};
 use crate::value::Value;
 
 /// An embedded document database.
@@ -474,6 +474,20 @@ impl Collection<'_> {
         })
     }
 
+    /// Snapshot-scoped twin of [`Collection::for_each_doc`]: stream every
+    /// `(key, document)` from `reader`'s snapshot to `f`, in key order,
+    /// decoding one document at a time. Constant memory regardless of size;
+    /// the decode stays here so reader call sites share one implementation.
+    pub(crate) fn for_each_doc_in<F>(&self, reader: &dyn SnapshotReader, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], Value) -> Result<bool>,
+    {
+        reader.for_each(self.name, &mut |key, bytes| {
+            let doc = Value::decode(bytes)?;
+            f(key, doc)
+        })
+    }
+
     /// The number of documents in the collection (O(1), maintained counter).
     pub fn len(&self) -> Result<usize> {
         Ok(self.db.store().count(self.name)? as usize)
@@ -537,6 +551,17 @@ impl Collection<'_> {
         }
     }
 
+    /// Snapshot-scoped twin of [`Collection::get`]: fetch and decode the
+    /// document at `key` from `reader`'s snapshot. The caller holds one read
+    /// transaction for a whole query (audit B3), so every per-key fetch
+    /// observes the same point in time.
+    pub(crate) fn get_in(&self, reader: &dyn SnapshotReader, key: &[u8]) -> Result<Option<Value>> {
+        match reader.get(self.name, key)? {
+            Some(bytes) => Ok(Some(Value::decode(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Remove the document at `key`. Returns whether one was removed.
     ///
     /// Atomic: the row deletion and every persisted index's cleanup commit in
@@ -585,6 +610,16 @@ impl Collection<'_> {
     pub fn scan(&self) -> Result<Vec<(Vec<u8>, Value)>> {
         let mut out = Vec::new();
         for (k, bytes) in self.db.store().scan(self.name)? {
+            out.push((k, Value::decode(&bytes)?));
+        }
+        Ok(out)
+    }
+
+    /// Snapshot-scoped twin of [`Collection::scan`]: every `(key, document)`
+    /// pair from `reader`'s snapshot, in key order.
+    pub(crate) fn scan_in(&self, reader: &dyn SnapshotReader) -> Result<Vec<(Vec<u8>, Value)>> {
+        let mut out = Vec::new();
+        for (k, bytes) in reader.scan(self.name)? {
             out.push((k, Value::decode(&bytes)?));
         }
         Ok(out)
