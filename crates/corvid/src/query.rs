@@ -98,10 +98,13 @@ impl Collection<'_> {
     /// consecutive, in-order run of (analyzed) tokens, most relevant first.
     ///
     /// Uses the text index's stored positions when one is registered; otherwise
-    /// scans exactly. Analysis (stop words, stemming) applies to the phrase too,
-    /// so `"the quick fox"` matches on the analyzed tokens. Ties break by key.
-    /// Like [`Collection::text_search`], the whole search runs on one read
-    /// snapshot (audit B3).
+    /// scans exactly. Either way the score is the BM25 sum over the phrase
+    /// terms (corpus stats from the scanned corpus match the indexed paths'
+    /// whole-corpus stats), so creating or dropping an index never reorders
+    /// the same query (audit B7). Analysis (stop words, stemming) applies to
+    /// the phrase too, so `"the quick fox"` matches on the analyzed tokens.
+    /// Ties break by key. Like [`Collection::text_search`], the whole search
+    /// runs on one read snapshot (audit B3).
     pub fn phrase_search(&self, field: &str, phrase: &str, k: usize) -> Result<Vec<TextHit>> {
         // Resume discipline as [`Collection::text_search`]: before the snapshot.
         self.db().try_resume_index_builds(self.name())?;
@@ -123,29 +126,91 @@ impl Collection<'_> {
                 return Ok(out);
             }
 
-            // Exact fallback: scan, matching the phrase as a token-sequence window.
+            // Exact fallback: scan, matching the phrase as a token-sequence
+            // window. Corpus stats (doc count, lengths, per-term doc
+            // frequencies) are gathered in the same pass and occurrences are
+            // scored with the shared idf/term_score machinery — the same math
+            // the indexed paths use, so the fallback's ranking and score
+            // scale match them (audit B7).
             let phrase_terms = analyze(phrase);
             if phrase_terms.is_empty() || k == 0 {
                 return Ok(Vec::new());
             }
-            let mut hits: Vec<TextHit> = Vec::new();
+
+            /// One scanned document: what scoring needs after the corpus
+            /// stats are known. `tf` is the term frequency per phrase term
+            /// (parallel to `phrase_terms`), counting every occurrence of the
+            /// term — not just those inside phrase windows — matching the
+            /// indexed paths' postings counts.
+            struct ScanDoc {
+                key: Vec<u8>,
+                document: Value,
+                len: usize,
+                occurrences: u32,
+                tf: Vec<u32>,
+            }
+
+            let mut docs: Vec<ScanDoc> = Vec::new();
             self.for_each_doc_in(r, |key, doc| {
                 if let Some(text) = doc.get_path(field).and_then(Value::as_text) {
                     let tokens = analyze(text);
+                    let mut tf = vec![0u32; phrase_terms.len()];
+                    for token in &tokens {
+                        for (i, term) in phrase_terms.iter().enumerate() {
+                            if token == term {
+                                tf[i] += 1;
+                            }
+                        }
+                    }
                     let occurrences = tokens
                         .windows(phrase_terms.len())
                         .filter(|w| *w == phrase_terms.as_slice())
-                        .count();
-                    if occurrences > 0 {
-                        hits.push(TextHit {
-                            key: key.to_vec(),
-                            score: occurrences as f32,
-                            document: doc,
-                        });
-                    }
+                        .count() as u32;
+                    docs.push(ScanDoc {
+                        key: key.to_vec(),
+                        document: doc,
+                        len: tokens.len(),
+                        occurrences,
+                        tf,
+                    });
                 }
                 Ok(true)
             })?;
+
+            let n = docs.len();
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            let total_len: usize = docs.iter().map(|d| d.len).sum();
+            // Guard the all-empty-text corpus: avg_len 0 would divide by
+            // zero; occurrences are 0 there anyway so no doc becomes a hit.
+            let avg_len = match total_len as f32 / n as f32 {
+                0.0 => 1.0,
+                v => v,
+            };
+            let df: Vec<usize> = (0..phrase_terms.len())
+                .map(|i| docs.iter().filter(|d| d.tf[i] > 0).count())
+                .collect();
+
+            let params = Bm25Params::default();
+            let mut hits: Vec<TextHit> = docs
+                .into_iter()
+                .filter(|d| d.occurrences > 0)
+                .map(|d| {
+                    // Sum over the phrase terms as analyzed (duplicates score
+                    // per occurrence, mirroring the indexed paths).
+                    let score = phrase_terms
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| term_score(d.tf[i], d.len, avg_len, idf(n, df[i]), params))
+                        .sum();
+                    TextHit {
+                        key: d.key,
+                        score,
+                        document: d.document,
+                    }
+                })
+                .collect();
             hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
             hits.truncate(k);
             Ok(hits)
@@ -696,5 +761,71 @@ mod tests {
         c.insert(b"b", &doc_with_text("")).unwrap();
         let hits = c.text_search("body", "word", 5).unwrap();
         assert!(hits.is_empty());
+    }
+
+    /// Seed a corpus where occurrence-count ordering and BM25 ordering
+    /// genuinely disagree (audit B7): "short" holds ONE occurrence of a
+    /// two-term phrase in a two-token text; "long" holds THREE occurrences
+    /// of the same rare terms inside a 44-token text. Raw occurrence counts
+    /// rank "long" first; BM25 (length normalization + tf saturation) ranks
+    /// "short" first — so a parity test on this corpus discriminates a
+    /// fallback that still scores raw occurrence counts.
+    fn seed_phrase_disagreement() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        c.insert(b"short", &doc_with_text("zephyr xylophone"))
+            .unwrap();
+        let filler: String = (0..19).map(|i| format!("filler{i} ")).collect();
+        let long = format!("zephyr xylophone {filler}zephyr xylophone {filler}zephyr xylophone");
+        c.insert(b"long", &doc_with_text(&long)).unwrap();
+        db
+    }
+
+    /// The same no-filter phrase query returns the same order — and the same
+    /// BM25 score scale — via `phrase_search` (direct) and via the builder's
+    /// `.text()` source, across all index states (audit B7): creating an
+    /// index must never reorder a phrase query.
+    #[test]
+    fn phrase_fallback_scores_bm25_parity_across_paths() {
+        let phrase = "zephyr xylophone";
+        let want = vec![b"short".to_vec(), b"long".to_vec()];
+        let mut reference: Option<Vec<(Vec<u8>, f32)>> = None;
+        for state in ["none", "memory", "disk"] {
+            let db = seed_phrase_disagreement();
+            let c = db.collection("docs");
+            match state {
+                "memory" => c.create_text_index("body").unwrap(),
+                "disk" => c.create_text_index_ondisk("body").unwrap(),
+                _ => {}
+            }
+            let direct = c.phrase_search("body", phrase, 10).unwrap();
+            let direct_keys: Vec<_> = direct.iter().map(|h| h.key.clone()).collect();
+            assert_eq!(direct_keys, want, "direct order, index={state}");
+            let builder_keys: Vec<_> = c
+                .query()
+                .text("body", phrase, 10)
+                .run()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.key.clone())
+                .collect();
+            assert_eq!(builder_keys, want, "builder order, index={state}");
+            // Score SCALE parity with the indexed paths (same corpus stats,
+            // same term_score math), not just the same order.
+            let scored: Vec<_> = direct.iter().map(|h| (h.key.clone(), h.score)).collect();
+            match &reference {
+                None => reference = Some(scored),
+                Some(baseline) => {
+                    for ((ka, sa), (kb, sb)) in baseline.iter().zip(&scored) {
+                        assert_eq!(ka, kb, "score order, index={state}");
+                        assert!(
+                            (sa - sb).abs() < 1e-6,
+                            "score scale {sa} vs {sb} for {:?}, index={state}",
+                            String::from_utf8_lossy(ka)
+                        );
+                    }
+                }
+            }
+        }
     }
 }

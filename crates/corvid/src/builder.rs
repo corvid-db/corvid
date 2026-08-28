@@ -1229,6 +1229,10 @@ fn insert_path(out: &mut BTreeMap<String, Value>, path: &str, value: Value) {
 }
 
 /// Rank the filtered set for one source and return its capped key list.
+/// Text sources score BM25 with corpus statistics (n, avg_len, df) computed
+/// over this candidate set, not the whole corpus — unlike the direct
+/// `text_search`/`phrase_search` entry points, whose stats are always
+/// whole-corpus.
 fn keys_for(src: &Source, filtered: &[(Vec<u8>, Value)]) -> Vec<Vec<u8>> {
     let mut ranked = match src {
         Source::Vector {
