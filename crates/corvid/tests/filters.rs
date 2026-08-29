@@ -1692,6 +1692,114 @@ fn filters_compound_prefix_flag_roundtrips_dump_load() {
     }
 }
 
+/// A PRESENT-but-non-encodable field value (Array, Null, containers) in the
+/// corpus at INDEX-CREATION time is a silent backfill miss: the page cannot
+/// encode the tuple, so the doc is not indexed — the def must complete with
+/// `all_docs_indexed` = false and prefix-only windows must decline, with
+/// results identical to the scan twin (the offending doc still matches a
+/// prefix-only filter on the leading field).
+#[test]
+fn filters_compound_prefix_nonencodable_at_backfill_completes_flag_false() {
+    for offending in [
+        Value::Array(vec![Value::Int(1)]),
+        Value::Null,
+        Value::Map(BTreeMap::new()),
+    ] {
+        let docs: Vec<(&[u8], Value)> = vec![
+            (b"c1", map(&[("cat", text("blog")), ("n", Value::Int(5))])),
+            (b"c2", map(&[("cat", text("blog")), ("n", Value::Int(9))])),
+            (b"c3", map(&[("cat", text("news")), ("n", Value::Int(5))])),
+            // Present `n`, but a value the compound encoder declines — the
+            // doc is not indexed, so the flag must not complete true.
+            (
+                b"c4",
+                map(&[("cat", text("blog")), ("n", offending.clone())]),
+            ),
+        ];
+        let scan_db = Db::open_in_memory().unwrap();
+        let scan = seed(&scan_db, "compound", &docs);
+        let idx_db = Db::open_in_memory().unwrap();
+        let idx = seed(&idx_db, "compound", &docs);
+        idx.create_compound_index(&["cat", "n"]).unwrap();
+
+        assert_eq!(
+            idx.query()
+                .filter(field("cat").eq(text("blog")))
+                .plan_shape(),
+            PlanShape::Scan {
+                collection: "compound".to_owned()
+            },
+            "a non-encodable present value at backfill must complete the flag false ({offending:?})"
+        );
+        let p = field("cat").eq(text("blog"));
+        assert_eq!(
+            matching_keys(&scan, &p),
+            ks(&["c1", "c2", "c4"]),
+            "scan side of {offending:?}"
+        );
+        assert_eq!(
+            matching_keys(&idx, &p),
+            ks(&["c1", "c2", "c4"]),
+            "indexed side of {offending:?}"
+        );
+    }
+}
+
+/// The same hole AFTER completion: an insert whose doc carries a
+/// present-but-non-encodable value in an indexed field is unindexed by
+/// maintenance — the write must flip the flag false, so subsequent
+/// prefix-only queries decline and return the full correct set via the
+/// scan fallback (including the offending doc).
+#[test]
+fn filters_compound_prefix_nonencodable_insert_after_completion_flips_flag() {
+    for offending in [
+        Value::Array(vec![Value::Int(1)]),
+        Value::Null,
+        Value::Map(BTreeMap::new()),
+    ] {
+        let idx_db = Db::open_in_memory().unwrap();
+        let idx = idx_db.collection("compound");
+        for (k, cat, n) in [
+            (b"c1", "blog", Value::Int(5)),
+            (b"c2", "blog", Value::Int(9)),
+            (b"c3", "news", Value::Int(5)),
+        ] {
+            idx.insert(k, &map(&[("cat", text(cat)), ("n", n)]))
+                .unwrap();
+        }
+        idx.create_compound_index(&["cat", "n"]).unwrap();
+        assert_eq!(
+            idx.query()
+                .filter(field("cat").eq(text("blog")))
+                .plan_shape(),
+            PlanShape::IndexedWindow { kind: "compound" },
+            "fixture sanity: all-present-encodable corpus earns the flag ({offending:?})"
+        );
+
+        // The offending insert: `n` present but non-encodable.
+        idx.insert(
+            b"c4",
+            &map(&[("cat", text("blog")), ("n", offending.clone())]),
+        )
+        .unwrap();
+        assert_eq!(
+            idx.query()
+                .filter(field("cat").eq(text("blog")))
+                .plan_shape(),
+            PlanShape::Scan {
+                collection: "compound".to_owned()
+            },
+            "a non-encodable present insert must flip the flag false ({offending:?})"
+        );
+        let rows = idx
+            .query()
+            .filter(field("cat").eq(text("blog")))
+            .run()
+            .unwrap();
+        assert_eq!(keys(&rows), ks(&["c1", "c2", "c4"]));
+    }
+}
+
 /// Legacy def rows (pre-flag, no kind byte) decode as NOT-all-indexed:
 /// even over an all-present corpus, a legacy `Complete` def declines
 /// prefix-only windows until the index is re-created (backward

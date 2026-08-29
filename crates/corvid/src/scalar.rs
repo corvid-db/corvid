@@ -42,7 +42,8 @@ const COMPOUND_DEFS: &str = "__cscalar_indexes__";
 
 /// Reserved collection holding compound-index **miss markers**: one row per
 /// compound def that has ever observed (in backfill or maintenance) a
-/// document leaving an indexed field missing/non-encodable. Presence means
+/// document this index will not hold: an indexed field MISSING, or present
+/// but NON-ENCODABLE (null/containers/bytes). Presence means
 /// `all_docs_indexed` must be false for that def — see [`CompoundDef`].
 /// A separate namespace (not a def-key suffix) so the def scans never see
 /// phantom definitions.
@@ -63,6 +64,7 @@ const COMPOUND_MISS: &str = "__cscalar_misses__";
 ///   corpus). A `Building` row with other kind bytes is a pre-flag legacy
 ///   cycle: its early pages counted no misses, so completion must not set
 ///   the flag.
+const KIND_NOT_ALL_INDEXED: u8 = 0;
 const KIND_ALL_INDEXED: u8 = 1;
 const KIND_FLAG_AWARE: u8 = 2;
 
@@ -74,11 +76,13 @@ pub(crate) struct CompoundDef {
     /// re-creation) resumes the build.
     pub(crate) building: bool,
     /// Whether EVERY document in the collection has all this index's fields
-    /// present and encodable — set at backfill completion iff no miss was
-    /// ever observed (backfill page or maintenance write), and flipped
-    /// false permanently on any miss write. `false` for building defs and
-    /// all legacy defs. Recomputed by re-registration (a fresh cycle clears
-    /// the miss markers and re-walks the corpus).
+    /// present AND encodable — set at backfill completion iff no miss was
+    /// ever observed, and flipped false permanently on any miss write. A
+    /// **miss** is a document this index will not hold: an indexed field
+    /// missing, or present-but-non-encodable (null/containers/bytes —
+    /// `encode_tuple` declines). `false` for building defs and all legacy
+    /// defs. Recomputed by re-registration (a fresh cycle clears the miss
+    /// markers and re-walks the corpus).
     pub(crate) all_docs_indexed: bool,
 }
 
@@ -461,22 +465,28 @@ fn skip_values(key: &[u8], n: usize) -> Option<usize> {
     Some(pos)
 }
 
-/// Index `doc_key`'s tuple of field values (composite). Missing/non-indexable
-/// any field → the document is simply not in this index.
+/// Index `doc_key`'s tuple of field values (composite). Returns whether the
+/// document WAS indexed; `false` means the tuple had a present-but-
+/// non-encodable value (null/containers/bytes in a compound field) and the
+/// document is simply not in this index — the caller's `all_docs_indexed`
+/// miss bookkeeping must treat that exactly like a missing field (the
+/// maintenance path used to decline here silently, leaving the flag true
+/// over an unindexed matching document).
 fn compound_insert_in_txn(
     tx: &mut crate::store::WriteBatch<'_>,
     ns: &str,
     doc_key: &[u8],
     values: &[&Value],
-) -> Result<()> {
+) -> Result<bool> {
     compound_remove_in_txn(tx, ns, doc_key)?;
     if let Some(enc) = encode_tuple(values) {
         let mut idx_key = enc.clone();
         idx_key.extend_from_slice(doc_key);
         tx.put(ns, &idx_key, &[])?;
         tx.put(ns, &fwd_key(doc_key), &enc)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn compound_remove_in_txn(
@@ -1040,9 +1050,16 @@ impl Db {
                     let doc = Value::decode(bytes)?;
                     let values: Option<Vec<&Value>> =
                         fields.iter().map(|f| doc.get_path(f)).collect();
-                    match &values {
-                        Some(vs) => compound_insert_in_txn(tx, &ns, doc_key, vs)?,
-                        None => tx.put(COMPOUND_MISS, &key, &[])?,
+                    // A miss is a document this index will NOT hold: a field
+                    // missing, OR present-but-non-encodable
+                    // (`compound_insert_in_txn` declines the tuple). Either
+                    // way the marker must commit with the page.
+                    let miss = match &values {
+                        Some(vs) => !compound_insert_in_txn(tx, &ns, doc_key, vs)?,
+                        None => true,
+                    };
+                    if miss {
+                        tx.put(COMPOUND_MISS, &key, &[])?;
                     }
                 }
                 Ok(())
@@ -1086,34 +1103,41 @@ impl Db {
         for fields in self.compound_fields(collection) {
             let ns = compound_namespace(collection, &fields);
             let values: Option<Vec<&Value>> = fields.iter().map(|f| doc.get_path(f)).collect();
-            match &values {
-                Some(vs) => compound_insert_in_txn(tx, &ns, key, vs)?,
+            // A miss is a document this index will NOT hold: a field
+            // missing, OR present-but-non-encodable
+            // (`compound_insert_in_txn` declines the tuple — null,
+            // containers, bytes in a compound field).
+            let miss = match &values {
+                Some(vs) => !compound_insert_in_txn(tx, &ns, key, vs)?,
                 None => {
                     compound_remove_in_txn(tx, &ns, key)?;
-                    // Persist the miss: disk state decides which shape to
-                    // write (the in-memory `building` bit may lag a
-                    // concurrent re-registration).
-                    let dk = compound_def_key(collection, &fields);
-                    if let Some(row) = tx.get(COMPOUND_DEFS, &dk)? {
-                        let (_, st) = crate::index_build::decode_def(&row);
-                        match st {
-                            crate::index_build::DefState::Complete => {
-                                tx.put(
-                                    COMPOUND_DEFS,
-                                    &dk,
-                                    &crate::index_build::encode_def(
-                                        &[0],
-                                        &crate::index_build::DefState::Complete,
-                                    ),
-                                )?;
-                            }
-                            crate::index_build::DefState::Building { .. } => {
-                                tx.put(COMPOUND_MISS, &dk, &[])?;
-                            }
+                    true
+                }
+            };
+            if miss {
+                // Persist the miss: disk state decides which shape to
+                // write (the in-memory `building` bit may lag a
+                // concurrent re-registration).
+                let dk = compound_def_key(collection, &fields);
+                if let Some(row) = tx.get(COMPOUND_DEFS, &dk)? {
+                    let (_, st) = crate::index_build::decode_def(&row);
+                    match st {
+                        crate::index_build::DefState::Complete => {
+                            tx.put(
+                                COMPOUND_DEFS,
+                                &dk,
+                                &crate::index_build::encode_def(
+                                    &[KIND_NOT_ALL_INDEXED],
+                                    &crate::index_build::DefState::Complete,
+                                ),
+                            )?;
+                        }
+                        crate::index_build::DefState::Building { .. } => {
+                            tx.put(COMPOUND_MISS, &dk, &[])?;
                         }
                     }
-                    self.compound_miss_in_memory(collection, &fields);
                 }
+                self.compound_miss_in_memory(collection, &fields);
             }
         }
         Ok(())
