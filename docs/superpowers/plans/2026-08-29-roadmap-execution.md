@@ -185,6 +185,13 @@ optional `rename` object param if cheap and consistent. AUDIT row → Fixed.
 
 ## Task 9: Dump format v2 (u64 sections)
 
+Prepend (Task 8 review minors, binding): (a) add a compound-def rename
+observable pin (query through the renamed compound index asserting
+IndexedWindow{kind:"compound"} on a corpus where the scalar probe loses
+keep_smaller — or equivalent direct observability); (b) add the
+rename-into-non-empty-DB test; (c) document the reserved-source-no-op
+contract edge in load_with_renames' doc comment.
+
 Bump the dump format to v2 with u64 length prefixes (loader accepts v1
 and v2; dumper writes v2). Round-trip tests: v2 dump→load; v1 fixture
 load (craft a small v1 dump by hand/bytestring in the test); boundary
