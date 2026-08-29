@@ -112,6 +112,12 @@ to Fixed with the mechanism named.
 
 ## Task 7: Adjacency edge layout (derived indexes)
 
+Prepend (Task 3 review, binding): fix the remaining corpus-doc numbers in
+benches/engine.rs edge_churn comments (~line 195 "~1 in-edge on average" is
+wrong — non-hub mean in-degree is ~7.5; ~line 218 hub "~625" counts calls,
+distinct ≈ 382 after the deterministic i/i+6000 collisions; state ~382
+distinct and the bimodal ~51:1 contrast).
+
 Deletes/purges currently scan both edge namespaces per delete (O(E)).
 Design (controller ruling, binding unless the implementer proves it
 unsound): add endpoint-keyed ADJACENCY structures as derived state —
