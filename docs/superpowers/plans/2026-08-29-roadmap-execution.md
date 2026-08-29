@@ -105,6 +105,14 @@ across the full kind lattice (extend queries.rs).
 
 ## Task 6: Compound prefix windows — sound re-enable
 
+Prepend (Task 5 review nits, binding): (a) scalar.rs comparable_entries
+(~366) silently skips malformed index keys — make it error Error::CorruptIndex
+per the engine's corruption philosophy (unreachable via the encoder, but
+defense-in-depth consistency matters; a test pinning the error path via a
+hand-corrupted row if constructible); (b) builder.rs descending eviction
+(~1665) Vec::remove(0) is O(retained) — switch to VecDeque or an index-based
+head skip so evictions are O(1).
+
 Per-def metadata `all_docs_indexed` on the compound index def (persisted
 in the def record): maintained true on creation backfill (every doc has
 all fields encodable) and flipped false permanently on any insert/update
