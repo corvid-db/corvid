@@ -1401,27 +1401,49 @@ mod tests {
         assert_eq!(rd.count().unwrap(), 2);
     }
 
-    /// v2 prefixes with high bits set are HONORED, not truncated: three
-    /// crafted minimal dumps each carry a prefix just past u32::MAX (the
-    /// v1 cap) followed by a well-formed remainder. A reader that narrowed
-    /// the prefix to u32 would parse the remainder as the next field(s) and
-    /// load successfully; the v2 reader must fail instead.
+    /// v2 prefixes with high bits set are HONORED, not narrowed: four
+    /// crafted minimal dumps carry a length/count prefix past u32::MAX (the
+    /// v1 cap) at a version-dependent site — record VALUE length, edge
+    /// RELATION-STRING length, schema FIELD count, record NAME length.
+    /// (Section counts are u64 in BOTH versions, so they cannot pin the
+    /// width.) Two narrowing regressions are imaginable, and each case is
+    /// built so the narrowed reader LOADS THE DUMP (the silent-failure
+    /// outcome a regression would produce) while the correct u64 reader
+    /// dies at EOF:
+    ///
+    /// - the TRUNCATION shape — an 8-byte read cast to u32 — keeps the
+    ///   stream aligned and sees only each prefix's low half: (a)/(b)/(c)
+    ///   carry prefixes of 2^32+1 whose low half (1) is satisfied by a
+    ///   crafted one-byte payload completing the field, so the narrowed
+    ///   parse runs to `Ok(())` (verified by mutation for (a), which the
+    ///   suite hits first; (b)/(c) share the construction);
+    /// - the WIDTH-REVERTED shape — `count()` back to a 4-byte read —
+    ///   leaves every prefix's high half in-stream, and on a mostly-zero
+    ///   stream the misaligned parse happens to die at EOF with the same
+    ///   message (verified by mutation: (a)-(c) then pass for the wrong
+    ///   reason). (d) is the polyglot that catches it: a record NAME
+    ///   length of 4·2^32+4 whose prefix's high half is itself a valid
+    ///   4-byte name — the reverted reader reads length 4, takes the high
+    ///   half AS the name (consuming exactly the 8 bytes the correct
+    ///   reader would), and the crafted key/value/sections after it load
+    ///   cleanly to `Ok(())`, while the correct reader demands 2^32+4
+    ///   name bytes and dies at EOF.
     #[test]
     fn v2_honors_u64_prefixes_past_the_u32_cap() {
-        let past = 0x1_0000_0000u64; // exactly u32::MAX + 1
+        let past = 0x1_0000_0001u64; // u32::MAX + 2, low half = 1
 
-        // (a) A record VALUE length of 2^32+1 with a one-byte payload: a
-        // u32-narrowing reader reads length 1, takes the payload byte (a
-        // `Null`) as the value, and the all-zero remainder still parses as
-        // empty sections (one spare byte) — the load SUCCEEDS. Correct:
-        // 2^32+1 bytes of payload are demanded and the stream ends.
+        // (a) A record VALUE length of 2^32+1 with a one-byte payload
+        // (TAG_NULL). Correct: 2^32+1 payload bytes are demanded and the
+        // stream ends. Truncation-narrowed: length 1, the Null payload is
+        // the value, the all-zero remainder parses as empty sections (one
+        // spare byte) — the load SUCCEEDS.
         let mut a = Vec::new();
         a.extend_from_slice(MAGIC_V2);
         put_u64(&mut a, 1); // one record
         put_str(&mut a, "docs");
         put_bytes(&mut a, b"k");
-        a.extend_from_slice(&0x1_0000_0001u64.to_le_bytes()); // the value length
-        a.push(0); // TAG_NULL — the payload a narrowing reader would take
+        a.extend_from_slice(&past.to_le_bytes()); // the value length
+        a.push(0); // TAG_NULL — the payload a truncating reader would take
         empty_tail(&mut a);
         a.push(0); // the spare byte that keeps the narrowed parse well-formed
         let err = Db::open_in_memory().unwrap().load(&a[..]);
@@ -1430,30 +1452,35 @@ mod tests {
             "a 2^32+1 value length must be honored to EOF, got {err:?}"
         );
 
-        // (b) A SECTION COUNT of 2^32 in the final (edges) section, one
-        // real edge, and nothing after: truncating to u32 reads count 0 and
-        // the load SUCCEEDS (that is exactly the v1 encoding of this dump);
-        // correct demands edge 2 at EOF.
+        // (b) An edge RELATION-STRING length of 2^32+1 in the final
+        // section, its low half (1) satisfied by a one-byte payload and a
+        // complete real edge after it. Correct: 2^32+1 relation bytes are
+        // demanded and the stream ends. Truncation-narrowed: length 1, the
+        // payload byte is the relation, the real from/to keys and weight
+        // follow — the edge links and the load SUCCEEDS.
         let mut b = Vec::new();
         b.extend_from_slice(MAGIC_V2);
-        for _ in 0..8 {
-            put_u64(&mut b, 0); // records…autos
+        for _ in 0..9 {
+            put_u64(&mut b, 0); // records…autos (nine counts)
         }
-        b.extend_from_slice(&past.to_le_bytes()); // the edge count
+        put_u64(&mut b, 1); // one edge
         put_str(&mut b, "docs");
-        put_str(&mut b, "knows");
+        b.extend_from_slice(&past.to_le_bytes()); // the relation length
+        b.push(b'r'); // the payload a truncating reader would take
         put_bytes(&mut b, b"a");
         put_bytes(&mut b, b"b");
         put_f64(&mut b, 0.5);
         let err = Db::open_in_memory().unwrap().load(&b[..]);
         assert!(
             matches!(&err, Err(Error::InvalidDump(m)) if m.contains("unexpected end")),
-            "a 2^32 section count must be honored to EOF, got {err:?}"
+            "a 2^32+1 relation length must be honored to EOF, got {err:?}"
         );
 
-        // (c) A schema FIELD COUNT of 2^32: truncating reads zero fields,
-        // declares an empty schema, and the tail parses. Correct: the loop
-        // demands 2^32 field records that aren't there.
+        // (c) A schema FIELD COUNT of 2^32+1 over a zero tail. Correct:
+        // 2^32+1 field records are demanded; the loop consumes the tail as
+        // (Any, off, off, "") fields and dies mid-field at EOF.
+        // Truncation-narrowed: count 1, one (Any, "") field from the zeros,
+        // then the remaining sections parse — the load SUCCEEDS.
         let mut c = Vec::new();
         c.extend_from_slice(MAGIC_V2);
         put_u64(&mut c, 0); // records
@@ -1465,11 +1492,34 @@ mod tests {
         put_u64(&mut c, 1); // one schema def
         put_str(&mut c, "docs");
         c.extend_from_slice(&past.to_le_bytes()); // the field count
-        empty_tail(&mut c); // (ttls/autos/edges, misaligned from here on)
+        empty_tail(&mut c); // consumed as fields by a correct reader
         let err = Db::open_in_memory().unwrap().load(&c[..]);
         assert!(
-            matches!(&err, Err(Error::InvalidDump(_))),
-            "a 2^32 schema field count must be honored, got {err:?}"
+            matches!(&err, Err(Error::InvalidDump(m)) if m.contains("unexpected end")),
+            "a 2^32+1 schema field count must be honored to EOF, got {err:?}"
+        );
+
+        // (d) The WIDTH-REVERTED polyglot: a record NAME length of
+        // 4·2^32+4 — prefix bytes [04 00 00 00 04 00 00 00]. A 4-byte
+        // `count` reads length 4 and takes the prefix's HIGH half as the
+        // name, consuming exactly the 8 bytes the correct reader consumes,
+        // so the parse re-aligns and the crafted key/value/sections after
+        // it load cleanly to Ok(()) — a silent narrowing regression made
+        // the load succeed. Correct: 2^32+4 name bytes are demanded and
+        // the stream ends.
+        let mut d = Vec::new();
+        d.extend_from_slice(MAGIC_V2);
+        put_u64(&mut d, 1); // one record
+        d.extend_from_slice(&0x4_0000_0004u64.to_le_bytes()); // the name length
+        d.extend_from_slice(&[1, 0, 0, 0]); // reverted reader's key length
+        d.push(b'k');
+        d.extend_from_slice(&[1, 0, 0, 0]); // reverted reader's value length
+        d.push(0); // TAG_NULL
+        empty_tail(&mut d);
+        let err = Db::open_in_memory().unwrap().load(&d[..]);
+        assert!(
+            matches!(&err, Err(Error::InvalidDump(m)) if m.contains("unexpected end")),
+            "a 4·2^32+4 name length must be honored to EOF, got {err:?}"
         );
     }
 
