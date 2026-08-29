@@ -527,6 +527,13 @@ mod tests {
     /// reproducible run over run.
     #[test]
     fn parallel_training_codebook_is_bit_identical_to_sequential() {
+        // The pin only means something if the parallel path actually
+        // engaged: on a single-participant machine this fires instead of
+        // silently weakening the assertion to seq-vs-seq.
+        debug_assert!(
+            parallelism() > 1,
+            "equivalence test needs >1 participant; run on a multi-core host"
+        );
         let data = clustered(900, 32, 8);
         let seq = Pq::train_inner(&data, 8, 32, false).unwrap();
         let par = Pq::train(&data, 8, 32).unwrap();

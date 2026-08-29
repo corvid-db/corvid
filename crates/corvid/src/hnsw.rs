@@ -397,7 +397,6 @@ impl Hnsw {
     /// distance evaluations feed a data-dependent heap loop one at a time,
     /// and batching them behind a fork/join handshake measured slower
     /// than computing them inline (Task 13's report has the numbers).
-    #[allow(clippy::too_many_arguments)]
     fn search_layer(
         nodes: &[Node],
         scorer: &Scorer,

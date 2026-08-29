@@ -92,13 +92,22 @@ pub(crate) use span;
 /// emit their spans/events. The subscriber is hand-rolled (no
 /// `tracing-subscriber` dev-dependency — the feature's whole point is
 /// minimal footprint): it records every call-site this shim owns (asserted
-/// via the `corvid` target) into a shared log that the assertions grep.
+/// via the `corvid` target) into a log that the assertions grep.
+///
+/// Each test installs a PRIVATE recorder via `set_default` (a thread-local
+/// default subscriber), not a shared global: libtest runs tests in parallel
+/// on separate threads, and one global recorder would let a sibling test's
+/// `clear()` wipe this test's events between push and join (an observed
+/// ~1-in-20 flake). The engine's instrumented paths run synchronously on
+/// the calling thread, so a thread-local default captures exactly the
+/// events the test itself caused and nothing else — no cross-test state,
+/// no global to clean up.
 ///
 /// Compiles only under the feature; the default build's zero-dep posture is
 /// enforced elsewhere (CI's `cargo tree` assertion + the wasm job).
 #[cfg(all(test, feature = "tracing"))]
 mod tests {
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
 
     use tracing::field::{Field, Visit};
     use tracing::span::Attributes;
@@ -149,11 +158,14 @@ mod tests {
         fn exit(&self, _span: &Id) {}
     }
 
-    fn install() -> Recorder {
-        static REC: OnceLock<Recorder> = OnceLock::new();
-        let rec = REC.get_or_init(Recorder::default).clone();
-        let _ = tracing::subscriber::set_global_default(rec.clone());
-        rec
+    /// A fresh private recorder, installed as THIS thread's default
+    /// subscriber. Engine events fire on the calling thread, so the test
+    /// observes only its own events; the guard must stay alive for the
+    /// test's duration (it is returned, binding the thread-local default).
+    fn install() -> (Recorder, tracing::subscriber::DefaultGuard) {
+        let rec = Recorder::default();
+        let guard = tracing::subscriber::set_default(rec.clone());
+        (rec, guard)
     }
 
     fn doc(n: i64) -> crate::Value {
@@ -174,7 +186,7 @@ mod tests {
 
     #[test]
     fn tracing_feature_instrumentation_fires_for_build_and_query() {
-        let rec = install();
+        let (rec, _guard) = install();
         let db = crate::Db::open_in_memory().unwrap();
         let c = db.collection("tr_docs");
         for i in 0..10i64 {
@@ -244,7 +256,7 @@ mod tests {
     /// next search compacts). The buggy field reported live=21.
     #[test]
     fn inmemory_compaction_event_reports_live_nodes() {
-        let rec = install();
+        let (rec, _guard) = install();
         let db = crate::Db::open_in_memory().unwrap();
         let c = db.collection("tr_compact");
         c.create_vector_index("embedding", crate::Metric::L2)

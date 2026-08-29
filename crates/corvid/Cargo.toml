@@ -20,7 +20,8 @@ thiserror.workspace = true
 # workspace entry trims tracing's defaults: the engine instruments via the
 # `span!`/`event!` macros only, so the `attributes` proc-macro feature
 # (and its syn/quote tree) is left out; the footprint is the facade +
-# `tracing-core`.
+# `tracing-core` (+ `once_cell`, via the `std` the feature's per-test
+# recorders need — see the workspace entry).
 tracing = { workspace = true, optional = true }
 
 [features]

@@ -34,7 +34,20 @@
 //!   counter before parking on the condvar, so back-to-back batches
 //!   inside one region (k-means iterations) stay hot, while an idle
 //!   team's workers sleep in the OS and cost nothing.
+//!
+//! * **Panics poison, they never hang.** A panic inside a dispatched job
+//!   or the region callback would otherwise strand the handshake (a
+//!   worker that unwinds skips its completion count; a forking thread
+//!   that unwinds skips the shutdown bump and `thread::scope` never
+//!   joins). Jobs run under [`std::panic::catch_unwind`] and the region
+//!   callback is wrapped the same way: the completion/shutdown handshake
+//!   always runs to completion, then the panic is re-raised on the
+//!   forking thread (the original payload, via
+//!   [`std::panic::resume_unwind`]). A panicking region therefore fails
+//!   promptly, loudly, and with every worker joined.
 
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -78,6 +91,17 @@ struct Inner {
     /// a worker could snapshot `seq` after the first publish and skip
     /// that dispatch (and its completion count) — a deadlock.
     ready: AtomicUsize,
+    /// Poison flag: set by a worker whose dispatched chunk panicked.
+    /// Once set, `map` re-raises the stashed payload after the join —
+    /// results from a region that lost a job are never returned. The
+    /// handshake itself always completes first. (A panic in the forking
+    /// thread's own chunk needs no flag: it unwinds through `with_team`,
+    /// which runs the shutdown handshake before re-raising.)
+    poisoned: AtomicBool,
+    /// The first panicked chunk's payload, stashed for the forking thread
+    /// to `resume_unwind` (later panics in the same dispatch are dropped:
+    /// one panic is re-raised, faithfully).
+    panic_payload: Mutex<Option<Box<dyn Any + Send>>>,
 }
 
 /// Contiguous chunk `idx` of `n` items over `participants` chunks.
@@ -145,6 +169,8 @@ pub(crate) fn with_team<R>(participants: usize, f: impl FnOnce(&mut Team) -> R) 
         done_lock: Mutex::new(()),
         done_cv: Condvar::new(),
         ready: AtomicUsize::new(0),
+        poisoned: AtomicBool::new(false),
+        panic_payload: Mutex::new(None),
     });
     let shutdown = Arc::clone(&inner);
     let mut spawned = 0usize;
@@ -164,22 +190,38 @@ pub(crate) fn with_team<R>(participants: usize, f: impl FnOnce(&mut Team) -> R) 
         // completion count (deadlock). Bounded by thread-start latency,
         // paid once per team.
         while inner.ready.load(Ordering::Acquire) < spawned {
+            // yield_now (not spin_loop): the wait is bounded by OS
+            // thread-start latency, which the scheduler always makes
+            // progress on — no spin budget is consumed here.
             thread::yield_now();
         }
-        let result = f(&mut Team {
-            inner,
-            workers: spawned,
-            min_items: FLOOR_MIN_ITEMS.max((spawned + 1) * 32),
-        });
-        // Shutdown handshake: bump `seq` under `park_lock` with the slot
-        // empty. Every worker takes one final lap, sees no dispatch, and
+        // The region runs under catch_unwind so the shutdown handshake
+        // below executes even when it panics (otherwise the workers
+        // would re-park forever and `thread::scope` would never join);
+        // the panic is re-raised on this thread after the join.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            f(&mut Team {
+                inner,
+                workers: spawned,
+                min_items: FLOOR_MIN_ITEMS.max((spawned + 1) * 32),
+            })
+        }));
+        // Shutdown handshake: clear the slot, then bump `seq` under
+        // `park_lock`. The clearing matters on the unwind path — a `map`
+        // abandoned mid-dispatch leaves its dispatch published, and a
+        // worker must not mistake that stale dispatch for new work.
+        // Every worker takes one final lap, sees no dispatch, and
         // returns; the scope then joins them.
         if spawned > 0 {
+            *shutdown.slot.lock().unwrap() = None;
             let _guard = shutdown.park_lock.lock().unwrap();
             shutdown.seq.fetch_add(1, Ordering::Release);
             shutdown.park_cv.notify_all();
         }
-        result
+        match result {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
+        }
     })
 }
 
@@ -222,7 +264,17 @@ fn worker_loop(inner: &Inner, worker: usize) {
         };
         let (start, end) = chunk_of(worker + 1, dispatch.n, dispatch.participants);
         if start < end {
-            (dispatch.f)(start, end);
+            // Poison, don't die: a panicking chunk is caught so this
+            // worker still contributes its completion count (the caller's
+            // join completes) and the payload is stashed for the caller
+            // to re-raise. An unwinding worker could do neither.
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| (dispatch.f)(start, end))) {
+                inner.poisoned.store(true, Ordering::Release);
+                let mut stash = inner.panic_payload.lock().unwrap();
+                if stash.is_none() {
+                    *stash = Some(payload);
+                }
+            }
         }
         let done = inner.done.fetch_add(1, Ordering::Release) + 1;
         if inner.caller_waiting.load(Ordering::Relaxed)
@@ -334,10 +386,106 @@ impl Team {
             inner.caller_waiting.store(false, Ordering::Relaxed);
         }
         *inner.slot.lock().unwrap() = None;
+        // Poison check BEFORE collecting: a panicked participant's slots
+        // are unfilled (the collect's `expect` would misreport), and a
+        // region that lost a job must panic, not return partial results.
+        if inner.poisoned.load(Ordering::Acquire) {
+            let payload = inner.panic_payload.lock().unwrap().take();
+            if let Some(payload) = payload {
+                resume_unwind(payload);
+            }
+            panic!("corvid team: a dispatched job panicked without a payload");
+        }
         let mut filled = slots.lock().unwrap();
         filled
             .iter_mut()
             .map(|slot| slot.take().expect("every slot filled by its chunk"))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How long a poison probe may take before it counts as a hang. The
+    /// handshake costs microseconds; the pre-poison failure mode was a
+    /// wait with no bound at all, so a watchdog turns that regression
+    /// into a failing test instead of a stalled binary.
+    const HANG_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A panicking dispatched job must poison the team and come back as a
+    /// panic on the forking thread — promptly. The probe panics on the
+    /// LAST item, which lands in the final worker's chunk, so with
+    /// workers this exercises the worker-side catch + completion +
+    /// re-raise path; the workerless fallback panics on the caller
+    /// directly. Either way the contract is the same one.
+    #[test]
+    fn panicking_job_poisons_the_team_and_propagates_promptly() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                with_team(parallelism(), |team| {
+                    let n = team.min_items().max(4096);
+                    let _ = map_owned(team, n, move |i| {
+                        if i == n - 1 {
+                            panic!("team poison probe");
+                        }
+                        i
+                    });
+                });
+            }));
+            let _ = tx.send(outcome);
+        });
+        let outcome = rx
+            .recv_timeout(HANG_LIMIT)
+            .expect("poisoned map returned (no hang)");
+        match outcome {
+            Ok(()) => panic!("a poisoned map must panic, not return"),
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string payload>");
+                assert!(
+                    msg.contains("team poison probe"),
+                    "wrong panic re-raised: {msg}"
+                );
+            }
+        }
+    }
+
+    /// A panicking region callback must not strand the workers: the
+    /// shutdown handshake runs on the unwind path, `thread::scope` joins,
+    /// and the panic reaches the caller.
+    #[test]
+    fn panicking_region_callback_still_shuts_down_and_propagates() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                with_team(parallelism(), |_| -> () {
+                    panic!("region poison probe");
+                });
+            }));
+            let _ = tx.send(outcome);
+        });
+        let outcome = rx
+            .recv_timeout(HANG_LIMIT)
+            .expect("panicking region returned (workers joined, no hang)");
+        match outcome {
+            Ok(()) => panic!("a panicking region must propagate the panic"),
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string payload>");
+                assert!(
+                    msg.contains("region poison probe"),
+                    "wrong panic re-raised: {msg}"
+                );
+            }
+        }
     }
 }

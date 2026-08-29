@@ -19,7 +19,11 @@ tempfile = "3"
 serde_json = "1"
 # Default features trimmed for the optional instrumentation feature (Task
 # 11): span!/event! only, so the attributes proc-macro tree stays out.
-tracing = { version = "0.1", default-features = false }
+# `std` stays on: the feature's own tests install per-test recorders via
+# thread-local default subscribers (`subscriber::set_default`), which
+# tracing gates behind `std` (this pulls `once_cell` into the feature's
+# graph only — the default build and the WASM target never see any of it).
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 corvid = { path = "crates/corvid" }
 
 # Size-optimized profile for the WASM bundle (keeps it under the 2 MB gzipped
