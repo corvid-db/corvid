@@ -217,6 +217,12 @@ memory proxy — e.g., size_of heap estimate or documented reasoning).
 
 ## Task 11: tracing (feature-gated)
 
+Prepend (Task 10 review nit, binding): tighten the in-memory PQ recall
+pins to house precedent — either pin the ef-insensitivity premise (ef loop
+100/200/400 in the test) or raise the bounds toward measured values
+(conformance ≥0.7, unit ≥0.55) with the justification updated to match
+what is actually pinned.
+
 `tracing` as an OPTIONAL cargo feature (default-off; must not enter the
 default build, the WASM budget, or the zero-dep posture — CI verifies
 `cargo build --no-default-features` and the wasm job stays green).
