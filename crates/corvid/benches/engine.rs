@@ -487,6 +487,65 @@ fn bench_selective_window_verify(c: &mut Criterion) {
     g.finish();
 }
 
+/// order_by over a scalar-indexed field (roadmap Task 5's target). A
+/// filterless `order_by(n).limit(20)` historically materialized and sorted
+/// the whole corpus (`stream_scan_only`'s pruned buffer); the sort-index
+/// walk now serves the window from the index (documents fetched only for
+/// the 20 emitted rows). Corpus (deterministic index math + seeded
+/// xorshift shuffle): 5k docs with DISTINCT `n` (so the walk's encoding
+/// buckets are singletons — the common case) in shuffled insertion order,
+/// plus a realistic body. `asc_limit20` walks forward and stops at 20
+/// rows; `desc_limit20` pages the whole index forward keeping a bounded
+/// newest-buckets buffer (scan_from is forward-only), then emits the top
+/// window — still no sort and no corpus fetch. Setup happens once outside
+/// the measured routine (the workload is read-only), so default sampling
+/// applies.
+///
+/// Literal invocation (audit C10, recorded so before/after numbers are
+/// reproducible):
+///
+/// ```text
+/// cargo bench -p corvid --bench engine -- order_by_indexed_5k
+/// ```
+fn bench_order_by_indexed(c: &mut Criterion) {
+    const DOCS: usize = 5_000;
+
+    // Seeded Fisher-Yates over 0..DOCS: distinct values, shuffled order.
+    let ns: Vec<i64> = {
+        let mut vals: Vec<i64> = (0..DOCS as i64).collect();
+        let mut state: u64 = 0x1234_5678;
+        for i in (1..vals.len()).rev() {
+            state = xorshift(state);
+            let j = (state % (i as u64 + 1)) as usize;
+            vals.swap(i, j);
+        }
+        vals
+    };
+
+    let db = Db::open_in_memory().unwrap();
+    let coll = db.collection("docs");
+    for (i, n) in ns.iter().enumerate() {
+        let mut m = BTreeMap::new();
+        m.insert("n".to_owned(), Value::Int(*n));
+        m.insert(
+            "body".to_owned(),
+            Value::Text("a benchmark document with a realistic body".into()),
+        );
+        coll.insert(format!("k{i:06}").as_bytes(), &Value::Map(m))
+            .unwrap();
+    }
+    coll.create_scalar_index("n").unwrap();
+
+    let mut g = c.benchmark_group("order_by_indexed_5k");
+    g.bench_function("asc_limit20", |b| {
+        b.iter(|| coll.query().order_by("n", false).limit(20).run().unwrap())
+    });
+    g.bench_function("desc_limit20", |b| {
+        b.iter(|| coll.query().order_by("n", true).limit(20).run().unwrap())
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_codec,
@@ -497,6 +556,7 @@ criterion_group!(
     bench_edge_churn,
     bench_compound_prefix_scan,
     bench_delete_heavy,
-    bench_selective_window_verify
+    bench_selective_window_verify,
+    bench_order_by_indexed
 );
 criterion_main!(benches);

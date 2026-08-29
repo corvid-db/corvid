@@ -306,6 +306,81 @@ fn doc_key_of(key: &[u8]) -> Option<Vec<u8>> {
     terminator_pos(key).map(|t| key[t + 2..].to_vec())
 }
 
+/// Decode a numeric-lane index key's value portion back to its `f64` (the
+/// inverse of `num_payload`'s order transform, unescaping applied). `None`
+/// on a malformed key.
+fn num_value_of(key: &[u8]) -> Option<f64> {
+    let t = terminator_pos(key)?;
+    let mut payload: Vec<u8> = Vec::with_capacity(8);
+    let mut i = 1; // skip the lane byte
+    while i < t {
+        if key[i] == 0x00 {
+            // Inside the value portion a 0x00 is always an escaped zero
+            // (0x00 0x01) — the raw terminator ends the portion at `t`.
+            i += 2;
+            payload.push(0x00);
+        } else {
+            payload.push(key[i]);
+            i += 1;
+        }
+    }
+    let bits = u64::from_be_bytes(payload.try_into().ok()?);
+    let orig = if bits & (1 << 63) != 0 {
+        bits & !(1 << 63) // was non-negative: only the sign bit was set
+    } else {
+        !bits // was negative: all bits were flipped
+    };
+    Some(f64::from_bits(orig))
+}
+
+/// Stream the index's COMPARABLE entries — every document whose field value
+/// is `Int`/`Float` (numeric lane, IEEE-754 total order, `-0.0` and `+0.0`
+/// sharing one key) or `Text` (text lane, lexical) — in ascending value
+/// order: numeric lane first, then text lane (the ordering contract's
+/// class-0 order: numbers before texts, each lane in value order, ties by
+/// doc key — exactly what the `(lane ‖ payload ‖ terminator ‖ doc_key)` key
+/// layout sorts to). `f` receives each entry's `(value_bytes, doc_key)`
+/// (value bytes = the key up to the terminator); returning `Ok(false)`
+/// stops the walk. Entries whose numeric payload decodes to NaN are
+/// SKIPPED: NaN is indexed (it is a float) but incomparable, so it belongs
+/// to the post-comparable tail of the order, not the walk. The forward map
+/// (`0x00`-prefixed) and the bool lane sort below the numeric lane and are
+/// never visited.
+pub(crate) fn comparable_entries(
+    reader: &dyn SnapshotReader,
+    ns: &str,
+    mut f: impl FnMut(&[u8], &[u8]) -> Result<bool>,
+) -> Result<()> {
+    let mut cursor = vec![LANE_NUM];
+    loop {
+        let page = reader.scan_from(ns, &cursor, PAGE)?;
+        if page.is_empty() {
+            break;
+        }
+        let mut stop = false;
+        for (key, _) in &page {
+            if key[0] > LANE_TEXT {
+                stop = true; // past the text lane: nothing comparable remains
+                break;
+            }
+            let Some(t) = terminator_pos(key) else {
+                continue; // malformed entry: no doc key to offer
+            };
+            if key[0] == LANE_NUM && num_value_of(key).is_some_and(f64::is_nan) {
+                continue; // NaN: incomparable (class 1) — tail, not walk
+            }
+            if !f(&key[..t], &key[t + 2..])? {
+                return Ok(());
+            }
+        }
+        if stop {
+            break;
+        }
+        cursor = next_after(&page.last().unwrap().0);
+    }
+    Ok(())
+}
+
 /// The smallest key strictly greater than `key`.
 fn next_after(key: &[u8]) -> Vec<u8> {
     let mut k = key.to_vec();
@@ -535,6 +610,18 @@ impl Db {
             .defs
             .get(&(collection.to_owned(), field.to_owned()))
             .is_some_and(|building| !*building)
+    }
+
+    /// Whether `field` of `collection` has a scalar-index DEFINITION at all
+    /// (complete or building) — the static "this query may consult the
+    /// index, so `run` must offer the build a resume first" gate for the
+    /// order-index arm (builder.rs), which unlike filtered probes has no
+    /// filter to trigger the existing resume condition.
+    pub(crate) fn has_scalar_index_def(&self, collection: &str, field: &str) -> bool {
+        let state = self.scalar().lock().expect("scalar lock");
+        state
+            .defs
+            .contains_key(&(collection.to_owned(), field.to_owned()))
     }
 
     /// Flip a scalar index's in-memory def to complete after its backfill
@@ -1251,6 +1338,68 @@ mod tests {
         let mut sorted = encs.clone();
         sorted.sort();
         assert_eq!(encs, sorted);
+    }
+
+    /// The order walk's two per-entry facts, pinned on the raw encoding:
+    /// `num_value_of` inverts `num_payload` exactly (NaN payloads decode
+    /// to NaN, everything else round-trips), and `comparable_entries`
+    /// streams numeric lane then text lane in value order while skipping
+    /// NaN entries and never touching the forward map or the bool lane —
+    /// the class-0 order `order_index_rows` (builder.rs) serves from.
+    #[test]
+    fn comparable_entries_walks_class0_order_and_skips_nan() {
+        // Payload decode: round-trips non-NaN (including ±0.0 and the
+        // extremes), and flags both NaN signs.
+        for f in [
+            0.0,
+            -0.0,
+            -1.5,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::MIN,
+            f64::MAX,
+        ] {
+            let key = encode_value(&Value::Float(f)).unwrap();
+            assert_eq!(num_value_of(&key), Some(f), "round-trip {f}");
+        }
+        for nan in [f64::NAN, -f64::NAN] {
+            let key = encode_value(&Value::Float(nan)).unwrap();
+            assert!(num_value_of(&key).is_some_and(f64::is_nan));
+        }
+
+        // The walk: numbers in value order, then texts, NaN skipped, bool
+        // and forward-map rows never visited. Keys deliberately oppose
+        // value order.
+        let store = Store::open_in_memory().unwrap();
+        let rows: Vec<(Value, &str)> = vec![
+            (Value::Int(5), "z"),
+            (Value::Float(-1.0), "y"),
+            (Value::Float(2.0), "x"),
+            (Value::Int(2), "w"), // same f64 as 2.0: one bucket, key order
+            (Value::Float(f64::NAN), "v"), // skipped: incomparable
+            (Value::Bool(true), "u"), // bool lane: never visited
+            (Value::Text("b".into()), "t"),
+            (Value::Text("a".into()), "s"),
+        ];
+        store
+            .transaction(|tx| {
+                for (v, doc) in &rows {
+                    insert_in_txn(tx, "ix", doc.as_bytes(), v)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut got: Vec<String> = Vec::new();
+        comparable_entries(&store, "ix", |_value, doc| {
+            got.push(String::from_utf8_lossy(doc).into_owned());
+            Ok(true)
+        })
+        .unwrap();
+        // Numeric lane by value (Float(-1.0) first, then the 2/2.0 bucket —
+        // one encoding, doc-key order inside it; the EXACT within-bucket
+        // order is the builder's job), then the text lane; NaN and bool
+        // rows absent.
+        assert_eq!(got, vec!["y", "w", "x", "z", "s", "t"]);
     }
 
     #[test]

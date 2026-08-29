@@ -857,10 +857,12 @@ pub(crate) trait SnapshotReader {
     /// Prefix scans (postings, edges) run on this (audit B3).
     fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     /// The maintained record count for `collection` (O(1), no scan).
-    /// `verify_candidates` (builder.rs) reads it on the same snapshot as
-    /// the candidate fetch as the density signal of its fetch-strategy
-    /// pick — a heuristic signal only; both strategies are correct for
-    /// any count.
+    /// Scoped to the backing: a [`ReadBatch`] reads the counter on the
+    /// caller's shared snapshot; the [`Store`] impl opens its own read
+    /// transaction per call (its per-op contract). `verify_candidates`
+    /// (builder.rs) reads it on the same snapshot as the candidate fetch
+    /// as the density signal of its fetch-strategy pick — a heuristic
+    /// signal only; both strategies are correct for any count.
     fn count(&self, collection: &str) -> Result<u64>;
     /// Stream every pair in `collection` to `f` in key order; `f` returns
     /// `false` to stop early. Its slices are valid only for the call.

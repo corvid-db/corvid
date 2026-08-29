@@ -26,10 +26,12 @@
 //!
 //! 1. Build the candidate set with the most bounded source available: an ANN
 //!    or text index for a single indexed source, a scalar/geo index when a
-//!    filter drives it, a streaming bounded top-k for an unindexed single
-//!    vector source, or a full scan as the fallback. Filtering happens *before*
-//!    ranking, so `filter` is a true predicate over the corpus — top-k is
-//!    computed among matching documents, never post-hoc.
+//!    filter drives it, the scalar-index ORDER WALK for a filterless
+//!    `order_by` over an indexed field (documents fetched only for the
+//!    `offset + limit` window), a streaming bounded top-k for an unindexed
+//!    single vector source, or a full scan as the fallback. Filtering
+//!    happens *before* ranking, so `filter` is a true predicate over the
+//!    corpus — top-k is computed among matching documents, never post-hoc.
 //! 2. Rank the filtered set independently for each retrieval source (each
 //!    capped at its own `k`).
 //! 3. Fuse the per-source rankings with Reciprocal Rank Fusion (a single
@@ -120,6 +122,14 @@ pub enum PlanShape {
     /// Single vector source with no usable ANN index: bounded streaming
     /// top-k (`streaming_vector_candidates`).
     StreamingTopK,
+    /// No retrieval sources and no filters: `order_by(field)` served by
+    /// walking `field`'s complete scalar index in the total-order
+    /// contract's comparable-class order (`order_index_rows`) instead of
+    /// materializing and sorting every row.
+    SortIndex {
+        /// The indexed ordering field.
+        field: String,
+    },
     /// Full collection scan + filter (the fallback arm).
     Scan {
         /// The scanned collection.
@@ -1213,8 +1223,10 @@ impl QueryBuilder<'_> {
     /// (audit C3): an advisory, execution-free probe mirroring its ladder
     /// arm for arm —
     ///
-    /// * no sources → `indexed_candidates`' window if a filter index is
-    ///   serviceable, else the streaming filter scan (`Scan`),
+    /// * no sources → the order-index walk (`SortIndex`) when `order_by`
+    ///   targets a completely indexed field with no filters, else
+    ///   `indexed_candidates`' window if a filter index is serviceable,
+    ///   else the streaming filter scan (`Scan`),
     /// * a single vector source with filters only under `approx`, and a
     ///   consultable ANN index (`vector_index_consultable`) → `AnnIndex`,
     /// * a single text source under the same filter rule with a consultable
@@ -1233,6 +1245,17 @@ impl QueryBuilder<'_> {
     pub fn plan_shape(&self) -> PlanShape {
         let coll = self.collection.name().to_owned();
         if self.sources.is_empty() {
+            // The order-index arm precedes the filter window in `run_with`'s
+            // ladder; the two are mutually exclusive (it declines any
+            // filtered query), so the check order cannot shadow anything.
+            if let Some((field, _)) = &self.order_by
+                && self.filters.is_empty()
+                && self.collection.db().has_scalar_index(&coll, field)
+            {
+                return PlanShape::SortIndex {
+                    field: field.clone(),
+                };
+            }
             return match self.indexed_window_kind() {
                 Some(kind) => PlanShape::IndexedWindow { kind },
                 None => PlanShape::Scan { collection: coll },
@@ -1288,6 +1311,7 @@ impl QueryBuilder<'_> {
             PlanShape::TextIndex { field } => format!("text-index({field})"),
             PlanShape::IndexedWindow { kind } => format!("indexed-window({kind})"),
             PlanShape::StreamingTopK => "streaming-topk".to_owned(),
+            PlanShape::SortIndex { field } => format!("sort-index({field})"),
             PlanShape::Scan { collection } => format!("scan({collection})"),
         });
         if !self.filters.is_empty() {
@@ -1348,20 +1372,35 @@ impl QueryBuilder<'_> {
     /// so they must not run inside execution (audit B3 discipline). Gated on
     /// "this query will consult an index", mirroring the probes it
     /// precedes: a filtered query may drive the scalar/geo fast path
-    /// (`indexed_candidates`), and a single-source query drives the ANN or
+    /// (`indexed_candidates`), a single-source query drives the ANN or
     /// text index paths (`ann_candidates`/`text_candidates`) even with no
-    /// filters — that is the normal `.vector(...)`/`.text(...)` shape.
-    /// Only a filterless, zero-or-multi-source query never consults an
-    /// index (pure streaming/scan), so only it skips resuming. Try-lock
+    /// filters — that is the normal `.vector(...)`/`.text(...)` shape —
+    /// and a filterless `order_by` over a scalar-indexed field drives the
+    /// order-index walk (`order_index_rows`). Only a query that consults
+    /// no index (pure streaming/scan) skips resuming. Try-lock
     /// inside: a concurrent resumer means we just probe stale and fall back
     /// to the (correct) scan.
     fn resume_index_builds(&self) -> Result<()> {
-        if self.filters.is_empty() && self.sources.len() != 1 {
+        if self.filters.is_empty() && self.sources.len() != 1 && !self.order_index_consultable() {
             return Ok(());
         }
         self.collection
             .db()
             .try_resume_index_builds(self.collection.name())
+    }
+
+    /// Whether a filterless, sourceless `order_by` targets a field with a
+    /// scalar-index DEFINITION (complete or building) — the static
+    /// "may consult the order index" fact `resume_index_builds` gates on
+    /// (execution itself re-checks completeness on the registry).
+    fn order_index_consultable(&self) -> bool {
+        self.sources.is_empty()
+            && self.filters.is_empty()
+            && self.order_by.as_ref().is_some_and(|(field, _)| {
+                self.collection
+                    .db()
+                    .has_scalar_index_def(self.collection.name(), field)
+            })
     }
 
     /// The execution core of [`Self::run`]: the entire query — candidate
@@ -1380,6 +1419,15 @@ impl QueryBuilder<'_> {
         //   5. full scan + filter (multi-source / unindexed text).
         let filtered: Vec<(Vec<u8>, Value)> = if self.sources.is_empty() {
             // No retrieval sources → a pure filter/order/paginate query.
+            // Order-index fast path first: a FILTERLESS order_by over a
+            // scalar-indexed field is served by walking the index in the
+            // total-order contract's comparable-class order (bounded
+            // memory under a limit; identical rows to the sort by
+            // construction). It declines any filtered query, so it never
+            // shadows the window path below.
+            if let Some(rows) = self.order_index_rows(reader)? {
+                return Ok(rows);
+            }
             // Scalar-index fast path: fetch only candidate documents instead
             // of scanning the whole collection, then order/paginate in memory
             // (the set is bounded by the number of matches).
@@ -1504,6 +1552,174 @@ impl QueryBuilder<'_> {
             }
         }
         Ok(buf)
+    }
+
+    /// Serve a filterless `order_by(field)` query (no retrieval sources,
+    /// no filters) from the field's COMPLETE scalar index instead of
+    /// materializing and sorting every row: the index walk
+    /// (`scalar::comparable_entries`) enumerates the COMPARABLE class
+    /// (ints/floats numerically, then texts lexically — the order
+    /// contract's class-0 order) and documents are fetched only for the
+    /// `offset + limit` window. Docs the index cannot hold — missing the
+    /// field, or incomparable values (bools, NaN, containers) — sort after
+    /// every comparable row in BOTH directions, so they only matter when
+    /// the window reaches past the comparable set; the on-exhaustion
+    /// fallback scans that tail and orders it with the same comparator.
+    /// Walk-order ++ tail-order is exactly `sort_by_field`'s total order,
+    /// so results are identical to the scan path by construction.
+    ///
+    /// Decline rules (identical results or decline — never approximate):
+    /// * any retrieval source: there the rank/fusion order is the
+    ///   contract, and this arm only covers the no-source shape;
+    /// * any filter: the selectivity-driven window machinery serves
+    ///   those, and an order walk would fetch-and-drop every comparable
+    ///   document for a selective filter — over-fetch that is unbounded
+    ///   without a window;
+    /// * no complete scalar index on the ordering field (a building def
+    ///   is resumed by [`Self::run`] before the snapshot opens; under a
+    ///   contended resume the gate stays false and the scan path serves).
+    ///
+    /// Exactness notes: entries sharing one encoded value (true ties —
+    /// `-0.0`/`+0.0`, equal texts — and distinct i64s beyond 2^53 that
+    /// collapse onto one f64 in the numeric lane) are flushed as one
+    /// bucket ordered by the EXACT comparator, so the index's doc-key
+    /// tiebreak never leaks a precision collision into the result; NaN
+    /// entries are indexed floats but incomparable, so the walk skips
+    /// them and they land in the tail with the other class-1 rows.
+    fn order_index_rows(&self, reader: &dyn SnapshotReader) -> Result<Option<Vec<ResultRow>>> {
+        let Some((field, descending)) = &self.order_by else {
+            return Ok(None);
+        };
+        if !self.filters.is_empty() || !self.sources.is_empty() {
+            return Ok(None);
+        }
+        let collection = self.collection;
+        let coll = collection.name();
+        if !collection.db().has_scalar_index(coll, field) {
+            return Ok(None);
+        }
+        // Audit C10: the order index actually served this query.
+        #[cfg(test)]
+        test_probe::bump_sort();
+
+        let limit = self.limit;
+        if limit == Some(0) {
+            return Ok(Some(Vec::new())); // the empty window, no walk needed
+        }
+        let ns = crate::scalar::namespace(coll, field);
+        let mut win = OrderWindow {
+            collection: &collection,
+            field,
+            descending: *descending,
+            limit,
+            skip: self.offset,
+            out: Vec::new(),
+        };
+
+        if !*descending {
+            // Ascending: buckets flush as their encoded value changes; the
+            // walk stops the moment the window fills.
+            let mut bucket: Vec<Vec<u8>> = Vec::new();
+            let mut enc: Option<Vec<u8>> = None;
+            let mut stop = false;
+            crate::scalar::comparable_entries(reader, &ns, |value, doc_key| {
+                if win.full() {
+                    stop = true;
+                    return Ok(false);
+                }
+                if enc.as_deref() == Some(value) {
+                    bucket.push(doc_key.to_vec());
+                } else {
+                    if enc.is_some() {
+                        // Encoded value changed: the pending bucket is
+                        // complete and emits through the window.
+                        win.emit_bucket(reader, &bucket)?;
+                        bucket.clear();
+                    }
+                    bucket.push(doc_key.to_vec());
+                    enc = Some(value.to_vec());
+                }
+                Ok(true)
+            })?;
+            if !stop && !bucket.is_empty() {
+                win.emit_bucket(reader, &bucket)?;
+            }
+        } else {
+            // Descending: scan_from pages forward only, so the walk stays
+            // ascending and the buffer keeps the NEWEST buckets — the
+            // descending head — evicting a complete head bucket only while
+            // the retained tail still covers the whole offset+limit window.
+            // The buffer therefore holds the window extended back to a
+            // bucket boundary (exact within-bucket order needs whole
+            // buckets); memory stays bounded by window + largest bucket.
+            let window = limit.map_or(usize::MAX, |l| self.offset.saturating_add(l));
+            let mut buckets: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+            let mut buffered = 0usize;
+            crate::scalar::comparable_entries(reader, &ns, |value, doc_key| {
+                match buckets.last_mut() {
+                    Some((e, b)) if e.as_slice() == value => b.push(doc_key.to_vec()),
+                    _ => buckets.push((value.to_vec(), vec![doc_key.to_vec()])),
+                }
+                buffered += 1;
+                while buckets.len() > 1 && buffered - buckets[0].1.len() >= window {
+                    buffered -= buckets.remove(0).1.len();
+                }
+                Ok(true)
+            })?;
+            for (_, bucket) in buckets.into_iter().rev() {
+                if win.full() {
+                    break;
+                }
+                win.emit_bucket(reader, &bucket)?;
+            }
+        }
+
+        // Exhaustion: the walk ended before the window filled, so the rows
+        // still owed are the incomparable/missing docs the index does not
+        // hold. Scan them, order by the same comparator, and continue the
+        // window — the exact tail of the total order. (Only reachable when
+        // offset+limit exceeds the comparable count — the common top-k
+        // query never pays this scan.)
+        if !win.full() {
+            let mut tail: Vec<(Vec<u8>, Value)> = Vec::new();
+            collection.for_each_doc_in(reader, |key, doc| {
+                let comparable = doc
+                    .get_path(field)
+                    .is_some_and(|v| crate::filter::value_order(v, v).is_some());
+                if !comparable {
+                    tail.push((key.to_vec(), doc));
+                }
+                Ok(true)
+            })?;
+            sort_by_field(&mut tail, field, *descending);
+            for (key, doc) in tail {
+                if win.full() {
+                    break;
+                }
+                if win.skip > 0 {
+                    win.skip -= 1;
+                    continue;
+                }
+                win.out.push((key, doc));
+            }
+        }
+
+        Ok(Some(
+            win.out
+                .into_iter()
+                .map(|(key, document)| {
+                    let document = match &self.projection {
+                        Some(fields) => project(document, fields),
+                        None => document,
+                    };
+                    ResultRow {
+                        key,
+                        score: 0.0,
+                        document,
+                    }
+                })
+                .collect(),
+        ))
     }
 
     /// Offset + limit + projection over already-ordered `(key, document)`
@@ -1768,6 +1984,63 @@ fn sort_by_field(buf: &mut [(Vec<u8>, Value)], field: &str, descending: bool) {
     });
 }
 
+/// The order-window state the sort-index walk (`order_index_rows`) flushes
+/// its buckets through: the comparator parameters, the rows still to skip
+/// (the offset), and the rows emitted so far against the limit.
+struct OrderWindow<'c> {
+    collection: &'c Collection<'c>,
+    field: &'c str,
+    descending: bool,
+    limit: Option<usize>,
+    skip: usize,
+    out: Vec<(Vec<u8>, Value)>,
+}
+
+impl OrderWindow<'_> {
+    /// Whether the offset+limit window is already full.
+    fn full(&self) -> bool {
+        self.limit.is_some_and(|n| self.out.len() >= n)
+    }
+
+    /// Fetch one ORDER-BUCKET's documents — every doc sharing one encoded
+    /// index value — order them with the exact `order_by` comparator, and
+    /// run them through the skip/limit window.
+    ///
+    /// Why the re-sort: the index orders same-encoded entries by doc key,
+    /// which is the contract's tiebreak for TRUE ties (`-0.0`/`+0.0`, equal
+    /// texts) but not for distinct large i64s that collapse onto one `f64`
+    /// in the numeric lane — those compare exactly in the contract and must
+    /// not inherit the index's key order. A bucket the window skips
+    /// entirely is accounted without fetching anything (every entry is
+    /// exactly one result row: a complete index on this snapshot mirrors
+    /// the documents, and a key with no document would be invisible to the
+    /// scan path too).
+    fn emit_bucket(&mut self, reader: &dyn SnapshotReader, keys: &[Vec<u8>]) -> Result<()> {
+        if self.skip >= keys.len() {
+            self.skip -= keys.len();
+            return Ok(());
+        }
+        let mut rows: Vec<(Vec<u8>, Value)> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(doc) = self.collection.get_in(reader, key)? {
+                rows.push((key.clone(), doc));
+            }
+        }
+        sort_by_field(&mut rows, self.field, self.descending);
+        for (key, doc) in rows {
+            if self.full() {
+                break; // window already full: account nothing further
+            }
+            if self.skip > 0 {
+                self.skip -= 1;
+                continue;
+            }
+            self.out.push((key, doc));
+        }
+        Ok(())
+    }
+}
+
 /// Narrow a document to the named field paths, which may be dotted
 /// (`"meta.author"`); the projected structure is rebuilt nested. Missing paths
 /// are omitted. Non-map documents pass through unchanged.
@@ -1877,18 +2150,20 @@ pub(crate) mod test_probe {
     use std::cell::Cell;
 
     /// Serve counts since the last [`reset`]: how many times the ANN, text,
-    /// and filter-index candidate sources each served a query.
+    /// filter-index, and order-index candidate sources each served a query.
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct Served {
         pub ann: usize,
         pub text: usize,
         pub indexed: usize,
+        pub sort: usize,
     }
 
     thread_local! {
         static ANN: Cell<usize> = const { Cell::new(0) };
         static TEXT: Cell<usize> = const { Cell::new(0) };
         static INDEXED: Cell<usize> = const { Cell::new(0) };
+        static SORT: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn bump_ann() {
@@ -1903,10 +2178,15 @@ pub(crate) mod test_probe {
         INDEXED.with(|c| c.set(c.get() + 1));
     }
 
+    pub(crate) fn bump_sort() {
+        SORT.with(|c| c.set(c.get() + 1));
+    }
+
     pub(crate) fn reset() {
         ANN.with(|c| c.set(0));
         TEXT.with(|c| c.set(0));
         INDEXED.with(|c| c.set(0));
+        SORT.with(|c| c.set(0));
     }
 
     pub(crate) fn read() -> Served {
@@ -1914,6 +2194,7 @@ pub(crate) mod test_probe {
             ann: ANN.with(Cell::get),
             text: TEXT.with(Cell::get),
             indexed: INDEXED.with(Cell::get),
+            sort: SORT.with(Cell::get),
         }
     }
 }
@@ -2487,7 +2768,8 @@ mod tests {
             test_probe::Served {
                 ann: 1,
                 text: 0,
-                indexed: 0
+                indexed: 0,
+                sort: 0
             }
         );
     }
@@ -2517,7 +2799,8 @@ mod tests {
             test_probe::Served {
                 ann: 1,
                 text: 0,
-                indexed: 0
+                indexed: 0,
+                sort: 0
             }
         );
     }
@@ -2544,7 +2827,8 @@ mod tests {
             test_probe::Served {
                 ann: 0,
                 text: 0,
-                indexed: 0
+                indexed: 0,
+                sort: 0
             }
         );
     }
@@ -2594,7 +2878,8 @@ mod tests {
             test_probe::Served {
                 ann: 0,
                 text: 1,
-                indexed: 0
+                indexed: 0,
+                sort: 0
             }
         );
     }
@@ -2657,6 +2942,12 @@ mod tests {
             .explain();
         assert!(indexed.starts_with("indexed-window(scalar)"), "{indexed}");
         assert!(indexed.contains("filter x1"), "{indexed}");
+
+        // A filterless order_by over the scalar-indexed `category` field
+        // plans as the sort-index walk.
+        let sort = c.query().order_by("category", false).explain();
+        assert!(sort.starts_with("sort-index(category)"), "{sort}");
+        assert!(sort.contains("order_by(category)"), "{sort}");
 
         // No vector index on this one → the single vector source streams.
         let plain = Db::open_in_memory().unwrap();
@@ -2775,6 +3066,9 @@ mod tests {
                             (served.ann, served.text, served.indexed),
                             (0, 0, 1),
                             "indexed shape but served {served:?}: {label}"
+                        ),
+                        PlanShape::SortIndex { .. } => unreachable!(
+                            "the matrix sets no order_by; sort rows are below: {label}"
                         ),
                         PlanShape::StreamingTopK | PlanShape::Scan { .. } => assert_eq!(
                             (served.ann, served.text, served.indexed),
@@ -3028,6 +3322,56 @@ mod tests {
                 .filter(field("n").le(Value::Int(5))),
             PlanShape::IndexedWindow { kind: "scalar" },
             "clean range on an indexed field",
+        );
+
+        // Sort-index kind: a FILTERLESS order_by over a completely indexed
+        // field is served by the index order walk (both directions, with a
+        // window); any filtered order_by declines it — the selectivity-
+        // driven window keeps those, ordering on top of the candidates.
+        fn parity_sort(q: QueryBuilder<'_>, expected: PlanShape, label: &str) {
+            assert_eq!(q.plan_shape(), expected, "plan_shape lied: {label}");
+            test_probe::reset();
+            let rows = q.run().unwrap();
+            let served = test_probe::read();
+            assert_eq!(
+                (served.ann, served.text, served.indexed, served.sort),
+                (0, 0, 0, 1),
+                "sort-index shape but served {served:?}: {label}"
+            );
+            assert!(!rows.is_empty(), "fixture row sanity: {label}");
+        }
+        parity_sort(
+            sdb.collection("docs").query().order_by("n", false).limit(3),
+            PlanShape::SortIndex {
+                field: "n".to_owned(),
+            },
+            "sort-index walk asc",
+        );
+        parity_sort(
+            sdb.collection("docs")
+                .query()
+                .order_by("n", true)
+                .offset(2)
+                .limit(3),
+            PlanShape::SortIndex {
+                field: "n".to_owned(),
+            },
+            "sort-index walk desc window",
+        );
+        parity(
+            sdb.collection("docs")
+                .query()
+                .filter(field("n").ge(Value::Int(1)))
+                .order_by("n", false),
+            PlanShape::IndexedWindow { kind: "scalar" },
+            "filtered order_by declines the sort-index walk",
+        );
+        parity(
+            sdb.collection("docs").query().order_by("other", false),
+            PlanShape::Scan {
+                collection: "docs".to_owned(),
+            },
+            "order_by on an unindexed field scans",
         );
 
         // Compound twins: no scalar index anywhere, so the ladder reaches

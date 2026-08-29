@@ -38,6 +38,17 @@ format and API may change without backward-compatibility guarantees.
   instead of falling back to a default.
 
 ### Changed
+- A filterless `order_by(field)` whose field has a complete scalar index is
+  now served by an index order walk instead of materializing and sorting
+  every row: rows and their order are identical (the walk enumerates the
+  comparable class in the pinned total order; ties and large-integer
+  encoding collisions re-sort with the exact comparator; incomparable and
+  missing values still sort last via an on-exhaustion tail scan), but
+  documents are fetched only for the `offset + limit` window. On a 5k-doc
+  corpus with `limit 20`: ~9x faster ascending, ~2.7x faster descending.
+  `plan_shape()`/`explain()` report the new `PlanShape::SortIndex` arm for
+  this shape; queries with retrieval sources, filters, or no index on the
+  ordered field keep their previous plans.
 - Indexed query verification (a filter served by a scalar/compound/geo/OR
   index window) now batches its document fetch when the window is dense
   relative to the collection: instead of one point-get per candidate key,

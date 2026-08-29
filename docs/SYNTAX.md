@@ -253,7 +253,7 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::JoinRow` — `joins_smoke_left_outer_resolves_and_misses`, `joins_happy_path_join_row_shape_is_exact`, `joins_missing_fk_field_and_dangling_reference_retain_rows_with_none`, `joins_foreign_key_kinds_text_bytes_int_and_unusable_shapes`, `joins_self_join_references_within_one_collection`, `joins_empty_left_empty_right_and_unknown_right_collection`, `joins_rows_follow_left_collection_key_order`, `joins_non_map_left_documents_retained_with_none`
 - `corvid::Collection::join` — `joins_smoke_left_outer_resolves_and_misses`, `joins_happy_path_join_row_shape_is_exact`, `joins_dotted_foreign_key_path_resolves_nested_maps`, `joins_missing_fk_field_and_dangling_reference_retain_rows_with_none`, `joins_foreign_key_kinds_text_bytes_int_and_unusable_shapes`, `joins_self_join_references_within_one_collection`, `joins_empty_left_empty_right_and_unknown_right_collection`, `joins_rows_follow_left_collection_key_order`, `joins_track_right_and_left_side_mutations`, `joins_non_map_left_documents_retained_with_none`
 
-## Lifecycle — 102 construct(s)
+## Lifecycle — 103 construct(s)
 
 - `corvid::value::MAX_NESTING` — `lifecycle_value_decode_enforces_max_nesting_bound`
 - `corvid::Value::encode` — `lifecycle_dump_load_roundtrips_every_value_variant_bytes_exact`, `lifecycle_value_decode_enforces_max_nesting_bound`
@@ -276,6 +276,7 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::PlanShape::AnnIndex` — `queries_plan_shape_ann_index_for_single_vector_source`
 - `corvid::PlanShape::TextIndex` — `queries_plan_shape_text_index_for_single_text_source`
 - `corvid::PlanShape::IndexedWindow` *(shared across classes: WHERE, SELECT shaping)* — `filters_indexed_vs_scan_scalar_predicates`, `queries_plan_shape_indexed_window_kinds_and_explain_families`
+- `corvid::PlanShape::SortIndex` — `queries_plan_shape_sort_index_for_order_by_on_indexed_field`, `queries_order_by_index_walk_parity_across_kind_lattice`
 - `corvid::PlanShape::StreamingTopK` — `queries_plan_shape_streaming_topk_without_index`
 - `corvid::PlanShape::Scan` *(shared across classes: WHERE, SELECT shaping)* — `filters_indexed_vs_scan_scalar_predicates`, `queries_plan_shape_indexed_window_kinds_and_explain_families`
 - `corvid::QueryBuilder::plan` — `lifecycle_query_plan_key_is_canonical_for_identical_shapes`
@@ -416,8 +417,8 @@ the in-process duplex-I/O suite in `crates/corvid-mcp/tests/tools/`.
 - `mcp::tool::set_schema` — `set_schema_then_get_schema_roundtrips`, `set_schema_unique_enforced_on_stores`, `set_schema_required_and_type_violations`, `set_schema_param_and_name_errors`, `dump_load_preserves_schema_constraints`, `set_schema_flag_type_errors`, `set_schema_declared_empty_vs_undeclared_fields`
 - `mcp::tool::get_schema` — `set_schema_then_get_schema_roundtrips`, `set_schema_param_and_name_errors`, `dump_load_preserves_schema_constraints`, `set_schema_declared_empty_vs_undeclared_fields`
 
-304 engine construct(s) across 13 statement classes, 51 wire construct(s),
-289 distinct covering tests (existence and uniqueness enforced by the
+305 engine construct(s) across 13 statement classes, 51 wire construct(s),
+291 distinct covering tests (existence and uniqueness enforced by the
 radars; the 7 exempt row(s) above are the only uncovered ones, each
 with its justification).
 

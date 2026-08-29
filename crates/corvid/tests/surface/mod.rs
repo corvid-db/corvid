@@ -826,6 +826,14 @@ static MANIFEST: &[Row] = &[
         ],
     ),
     row(
+        "corvid::PlanShape::SortIndex",
+        "Lifecycle",
+        &[
+            "queries_plan_shape_sort_index_for_order_by_on_indexed_field",
+            "queries_order_by_index_walk_parity_across_kind_lattice",
+        ],
+    ),
+    row(
         "corvid::PlanShape::StreamingTopK",
         "Lifecycle",
         &["queries_plan_shape_streaming_topk_without_index"],
