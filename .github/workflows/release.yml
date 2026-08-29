@@ -6,10 +6,21 @@ name: Release
 # and the tag has been verified against the workspace version; the release
 # job then attaches the platform archives plus a checksums.txt of their
 # sha256 digests.
+#
+# Dry-run (no publishing, e.g. after touching this file): run the workflow
+# manually from Actions with `dry_run` checked — every matrix build, the
+# tag/version verification, and the sha256 checksums all execute, but the
+# release/upload steps are skipped (an explicit echo marks the skip).
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build + checksum everything, but skip the release/upload steps
+        type: boolean
+        default: false
 
 # Least privilege by default; each job scopes its own grant below.
 permissions: {}
@@ -72,12 +83,24 @@ jobs:
       - uses: actions/checkout@v7
       - name: Tag must match the workspace version
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
           VERSION=$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version = /{gsub(/[";]/,"",$3); print $3; exit}' Cargo.toml)
-          echo "tag: ${GITHUB_REF_NAME} (version part: ${TAG}), workspace version: ${VERSION}"
-          if [ -z "$VERSION" ] || [ "$TAG" != "$VERSION" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${VERSION:-<not found>}"
+          if [ -z "$VERSION" ]; then
+            echo "::error::workspace version not found in Cargo.toml"
             exit 1
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # A dispatch run has no tag (GITHUB_REF_NAME is the branch), so
+            # the tag<->version equality cannot be evaluated here; only the
+            # version-constant half of the check runs. The equality itself is
+            # enforced on the tag push that triggers a real release.
+            echo "dispatch (dry_run=${{ inputs.dry_run }}): no tag context; workspace version constant: ${VERSION}; tag<->version equality enforced on tag pushes"
+          else
+            TAG="${GITHUB_REF_NAME#v}"
+            echo "tag: ${GITHUB_REF_NAME} (version part: ${TAG}), workspace version: ${VERSION}"
+            if [ "$TAG" != "$VERSION" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${VERSION}"
+              exit 1
+            fi
           fi
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -90,7 +113,14 @@ jobs:
           ls -l
           sha256sum corvid-mcp-* > checksums.txt
           cat checksums.txt
+      - name: "dry-run: publish skipped"
+        if: inputs.dry_run == true
+        run: >
+          echo "dry-run: publish skipped — matrix builds, version
+          verification, and sha256 checksums all ran; no GitHub release
+          created, no assets uploaded."
       - name: Create the release (idempotent) and attach assets
+        if: inputs.dry_run != true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
