@@ -233,6 +233,16 @@ subsumed or explicitly left future).
 
 ## Task 12: Page-level single-snapshot
 
+Prepend (Task 11 review, binding): (a) fix inmemory_compaction's `live`
+telemetry field (index.rs ~604-617: node_to_key.len() counts tombstoned
+nodes — use live = total − dead, matching the on-disk event's semantics);
+(b) align the plan_shape telemetry docs with reality: the window event
+carries no family discriminator and stream_scan is intentionally finer
+than explain()'s Scan — either add the family field or soften report/
+AUDIT/CHANGELOG/DESIGN wording, pick one; (c) add the missing
+index.rs::resume_vector lazy_index_resume span to the report's inventory
+table (report-only edit).
+
 `page`/`page_where` execute their whole walk inside ONE read transaction
 (chunked reads INSIDE the txn to preserve bounded memory). Conformance:
 existing page tests green; new test proves page-consistency under an
