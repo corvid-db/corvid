@@ -11,9 +11,13 @@
 //! delete (O(E)). Two private adjacency namespaces (`__adj_out__<collection>`,
 //! `__adj_in__<collection>`) now hold the same edges re-keyed *endpoint-first*:
 //! DERIVED state (the edge rows stay the only source of truth; their format is
-//! unchanged), rebuilt lazily from them on first cascade use after open and
-//! maintained transactionally by [`Collection::link`],
-//! [`Collection::link_weighted`] and [`Collection::unlink`] — so the cascade
+//! unchanged), established lazily inside the first edge write's own
+//! transaction (an empty build on a fresh database, a one-time re-derive after
+//! a plain reopen) and maintained transactionally by [`Collection::link`],
+//! [`Collection::link_weighted`] and [`Collection::unlink`] — so a dump→load
+//! replay leaves it BUILT by the end of load (every replayed edge write
+//! maintains it), while a plain reopen defers the re-derive to the first edge
+//! write or cascade — and the cascade
 //! finds a document's edges directly, in O(edges-of-doc). See
 //! `Db::edges_on_delete_in_txn` for the layout, rebuild and fallback rules.
 //!
@@ -447,7 +451,9 @@ impl Db {
     /// `(collection, relation, from, to, weight)`, for dump/migrate. Edges of
     /// reserved collections are engine-internal and excluded — as is the
     /// derived adjacency (a dump contains only source-of-truth namespaces;
-    /// `load` rebuilds adjacency lazily like any fresh database). Reads the
+    /// `load` replays every edge through `link_weighted`, which maintains
+    /// adjacency transactionally, so it is BUILT by the end of load — not
+    /// deferred to first use like a plain reopen's re-derive). Reads the
     /// edge namespaces (and the catalog walk) through `reader`, so a dump
     /// enumerates them on the same snapshot as its records (audit B8).
     pub(crate) fn all_edges_in(
