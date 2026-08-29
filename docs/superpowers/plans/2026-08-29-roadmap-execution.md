@@ -194,7 +194,7 @@ parallelism is INSIDE one build).
 
 ## Task 14: Program exit
 
-Full gates; all benches recorded (before/after tables consolidated);
+Full gates; all benches recorded AND COMMITTED IN-REPO as docs/BENCHES.md (machine, date, before/after per task — the wave-1 baselines currently live only in git-ignored workspace reports; this file is the durable record);
 SYNTAX.md regenerated if surface grew; CHANGELOG complete; AUDIT.md
 Open→Fixed flips verified; DESIGN.md decision-log rows for every shipped
 item; final whole-branch review; ledger close; push.
