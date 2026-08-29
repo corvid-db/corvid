@@ -14,6 +14,24 @@ readme = "../../README.md"
 [dependencies]
 redb.workspace = true
 thiserror.workspace = true
+# OPTIONAL instrumentation (Task 11): never in the default build, the WASM
+# budget, or the zero-dependency posture — pulled in only by
+# `--features tracing` (see `[features]` and `src/telemetry.rs`). The
+# workspace entry trims tracing's defaults: the engine instruments via the
+# `span!`/`event!` macros only, so the `attributes` proc-macro feature
+# (and its syn/quote tree) is left out; the footprint is the facade +
+# `tracing-core`.
+tracing = { workspace = true, optional = true }
+
+[features]
+## Structured instrumentation at the engine's load-bearing points (index
+## backfill pages, compactions, lazy resumes/adjacency rebuilds, query plan
+## selection, edge-cascade fallbacks). OFF by default: the default build
+## keeps the zero-dependency posture and the WASM size budget; enabling adds
+## the `tracing` facade (span!/event! only — the attributes proc-macro
+## feature is disabled) and no public API. All call sites go through
+## `src/telemetry.rs`, which compiles to nothing when off.
+tracing = ["dep:tracing"]
 
 [dev-dependencies]
 tempfile.workspace = true

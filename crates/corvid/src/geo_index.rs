@@ -370,6 +370,7 @@ impl Db {
         crate::index_build::run_atomic_backfill(
             self.store(),
             collection,
+            "geo",
             GEO_DEFS,
             &def_key(collection, field),
             &kb,

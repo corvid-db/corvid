@@ -116,11 +116,19 @@ fn abort_after_pages() -> Option<usize> {
 
 /// Drive one atomic backfill over `collection` starting at `start_cursor`.
 /// Each page's `index_page` writes and the cursor advance commit in ONE
-/// transaction; a final transaction marks the def `Complete`.
+/// transaction; a final transaction marks the def `Complete`. `kind` is the
+/// index-family label for instrumentation ("scalar", "compound", "text",
+/// "geo", "vector") — a label, never parsed.
 #[allow(clippy::type_complexity)]
+// The 8th arg is the instrumentation label; the driver's inputs are
+// inherently (store, collection, defs namespace, def key, kind bytes,
+// cursor, page fn).
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "tracing"), allow(unused_variables))]
 pub(crate) fn run_atomic_backfill(
     store: &Store,
     collection: &str,
+    kind: &str,
     defs_ns: &str,
     def_key: &[u8],
     kind_bytes: &[u8],
@@ -139,17 +147,30 @@ pub(crate) fn run_atomic_backfill(
         };
         let mut next = last_key.clone();
         next.push(0);
-        let def_value = encode_def(
-            kind_bytes,
-            &DefState::Building {
-                cursor: next.clone(),
-            },
-        );
-        store.transaction(|tx| {
-            index_page(tx, &page)?;
-            tx.put(defs_ns, def_key, &def_value)?;
-            Ok(())
-        })?;
+        {
+            // Per-page span (feature-gated via telemetry): collection, index
+            // kind, page size, and the cursor this page starts from — the
+            // progress signal for a build that may resume across crashes.
+            let _page = crate::telemetry::span!(
+                DEBUG,
+                "index_backfill_page",
+                collection = crate::telemetry::display(collection),
+                kind = crate::telemetry::display(kind),
+                docs = page.len() as u64,
+                cursor = crate::telemetry::debug(&cursor),
+            );
+            let def_value = encode_def(
+                kind_bytes,
+                &DefState::Building {
+                    cursor: next.clone(),
+                },
+            );
+            store.transaction(|tx| {
+                index_page(tx, &page)?;
+                tx.put(defs_ns, def_key, &def_value)?;
+                Ok(())
+            })?;
+        }
         cursor = next;
         committed_pages += 1;
         if let Some(n) = abort_after_pages()
@@ -160,6 +181,13 @@ pub(crate) fn run_atomic_backfill(
     }
     let complete = encode_def(kind_bytes, &DefState::Complete);
     store.transaction(|tx| tx.put(defs_ns, def_key, &complete))?;
+    crate::telemetry::event!(
+        DEBUG,
+        message = "index_backfill_complete",
+        collection = crate::telemetry::display(collection),
+        kind = crate::telemetry::display(kind),
+        pages = committed_pages as u64,
+    );
     Ok(())
 }
 
@@ -245,6 +273,7 @@ mod tests {
         run_atomic_backfill(
             &s,
             "docs",
+            "test",
             "__tdefs__",
             b"docs\x00f",
             &[5],
@@ -268,6 +297,7 @@ mod tests {
         run_atomic_backfill(
             &s,
             "docs",
+            "test",
             "__tdefs__",
             b"docs\x00f",
             &[5],
@@ -294,6 +324,7 @@ mod tests {
         let r = run_atomic_backfill(
             &s,
             "docs",
+            "test",
             "__tdefs__",
             b"docs\x00f",
             &[],

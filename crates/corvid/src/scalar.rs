@@ -752,6 +752,7 @@ impl Db {
         crate::index_build::run_atomic_backfill(
             self.store(),
             collection,
+            "scalar",
             SCALAR_DEFS,
             &def_key(collection, field),
             &kb,
@@ -1103,6 +1104,7 @@ impl Db {
         crate::index_build::run_atomic_backfill(
             self.store(),
             collection,
+            "compound",
             COMPOUND_DEFS,
             &key,
             &kb,

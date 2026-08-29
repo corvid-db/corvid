@@ -28,6 +28,18 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --all-targets --workspace -- -D warnings
+      - name: Zero-dep posture (Task 11)
+        run: |
+          cargo build -p corvid --no-default-features
+          if cargo tree -p corvid --edges normal | grep -qE '(^|[^a-z-])tracing v'; then
+            echo "::error::tracing must not be in the default dependency graph (feature leak)"
+            exit 1
+          fi
+      - name: Feature-gated tracing (clippy + doc + test with the feature on)
+        run: |
+          cargo clippy -p corvid --features tracing --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc -p corvid --features tracing --no-deps
+          cargo test -p corvid --features tracing
       - name: Docs
         run: cargo doc --no-deps --workspace
         env:
@@ -61,6 +73,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build WASM bundle
         run: cargo build -p corvid-wasm --target wasm32-unknown-unknown --profile wasm-release
+      - name: WASM graph excludes tracing (Task 11)
+        run: |
+          if cargo tree -p corvid-wasm --target wasm32-unknown-unknown --edges normal | grep -qE '(^|[^a-z-])tracing v'; then
+            echo "::error::tracing must never reach the wasm dependency graph"
+            exit 1
+          fi
       - name: Enforce bundle-size budget
         run: |
           WASM=target/wasm32-unknown-unknown/wasm-release/corvid_wasm.wasm

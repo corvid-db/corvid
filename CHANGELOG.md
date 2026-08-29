@@ -7,6 +7,35 @@ format and API may change without backward-compatibility guarantees.
 ## [Unreleased]
 
 ### Added
+- Optional `tracing` cargo feature (default OFF) on the `corvid` crate:
+  structured instrumentation at the engine's load-bearing points, via the
+  `tracing` crate (default features trimmed: `span!`/`event!` only, so the
+  `attributes` proc-macro tree stays out — the footprint is the facade +
+  `tracing-core` + `pin-project-lite`), no public API change either way, and nothing at all when off (every call site goes
+  through the engine-private `telemetry` shim, which compiles to no code
+  and no dependency graph entries). Enable with
+  `corvid = { features = ["tracing"] }` and attach any
+  `tracing`-compatible subscriber (events carry `target = "corvid"`).
+  Instrumented, at per-operation/per-page granularity (never
+  per-document): index creation/backfill (a span per committed page with
+  collection, index family — scalar/compound/text/geo/vector — page size,
+  and cursor progress, plus a completion event with the page count);
+  compactions (the in-memory and on-disk dead/live trigger math on the
+  actual crossing, and the rebuild outcome); lazy index-build resumes and
+  adjacency rebuilds (including whether the adjacency marker was absent
+  or stale-shaped); query plan-shape selection (one event per query:
+  which arm drove the candidate set — labels mirroring the public
+  `PlanShape` variants — and how many candidates it produced, making the
+  index-walk vs point-get decision visible); the order-index walk's
+  on-exhaustion tail scan; the edge-cascade rebuild fallback on a corrupt
+  adjacency row; and semantic-cache hit/miss with the deciding distance.
+  Counters (DESIGN's "cache hits, index probes" future item) are subsumed
+  by these events — a subscriber aggregating `plan_shape` per `shape` or
+  `semantic_cache_hit`/`miss` has the counter; plan-cache hit counters
+  stay future (`PlanCache` is host-side state). CI enforces the default
+  posture both ways: `cargo build --no-default-features` plus a
+  `cargo tree` assertion that the default and wasm-target graphs never
+  contain `tracing`, and clippy/doc/test with the feature on.
 - `Collection::create_vector_index_pq(field, metric, m, k)` (and
   `Hnsw::with_pq(metric, pq, m, ef_construction)` on the direct index API):
   product quantization for the **in-memory** HNSW — the same compression the

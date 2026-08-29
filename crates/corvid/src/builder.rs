@@ -1433,6 +1433,24 @@ impl QueryBuilder<'_> {
         //   3. text index (single indexed text source),
         //   4. streaming bounded top-k (single vector source, no index),
         //   5. full scan + filter (multi-source / unindexed text).
+        //
+        // Each arm emits its plan-shape choice (feature-gated via telemetry):
+        // ONE event per query at the decision point — which source drove,
+        // how many candidates it produced. The labels mirror the
+        // [`PlanShape`] variants, so a subscriber counting these events is
+        // counting index probes per family (the "counters" story in
+        // DESIGN's Observability section).
+        macro_rules! plan_shape {
+            ($shape:literal, $coll:expr, $rows:expr) => {
+                crate::telemetry::event!(
+                    DEBUG,
+                    message = "plan_shape",
+                    collection = crate::telemetry::display($coll),
+                    shape = $shape,
+                    rows = $rows as u64,
+                );
+            };
+        }
         let filtered: Vec<(Vec<u8>, Value)> = if self.sources.is_empty() {
             // No retrieval sources → a pure filter/order/paginate query.
             // Order-index fast path first: a FILTERLESS order_by over a
@@ -1442,33 +1460,44 @@ impl QueryBuilder<'_> {
             // construction). It declines any filtered query, so it never
             // shadows the window path below.
             if let Some(rows) = self.order_index_rows(reader)? {
+                plan_shape!("sort_index", self.collection.name(), rows.len());
                 return Ok(rows);
             }
             // Scalar-index fast path: fetch only candidate documents instead
             // of scanning the whole collection, then order/paginate in memory
             // (the set is bounded by the number of matches).
             if let Some(mut matched) = self.indexed_candidates(reader)? {
+                plan_shape!("indexed_window", self.collection.name(), matched.len());
                 match &self.order_by {
                     Some((field, descending)) => sort_by_field(&mut matched, field, *descending),
                     None => matched.sort_by(|(ka, _), (kb, _)| ka.cmp(kb)),
                 }
                 return Ok(self.window_rows(matched));
             }
-            self.stream_scan_only(reader)?
+            let scanned = self.stream_scan_only(reader)?;
+            plan_shape!("stream_scan", self.collection.name(), scanned.len());
+            scanned
         } else if let Some(c) = self.ann_candidates(reader)? {
+            plan_shape!("ann_index", self.collection.name(), c.len());
             c
         } else if let Some(c) = self.text_candidates(reader)? {
+            plan_shape!("text_index", self.collection.name(), c.len());
             c
         } else if let Some(c) = self.indexed_candidates(reader)? {
+            plan_shape!("indexed_window", self.collection.name(), c.len());
             c
         } else if let Some(c) = self.streaming_vector_candidates(reader)? {
+            plan_shape!("streaming_top_k", self.collection.name(), c.len());
             c
         } else {
-            self.collection
+            let c: Vec<(Vec<u8>, Value)> = self
+                .collection
                 .scan_in(reader)?
                 .into_iter()
                 .filter(|(_, doc)| self.filters.iter().all(|p| p.eval(doc)))
-                .collect()
+                .collect();
+            plan_shape!("scan", self.collection.name(), c.len());
+            c
         };
 
         // 2. Rank the filtered set per source.
@@ -1699,6 +1728,15 @@ impl QueryBuilder<'_> {
         // offset+limit exceeds the comparable count — the common top-k
         // query never pays this scan.)
         if !win.full() {
+            // The walk-vs-scan fallback: the window reached past everything
+            // the index holds, so the tail scan runs. Rare by construction
+            // (only when offset+limit exceeds the comparable count).
+            crate::telemetry::event!(
+                DEBUG,
+                message = "order_index_tail_scan",
+                collection = crate::telemetry::display(collection.name()),
+                field = crate::telemetry::display(field),
+            );
             let mut tail: Vec<(Vec<u8>, Value)> = Vec::new();
             collection.for_each_doc_in(reader, |key, doc| {
                 let comparable = doc

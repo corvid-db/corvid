@@ -619,6 +619,7 @@ impl Db {
         crate::index_build::run_atomic_backfill(
             self.store(),
             collection,
+            "text",
             TEXT_DEFS,
             &def_key(collection, field),
             &kb,

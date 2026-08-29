@@ -673,8 +673,10 @@ mod tests {
         let recall_at = |ef: usize| {
             let mut total = 0.0;
             for q in &queries {
-                let approx: HashSet<usize> = h.search(q, k, ef).into_iter().map(|(i, _)| i).collect();
-                let exact: HashSet<usize> = exact_knn(&data, q, k, Metric::L2).into_iter().collect();
+                let approx: HashSet<usize> =
+                    h.search(q, k, ef).into_iter().map(|(i, _)| i).collect();
+                let exact: HashSet<usize> =
+                    exact_knn(&data, q, k, Metric::L2).into_iter().collect();
                 total += approx.intersection(&exact).count() as f64 / k as f64;
             }
             total / queries.len() as f64
@@ -685,7 +687,10 @@ mod tests {
         // ranking — the residual gap to exact is the codebook's resolution,
         // not graph reach. Raising ef cannot buy recall that ADC ranking
         // never contained.
-        let recalls: Vec<f64> = [100usize, 200, 400].iter().map(|&ef| recall_at(ef)).collect();
+        let recalls: Vec<f64> = [100usize, 200, 400]
+            .iter()
+            .map(|&ef| recall_at(ef))
+            .collect();
         for (i, ef) in [100usize, 200, 400].iter().enumerate() {
             assert!(
                 recalls[i] >= 0.55,

@@ -586,6 +586,14 @@ impl Db {
         {
             let mut state = self.indexes().lock().expect("index lock");
             if !state.built.contains_key(&map_key) {
+                // The lazy in-memory build: first search after open/reopen
+                // pays it; every later search reuses the graph.
+                let _build = crate::telemetry::span!(
+                    DEBUG,
+                    "lazy_inmemory_build",
+                    collection = crate::telemetry::display(collection),
+                    field = crate::telemetry::display(field),
+                );
                 let built = build_index(self.store(), collection, field, def.clone())?;
                 state.built.entry(map_key.clone()).or_insert(built);
             }
@@ -593,11 +601,20 @@ impl Db {
             // Compact if more than half the graph is tombstoned. The rebuild
             // reads fresh state under the lock for the same reason as the
             // first build above.
-            let needs_compact = state
+            let (dead, live) = state
                 .built
                 .get(&map_key)
-                .is_some_and(|b| !b.node_to_key.is_empty() && b.dead() * 2 > b.node_to_key.len());
-            if needs_compact {
+                .map(|b| (b.dead(), b.node_to_key.len()))
+                .unwrap_or((0, 0));
+            if live > 0 && dead * 2 > live {
+                crate::telemetry::event!(
+                    INFO,
+                    message = "inmemory_compaction",
+                    collection = crate::telemetry::display(collection),
+                    field = crate::telemetry::display(field),
+                    dead = dead as u64,
+                    live = live as u64,
+                );
                 let built = build_index(self.store(), collection, field, def.clone())?;
                 state.built.insert(map_key.clone(), built);
             }
@@ -697,27 +714,41 @@ impl Db {
             kind_byte(def.kind),
         ];
         let params = def.disk_params();
-        crate::index_build::run_atomic_backfill(
-            self.store(),
-            collection,
-            INDEX_DEFS,
-            &def_key(collection, field),
-            &kb,
-            cursor,
-            &mut |tx, page| {
-                let mut batch: Vec<(Vec<u8>, Vec<f32>)> = Vec::with_capacity(page.len());
-                for (key, bytes) in page {
-                    let doc = Value::decode(bytes)?;
-                    if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
-                        batch.push((key.clone(), v.to_vec()));
+        {
+            // A resume is a load-bearing recovery: a Building def only ever
+            // reaches Complete through here (creation, post-crash resume, or
+            // the compaction re-backfill below).
+            let _resume = crate::telemetry::span!(
+                DEBUG,
+                "lazy_index_resume",
+                collection = crate::telemetry::display(collection),
+                field = crate::telemetry::display(field),
+                kind = "vector",
+                cursor = crate::telemetry::debug(cursor),
+            );
+            crate::index_build::run_atomic_backfill(
+                self.store(),
+                collection,
+                "vector",
+                INDEX_DEFS,
+                &def_key(collection, field),
+                &kb,
+                cursor,
+                &mut |tx, page| {
+                    let mut batch: Vec<(Vec<u8>, Vec<f32>)> = Vec::with_capacity(page.len());
+                    for (key, bytes) in page {
+                        let doc = Value::decode(bytes)?;
+                        if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
+                            batch.push((key.clone(), v.to_vec()));
+                        }
                     }
-                }
-                if !batch.is_empty() {
-                    disk_hnsw::insert_page_in_txn(tx, &ns, &params, &batch)?;
-                }
-                Ok(())
-            },
-        )?;
+                    if !batch.is_empty() {
+                        disk_hnsw::insert_page_in_txn(tx, &ns, &params, &batch)?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
         self.mark_vector_complete(collection, field);
         Ok(())
     }
@@ -817,6 +848,18 @@ impl Db {
         if !def.kind.is_on_disk() || def.building {
             return Ok(()); // replaced by an in-memory kind / already building
         }
+        // The trigger math, as read under the lock (the second crossing
+        // check above is the authoritative one): dead exceeds one third of
+        // total nodes. Emitted only on an actual crossing — the per-write
+        // checks that stay below the threshold are deliberately silent.
+        crate::telemetry::event!(
+            INFO,
+            message = "ondisk_compaction",
+            collection = crate::telemetry::display(collection),
+            field = crate::telemetry::display(field),
+            dead = dead as u64,
+            live = live,
+        );
         // The registration transaction, verbatim: reset the namespace (dead
         // counter included), keep the codebook (it lives IN the namespace,
         // so it must be rewritten after the clear), fresh Building cursor.
@@ -845,8 +888,15 @@ impl Db {
         }
         // Driver re-backfill from the fresh cursor; this also flips the def
         // Complete in memory (`mark_vector_complete`) once it commits.
-        self.resume_vector(collection, field, &[])?;
-        Ok(())
+        let outcome = self.resume_vector(collection, field, &[]);
+        crate::telemetry::event!(
+            DEBUG,
+            message = "ondisk_compaction_outcome",
+            collection = crate::telemetry::display(collection),
+            field = crate::telemetry::display(field),
+            ok = outcome.is_ok(),
+        );
+        outcome
     }
 }
 

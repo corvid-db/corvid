@@ -45,6 +45,9 @@ pub mod schema;
 pub mod semantic_cache;
 pub mod sketch;
 pub mod store;
+/// Feature-gated instrumentation shim — engine-private; see the module docs
+/// and the `tracing` feature in `Cargo.toml`.
+pub(crate) mod telemetry;
 pub mod text;
 pub mod ttl;
 pub mod value;

@@ -211,6 +211,16 @@ impl Db {
         if resume.is_err() {
             return Ok(());
         }
+        crate::telemetry::event!(
+            DEBUG,
+            message = "lazy_resume_batch",
+            collection = crate::telemetry::display(collection),
+            scalar = scalar_jobs.len() as u64,
+            compound = compound_jobs.len() as u64,
+            geo = geo_jobs.len() as u64,
+            text = text_jobs.len() as u64,
+            vector = vector_jobs.len() as u64,
+        );
         for (field, cursor) in scalar_jobs {
             self.resume_scalar(collection, &field, &cursor)?;
         }

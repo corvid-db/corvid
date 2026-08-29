@@ -441,6 +441,15 @@ impl Db {
     ) -> Result<()> {
         ensure_adjacency_in_txn(tx, collection)?;
         if !cascade_edges_via_adjacency(tx, collection, key)? {
+            // The fallback: an adjacency row failed to decode, so the derived
+            // state is untrusted — rebuild it and re-run. The cost is the
+            // pre-adjacency full O(E) scan; worth its own signal.
+            crate::telemetry::event!(
+                WARN,
+                message = "edge_cascade_fallback",
+                collection = crate::telemetry::display(collection),
+                reason = "corrupt_adjacency_row",
+            );
             build_adjacency_in_txn(tx, collection)?;
             cascade_edges_via_adjacency(tx, collection, key)?;
         }
@@ -502,6 +511,19 @@ fn adjacency_ready_in_txn(tx: &WriteBatch<'_>, collection: &str) -> Result<bool>
 /// delete cascade (a legacy database whose first operation is a delete).
 fn ensure_adjacency_in_txn(tx: &mut WriteBatch<'_>, collection: &str) -> Result<()> {
     if !adjacency_ready_in_txn(tx, collection)? {
+        // Absent (never built, or wiped) vs stale-shaped (an unrecognized
+        // version byte) — the same rebuild either way, but different signals.
+        // The marker re-read lives in the event's arguments, so with the
+        // feature off it never executes (no extra point-get).
+        crate::telemetry::event!(
+            DEBUG,
+            message = "adjacency_rebuild",
+            collection = crate::telemetry::display(collection),
+            reason = match tx.get(&adj_out_name(collection), &adjacency_marker_key())? {
+                Some(_) => "stale_marker",
+                None => "marker_absent",
+            },
+        );
         build_adjacency_in_txn(tx, collection)?;
     }
     Ok(())
@@ -515,6 +537,11 @@ fn ensure_adjacency_in_txn(tx: &mut WriteBatch<'_>, collection: &str) -> Result<
 /// ONE transaction: atomic against crashes, and serialized against every
 /// concurrent edge write by the store's write lock.
 fn build_adjacency_in_txn(tx: &mut WriteBatch<'_>, collection: &str) -> Result<()> {
+    let _rebuild = crate::telemetry::span!(
+        DEBUG,
+        "adjacency_build",
+        collection = crate::telemetry::display(collection),
+    );
     let (out_ns, in_ns) = (adj_out_name(collection), adj_in_name(collection));
     crate::store::clear_in_txn(tx, &out_ns)?;
     crate::store::clear_in_txn(tx, &in_ns)?;
