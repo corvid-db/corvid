@@ -251,6 +251,13 @@ AUDIT row → Fixed.
 
 ## Task 13: Parallel HNSW build (+ PQ training)
 
+Prepend (Task 12 review minors, binding): (a) add the cheap end-to-end
+multi-chunk page pin (page/page_where over a >2500-key corpus, full cursor
+walk — closes the pre-existing gap); (b) fix the stale builder.rs ~1439
+comment ("mirror the PlanShape variants ... per family") to match the
+softened docs; (c) fix the AUDIT.md line-67 leading-space row and remove
+the stray trailing blank line after the table.
+
 Parallelize in-memory HNSW construction and PQ k-means with std scoped
 threads (no new deps) OR rayon — implementer picks and justifies in the
 report (bundle-size and MSRV constraints). HARD constraint: build
