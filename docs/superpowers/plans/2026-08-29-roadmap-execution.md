@@ -82,6 +82,12 @@ exists — e.g. `selective_window_verify`). All conformance suites green
 
 ## Task 5: Sort indexes (order_by via scalar index)
 
+Prepend (Task 4 review nits, binding): (a) scope the SnapshotReader::count
+trait doc to the ReadBatch backing (the Store impl opens its own read txn
+per its per-op contract — say so); (b) in task-4-report.md add the one
+sentence on how BEFORE numbers were produced for a bench that didn't exist
+at base (bench file backported to base).
+
 When `order_by(field)` matches a scalar index on that field and no
 filter/limit/offset semantics are violated, serve the order from the index
 walk instead of an in-memory unbounded sort. HARD constraint: the total
