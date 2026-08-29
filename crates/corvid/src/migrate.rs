@@ -15,7 +15,40 @@
 //! [`Db::load_with_renames`] is the collection-rename path for dumps from
 //! pre-wave-4 databases whose collection names contain `__` (rejected by
 //! name validation since): every collection-name occurrence in the stream
-//! is rewritten through a caller-supplied map before replay.
+//! is rewritten through a caller-supplied map before replay. Renames apply
+//! regardless of the dump's format version.
+//!
+//! # Dump format (v1 / v2)
+//!
+//! Header: a 12-byte magic that IS the version marker — `CORVIDDUMPv1`
+//! (format v1) or `CORVIDDUMPv2` (format v2, what [`Db::dump`] writes
+//! today). Any other magic is `InvalidDump` ("bad magic / unknown dump
+//! version") — including a future v3, which old loaders reject by the same
+//! check. All integers are little-endian.
+//!
+//! Sections, in order: records (count, then per record: collection name,
+//! key, encoded value), vector index defs (collection, field, metric byte,
+//! quant byte, mode byte, and for PQ mode the `m`/`k` parameters), text
+//! index defs, scalar index defs, compound index defs (collection, field
+//! count, field names), geo index defs, schemas (collection, field count,
+//! per field: type byte, required byte, unique byte, name), TTLs
+//! (collection, key, i64 expiry), auto-id counters (collection, u64 next),
+//! graph edges (collection, relation, from key, to key, f64 weight).
+//!
+//! Widths. Section counts (the record count and every section's entry
+//! count) are u64 in BOTH versions. The remaining length/count prefixes —
+//! byte-field lengths (strings, keys, values), the per-def field counts
+//! (compound, schema), and the PQ `m`/`k` parameters — are u32 in v1 and
+//! u64 in v2. v1 therefore cannot represent a single value, key, string,
+//! or def field count at or above 4 GiB (`put as u32` truncated silently —
+//! the audited limitation); v2 has no 32-bit representable limit anywhere
+//! in the format. Fixed-width value fields (i64 TTL expiries, f64 edge
+//! weights, u64 auto-id counters) are byte-identical in both versions.
+//!
+//! Compat matrix: the loader accepts v1 AND v2 (the width of every prefix
+//! is decided by the header magic, nothing else differs); the writer emits
+//! v2 only. A v1 dump in the wild keeps loading unchanged; re-dumping it
+//! with the current binary produces v2.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -27,10 +60,20 @@ use crate::schema::{Field, FieldType, Schema};
 use crate::value::Value;
 use crate::{Metric, Quantization};
 
-const MAGIC: &[u8] = b"CORVIDDUMPv1";
+/// Format v1 magic (legacy dumps in the wild): u32 length/count prefixes.
+const MAGIC_V1: &[u8] = b"CORVIDDUMPv1";
+/// Format v2 magic (what [`Db::dump`](Db::dump) writes): those prefixes
+/// widen to u64 — no 4 GiB representable limit anywhere in the format.
+const MAGIC_V2: &[u8] = b"CORVIDDUMPv2";
+/// The header is one fixed-size read, so both magics must stay the same
+/// length (a longer v1 magic could never match the buffer and would
+/// silently strand every legacy dump).
+const _: () = assert!(MAGIC_V1.len() == MAGIC_V2.len());
 
-// ---- byte writers ----
+// ---- byte writers (format v2) ----
 
+/// v1's u32 writer — only the hand-crafted v1 fixtures in the tests use it.
+#[cfg(test)]
 fn put_u32(out: &mut Vec<u8>, n: usize) {
     out.extend_from_slice(&(n as u32).to_le_bytes());
 }
@@ -44,7 +87,7 @@ fn put_f64(out: &mut Vec<u8>, n: f64) {
     out.extend_from_slice(&n.to_bits().to_le_bytes());
 }
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    put_u32(out, b.len());
+    put_u64(out, b.len());
     out.extend_from_slice(b);
 }
 fn put_str(out: &mut Vec<u8>, s: &str) {
@@ -53,29 +96,41 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
 
 // ---- byte reader ----
 
+/// Read exactly `buf.len()` bytes from `r`; a short stream is an
+/// `InvalidDump` (not a raw I/O error), matching the slice-based reader the
+/// streaming one replaced. Shared by the header parse (before the
+/// [`Reader`] exists) and the reader itself.
+fn exact_read<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
+    r.read_exact(buf).map_err(|e| match e.kind() {
+        std::io::ErrorKind::UnexpectedEof => Error::InvalidDump("unexpected end of dump".into()),
+        _ => Error::Io(e),
+    })
+}
+
 /// Streaming primitive reader over any [`Read`] (audit B8): the dump is
 /// consumed through bounded, exact reads (`BufReader` underneath) instead of
 /// `read_to_end`, so loading never holds the whole file in memory. Length
 /// prefixes are honored allocation-conservatively: variable-size fields grow
 /// in chunks, so a forged length cannot drive a huge up-front allocation.
+///
+/// The reader is bound to one dump format version (from the header magic):
+/// [`Reader::count`] — every length/count prefix — reads u32 in a v1 dump
+/// and u64 in a v2 dump. Section counts are u64 in both.
 struct Reader<R> {
     r: R,
+    /// `true` for a v2 dump (u64 length/count prefixes), `false` for v1.
+    v2: bool,
 }
 
 impl<R: Read> Reader<R> {
-    fn new(r: R) -> Self {
-        Reader { r }
+    fn new(r: R, v2: bool) -> Self {
+        Reader { r, v2 }
     }
 
     /// Read exactly `buf.len()` bytes; a short stream is an `InvalidDump`
     /// (not a raw I/O error), matching the slice-based reader this replaces.
     fn exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.r.read_exact(buf).map_err(|e| match e.kind() {
-            std::io::ErrorKind::UnexpectedEof => {
-                Error::InvalidDump("unexpected end of dump".into())
-            }
-            _ => Error::Io(e),
-        })
+        exact_read(&mut self.r, buf)
     }
     fn u8(&mut self) -> Result<u8> {
         let mut b = [0u8; 1];
@@ -107,12 +162,18 @@ impl<R: Read> Reader<R> {
         self.exact(&mut b)?;
         Ok(u64::from_le_bytes(b))
     }
-    /// Read a length-prefixed byte field. The u32 length is untrusted: the
-    /// buffer grows in bounded chunks as bytes actually arrive, so a forged
-    /// huge length fails on truncated input without first allocating it.
+    /// A length/count prefix: u32 in a v1 dump, u64 in a v2 dump (the one
+    /// width the format version decides — see the module doc).
+    fn count(&mut self) -> Result<usize> {
+        if self.v2 { self.u64() } else { self.u32() }
+    }
+    /// Read a length-prefixed byte field. The prefix (u32 or u64 by dump
+    /// version) is untrusted: the buffer grows in bounded chunks as bytes
+    /// actually arrive, so a forged huge length fails on truncated input
+    /// without first allocating it.
     fn bytes(&mut self) -> Result<Vec<u8>> {
         const CHUNK: usize = 64 * 1024;
-        let n = self.u32()?;
+        let n = self.count()?;
         let mut out = Vec::new();
         let mut chunk = vec![0u8; n.min(CHUNK)];
         let mut remaining = n;
@@ -164,7 +225,9 @@ fn quant_from(b: u8) -> Result<Quantization> {
 impl Db {
     /// Write a logical, version-stamped dump of the whole database to `w`:
     /// every user document plus all index, schema, and TTL definitions. Load it
-    /// into a fresh database with [`Db::load`].
+    /// into a fresh database with [`Db::load`]. The stream is format v2 (see
+    /// the module doc: u64 length/count prefixes); [`Db::load`] also accepts
+    /// v1 dumps from older binaries.
     ///
     /// One read snapshot covers the WHOLE dump (audit B8): the catalog walk,
     /// every collection's records, the TTL and edge namespaces, and the
@@ -180,7 +243,7 @@ impl Db {
     /// lifetime, like any long query.
     pub fn dump<W: Write>(&self, w: W) -> Result<()> {
         let mut w = std::io::BufWriter::new(w);
-        w.write_all(MAGIC)?;
+        w.write_all(MAGIC_V2)?;
 
         self.store().read(|r| {
             let collections: Vec<String> = r
@@ -225,8 +288,8 @@ impl Db {
                     VectorMode::OnDisk => buf.push(1),
                     VectorMode::OnDiskPq { m, k } => {
                         buf.push(2);
-                        put_u32(&mut buf, m);
-                        put_u32(&mut buf, k);
+                        put_u64(&mut buf, m);
+                        put_u64(&mut buf, k);
                     }
                 }
             }
@@ -253,7 +316,7 @@ impl Db {
             put_u64(&mut buf, compounds.len());
             for (coll, fields) in &compounds {
                 put_str(&mut buf, coll);
-                put_u32(&mut buf, fields.len());
+                put_u64(&mut buf, fields.len());
                 for f in fields {
                     put_str(&mut buf, f);
                 }
@@ -272,7 +335,7 @@ impl Db {
             put_u64(&mut buf, schemas.len());
             for (coll, schema) in &schemas {
                 put_str(&mut buf, coll);
-                put_u32(&mut buf, schema.fields().len());
+                put_u64(&mut buf, schema.fields().len());
                 for f in schema.fields() {
                     buf.push(f.ty.to_byte());
                     buf.push(f.required as u8);
@@ -329,7 +392,9 @@ impl Db {
     /// then indexes are recreated (rebuilt from the documents), schemas
     /// declared, and TTLs restored. The dump streams through a buffered
     /// reader — memory is bounded by the largest single field, never the
-    /// whole file (audit B8). Equivalent to
+    /// whole file (audit B8). Both dump format versions load (see the
+    /// module doc): v2 (what [`Db::dump`] writes) and v1 (dumps from older
+    /// binaries, with u32 length prefixes). Equivalent to
     /// [`load_with_renames`](Db::load_with_renames) with an empty map.
     pub fn load<R: Read>(&self, r: R) -> Result<()> {
         self.load_with_renames(r, &BTreeMap::new())
@@ -364,26 +429,39 @@ impl Db {
     ///   in [`Db::load`], before mapping: a rename cannot launder an
     ///   engine-internal namespace into a user name.
     /// - A map entry whose source never occurs in the dump is a no-op; names
-    ///   not in the map pass through unchanged.
+    ///   not in the map pass through unchanged. That includes a source that
+    ///   is itself engine-reserved (`__`-prefixed): no legitimate dump names
+    ///   one, and a dump that did is rejected before mapping regardless of
+    ///   the map — such an entry can never fire (its target is still
+    ///   validated upfront like every other).
     ///
     /// The recipe: dump the old database with the old binary version (or use
     /// an existing dump file), open a fresh database with the current
-    /// engine, and `load_with_renames` with `{ "a__b": "a_b", … }`.
+    /// engine, and `load_with_renames` with `{ "a__b": "a_b", … }`. Renames
+    /// apply regardless of the dump's format version.
     pub fn load_with_renames<R: Read>(
         &self,
         r: R,
         renames: &BTreeMap<String, String>,
     ) -> Result<()> {
         let mut renames = Renames::new(renames)?;
-        let mut rd = Reader::new(std::io::BufReader::new(r));
-
-        let mut magic = [0u8; MAGIC.len()];
-        rd.exact(&mut magic)?;
-        if magic.as_slice() != MAGIC {
+        // Header: the 12-byte magic IS the version marker. v2 dumps (what
+        // `dump` writes) carry u64 length/count prefixes; v1 dumps in the
+        // wild carry u32 and must keep loading — the reader is bound to the
+        // version before the first prefixed field.
+        let mut br = std::io::BufReader::new(r);
+        let mut magic = [0u8; MAGIC_V2.len()];
+        exact_read(&mut br, &mut magic)?;
+        let v2 = if magic.as_slice() == MAGIC_V2 {
+            true
+        } else if magic.as_slice() == MAGIC_V1 {
+            false
+        } else {
             return Err(Error::InvalidDump(
                 "bad magic / unknown dump version".into(),
             ));
-        }
+        };
+        let mut rd = Reader::new(br, v2);
 
         // Records → store directly (indexes are recreated afterwards). The
         // `__`-prefixed namespaces are engine-internal; a dump that names one
@@ -410,8 +488,8 @@ impl Db {
                 0 => c.create_vector_index_quantized(&field, metric, quant)?,
                 1 => c.create_vector_index_ondisk_quantized(&field, metric, quant)?,
                 2 => {
-                    let m = rd.u32()?;
-                    let k = rd.u32()?;
+                    let m = rd.count()?;
+                    let k = rd.count()?;
                     c.create_vector_index_ondisk_pq(&field, metric, m, k)?;
                 }
                 _ => return Err(Error::InvalidDump("bad vector mode".into())),
@@ -444,7 +522,7 @@ impl Db {
         let n_compound = rd.u64()?;
         for _ in 0..n_compound {
             let coll = renames.apply("index", rd.string()?)?;
-            let nf = rd.u32()?;
+            let nf = rd.count()?;
             // The count is untrusted input; allocate conservatively and grow.
             let mut fields = Vec::with_capacity(nf.min(4096));
             for _ in 0..nf {
@@ -466,7 +544,7 @@ impl Db {
         let n_schema = rd.u64()?;
         for _ in 0..n_schema {
             let coll = renames.apply("schema", rd.string()?)?;
-            let nf = rd.u32()?;
+            let nf = rd.count()?;
             let mut schema = Schema::new();
             for _ in 0..nf {
                 let ty = FieldType::from_byte(rd.u8()?)
@@ -773,7 +851,7 @@ mod tests {
     #[test]
     fn load_rejects_reserved_collection_names() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(MAGIC_V2);
         put_u64(&mut bytes, 1); // one record
         put_str(&mut bytes, "__schemas__"); // reserved name
         put_bytes(&mut bytes, b"users");
@@ -864,7 +942,7 @@ mod tests {
         // A valid dump prologue with zero records.
         fn head() -> Vec<u8> {
             let mut b = Vec::new();
-            b.extend_from_slice(MAGIC);
+            b.extend_from_slice(MAGIC_V2);
             put_u64(&mut b, 0);
             b
         }
@@ -923,7 +1001,7 @@ mod tests {
                 put_u64(&mut b, 0); // geos
                 put_u64(&mut b, 1);
                 put_str(&mut b, reserved);
-                put_u32(&mut b, 1); // one field
+                put_u64(&mut b, 1); // one field
                 b.push(2); // FieldType::Int
                 b.push(0); // required
                 b.push(0); // unique
@@ -1050,14 +1128,16 @@ mod tests {
     #[test]
     fn load_rejects_absurd_compound_field_counts() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(MAGIC_V2);
         put_u64(&mut bytes, 0); // no records
         put_u64(&mut bytes, 0); // vector indexes
         put_u64(&mut bytes, 0); // text indexes
         put_u64(&mut bytes, 0); // scalar indexes
         put_u64(&mut bytes, 1); // compound indexes
         put_str(&mut bytes, "docs");
-        put_u32(&mut bytes, u32::MAX as usize); // absurd field count
+        // v2 field counts are u64 — an all-ones 64-bit prefix is the absurd
+        // shape; the guard (`with_capacity(min(4096))`) predates it.
+        put_u64(&mut bytes, u64::MAX as usize); // absurd field count
         let dst = Db::open_in_memory().unwrap();
         // Must fail cleanly on truncated input, not abort on allocation.
         assert!(matches!(dst.load(&bytes[..]), Err(Error::InvalidDump(_))));
@@ -1071,7 +1151,7 @@ mod tests {
     #[test]
     fn load_rejects_reserved_collection_on_auto_id_path() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(MAGIC_V2);
         put_u64(&mut bytes, 0); // records
         put_u64(&mut bytes, 0); // vectors
         put_u64(&mut bytes, 0); // texts
@@ -1105,7 +1185,7 @@ mod tests {
             Value::Map(m)
         };
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(MAGIC_V2);
         put_u64(&mut bytes, 1); // one record
         put_str(&mut bytes, "a__b");
         put_bytes(&mut bytes, b"k");
@@ -1171,7 +1251,7 @@ mod tests {
         // One record under a__b, one under a_b.
         fn two_records() -> Vec<u8> {
             let mut b = Vec::new();
-            b.extend_from_slice(MAGIC);
+            b.extend_from_slice(MAGIC_V2);
             put_u64(&mut b, 2);
             put_str(&mut b, "a__b");
             put_bytes(&mut b, b"x");
@@ -1217,7 +1297,7 @@ mod tests {
 
         // A reserved dump name is rejected before mapping — no laundering.
         let mut reserved = Vec::new();
-        reserved.extend_from_slice(MAGIC);
+        reserved.extend_from_slice(MAGIC_V2);
         put_u64(&mut reserved, 1);
         put_str(&mut reserved, "__edges__docs");
         put_bytes(&mut reserved, b"k");
@@ -1247,6 +1327,229 @@ mod tests {
         assert_eq!(
             dst.collections().unwrap(),
             vec!["a__b".to_owned(), "a_b".to_owned()]
+        );
+    }
+
+    // ---- dump format v2 (Task 9): u64 length/count prefixes ----
+
+    /// v1 encoders for the hand-crafted legacy fixture below: identical to
+    /// v2 except every length/count prefix the version decides is u32.
+    fn v1_bytes(out: &mut Vec<u8>, b: &[u8]) {
+        put_u32(out, b.len());
+        out.extend_from_slice(b);
+    }
+    fn v1_str(out: &mut Vec<u8>, s: &str) {
+        v1_bytes(out, s.as_bytes());
+    }
+    /// The nine zero section counts (vectors…edges) that end an otherwise
+    /// empty dump — appended after a crafted prologue so a reader that
+    /// UNDER-reads the prologue would find a well-formed remainder and
+    /// succeed.
+    fn empty_tail(out: &mut Vec<u8>) {
+        for _ in 0..9 {
+            put_u64(out, 0);
+        }
+    }
+
+    /// `dump` writes format v2, and the v2 layout is byte-pinned at the
+    /// smallest corpus: an empty database is EXACTLY the 12-byte v2 magic
+    /// followed by ten u64 zero counts (records + nine sections), and every
+    /// length prefix is 8-byte little-endian (the four high bytes present).
+    #[test]
+    fn dump_writes_v2_magic_and_u64_prefix_layout() {
+        let src = Db::open_in_memory().unwrap();
+        let mut bytes = Vec::new();
+        src.dump(&mut bytes).unwrap();
+        let mut want = Vec::new();
+        want.extend_from_slice(MAGIC_V2);
+        for _ in 0..10 {
+            want.extend_from_slice(&0u64.to_le_bytes());
+        }
+        assert_eq!(bytes, want, "empty v2 dump = magic + ten u64 counts");
+
+        // The prefix width, pinned on a non-empty field: `put_str("docs")`
+        // is 8 bytes of length (value 4 LE, four high zero bytes) + payload.
+        let mut field = Vec::new();
+        put_str(&mut field, "docs");
+        assert_eq!(
+            field,
+            [4u8, 0, 0, 0, 0, 0, 0, 0, b'd', b'o', b'c', b's'],
+            "v2 string fields carry a u64 LE length prefix"
+        );
+    }
+
+    /// The u64 prefix primitives round-trip across the u32 boundary: every
+    /// count at and past u32::MAX (v1's hard cap) encodes and decodes
+    /// bit-exactly through the v2 reader — no multi-GiB fixture needed, the
+    /// width is the claim under test.
+    #[test]
+    fn u64_prefix_primitives_round_trip_across_the_u32_boundary() {
+        let n = u32::MAX as usize;
+        for v in [n - 1, n, n + 1, 0x1_0000_0000, 0xFFFF_FFFF_FFFF_FFFFusize] {
+            let mut buf = Vec::new();
+            put_u64(&mut buf, v);
+            assert_eq!(buf.len(), 8);
+            let mut rd = Reader::new(&buf[..], true);
+            assert_eq!(rd.u64().unwrap(), v, "u64 width must round-trip {v:#x}");
+            let mut rd = Reader::new(&buf[..], true);
+            assert_eq!(rd.count().unwrap(), v, "v2 count must round-trip {v:#x}");
+        }
+        // A v1 reader on the same 8 bytes never sees the high half (reads
+        // the low u32 = 2).
+        let narrow = (u32::MAX as u64 + 3).to_le_bytes();
+        let mut rd = Reader::new(&narrow[..], false);
+        assert_eq!(rd.count().unwrap(), 2);
+    }
+
+    /// v2 prefixes with high bits set are HONORED, not truncated: three
+    /// crafted minimal dumps each carry a prefix just past u32::MAX (the
+    /// v1 cap) followed by a well-formed remainder. A reader that narrowed
+    /// the prefix to u32 would parse the remainder as the next field(s) and
+    /// load successfully; the v2 reader must fail instead.
+    #[test]
+    fn v2_honors_u64_prefixes_past_the_u32_cap() {
+        let past = 0x1_0000_0000u64; // exactly u32::MAX + 1
+
+        // (a) A record VALUE length of 2^32+1 with a one-byte payload: a
+        // u32-narrowing reader reads length 1, takes the payload byte (a
+        // `Null`) as the value, and the all-zero remainder still parses as
+        // empty sections (one spare byte) — the load SUCCEEDS. Correct:
+        // 2^32+1 bytes of payload are demanded and the stream ends.
+        let mut a = Vec::new();
+        a.extend_from_slice(MAGIC_V2);
+        put_u64(&mut a, 1); // one record
+        put_str(&mut a, "docs");
+        put_bytes(&mut a, b"k");
+        a.extend_from_slice(&0x1_0000_0001u64.to_le_bytes()); // the value length
+        a.push(0); // TAG_NULL — the payload a narrowing reader would take
+        empty_tail(&mut a);
+        a.push(0); // the spare byte that keeps the narrowed parse well-formed
+        let err = Db::open_in_memory().unwrap().load(&a[..]);
+        assert!(
+            matches!(&err, Err(Error::InvalidDump(m)) if m.contains("unexpected end")),
+            "a 2^32+1 value length must be honored to EOF, got {err:?}"
+        );
+
+        // (b) A SECTION COUNT of 2^32 in the final (edges) section, one
+        // real edge, and nothing after: truncating to u32 reads count 0 and
+        // the load SUCCEEDS (that is exactly the v1 encoding of this dump);
+        // correct demands edge 2 at EOF.
+        let mut b = Vec::new();
+        b.extend_from_slice(MAGIC_V2);
+        for _ in 0..8 {
+            put_u64(&mut b, 0); // records…autos
+        }
+        b.extend_from_slice(&past.to_le_bytes()); // the edge count
+        put_str(&mut b, "docs");
+        put_str(&mut b, "knows");
+        put_bytes(&mut b, b"a");
+        put_bytes(&mut b, b"b");
+        put_f64(&mut b, 0.5);
+        let err = Db::open_in_memory().unwrap().load(&b[..]);
+        assert!(
+            matches!(&err, Err(Error::InvalidDump(m)) if m.contains("unexpected end")),
+            "a 2^32 section count must be honored to EOF, got {err:?}"
+        );
+
+        // (c) A schema FIELD COUNT of 2^32: truncating reads zero fields,
+        // declares an empty schema, and the tail parses. Correct: the loop
+        // demands 2^32 field records that aren't there.
+        let mut c = Vec::new();
+        c.extend_from_slice(MAGIC_V2);
+        put_u64(&mut c, 0); // records
+        put_u64(&mut c, 0); // vectors
+        put_u64(&mut c, 0); // texts
+        put_u64(&mut c, 0); // scalars
+        put_u64(&mut c, 0); // compounds
+        put_u64(&mut c, 0); // geos
+        put_u64(&mut c, 1); // one schema def
+        put_str(&mut c, "docs");
+        c.extend_from_slice(&past.to_le_bytes()); // the field count
+        empty_tail(&mut c); // (ttls/autos/edges, misaligned from here on)
+        let err = Db::open_in_memory().unwrap().load(&c[..]);
+        assert!(
+            matches!(&err, Err(Error::InvalidDump(_))),
+            "a 2^32 schema field count must be honored, got {err:?}"
+        );
+    }
+
+    /// A v1 dump from an older binary still loads: a hand-crafted
+    /// `CORVIDDUMPv1` stream (u32 length prefixes, u32 def field counts)
+    /// replays its records, definitions, TTL, auto-id counter, and edge.
+    /// The compat matrix's load-side half, pinned at the format's home.
+    #[test]
+    fn load_accepts_a_hand_crafted_v1_dump() {
+        let doc = {
+            let mut m = BTreeMap::new();
+            m.insert("n".to_owned(), Value::Int(7));
+            Value::Map(m)
+        };
+        let mut b = Vec::new();
+        b.extend_from_slice(MAGIC_V1);
+        put_u64(&mut b, 1); // one record
+        v1_str(&mut b, "old");
+        v1_bytes(&mut b, b"k");
+        v1_bytes(&mut b, &doc.encode());
+        put_u64(&mut b, 0); // vectors
+        put_u64(&mut b, 0); // texts
+        put_u64(&mut b, 1); // one scalar index
+        v1_str(&mut b, "old");
+        v1_str(&mut b, "n");
+        put_u64(&mut b, 1); // one compound index (u32 field count)
+        v1_str(&mut b, "old");
+        put_u32(&mut b, 2);
+        v1_str(&mut b, "n");
+        v1_str(&mut b, "m");
+        put_u64(&mut b, 0); // geos
+        put_u64(&mut b, 0); // schemas
+        put_u64(&mut b, 1); // one TTL
+        v1_str(&mut b, "old");
+        v1_bytes(&mut b, b"k");
+        put_i64(&mut b, 4242);
+        put_u64(&mut b, 1); // one auto-id counter
+        v1_str(&mut b, "old");
+        b.extend_from_slice(&9u64.to_le_bytes());
+        put_u64(&mut b, 1); // one edge
+        v1_str(&mut b, "old");
+        v1_str(&mut b, "knows");
+        v1_bytes(&mut b, b"a");
+        v1_bytes(&mut b, b"b");
+        put_f64(&mut b, 0.5);
+
+        let dst = Db::open_in_memory().unwrap();
+        dst.load(&b[..]).unwrap();
+        let c = dst.collection("old");
+        assert_eq!(c.get(b"k").unwrap(), Some(doc));
+        // The scalar index was rebuilt from the record and is serviceable.
+        let hits: Vec<_> = c
+            .query()
+            .filter(crate::field("n").eq(Value::Int(7)))
+            .run()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(hits, vec![b"k".to_vec()]);
+        assert_eq!(c.ttl(b"k").unwrap(), Some(4242));
+        assert_eq!(c.neighbors(b"a", "knows").unwrap(), vec![b"b".to_vec()]);
+        assert_eq!(
+            c.insert_auto(&Value::Int(1)).unwrap(),
+            b"00000000000000000009".to_vec()
+        );
+    }
+
+    /// An unknown dump version is rejected by the magic check — a future
+    /// v3 stream (written by a newer binary) fails `InvalidDump` here, the
+    /// same one-way compat the v1 magic check always had.
+    #[test]
+    fn load_rejects_unknown_dump_version_magic() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"CORVIDDUMPv3");
+        empty_tail(&mut bytes);
+        let err = Db::open_in_memory().unwrap().load(&bytes[..]);
+        assert!(
+            matches!(&err, Err(Error::InvalidDump(m)) if m.contains("unknown dump version")),
+            "a v3 magic must be rejected as unknown version, got {err:?}"
         );
     }
 }

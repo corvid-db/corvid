@@ -283,6 +283,30 @@ still merges with pre-existing collections, exactly like `Db::load`. The
 MCP `load` tool takes the same table as an optional `rename` object
 param.
 
+### Dump format versions (v2, u64 prefixes) — shipped (Task 9)
+
+The dump's 12-byte magic IS the version marker: `CORVIDDUMPv1` (legacy)
+or `CORVIDDUMPv2` (what `Db::dump` writes today). v1's length/count
+prefixes — byte-field lengths (strings, keys, values), the compound and
+schema per-def field counts, and the PQ `m`/`k` parameters — were u32, so
+a single value, key, string, or field count at or above 4 GiB could not be
+represented (and the writer's `as u32` truncated silently). v2 widens
+every one of those prefixes to u64: no 32-bit representable limit remains
+anywhere in the format. Section counts (the record count and every
+section's entry count) were already u64 and stay so; fixed-width fields
+(i64 TTL expiries, f64 edge weights, u64 auto-id counters) are
+byte-identical across versions.
+
+Compat matrix (one-way, by design): the loader accepts v1 AND v2 — the
+prefix width is decided by the header magic and nothing else differs; the
+writer emits v2 only. A v1 dump in the wild keeps loading unchanged; a
+dump re-taken with the current binary comes out v2; an unknown magic
+(e.g. a future v3) is `Error::InvalidDump` in older binaries, exactly as
+a v2 dump is in pre-v2 ones — that is the migration story: dump with the
+old binary, load with the new. `load_with_renames` applies identically
+to both versions. The full format spec lives in `migrate.rs`'s module
+doc.
+
 ---
 
 ## Scaling characteristics (measured)
@@ -528,3 +552,4 @@ These need answers before specific layers can be implemented. Listed in rough or
 | 2026-08-28 | Compound prefix-only windows re-enabled soundly: each compound def persists an `all_docs_indexed` flag (def-record kind byte; legacy rows decode false) set at backfill completion iff no miss was ever observed — backfill pages commit a miss marker per declined doc, document maintenance persists a miss (marker while Building, def-rewrite once Complete) in the write's own transaction, re-registration clears the markers (fresh cycle), and the completion computes `flag-aware ∧ marker-free` in one transaction; the planner probe and its plan_shape twin admit prefix-only windows only under the flag, full-coverage shapes regardless | With the flag, every document has ALL index fields present and encodable, so every doc matching a prefix-only filter (matching requires the leading field present, encodable, equal) IS in the index — the window is a verified superset; without it, the fabfe6e omission bug's shape (missing-tail docs match but sit outside the index) stands and the query declines to scan. 5k-doc all-present corpus: prefix-only equality goes 1.540 ms scan → 241 µs window (6.4×, `compound_prefix_scan` bench). Closes AUDIT Open "Compound prefix-only windows" |
 | 2026-08-28 | Edge adjacency is DERIVED state in two private namespaces (`__adj_out__<coll>`/`__adj_in__<coll>`), one row per edge per endpoint, endpoint-first re-keyed; NOT a change to the edge-row layout | The edge rows (`__edges__`/`__redges__`) stay the only source of truth and keep their format — no file migration (a permanent non-goal), legacy databases simply build the adjacency lazily inside the first edge write's or first cascade's transaction (one clear + one paged re-derive from the source rows + a version marker, all atomic — a crash rolls it back and the next use rebuilds). Per-edge rows (not per-endpoint consolidated values): a hub's value would make every link to it an O(degree) read-modify-write, while per-edge rows keep link O(1) and idempotent by key. `link`/`unlink` maintain the rows transactionally (two extra rows per edge, the measured ~1.4× on the pure-link microbench); a malformed adjacency row falls back to rebuild-from-source + re-run. Deletes go O(edges-of-doc): `edge_delete_sweep_100` 241.0 → 40.5 ms, `delete_half_2p5k` 566.8 → 194.5 ms. Closes AUDIT Open "Endpoint-indexed edge layout" |
 | 2026-08-28 | `a__b` migration: `Db::load_with_renames(reader, renames)` maps EVERY collection-name occurrence in the dump stream (records, index/schema definitions, TTLs, edges, auto-id counters) through a caller-supplied rename table before replay; reserved dump names are rejected before mapping, targets are validated upfront, and one output name is allowed per dump name | Pre-wave-4 databases accepted `__`-containing collection names; `validate_name` rejects them since wave 4, so their dumps failed `Db::load` at index/schema replay with no automated path (rename by hand on the source, or re-create indexes after load). Mapping all occurrences together keeps documents and their definitions in one keyspace — index defs replay through the create-* backfill over the already-renamed records, so every index rebuilds under the new name automatically. Collisions (two sources sharing a target, or a target an unmapped dump collection already occupies) merge keyspaces and are rejected `InvalidArgument`; the MCP `load` tool takes the table as an optional `rename` param. Closes AUDIT Open "`a__b` migration tooling" |
+| 2026-08-29 | Dump format v2: the header magic IS the version marker (`CORVIDDUMPv1`/`CORVIDDUMPv2`, 12 bytes), and every u32 length/count prefix of v1 (byte-field lengths, compound/schema field counts, PQ m/k) widens to u64 in v2; section counts were already u64, fixed-width fields are unchanged | v1 could not represent a single value, key, string, or def field count at or above 4 GiB and its writer truncated silently (`as u32`) — the audited limitation; v2 has no 32-bit representable limit anywhere. Compat is one-way by design: the loader accepts v1 AND v2 (the magic decides the prefix width, nothing else differs), the writer emits v2 only — an unknown magic (future v3) is `InvalidDump` in older binaries, which IS the migration story (dump old, load new). Closes AUDIT Open ">4 GiB dump sections" |

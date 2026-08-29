@@ -1150,9 +1150,10 @@ fn lifecycle_dump_load_into_nonempty_db_merges_records_and_counters() {
 /// A dump naming an engine-reserved (`__`-prefixed) collection is rejected
 /// on load with `Error::InvalidDump` (engine-level pin; corvid-mcp drives the
 /// wire form) — replaying it would forge internal state. A truncated or
-/// bad-magic stream is likewise `InvalidDump`. (The dump container format —
-/// magic `CORVIDDUMPv1` + u64 LE section counts + u32 LE length prefixes —
-/// is the stable public dump format.)
+/// bad-magic stream is likewise `InvalidDump`. (These hand-built bytes are
+/// format v1 — magic `CORVIDDUMPv1`, u32 LE length prefixes, u64 LE section
+/// counts; the current dumper writes v2, which widens the prefixes to u64,
+/// and the loader accepts both.)
 #[test]
 fn lifecycle_load_rejects_reserved_names_and_malformed_streams() {
     fn record(coll: &str) -> Vec<u8> {
@@ -1250,7 +1251,9 @@ fn lifecycle_dump_of_empty_db_loads_empty_and_io_errors_surface() {
 // ===========================================================================
 
 /// Length-prefix helpers for the hand-built legacy fixture below (the dump
-/// container format: u32 LE length prefixes, u64 LE section counts).
+/// container format's v1: u32 LE length prefixes, u64 LE section counts —
+/// v2 widens the prefixes to u64, and the loader accepts both, so these
+/// bytes stay exactly loadable).
 fn put_str(b: &mut Vec<u8>, s: &str) {
     b.extend_from_slice(&(s.len() as u32).to_le_bytes());
     b.extend_from_slice(s.as_bytes());
@@ -1563,6 +1566,123 @@ fn lifecycle_load_with_renames_error_contract_invalid_target_collisions_and_noop
     assert_eq!(
         dst.collections().unwrap(),
         vec!["a__b".to_owned(), "a_b".to_owned()]
+    );
+}
+
+/// Task 8 review minor (a), the compound-def rename pin made DIRECTLY
+/// observable: a legacy dump's compound index def is rebuilt under the
+/// renamed collection and SERVES — `plan_shape` attributes
+/// `IndexedWindow{kind:"compound"}`. The corpus is shaped for attribution:
+/// `plan_shape` prefers any serviceable scalar window (the twin checks the
+/// scalar probe first, mirroring `keep_smaller`'s probe order), so the
+/// fixture carries ONLY the compound def; selectivity-wise the same corpus
+/// makes a scalar `n` window unselective (n repeats across half the docs)
+/// where the compound full-equality tuple is exact — with a scalar def
+/// present the compound candidate set would win `keep_smaller` at runtime
+/// while attribution still said "scalar", which is why the def is absent.
+/// The query constrains BOTH compound fields with Eq — a full-equality
+/// prefix, serviceable regardless of `all_docs_indexed`.
+#[test]
+fn lifecycle_load_with_renames_compound_index_serves_under_the_new_name() {
+    // 6 docs: n alternates 0/1 (unselective alone), body is unique per doc.
+    let mut dump = LegacyDump::new(6).buf;
+    for i in 0..6i64 {
+        let doc = map(&[
+            ("n", Value::Int(i % 2)),
+            ("body", Value::Text(format!("item {i}"))),
+        ]);
+        put_str(&mut dump, "a__b");
+        put_bytes(&mut dump, &[i as u8]);
+        put_bytes(&mut dump, &doc.encode());
+    }
+    put_u64(&mut dump, 0); // vectors
+    put_u64(&mut dump, 0); // texts
+    put_u64(&mut dump, 0); // scalars — deliberately none (see doc comment)
+    put_u64(&mut dump, 1); // one compound def on (n, body)
+    put_str(&mut dump, "a__b");
+    put_u32(&mut dump, 2);
+    put_str(&mut dump, "n");
+    put_str(&mut dump, "body");
+    put_u64(&mut dump, 0); // geos
+    put_u64(&mut dump, 0); // schemas
+    put_u64(&mut dump, 0); // ttls
+    put_u64(&mut dump, 0); // autos
+    put_u64(&mut dump, 0); // edges
+
+    let mut renames = BTreeMap::new();
+    renames.insert("a__b".to_owned(), "a_b".to_owned());
+    let dst = Db::open_in_memory().unwrap();
+    dst.load_with_renames(dump.as_slice(), &renames).unwrap();
+    let c = dst.collection("a_b");
+    assert_eq!(c.len().unwrap(), 6);
+
+    // The renamed compound def is the query's index window — attributed
+    // "compound", not a scan and not the (absent) scalar probe.
+    assert_eq!(
+        c.query()
+            .filter(field("n").eq(Value::Int(1)))
+            .filter(field("body").eq(Value::Text("item 3".into())))
+            .plan_shape(),
+        corvid::PlanShape::IndexedWindow { kind: "compound" }
+    );
+
+    // ...and it serves the exact document through the renamed index.
+    let hits: Vec<_> = c
+        .query()
+        .filter(field("n").eq(Value::Int(1)))
+        .filter(field("body").eq(Value::Text("item 3".into())))
+        .run()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.key)
+        .collect();
+    assert_eq!(hits, vec![b"\x03".to_vec()]);
+}
+
+/// Task 8 review minor (b): `load_with_renames` into a NON-empty database
+/// MERGES with pre-existing collections by design (same contract as
+/// `load`) — including a rename target that already exists in the
+/// destination. The collision guard constrains intra-dump consistency only
+/// (two dump names into one output keyspace); a dump name landing on a
+/// pre-existing collection is the documented merge, not an error.
+#[test]
+fn lifecycle_load_with_renames_into_non_empty_db_merges_with_existing_collections() {
+    let mut dump = LegacyDump::new(1).buf;
+    put_str(&mut dump, "a__b");
+    put_bytes(&mut dump, b"d1");
+    put_bytes(&mut dump, &Value::Int(1).encode());
+    for _ in 0..9 {
+        put_u64(&mut dump, 0); // vectors…edges all empty
+    }
+
+    // Destination already holds an unrelated collection AND a collection
+    // named exactly the rename target.
+    let dst = Db::open_in_memory().unwrap();
+    dst.collection("keep")
+        .insert(b"k1", &Value::Int(42))
+        .unwrap();
+    dst.collection("a_b")
+        .insert(b"local", &Value::Text("mine".into()))
+        .unwrap();
+
+    let mut renames = BTreeMap::new();
+    renames.insert("a__b".to_owned(), "a_b".to_owned());
+    dst.load_with_renames(dump.as_slice(), &renames).unwrap();
+
+    // The unrelated collection is untouched.
+    assert_eq!(
+        dst.collection("keep").get(b"k1").unwrap(),
+        Some(Value::Int(42))
+    );
+    // The target collection now holds BOTH its local document and the
+    // dump's record — merged, not rejected, not overwritten.
+    let c = dst.collection("a_b");
+    assert_eq!(c.get(b"local").unwrap(), Some(Value::Text("mine".into())));
+    assert_eq!(c.get(b"d1").unwrap(), Some(Value::Int(1)));
+    assert_eq!(c.len().unwrap(), 2);
+    assert_eq!(
+        dst.collections().unwrap(),
+        vec!["a_b".to_owned(), "keep".to_owned()]
     );
 }
 

@@ -57,6 +57,19 @@ format and API may change without backward-compatibility guarantees.
   instead of falling back to a default.
 
 ### Changed
+- Dump format bumped to v2: `Db::dump` now stamps the header magic
+  `CORVIDDUMPv2` and writes every length/count prefix — byte-field
+  lengths (strings, keys, values), compound/schema per-definition field
+  counts, and the PQ `m`/`k` parameters — as u64 instead of v1's u32, so
+  a single value, key, string, or field count beyond 4 GiB is
+  representable (v1's writer silently truncated such lengths). Section
+  counts were already u64; all fixed-width fields are unchanged.
+  `Db::load` (and `load_with_renames`) accept BOTH v1 and v2 dumps — the
+  header magic decides the prefix width and nothing else differs — so
+  existing dump files keep loading unchanged; only re-dumping with the
+  new binary produces v2 bytes. An unknown magic (e.g. a future v3) is
+  rejected with `Error::InvalidDump`, the one-way compat the format has
+  always had.
 - Deleting a document (directly, via `compare_and_set`, or through a TTL
   purge) now resolves its graph edges in O(edges-of-that-document) instead
   of scanning the collection's entire edge namespaces: two new private
