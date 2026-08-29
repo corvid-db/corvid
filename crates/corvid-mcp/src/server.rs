@@ -425,9 +425,11 @@ impl Server {
 
     fn load(&self, p: &Json) -> Result<Json, ToolError> {
         let path = str_param(p, "path")?;
+        let renames = parse_renames(p)?;
         let file = std::fs::File::open(path)
             .map_err(|e| ToolError::BadParams(format!("cannot open dump file: {e}")))?;
-        self.db.load(std::io::BufReader::new(file))?;
+        self.db
+            .load_with_renames(std::io::BufReader::new(file), &renames)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -667,6 +669,31 @@ fn str_param<'a>(p: &'a Json, key: &str) -> Result<&'a str, ToolError> {
     p.get(key)
         .and_then(Json::as_str)
         .ok_or_else(|| ToolError::BadParams(format!("missing string '{key}'")))
+}
+
+/// The `load` tool's optional `rename` param: an object mapping dump
+/// collection names to their new names — the `a__b` migration path
+/// (engine: `Db::load_with_renames`; an invalid target or a collision is
+/// the engine's exact error, surfaced as a tool failure). Absent or `null`
+/// means no renames; anything but a string-to-string object is a
+/// `BadParams` error (the no-silent-fallback rule).
+fn parse_renames(p: &Json) -> Result<std::collections::BTreeMap<String, String>, ToolError> {
+    match p.get("rename") {
+        None | Some(Json::Null) => Ok(std::collections::BTreeMap::new()),
+        Some(Json::Object(m)) => m
+            .iter()
+            .map(|(from, to)| {
+                to.as_str()
+                    .map(|t| (from.clone(), t.to_owned()))
+                    .ok_or_else(|| {
+                        ToolError::BadParams(format!("'rename' values must be strings: '{from}'"))
+                    })
+            })
+            .collect(),
+        Some(_) => Err(ToolError::BadParams(
+            "'rename' must be an object of string to string".into(),
+        )),
+    }
 }
 
 /// Default cap on list-returning tools so a single call can't dump an

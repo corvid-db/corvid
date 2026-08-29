@@ -11,7 +11,13 @@
 //! encodings (which are what change); document *values* use the [`Value`]
 //! codec, and indexes are *recreated* (rebuilt from the loaded documents)
 //! rather than copying their derived internal state.
+//!
+//! [`Db::load_with_renames`] is the collection-rename path for dumps from
+//! pre-wave-4 databases whose collection names contain `__` (rejected by
+//! name validation since): every collection-name occurrence in the stream
+//! is rewritten through a caller-supplied map before replay.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 use crate::db::Db;
@@ -323,8 +329,52 @@ impl Db {
     /// then indexes are recreated (rebuilt from the documents), schemas
     /// declared, and TTLs restored. The dump streams through a buffered
     /// reader — memory is bounded by the largest single field, never the
-    /// whole file (audit B8).
+    /// whole file (audit B8). Equivalent to
+    /// [`load_with_renames`](Db::load_with_renames) with an empty map.
     pub fn load<R: Read>(&self, r: R) -> Result<()> {
+        self.load_with_renames(r, &BTreeMap::new())
+    }
+
+    /// [`Db::load`] with a collection-RENAME map — the migration path for
+    /// dumps from pre-wave-4 databases whose collection names contain `__`
+    /// (interior double underscore; rejected by name validation since, so
+    /// [`Db::load`] fails such a dump at index/schema replay with
+    /// [`Error::InvalidName`]). Every collection-name occurrence in the dump
+    /// stream — records, all index definitions, schemas, TTL entries, graph
+    /// edges, auto-id counters — is mapped through `renames` before replay,
+    /// so documents and their definitions land together under the target
+    /// name; index definitions replay via the create-* backfill path, which
+    /// reads the records already written under the target name, so every
+    /// index is rebuilt under the new name automatically (nothing to
+    /// re-create by hand).
+    ///
+    /// Contract:
+    ///
+    /// - Each target must be a valid user collection name (no `__` sequence,
+    ///   no NUL byte): an invalid target fails the load with that target's
+    ///   [`Error::InvalidName`] before the stream is read.
+    /// - No two dump names may load into one output name — neither two map
+    ///   sources sharing a target, nor a target colliding with another
+    ///   (mapped or unmapped) dump collection. Either would merge two
+    ///   collections' rows into one keyspace, silently overwriting
+    ///   documents; both fail with [`Error::InvalidArgument`]. (Loading into
+    ///   a non-empty database still MERGES with pre-existing collections,
+    ///   exactly like [`Db::load`].)
+    /// - Engine-reserved (`__`-prefixed) dump names are rejected exactly as
+    ///   in [`Db::load`], before mapping: a rename cannot launder an
+    ///   engine-internal namespace into a user name.
+    /// - A map entry whose source never occurs in the dump is a no-op; names
+    ///   not in the map pass through unchanged.
+    ///
+    /// The recipe: dump the old database with the old binary version (or use
+    /// an existing dump file), open a fresh database with the current
+    /// engine, and `load_with_renames` with `{ "a__b": "a_b", … }`.
+    pub fn load_with_renames<R: Read>(
+        &self,
+        r: R,
+        renames: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let mut renames = Renames::new(renames)?;
         let mut rd = Reader::new(std::io::BufReader::new(r));
 
         let mut magic = [0u8; MAGIC.len()];
@@ -340,8 +390,7 @@ impl Db {
         // is malformed (or hostile), since no legitimate dump can contain it.
         let n_records = rd.u64()?;
         for _ in 0..n_records {
-            let coll = rd.string()?;
-            reject_reserved("records", &coll)?;
+            let coll = renames.apply("records", rd.string()?)?;
             let key = rd.bytes()?;
             let value = rd.bytes()?;
             // Validate the value decodes under the current codec.
@@ -352,8 +401,7 @@ impl Db {
         // Vector indexes.
         let n_vec = rd.u64()?;
         for _ in 0..n_vec {
-            let coll = rd.string()?;
-            reject_reserved("vector index", &coll)?;
+            let coll = renames.apply("vector index", rd.string()?)?;
             let field = rd.string()?;
             let metric = metric_from(rd.u8()?)?;
             let quant = quant_from(rd.u8()?)?;
@@ -373,8 +421,7 @@ impl Db {
         // Text indexes.
         let n_text = rd.u64()?;
         for _ in 0..n_text {
-            let coll = rd.string()?;
-            reject_reserved("text index", &coll)?;
+            let coll = renames.apply("text index", rd.string()?)?;
             let field = rd.string()?;
             let on_disk = rd.u8()? != 0;
             let c = self.collection(&coll);
@@ -388,8 +435,7 @@ impl Db {
         // Scalar indexes.
         let n_scalar = rd.u64()?;
         for _ in 0..n_scalar {
-            let coll = rd.string()?;
-            reject_reserved("scalar index", &coll)?;
+            let coll = renames.apply("scalar index", rd.string()?)?;
             let field = rd.string()?;
             self.collection(&coll).create_scalar_index(&field)?;
         }
@@ -397,8 +443,7 @@ impl Db {
         // Compound indexes.
         let n_compound = rd.u64()?;
         for _ in 0..n_compound {
-            let coll = rd.string()?;
-            reject_reserved("index", &coll)?;
+            let coll = renames.apply("index", rd.string()?)?;
             let nf = rd.u32()?;
             // The count is untrusted input; allocate conservatively and grow.
             let mut fields = Vec::with_capacity(nf.min(4096));
@@ -412,8 +457,7 @@ impl Db {
         // Geo indexes.
         let n_geo = rd.u64()?;
         for _ in 0..n_geo {
-            let coll = rd.string()?;
-            reject_reserved("geo index", &coll)?;
+            let coll = renames.apply("geo index", rd.string()?)?;
             let field = rd.string()?;
             self.collection(&coll).create_geo_index(&field)?;
         }
@@ -421,8 +465,7 @@ impl Db {
         // Schemas.
         let n_schema = rd.u64()?;
         for _ in 0..n_schema {
-            let coll = rd.string()?;
-            reject_reserved("schema", &coll)?;
+            let coll = renames.apply("schema", rd.string()?)?;
             let nf = rd.u32()?;
             let mut schema = Schema::new();
             for _ in 0..nf {
@@ -446,8 +489,7 @@ impl Db {
         // TTLs.
         let n_ttl = rd.u64()?;
         for _ in 0..n_ttl {
-            let coll = rd.string()?;
-            reject_reserved("TTL", &coll)?;
+            let coll = renames.apply("TTL", rd.string()?)?;
             let key = rd.bytes()?;
             let expiry = rd.i64()?;
             self.collection(&coll).set_ttl(&key, expiry)?;
@@ -457,7 +499,7 @@ impl Db {
         let n_auto = rd.u64()?;
         let mut autos = Vec::with_capacity(n_auto.min(4096));
         for _ in 0..n_auto {
-            let coll = rd.string()?;
+            let coll = renames.apply("auto-ids", rd.string()?)?;
             let next = rd.u64_raw()?;
             autos.push((coll, next));
         }
@@ -467,8 +509,7 @@ impl Db {
         // forward+reverse pair is rebuilt atomically.
         let n_edges = rd.u64()?;
         for _ in 0..n_edges {
-            let coll = rd.string()?;
-            reject_reserved("edges", &coll)?;
+            let coll = renames.apply("edges", rd.string()?)?;
             let rel = rd.string()?;
             let from = rd.bytes()?;
             let to = rd.bytes()?;
@@ -492,6 +533,70 @@ fn reject_reserved(kind: &str, coll: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Collection-name rewriting for [`Db::load_with_renames`] (the `a__b`
+/// migration). Every collection-name occurrence in the dump stream passes
+/// through [`Renames::apply`] before replay.
+///
+/// The map is validated upfront, before the stream is touched: every target
+/// must pass [`crate::db::validate_name`] (a bad target surfaces that
+/// target's own [`Error::InvalidName`]), and no two sources may share a
+/// target (both would load into one keyspace and silently overwrite
+/// documents — [`Error::InvalidArgument`]).
+///
+/// `apply` enforces two per-name rules. Engine-reserved (`__`-prefixed)
+/// dump names are rejected BEFORE mapping — a rename cannot launder an
+/// engine-internal namespace into a user name — and one output name may be
+/// produced by at most one dump name per load: a rename target that a
+/// second, unmapped dump collection already occupies is the same silent
+/// keyspace merge and fails the same way. Names not in the map pass through
+/// unchanged (behaving exactly as [`Db::load`]); with an empty map every
+/// name maps to itself, so the collision guard can never fire.
+struct Renames<'a> {
+    map: &'a BTreeMap<String, String>,
+    /// Output name → the dump name that first produced it (the streaming
+    /// collision guard).
+    seen: BTreeMap<String, String>,
+}
+
+impl<'a> Renames<'a> {
+    fn new(map: &'a BTreeMap<String, String>) -> Result<Self> {
+        let mut targets: BTreeMap<&str, &str> = BTreeMap::new();
+        for (from, to) in map {
+            crate::db::validate_name(to)?;
+            if let Some(first) = targets.get(to.as_str()) {
+                return Err(Error::InvalidArgument(format!(
+                    "rename collision: '{first}' and '{from}' both map to '{to}'"
+                )));
+            }
+            targets.insert(to.as_str(), from.as_str());
+        }
+        Ok(Renames {
+            map,
+            seen: BTreeMap::new(),
+        })
+    }
+
+    /// Reject reserved dump names, then rewrite through the map.
+    fn apply(&mut self, kind: &str, name: String) -> Result<String> {
+        reject_reserved(kind, &name)?;
+        let out = match self.map.get(&name) {
+            Some(to) => to.clone(),
+            None => name.clone(),
+        };
+        if let Some(first) = self.seen.get(&out) {
+            if *first != name {
+                return Err(Error::InvalidArgument(format!(
+                    "rename collision: dump collection '{first}' already loads \
+                     into '{out}', which '{name}' would also target"
+                )));
+            }
+        } else {
+            self.seen.insert(out.clone(), name);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -956,5 +1061,192 @@ mod tests {
         let dst = Db::open_in_memory().unwrap();
         // Must fail cleanly on truncated input, not abort on allocation.
         assert!(matches!(dst.load(&bytes[..]), Err(Error::InvalidDump(_))));
+    }
+
+    /// Audit B8 family gap (found in Task 8): the auto-id section was the
+    /// ONE replay path without `reject_reserved` — a dump naming an
+    /// engine-reserved collection there would forge a `auto:__…` META
+    /// counter. Must be `InvalidDump` like every other section. (RED first:
+    /// passed Ok before the fix.)
+    #[test]
+    fn load_rejects_reserved_collection_on_auto_id_path() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        put_u64(&mut bytes, 0); // records
+        put_u64(&mut bytes, 0); // vectors
+        put_u64(&mut bytes, 0); // texts
+        put_u64(&mut bytes, 0); // scalars
+        put_u64(&mut bytes, 0); // compounds
+        put_u64(&mut bytes, 0); // geos
+        put_u64(&mut bytes, 0); // schemas
+        put_u64(&mut bytes, 0); // ttls
+        put_u64(&mut bytes, 1); // one auto-id counter...
+        put_str(&mut bytes, "__edges__docs"); // ...for a reserved namespace
+        bytes.extend_from_slice(&5u64.to_le_bytes());
+        put_u64(&mut bytes, 0); // edges
+        let dst = Db::open_in_memory().unwrap();
+        let err = dst.load(&bytes[..]);
+        assert!(
+            matches!(&err, Err(Error::InvalidDump(msg)) if msg.contains("reserved")),
+            "reserved auto-id collection must be rejected as InvalidDump, got {err:?}"
+        );
+    }
+
+    /// A compact legacy-dump rename: a dump naming `a__b` (impossible to
+    /// produce with the current `dump`, since name validation rejects it)
+    /// loads under a fresh name with its records, scalar index, TTL, edge,
+    /// and auto-id counter all moved together. (The full-family conformance
+    /// pin lives in tests/lifecycle.rs.)
+    #[test]
+    fn load_with_renames_migrates_a_legacy_collection() {
+        let doc = {
+            let mut m = BTreeMap::new();
+            m.insert("n".to_owned(), Value::Int(7));
+            Value::Map(m)
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        put_u64(&mut bytes, 1); // one record
+        put_str(&mut bytes, "a__b");
+        put_bytes(&mut bytes, b"k");
+        put_bytes(&mut bytes, &doc.encode());
+        put_u64(&mut bytes, 0); // vectors
+        put_u64(&mut bytes, 0); // texts
+        put_u64(&mut bytes, 1); // one scalar index on (a__b, n)
+        put_str(&mut bytes, "a__b");
+        put_str(&mut bytes, "n");
+        put_u64(&mut bytes, 0); // compounds
+        put_u64(&mut bytes, 0); // geos
+        put_u64(&mut bytes, 0); // schemas
+        put_u64(&mut bytes, 1); // one TTL on (a__b, k)
+        put_str(&mut bytes, "a__b");
+        put_bytes(&mut bytes, b"k");
+        put_i64(&mut bytes, 4242);
+        put_u64(&mut bytes, 1); // one auto-id counter for a__b
+        put_str(&mut bytes, "a__b");
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        put_u64(&mut bytes, 1); // one edge on (a__b)
+        put_str(&mut bytes, "a__b");
+        put_str(&mut bytes, "r");
+        put_bytes(&mut bytes, b"a");
+        put_bytes(&mut bytes, b"b");
+        put_f64(&mut bytes, 0.5);
+
+        let mut renames = BTreeMap::new();
+        renames.insert("a__b".to_owned(), "a_b".to_owned());
+        let dst = Db::open_in_memory().unwrap();
+        dst.load_with_renames(&bytes[..], &renames).unwrap();
+
+        // Everything landed under the new name; the old name is gone.
+        assert_eq!(dst.collections().unwrap(), vec!["a_b".to_owned()]);
+        let c = dst.collection("a_b");
+        assert_eq!(c.get(b"k").unwrap(), Some(doc));
+        // The scalar index was created under the renamed collection and is
+        // serviceable: the equality filter resolves through it.
+        let hits: Vec<_> = c
+            .query()
+            .filter(crate::field("n").eq(Value::Int(7)))
+            .run()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(hits, vec![b"k".to_vec()]);
+        assert_eq!(c.ttl(b"k").unwrap(), Some(4242));
+        assert_eq!(c.neighbors(b"a", "r").unwrap(), vec![b"b".to_vec()]);
+        // The restored counter (2) continues under the new name.
+        assert_eq!(
+            c.insert_auto(&Value::Int(1)).unwrap(),
+            b"00000000000000000002".to_vec()
+        );
+    }
+
+    /// The rename-map contract: an invalid target is that target's
+    /// `InvalidName`; two sources sharing a target, and a target colliding
+    /// with an unmapped dump collection, are `InvalidArgument` (one output
+    /// keyspace per dump name); a reserved dump name cannot be laundered by
+    /// a rename; an absent source is a no-op.
+    #[test]
+    fn load_with_renames_error_contract() {
+        // One record under a__b, one under a_b.
+        fn two_records() -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(MAGIC);
+            put_u64(&mut b, 2);
+            put_str(&mut b, "a__b");
+            put_bytes(&mut b, b"x");
+            put_bytes(&mut b, &Value::Int(1).encode());
+            put_str(&mut b, "a_b");
+            put_bytes(&mut b, b"y");
+            put_bytes(&mut b, &Value::Int(2).encode());
+            b
+        }
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+                .collect()
+        };
+
+        // Invalid target: the offending rename's own InvalidName.
+        let dst = Db::open_in_memory().unwrap();
+        let err = dst.load_with_renames(&two_records()[..], &map(&[("a__b", "x__y")]));
+        assert!(
+            matches!(&err, Err(Error::InvalidName(n)) if n == "x__y"),
+            "invalid target must be InvalidName naming it, got {err:?}"
+        );
+
+        // Two sources sharing one target.
+        let err = Db::open_in_memory()
+            .unwrap()
+            .load_with_renames(&two_records()[..], &map(&[("a__b", "z"), ("c__d", "z")]));
+        assert!(
+            matches!(&err, Err(Error::InvalidArgument(m)) if m.contains("a__b") && m.contains("c__d")),
+            "shared target must be InvalidArgument naming both sources, got {err:?}"
+        );
+
+        // A target colliding with an UNMAPPED dump collection (a__b → a_b
+        // while the dump also carries a_b) is the same keyspace merge.
+        let err = Db::open_in_memory()
+            .unwrap()
+            .load_with_renames(&two_records()[..], &map(&[("a__b", "a_b")]));
+        assert!(
+            matches!(&err, Err(Error::InvalidArgument(m)) if m.contains("a_b")),
+            "dump-vs-map collision must be InvalidArgument, got {err:?}"
+        );
+
+        // A reserved dump name is rejected before mapping — no laundering.
+        let mut reserved = Vec::new();
+        reserved.extend_from_slice(MAGIC);
+        put_u64(&mut reserved, 1);
+        put_str(&mut reserved, "__edges__docs");
+        put_bytes(&mut reserved, b"k");
+        put_bytes(&mut reserved, &Value::Int(1).encode());
+        let err = Db::open_in_memory()
+            .unwrap()
+            .load_with_renames(&reserved[..], &map(&[("__edges__docs", "laundry")]));
+        assert!(
+            matches!(&err, Err(Error::InvalidDump(m)) if m.contains("reserved")),
+            "a rename must not launder a reserved dump name, got {err:?}"
+        );
+
+        // A map entry whose source never occurs in the dump is a no-op.
+        let mut dump = two_records();
+        put_u64(&mut dump, 0); // vectors
+        put_u64(&mut dump, 0); // texts
+        put_u64(&mut dump, 0); // scalars
+        put_u64(&mut dump, 0); // compounds
+        put_u64(&mut dump, 0); // geos
+        put_u64(&mut dump, 0); // schemas
+        put_u64(&mut dump, 0); // ttls
+        put_u64(&mut dump, 0); // autos
+        put_u64(&mut dump, 0); // edges
+        let dst = Db::open_in_memory().unwrap();
+        dst.load_with_renames(&dump[..], &map(&[("absent__name", "zzz")]))
+            .unwrap();
+        assert_eq!(
+            dst.collections().unwrap(),
+            vec!["a__b".to_owned(), "a_b".to_owned()]
+        );
     }
 }

@@ -489,10 +489,16 @@ fn tools_list() -> Json {
             },
             {
                 "name": "load",
-                "description": "Replay a dump file (from 'dump') into this database, recreating documents and indexes.",
+                "description": "Replay a dump file (from 'dump') into this database, recreating documents and indexes. Optional 'rename' maps dump collection names to new names (the a__b migration for pre-wave-4 dumps whose names contain '__').",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "path": { "type": "string" } },
+                    "properties": {
+                        "path": { "type": "string" },
+                        "rename": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" }
+                        }
+                    },
                     "required": ["path"]
                 }
             },

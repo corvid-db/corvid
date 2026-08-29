@@ -245,7 +245,43 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 - **Page-level single-snapshot for `page`/`page_where`**: each page walks in 1024-key chunks and each chunk opens its own read transaction, so one page spanning concurrent writes can observe a mixed state (every chunk is consistent; the page as a whole is not one snapshot). Single-snapshot paging is deferred until a workload needs it — queries that must be point-in-time use the builder, which is snapshot-scoped.
 - **`geo_nearest` per-radius snapshots**: the expanding-radius search re-runs `geo_within_radius` (its own read snapshot) per radius step; results are exact per step, but the k-nearest answer as a whole is not one snapshot.
 - **`bulk` panic skips the closing flush**: `Db::bulk` flushes (fsyncs) only on normal return — a panic inside the closure unwinds past the flush; the next durable commit on any thread makes the writes durable. Rebulk or reopen if you must not rely on that.
-- **No `a__b` migration tooling**: loading a dump taken from a pre-wave-4 database whose collection or index names contain `__` (e.g. `a__b`) fails at the index/schema replay with `Error::InvalidName` — the dump format preserves such names, the loader rejects them. Rename the collections (or re-create the indexes after load) on the source database before dumping.
+
+### Migrating pre-wave-4 dumps (`a__b`) — shipped (Task 8)
+
+Collection names containing an interior `__` (e.g. `a__b`) were accepted
+before audit-remediation wave 4 and are rejected by name validation since
+(a user `a__b` could forge or collide with the engine's `__`-separated
+internal namespaces and index-def keys). The dump format preserves such
+names, so a dump from an old database still carries them — a plain
+`Db::load` fails at index/schema replay with
+`Error::InvalidName` naming the old collection.
+
+Recipe: dump the old database with the OLD binary version (or use an
+existing dump file), open a fresh database with the current engine, and
+
+```rust
+let mut renames = BTreeMap::new();
+renames.insert("a__b".to_owned(), "a_b".to_owned());
+db.load_with_renames(reader, &renames)?;
+```
+
+Every collection-name occurrence in the dump stream — documents, all
+index/schema definitions, TTL entries, graph edges, auto-id counters — is
+mapped through `renames` before replay. Indexes therefore rebuild under
+the new name automatically: definitions replay via the create-* backfill
+path, which reads the records already written under the target name
+(there is nothing to re-create by hand). Contract: each target must be a
+valid user name (the offending target's `Error::InvalidName`, checked
+before the stream is read); no two dump names may load into one output
+name — two map sources sharing a target, or a target colliding with an
+unmapped dump collection, is `Error::InvalidArgument` (either merges two
+collections' rows into one keyspace and would silently overwrite
+documents); engine-reserved dump names are rejected before mapping (a
+rename cannot launder an internal namespace); a map entry whose source
+never occurs in the dump is a no-op. Loading into a non-empty database
+still merges with pre-existing collections, exactly like `Db::load`. The
+MCP `load` tool takes the same table as an optional `rename` object
+param.
 
 ---
 
@@ -328,7 +364,11 @@ The invariant says *one committed state, one WAL*. But hnswlib-rs and tantivy ea
   the store's write lock), which for a large legacy edge namespace holds
   the write lock for the build's duration. `link`/`link_weighted` write
   two extra rows per edge (measured ~1.4× on the pure-link microbench —
-  the price of O(degree) cascades; see `edge_churn`).
+  the price of O(degree) cascades; see `edge_churn`). Tampering posture:
+  a valid current-version marker with externally deleted adjacency rows
+  diverges silently (the marker invariant trusts "present ⇒ complete") —
+  the same pre-existing posture as externally deleted `__edges__` rows
+  themselves; out of threat model.
 
 ---
 
@@ -487,3 +527,4 @@ These need answers before specific layers can be implemented. Listed in rough or
 | 2026-08-28 | A filterless `order_by(field)` over a complete scalar index is served by an index ORDER WALK (`PlanShape::SortIndex`): the numeric then text lane enumerates the comparable class in the pinned total order, same-encoded buckets re-sort with the exact comparator (i64s beyond 2^53 share an f64 encoding; NaN entries are skipped to the tail), docs are fetched only for the offset+limit window, and an on-exhaustion scan appends the incomparable/missing tail — identical results by construction, or decline (any source, any filter, or no complete index keeps the existing paths) | The lanes already sort to the class-0 contract order (numbers before texts ascending), so the walk replaces the unbounded materialize+sort with window-bounded reads: 5k-doc `order_by(n).limit(20)` goes 2.64 ms → 0.29 ms ascending, 2.79 ms → 1.02 ms descending (no reverse range scans in redb: descending pages forward keeping a bounded newest-buckets buffer). Closes AUDIT Open "Sort indexes" |
 | 2026-08-28 | Compound prefix-only windows re-enabled soundly: each compound def persists an `all_docs_indexed` flag (def-record kind byte; legacy rows decode false) set at backfill completion iff no miss was ever observed — backfill pages commit a miss marker per declined doc, document maintenance persists a miss (marker while Building, def-rewrite once Complete) in the write's own transaction, re-registration clears the markers (fresh cycle), and the completion computes `flag-aware ∧ marker-free` in one transaction; the planner probe and its plan_shape twin admit prefix-only windows only under the flag, full-coverage shapes regardless | With the flag, every document has ALL index fields present and encodable, so every doc matching a prefix-only filter (matching requires the leading field present, encodable, equal) IS in the index — the window is a verified superset; without it, the fabfe6e omission bug's shape (missing-tail docs match but sit outside the index) stands and the query declines to scan. 5k-doc all-present corpus: prefix-only equality goes 1.540 ms scan → 241 µs window (6.4×, `compound_prefix_scan` bench). Closes AUDIT Open "Compound prefix-only windows" |
 | 2026-08-28 | Edge adjacency is DERIVED state in two private namespaces (`__adj_out__<coll>`/`__adj_in__<coll>`), one row per edge per endpoint, endpoint-first re-keyed; NOT a change to the edge-row layout | The edge rows (`__edges__`/`__redges__`) stay the only source of truth and keep their format — no file migration (a permanent non-goal), legacy databases simply build the adjacency lazily inside the first edge write's or first cascade's transaction (one clear + one paged re-derive from the source rows + a version marker, all atomic — a crash rolls it back and the next use rebuilds). Per-edge rows (not per-endpoint consolidated values): a hub's value would make every link to it an O(degree) read-modify-write, while per-edge rows keep link O(1) and idempotent by key. `link`/`unlink` maintain the rows transactionally (two extra rows per edge, the measured ~1.4× on the pure-link microbench); a malformed adjacency row falls back to rebuild-from-source + re-run. Deletes go O(edges-of-doc): `edge_delete_sweep_100` 241.0 → 40.5 ms, `delete_half_2p5k` 566.8 → 194.5 ms. Closes AUDIT Open "Endpoint-indexed edge layout" |
+| 2026-08-28 | `a__b` migration: `Db::load_with_renames(reader, renames)` maps EVERY collection-name occurrence in the dump stream (records, index/schema definitions, TTLs, edges, auto-id counters) through a caller-supplied rename table before replay; reserved dump names are rejected before mapping, targets are validated upfront, and one output name is allowed per dump name | Pre-wave-4 databases accepted `__`-containing collection names; `validate_name` rejects them since wave 4, so their dumps failed `Db::load` at index/schema replay with no automated path (rename by hand on the source, or re-create indexes after load). Mapping all occurrences together keeps documents and their definitions in one keyspace — index defs replay through the create-* backfill over the already-renamed records, so every index rebuilds under the new name automatically. Collisions (two sources sharing a target, or a target an unmapped dump collection already occupies) merge keyspaces and are rejected `InvalidArgument`; the MCP `load` tool takes the table as an optional `rename` param. Closes AUDIT Open "`a__b` migration tooling" |

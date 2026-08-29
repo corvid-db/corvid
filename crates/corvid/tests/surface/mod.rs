@@ -713,13 +713,15 @@ static MANIFEST: &[Row] = &[
         "Schema (ALTER)",
         // Shared variant (conformance convention 1): document writes and
         // graph writes (link/unlink) raise it through the same
-        // `ensure_writable` gate, and the schema test drives it through every
-        // index-creation API's field-name validation (plus set_schema).
+        // `ensure_writable` gate, the schema test drives it through every
+        // index-creation API's field-name validation (plus set_schema), and
+        // the rename migration raises it for an invalid load target.
         &[
             "mutations_insert_rejects_reserved_and_invalid_collection_names",
             "mutations_write_paths_reject_reserved_and_invalid_collection_names",
             "graph_link_unlink_reject_reserved_and_invalid_collection_names",
             "schema_index_creation_validates_names_across_families",
+            "lifecycle_load_with_renames_error_contract_invalid_target_collisions_and_noops",
         ],
     ),
     row(
@@ -728,15 +730,17 @@ static MANIFEST: &[Row] = &[
         // Shared variant (conformance convention 1): raised by the hybrid
         // ranking params (fuse_rrf k, rerank_mmr lambda) at every execution
         // entry point, by the text-side Bm25Params domain checks, by the geo
-        // bbox bound validation (the only validating geo entry point), and
-        // by the aggregate entry points, which validate the fluent args
-        // before touching the store.
+        // bbox bound validation (the only validating geo entry point), by
+        // the aggregate entry points, which validate the fluent args
+        // before touching the store, and by the load rename map's collision
+        // guards.
         &[
             "aggregations_validate_ranking_args_before_aggregating",
             "hybrid_fuse_rrf_rejects_invalid_k_at_run",
             "hybrid_rerank_mmr_rejects_out_of_range_and_nan_at_run",
             "text_bm25_params_new_and_validate_error_variants",
             "geo_bbox_validation_exact_error_variants",
+            "lifecycle_load_with_renames_error_contract_invalid_target_collisions_and_noops",
         ],
     ),
     row("corvid::Error::IncompatibleFormat", "Lifecycle", &[]),
@@ -2345,6 +2349,14 @@ static MANIFEST: &[Row] = &[
             "lifecycle_dump_load_into_nonempty_db_merges_records_and_counters",
             "lifecycle_load_rejects_reserved_names_and_malformed_streams",
             "lifecycle_dump_of_empty_db_loads_empty_and_io_errors_surface",
+        ],
+    ),
+    row(
+        "corvid::Db::load_with_renames",
+        "Lifecycle",
+        &[
+            "lifecycle_load_with_renames_migrates_a_legacy_pre_wave4_dump",
+            "lifecycle_load_with_renames_error_contract_invalid_target_collisions_and_noops",
         ],
     ),
     // ===== pq.rs — product quantization (Task 13.5 rows, filled in Task 15) =====

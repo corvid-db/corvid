@@ -139,3 +139,76 @@ fn load_missing_and_garbage_file_errors() {
         "bad params: missing string 'path'"
     );
 }
+
+/// load's optional `rename` param (the `a__b` migration): a wire dump of
+/// `docs` loads under a new name with documents and edges intact, the old
+/// name absent; `null` behaves like absent; a non-string value or a
+/// non-object `rename` is BadParams (no silent fallback); and an invalid
+/// target surfaces the engine's exact `InvalidName` error.
+#[test]
+fn load_rename_param_migrates_collections_through_the_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let ps = dir.path().join("dump.bin");
+    let ps = ps.to_str().unwrap();
+    let mut w = Wire::new();
+    w.store("docs", "a", json!({"n": 1}));
+    w.store("docs", "b", json!({"n": 2}));
+    w.ok(
+        "link",
+        json!({"collection": "docs", "from": "a", "relation": "rel", "to": "b"}),
+    );
+    w.ok("dump", json!({"path": ps}));
+
+    let mut fresh = Wire::new();
+    assert_eq!(
+        fresh.ok(
+            "load",
+            json!({"path": ps, "rename": {"docs": "renamed_docs"}})
+        ),
+        json!({"ok": true})
+    );
+    assert_eq!(
+        fresh.ok("list_collections", json!({})),
+        json!({"collections": ["renamed_docs"]})
+    );
+    assert_eq!(fresh.get("renamed_docs", "a"), json!({"n": 1}));
+    let out = fresh.ok(
+        "neighbors",
+        json!({"collection": "renamed_docs", "from": "a", "relation": "rel"}),
+    );
+    assert_eq!(out["neighbors"], json!(["b"]));
+
+    // `null` behaves like absent: a plain load with the same dump.
+    let mut plain = Wire::new();
+    assert_eq!(
+        plain.ok("load", json!({"path": ps, "rename": null})),
+        json!({"ok": true})
+    );
+    assert_eq!(
+        plain.ok("list_collections", json!({})),
+        json!({"collections": ["docs"]})
+    );
+
+    // No silent fallbacks: a non-object rename and a non-string value are
+    // BadParams; an invalid target is the engine's InvalidName.
+    let mut bad = Wire::new();
+    assert_eq!(
+        bad.err("load", json!({"path": ps, "rename": ["docs"]})),
+        "bad params: 'rename' must be an object of string to string"
+    );
+    assert_eq!(
+        bad.err("load", json!({"path": ps, "rename": {"docs": 7}})),
+        "bad params: 'rename' values must be strings: 'docs'"
+    );
+    wire::starts_with(
+        &bad.err("load", json!({"path": ps, "rename": {"docs": "x__y"}})),
+        "invalid name (NUL byte or `__` is not allowed): ",
+    );
+    assert!(
+        bad.ok("list_collections", json!({}))["collections"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a rejected rename must not have loaded anything"
+    );
+}

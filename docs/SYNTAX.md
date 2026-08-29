@@ -176,7 +176,7 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 
 ## Hybrid — 6 construct(s)
 
-- `corvid::Error::InvalidArgument` *(shared across classes: Aggregations, Hybrid, Text search, Geo)* — `aggregations_validate_ranking_args_before_aggregating`, `hybrid_fuse_rrf_rejects_invalid_k_at_run`, `hybrid_rerank_mmr_rejects_out_of_range_and_nan_at_run`, `text_bm25_params_new_and_validate_error_variants`, `geo_bbox_validation_exact_error_variants`
+- `corvid::Error::InvalidArgument` *(shared across classes: Aggregations, Hybrid, Text search, Geo, Lifecycle)* — `aggregations_validate_ranking_args_before_aggregating`, `hybrid_fuse_rrf_rejects_invalid_k_at_run`, `hybrid_rerank_mmr_rejects_out_of_range_and_nan_at_run`, `text_bm25_params_new_and_validate_error_variants`, `geo_bbox_validation_exact_error_variants`, `lifecycle_load_with_renames_error_contract_invalid_target_collisions_and_noops`
 - `corvid::QueryBuilder::fuse_rrf` — `hybrid_fuse_rrf_rejects_invalid_k_at_run`, `hybrid_fusion_rrf_boost_beats_single_source`
 - `corvid::QueryBuilder::rerank_mmr` — `hybrid_rerank_mmr_rejects_out_of_range_and_nan_at_run`, `hybrid_rerank_mmr_noop_without_vector_source`, `hybrid_rerank_mmr_lambda_one_reorders_by_relevance`, `hybrid_rerank_mmr_lambda_zero_diversifies`, `hybrid_rerank_mmr_docs_without_embeddings_survive`
 - `corvid::DEFAULT_RRF_K` — `search_hybrid_smoke_rrf_fuses_vector_and_text`, `hybrid_rrf_direct_formula_exact_scores_and_edges`
@@ -197,7 +197,7 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 
 - `corvid::Error::CorruptIndex` — `lifecycle_corrupt_ondisk_index_bytes_on_disk_error_queries_with_exact_variant`
 - `corvid::Error::ReservedCollection` *(shared across classes: Mutations, Graph, Schema (ALTER))* — `mutations_insert_rejects_reserved_and_invalid_collection_names`, `mutations_write_paths_reject_reserved_and_invalid_collection_names`, `graph_link_unlink_reject_reserved_and_invalid_collection_names`, `schema_index_creation_validates_names_across_families`
-- `corvid::Error::InvalidName` *(shared across classes: Mutations, Graph, Schema (ALTER))* — `mutations_insert_rejects_reserved_and_invalid_collection_names`, `mutations_write_paths_reject_reserved_and_invalid_collection_names`, `graph_link_unlink_reject_reserved_and_invalid_collection_names`, `schema_index_creation_validates_names_across_families`
+- `corvid::Error::InvalidName` *(shared across classes: Mutations, Graph, Schema (ALTER), Lifecycle)* — `mutations_insert_rejects_reserved_and_invalid_collection_names`, `mutations_write_paths_reject_reserved_and_invalid_collection_names`, `graph_link_unlink_reject_reserved_and_invalid_collection_names`, `schema_index_creation_validates_names_across_families`, `lifecycle_load_with_renames_error_contract_invalid_target_collisions_and_noops`
 - `corvid::Error::EmptyIndexTraining` *(shared across classes: Vector search, Schema (ALTER))* — `vector_create_index_overloads_inmemory_ondisk_and_pq`, `schema_vector_pq_creation_training_error_variants_and_success`
 - `corvid::Error::SchemaViolation` *(shared across classes: Schema (ALTER), Mutations)* — `schema_field_type_matrix_and_fields_accessor`, `schema_unique_insert_conflict_rejects_with_exact_variant_and_stores_nothing`, `schema_unique_update_conflict_rejects_whole_write`, `schema_unique_nan_equals_nan_rejects_second_document`, `schema_unique_containers_bytes_text_vector_and_null_rule`, `schema_unique_delete_then_reinsert_same_value_allowed`, `schema_unique_batch_conflict_rolls_back_whole_batch`, `schema_unique_with_scalar_index_stays_enforced_and_moves_with_values`, `schema_unique_numeric_kind_equality_same_with_and_without_index`, `mutations_insert_batch_schema_violation_rolls_back_whole_batch`, `mutations_insert_batch_unique_conflict_rolls_back_whole_batch`, `mutations_insert_auto_failure_does_not_burn_an_id`
 - `corvid::Collection::create_geo_index` *(shared across classes: WHERE, SELECT shaping, Geo, Schema (ALTER))* — `filters_indexed_vs_scan_geo_window`, `queries_plan_shape_indexed_window_kinds_and_explain_families`, `geo_index_twins_equivalence_and_live_mutations`, `geo_index_plan_shape_serviceable_and_declined`, `schema_geo_index_duplicate_creation_and_non_point_docs_skipped`, `schema_geo_index_point_move_and_delete_maintained`
@@ -253,7 +253,7 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::JoinRow` — `joins_smoke_left_outer_resolves_and_misses`, `joins_happy_path_join_row_shape_is_exact`, `joins_missing_fk_field_and_dangling_reference_retain_rows_with_none`, `joins_foreign_key_kinds_text_bytes_int_and_unusable_shapes`, `joins_self_join_references_within_one_collection`, `joins_empty_left_empty_right_and_unknown_right_collection`, `joins_rows_follow_left_collection_key_order`, `joins_non_map_left_documents_retained_with_none`
 - `corvid::Collection::join` — `joins_smoke_left_outer_resolves_and_misses`, `joins_happy_path_join_row_shape_is_exact`, `joins_dotted_foreign_key_path_resolves_nested_maps`, `joins_missing_fk_field_and_dangling_reference_retain_rows_with_none`, `joins_foreign_key_kinds_text_bytes_int_and_unusable_shapes`, `joins_self_join_references_within_one_collection`, `joins_empty_left_empty_right_and_unknown_right_collection`, `joins_rows_follow_left_collection_key_order`, `joins_track_right_and_left_side_mutations`, `joins_non_map_left_documents_retained_with_none`
 
-## Lifecycle — 103 construct(s)
+## Lifecycle — 104 construct(s)
 
 - `corvid::value::MAX_NESTING` — `lifecycle_value_decode_enforces_max_nesting_bound`
 - `corvid::Value::encode` — `lifecycle_dump_load_roundtrips_every_value_variant_bytes_exact`, `lifecycle_value_decode_enforces_max_nesting_bound`
@@ -349,6 +349,7 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::BloomFilter::contains_bytes` — `lifecycle_bloom_filter_no_false_negatives_and_bounded_fp_rate`
 - `corvid::Db::dump` — `lifecycle_smoke_dump_load_roundtrips_documents`, `lifecycle_dump_load_roundtrips_every_value_variant_bytes_exact`, `lifecycle_dump_load_roundtrips_every_index_family_ttl_edges_schema_and_autoids`, `lifecycle_dump_load_into_nonempty_db_merges_records_and_counters`, `lifecycle_dump_of_empty_db_loads_empty_and_io_errors_surface`
 - `corvid::Db::load` — `lifecycle_smoke_dump_load_roundtrips_documents`, `lifecycle_dump_load_roundtrips_every_value_variant_bytes_exact`, `lifecycle_dump_load_roundtrips_every_index_family_ttl_edges_schema_and_autoids`, `lifecycle_dump_load_into_nonempty_db_merges_records_and_counters`, `lifecycle_load_rejects_reserved_names_and_malformed_streams`, `lifecycle_dump_of_empty_db_loads_empty_and_io_errors_surface`
+- `corvid::Db::load_with_renames` — `lifecycle_load_with_renames_migrates_a_legacy_pre_wave4_dump`, `lifecycle_load_with_renames_error_contract_invalid_target_collisions_and_noops`
 - `corvid::QueryPlan` — `lifecycle_query_plan_key_is_canonical_for_identical_shapes`
 - `corvid::QueryPlan::key` — `lifecycle_query_plan_key_is_canonical_for_identical_shapes`
 - `corvid::PlanCache` — `lifecycle_plan_cache_miss_hit_insert_replace_and_closure_runs_once`
@@ -410,15 +411,15 @@ the in-process duplex-I/O suite in `crates/corvid-mcp/tests/tools/`.
 - `mcp::tool::create_compound_index` — `create_compound_index_and_fields_errors`, `index_tools_param_and_name_errors`
 - `mcp::tool::backup` — `backup_reopens_as_a_live_database`, `backup_existing_target_and_missing_path_errors`
 - `mcp::tool::dump` — `dump_then_load_roundtrips_through_the_wire`, `load_missing_and_garbage_file_errors`
-- `mcp::tool::load` — `dump_then_load_roundtrips_through_the_wire`, `load_missing_and_garbage_file_errors`
+- `mcp::tool::load` — `dump_then_load_roundtrips_through_the_wire`, `load_missing_and_garbage_file_errors`, `load_rename_param_migrates_collections_through_the_wire`
 - `mcp::tool::list_collections` — `list_collections_lists_user_names_exactly`
 - `mcp::tool::count` — `count_exact_with_filter_and_unknown_collection`, `create_scalar_index_exact_under_mutation`
 - `mcp::tool::insert_auto` — `insert_auto_keys_ordered_and_distinct`, `dump_then_load_roundtrips_through_the_wire`
 - `mcp::tool::set_schema` — `set_schema_then_get_schema_roundtrips`, `set_schema_unique_enforced_on_stores`, `set_schema_required_and_type_violations`, `set_schema_param_and_name_errors`, `dump_load_preserves_schema_constraints`, `set_schema_flag_type_errors`, `set_schema_declared_empty_vs_undeclared_fields`
 - `mcp::tool::get_schema` — `set_schema_then_get_schema_roundtrips`, `set_schema_param_and_name_errors`, `dump_load_preserves_schema_constraints`, `set_schema_declared_empty_vs_undeclared_fields`
 
-305 engine construct(s) across 13 statement classes, 51 wire construct(s),
-291 distinct covering tests (existence and uniqueness enforced by the
+306 engine construct(s) across 13 statement classes, 51 wire construct(s),
+293 distinct covering tests (existence and uniqueness enforced by the
 radars; the 7 exempt row(s) above are the only uncovered ones, each
 with its justification).
 

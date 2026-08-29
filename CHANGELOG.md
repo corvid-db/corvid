@@ -7,6 +7,25 @@ format and API may change without backward-compatibility guarantees.
 ## [Unreleased]
 
 ### Added
+- `Db::load_with_renames(reader, renames)` — the `a__b` migration path:
+  loading a dump from a pre-wave-4 database whose collection names contain
+  `__` (accepted then, rejected by name validation since) through a
+  rename table `{ "a__b": "a_b", … }`. Every collection-name occurrence
+  in the dump stream — documents, all index/schema definitions, TTL
+  entries, graph edges, auto-id counters — is mapped before replay, so
+  documents and definitions land together under the new name and every
+  index is recreated from the renamed documents automatically (nothing to
+  re-create by hand). Targets must pass name validation (the offending
+  target's `InvalidName`); no two dump names may load into one output
+  name (`InvalidArgument` — merging keyspaces would silently overwrite
+  documents); reserved dump names are rejected before mapping (a rename
+  cannot launder an engine-internal namespace); a map entry whose source
+  never occurs in the dump is a no-op. The MCP `load` tool takes the same
+  table as an optional `rename` object param. `Db::load` is unchanged
+  (`load_with_renames` with an empty map), except one hardening fix: the
+  dump's auto-id counter section — the only replay path without the
+  reserved-name check — now rejects `__`-prefixed names like every other
+  section.
 - Syntax-conformance program: every public construct of `corvid` and
   `corvid-mcp` now has a committed surface manifest and radar
   (`crates/*/tests/surface/`) that fails CI on any drift between the

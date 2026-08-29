@@ -1025,18 +1025,22 @@ fn graph_cross_collection_endpoint_key_collision_namespaced() {
 // ===========================================================================
 
 /// Edges survive a reopen, and the first delete after the reopen cascades
-/// correctly — whether or not the adjacency had ever been built in the
-/// previous session (link alone maintains the rows but never the
-/// built-marker, so a fresh open lazily rebuilds from the source rows on
-/// first cascade use; a session that already deleted once leaves a built
-/// adjacency that the reopened database must also serve exactly).
+/// correctly through the adjacency `link` already established: `link`'s
+/// `ensure_adjacency_in_txn` writes the build marker in the SAME
+/// transaction as the rows, so a session that only linked still leaves a
+/// complete built adjacency for the reopened database to serve. (The
+/// "never-built across reopen" shape this test originally claimed cannot
+/// occur via the public API; the absent-marker branch of the lazy build is
+/// covered by the stale-marker unit test — a not-current marker takes the
+/// same not-ready path — and by every fresh database's first link.)
 #[test]
 fn graph_adjacency_cascade_correct_across_reopen_both_sessions() {
     let dir = tempfile_dir();
     let path = dir.path().join("corvid.db");
 
-    // Session 1: link a web of edges but never delete (adjacency rows exist,
-    // built-marker does not).
+    // Session 1: link a web of edges but never delete — link's ensure has
+    // already written the marker with the rows, so the reopened database
+    // finds the adjacency built.
     {
         let db = Db::open(&path).unwrap();
         let c = db.collection("nodes");

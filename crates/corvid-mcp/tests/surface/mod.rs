@@ -420,6 +420,7 @@ static MANIFEST: &[Row] = &[
         &[
             "dump_then_load_roundtrips_through_the_wire",
             "load_missing_and_garbage_file_errors",
+            "load_rename_param_migrates_collections_through_the_wire",
         ],
     ),
     row(

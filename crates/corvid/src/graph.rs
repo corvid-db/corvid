@@ -534,7 +534,9 @@ fn build_adjacency_in_txn(tx: &mut WriteBatch<'_>, collection: &str) -> Result<(
         start = last;
         start.push(0);
     }
-    tx.put(&out_ns, &adjacency_marker_key(), ADJACENCY_VERSION)?;
+    // The marker is uncounted like the rows (Task 8 prepend (b)): the
+    // adjacency namespaces are engine-private, nothing reads their counts.
+    tx.put_uncounted(&out_ns, &adjacency_marker_key(), ADJACENCY_VERSION)?;
     Ok(())
 }
 

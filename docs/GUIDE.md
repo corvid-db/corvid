@@ -435,6 +435,13 @@ let mut bytes = Vec::new();
 db.dump(&mut bytes)?;
 let fresh = Db::open(dir.path().join("new.corvid"))?;
 fresh.load(&bytes[..])?;   // documents + index/schema/TTL definitions
+// Pre-wave-4 dumps whose collection names contain `__` (rejected by name
+// validation since) migrate through a rename map instead of plain `load` —
+// every name occurrence (records, defs, TTLs, edges, auto-ids) moves
+// together and indexes rebuild under the new name automatically:
+//   let mut renames = std::collections::BTreeMap::new();
+//   renames.insert("a__b".to_owned(), "a_b".to_owned());
+//   fresh.load_with_renames(&bytes[..], &renames)?;
 # Ok::<(), corvid::Error>(())
 ```
 

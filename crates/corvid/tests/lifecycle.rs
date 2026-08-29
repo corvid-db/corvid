@@ -1246,6 +1246,327 @@ fn lifecycle_dump_of_empty_db_loads_empty_and_io_errors_surface() {
 }
 
 // ===========================================================================
+// load_with_renames — the `a__b` migration (Task 8)
+// ===========================================================================
+
+/// Length-prefix helpers for the hand-built legacy fixture below (the dump
+/// container format: u32 LE length prefixes, u64 LE section counts).
+fn put_str(b: &mut Vec<u8>, s: &str) {
+    b.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    b.extend_from_slice(s.as_bytes());
+}
+fn put_bytes(b: &mut Vec<u8>, s: &[u8]) {
+    b.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    b.extend_from_slice(s);
+}
+fn put_u32(b: &mut Vec<u8>, n: usize) {
+    b.extend_from_slice(&(n as u32).to_le_bytes());
+}
+fn put_u64(b: &mut Vec<u8>, n: u64) {
+    b.extend_from_slice(&n.to_le_bytes());
+}
+
+/// A hand-built LEGACY dump: a `CORVIDDUMPv1` stream naming a collection
+/// the current binary can no longer produce (`a__b` — name validation has
+/// rejected interior `__` since audit-remediation wave 4). The dump
+/// container format is stable and public, so building the bytes by hand is
+/// the fixture strategy: a pre-wave-4 `dump` wrote exactly this shape
+/// (`Db::dump` cannot, which is the bug being migrated). Every section
+/// carries the legacy name, so the rename must move the documents AND
+/// every definition together.
+struct LegacyDump {
+    buf: Vec<u8>,
+}
+
+impl LegacyDump {
+    fn new(n_records: u64) -> Self {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CORVIDDUMPv1");
+        put_u64(&mut buf, n_records);
+        LegacyDump { buf }
+    }
+    fn record(mut self, coll: &str, key: &[u8], doc: &Value) -> Self {
+        put_str(&mut self.buf, coll);
+        put_bytes(&mut self.buf, key);
+        put_bytes(&mut self.buf, &doc.encode());
+        self
+    }
+    fn vector_index(mut self, coll: &str, field: &str) -> Self {
+        put_u64(&mut self.buf, 1);
+        put_str(&mut self.buf, coll);
+        put_str(&mut self.buf, field);
+        self.buf.push(2); // metric: L2
+        self.buf.push(0); // quant: None
+        self.buf.push(0); // mode: in-memory
+        self
+    }
+    fn text_index(mut self, coll: &str, field: &str) -> Self {
+        put_u64(&mut self.buf, 1);
+        put_str(&mut self.buf, coll);
+        put_str(&mut self.buf, field);
+        self.buf.push(0); // in-memory
+        self
+    }
+    fn scalar_index(mut self, coll: &str, field: &str) -> Self {
+        put_u64(&mut self.buf, 1);
+        put_str(&mut self.buf, coll);
+        put_str(&mut self.buf, field);
+        self
+    }
+    fn compound_index(mut self, coll: &str, fields: &[&str]) -> Self {
+        put_u64(&mut self.buf, 1);
+        put_str(&mut self.buf, coll);
+        put_u32(&mut self.buf, fields.len());
+        for f in fields {
+            put_str(&mut self.buf, f);
+        }
+        self
+    }
+    fn geo_index(mut self, coll: &str, field: &str) -> Self {
+        put_u64(&mut self.buf, 1);
+        put_str(&mut self.buf, coll);
+        put_str(&mut self.buf, field);
+        self
+    }
+    fn schema(mut self, coll: &str) -> Self {
+        put_u64(&mut self.buf, 1);
+        put_str(&mut self.buf, coll);
+        put_u32(&mut self.buf, 2); // n: Int required, body: Text
+        self.buf.push(2);
+        self.buf.push(1);
+        self.buf.push(0);
+        put_str(&mut self.buf, "n");
+        self.buf.push(4);
+        self.buf.push(0);
+        self.buf.push(0);
+        put_str(&mut self.buf, "body");
+        self
+    }
+    fn ttl(mut self, coll: &str, key: &[u8], expiry: i64) -> Self {
+        put_u64(&mut self.buf, 1);
+        put_str(&mut self.buf, coll);
+        put_bytes(&mut self.buf, key);
+        self.buf.extend_from_slice(&expiry.to_le_bytes());
+        self
+    }
+    fn auto_id(mut self, coll: &str, next: u64) -> Self {
+        put_u64(&mut self.buf, 1);
+        put_str(&mut self.buf, coll);
+        put_u64(&mut self.buf, next);
+        self
+    }
+    fn edge(mut self, coll: &str, rel: &str, from: &[u8], to: &[u8], w: f64) -> Self {
+        put_u64(&mut self.buf, 1);
+        put_str(&mut self.buf, coll);
+        put_str(&mut self.buf, rel);
+        put_bytes(&mut self.buf, from);
+        put_bytes(&mut self.buf, to);
+        self.buf.extend_from_slice(&w.to_bits().to_le_bytes());
+        self
+    }
+    fn done(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+/// The `a__b` migration recipe, end to end: a legacy dump (every section
+/// naming `a__b`) loads through `load_with_renames{a__b → a_b}` with
+/// documents, EVERY index family (rebuilt from the renamed documents —
+/// serviceable, not just present), the schema, TTLs, graph edges, and the
+/// auto-id counter all landing under the new name; the old name is gone.
+/// Plain `load` on the same dump fails at index replay with `InvalidName`
+/// (the AUDIT row this closes).
+#[test]
+fn lifecycle_load_with_renames_migrates_a_legacy_pre_wave4_dump() {
+    let docs: Vec<Value> = (0..3i64)
+        .map(|i| rich_doc("v", vec![i as f32, 1.0], i))
+        .collect();
+    let dump = LegacyDump::new(3)
+        .record("a__b", b"\x00", &docs[0])
+        .record("a__b", b"\x01", &docs[1])
+        .record("a__b", b"\x02", &docs[2])
+        .vector_index("a__b", "v")
+        .text_index("a__b", "body")
+        .scalar_index("a__b", "n")
+        .compound_index("a__b", &["n", "body"])
+        .geo_index("a__b", "pos")
+        .schema("a__b")
+        .ttl("a__b", b"\x02", 424242)
+        .auto_id("a__b", 5)
+        .edge("a__b", "knows", b"a", b"b", 0.5)
+        .done();
+
+    // The unmigrated failure mode, pinned first: plain load rejects the
+    // legacy def name at index replay.
+    let plain = Db::open_in_memory().unwrap();
+    assert!(
+        matches!(plain.load(dump.as_slice()), Err(corvid::Error::InvalidName(n)) if n == "a__b"),
+        "plain load must fail the legacy dump with InvalidName naming it"
+    );
+
+    let mut renames = BTreeMap::new();
+    renames.insert("a__b".to_owned(), "a_b".to_owned());
+    let dst = Db::open_in_memory().unwrap();
+    dst.load_with_renames(dump.as_slice(), &renames).unwrap();
+
+    // The old name is gone; only the target exists.
+    assert_eq!(dst.collections().unwrap(), vec!["a_b".to_owned()]);
+    let c = dst.collection("a_b");
+    assert_eq!(c.len().unwrap(), 3);
+    assert_eq!(c.get(b"\x01").unwrap(), Some(docs[1].clone()));
+
+    // Scalar index: recreated AND serviceable under the new name.
+    let hits: Vec<_> = c
+        .query()
+        .filter(field("n").eq(Value::Int(1)))
+        .run()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.key)
+        .collect();
+    assert_eq!(hits, vec![b"\x01".to_vec()]);
+
+    // An index def landed and services: the filter resolves through an
+    // index window, not a scan. (The compound def's replay is forced by
+    // the same load success — an unmapped `a__b` in ANY def section fails
+    // the whole load with InvalidName, pinned above; attribution prefers
+    // the scalar probe, so the compound window is not separately shown.)
+    assert_eq!(
+        c.query().filter(field("n").eq(Value::Int(1))).plan_shape(),
+        corvid::PlanShape::IndexedWindow { kind: "scalar" }
+    );
+
+    // Text index: search finds the corpus.
+    assert_eq!(c.text_search("body", "item", 3).unwrap().len(), 3);
+
+    // Vector index: nearest-first under the renamed field.
+    let vhits = c
+        .query()
+        .vector("v", vec![2.0, 1.0], 2, Metric::L2)
+        .run()
+        .unwrap();
+    assert_eq!(vhits.len(), 2);
+    assert_eq!(vhits[0].key, b"\x02".to_vec());
+
+    // Geo index: the radius query resolves (docs sit at lat 10..12, lon 20).
+    assert_eq!(
+        c.geo_within_radius("pos", 11.0, 20.0, 200.0).unwrap().len(),
+        3
+    );
+
+    // Schema: restored and enforced on new writes under the new name.
+    assert!(matches!(
+        c.insert(b"new", &map(&[("body", Value::Text("no n".into()))])),
+        Err(corvid::Error::SchemaViolation(_))
+    ));
+
+    // TTL restored.
+    assert_eq!(c.ttl(b"\x02").unwrap(), Some(424242));
+
+    // Edges restored, both directions, weight intact.
+    assert_eq!(c.neighbors(b"a", "knows").unwrap(), vec![b"b".to_vec()]);
+    assert_eq!(c.in_neighbors(b"b", "knows").unwrap(), vec![b"a".to_vec()]);
+    assert_eq!(
+        c.neighbors_weighted(b"a", "knows").unwrap(),
+        vec![(b"b".to_vec(), 0.5)]
+    );
+
+    // The auto-id counter moved with the collection: next id is 5.
+    assert_eq!(
+        c.insert_auto(&map(&[("n", Value::Int(99))])).unwrap(),
+        b"00000000000000000005".to_vec()
+    );
+}
+
+/// The rename-map error contract: an invalid target fails upfront with that
+/// target's `InvalidName` (nothing loaded); two sources sharing a target,
+/// and a target colliding with an unmapped dump collection, are
+/// `InvalidArgument` (one output keyspace per dump name — merging two
+/// collections would silently overwrite documents); a reserved dump name
+/// cannot be laundered by a rename; a map entry whose source never occurs
+/// in the dump is a documented no-op.
+#[test]
+fn lifecycle_load_with_renames_error_contract_invalid_target_collisions_and_noops() {
+    fn two_records() -> Vec<u8> {
+        LegacyDump::new(2)
+            .record("a__b", b"x", &Value::Int(1))
+            .record("a_b", b"y", &Value::Int(2))
+            .done()
+    }
+    fn map_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+            .collect()
+    }
+
+    // Invalid target: the offending rename's own InvalidName, before the
+    // stream is read (nothing loads).
+    let dst = Db::open_in_memory().unwrap();
+    let err = dst.load_with_renames(two_records().as_slice(), &map_of(&[("a__b", "x__y")]));
+    assert!(
+        matches!(&err, Err(corvid::Error::InvalidName(n)) if n == "x__y"),
+        "invalid target must be InvalidName naming it, got {err:?}"
+    );
+    assert!(dst.collections().unwrap().is_empty());
+
+    // Two sources sharing one target: rejected upfront, both named.
+    let dst = Db::open_in_memory().unwrap();
+    let err = dst.load_with_renames(
+        two_records().as_slice(),
+        &map_of(&[("a__b", "z"), ("c__d", "z")]),
+    );
+    assert!(
+        matches!(&err, Err(corvid::Error::InvalidArgument(m)) if m.contains("a__b") && m.contains("c__d")),
+        "a shared target must be InvalidArgument naming both sources, got {err:?}"
+    );
+    assert!(dst.collections().unwrap().is_empty());
+
+    // A target colliding with an UNMAPPED dump collection is the same
+    // keyspace merge, caught mid-stream (records already replayed stay —
+    // the streaming posture of every mid-dump failure).
+    let err = Db::open_in_memory()
+        .unwrap()
+        .load_with_renames(two_records().as_slice(), &map_of(&[("a__b", "a_b")]));
+    assert!(
+        matches!(&err, Err(corvid::Error::InvalidArgument(m)) if m.contains("a_b")),
+        "a dump-vs-map collision must be InvalidArgument, got {err:?}"
+    );
+
+    // A reserved dump name is rejected before mapping — no laundering.
+    let reserved = LegacyDump::new(1)
+        .record("__edges__docs", b"k", &Value::Int(1))
+        .done();
+    let err = Db::open_in_memory()
+        .unwrap()
+        .load_with_renames(reserved.as_slice(), &map_of(&[("__edges__docs", "ok")]));
+    assert!(
+        matches!(&err, Err(corvid::Error::InvalidDump(m)) if m.contains("reserved")),
+        "a rename must not launder a reserved dump name, got {err:?}"
+    );
+
+    // A map entry whose source never occurs in the dump is a no-op: the
+    // dump loads unchanged under its own names.
+    let mut dump = two_records();
+    put_u64(&mut dump, 0); // vectors
+    put_u64(&mut dump, 0); // texts
+    put_u64(&mut dump, 0); // scalars
+    put_u64(&mut dump, 0); // compounds
+    put_u64(&mut dump, 0); // geos
+    put_u64(&mut dump, 0); // schemas
+    put_u64(&mut dump, 0); // ttls
+    put_u64(&mut dump, 0); // autos
+    put_u64(&mut dump, 0); // edges
+    let dst = Db::open_in_memory().unwrap();
+    dst.load_with_renames(dump.as_slice(), &map_of(&[("ghost__old", "zz")]))
+        .unwrap();
+    assert_eq!(
+        dst.collections().unwrap(),
+        vec!["a__b".to_owned(), "a_b".to_owned()]
+    );
+}
+
+// ===========================================================================
 // Error::CorruptIndex — corrupted on-disk index bytes (Task 11 routing)
 // ===========================================================================
 
