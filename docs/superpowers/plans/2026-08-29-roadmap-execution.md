@@ -162,6 +162,20 @@ identical); add a test proving adjacency rebuild after reopen.
 
 ## Task 8: `a__b` migration tooling
 
+Controller ratification at Task 7 exit (binding for the wave review): the
++40% edge_link_10k regression is ACCEPTED — permanent trade of 2 extra
+upserts per link for O(degree) cascades (5.9× sweep, 2.9× delete-heavy);
+deletes were the workload-blocking hazard; link throughput has the
+bulk/batch amortization path; disclosed in DESIGN B9 + CHANGELOG.
+Prepend (Task 7 review nits, binding): (a) correct the false coverage
+claim in tests/graph.rs ~1027-1039 and task-7-report.md ("never-built
+across reopen" doesn't execute — link's ensure writes the marker; the
+absent-marker branch is covered elsewhere — say that instead); (b) write
+the __adj__ build marker via put_uncounted (consistency with rows);
+(c) add the missing-row tampering shape to the residual-risk list
+(report + DESIGN B9): a valid marker with externally deleted adjacency
+rows diverges silently — same pre-existing posture as __edges__ tampering.
+
 Pre-wave-4 dumps with `__`-containing collection names fail at load.
 Ship a rename mechanism: `Db::load` gains an optional rename map (or a
 sibling API `load_with_renames`) — engine-level, tested; plus a small CLI
