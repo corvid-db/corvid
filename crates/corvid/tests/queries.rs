@@ -1141,6 +1141,64 @@ fn queries_page_over_empty_collection_yields_empty_page_with_no_cursor() {
     );
 }
 
+/// End-to-end multi-chunk pin (Task 12 review): `page`/`page_where` walk a
+/// corpus past the 1024-key chunk boundary of `page_inner`'s `scan_from`
+/// loop — 2503 keys forces at least three chunks per FULL walk — and the
+/// cursor-resumed page sequence yields every key exactly once, in key
+/// order, for both entry points. The store-level chunked-walk semantics
+/// are pinned in store.rs; this pins the public page contract on top of a
+/// corpus where a single page cannot be served by one chunk read.
+#[test]
+fn queries_page_walks_multi_chunk_corpus_end_to_end() {
+    let db = Db::open_in_memory().unwrap();
+    let c = db.collection("big");
+    let mut docs = Vec::new();
+    for i in 0..2503 {
+        docs.push((
+            format!("k{i:05}").into_bytes(),
+            map(&[("n", Value::Int(i as i64))]),
+        ));
+    }
+    for (key, doc) in &docs {
+        c.insert(key, doc).unwrap();
+    }
+    let want: Vec<Vec<u8>> = docs.iter().map(|(k, _)| k.clone()).collect();
+
+    // page: full cursor walk over pages that each span several chunks.
+    let mut seen = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let p = c.page(after.as_deref(), 1000).unwrap();
+        assert!(p.rows.len() == 1000 || p.next.is_none());
+        seen.extend(p.rows.iter().map(|(k, _)| k.clone()));
+        match p.next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    assert_eq!(seen, want);
+
+    // page_where with a half-matching predicate: the same walk visits the
+    // same chunks but keeps only the matches — every match exactly once.
+    let even = field("n").gt(Value::Int(1250));
+    let want_even: Vec<Vec<u8>> = docs
+        .iter()
+        .filter(|(_, d)| matches!(d.get("n"), Some(Value::Int(n)) if *n > 1250))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut seen = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let p = c.page_where(after.as_deref(), 700, even.clone()).unwrap();
+        seen.extend(p.rows.iter().map(|(k, _)| k.clone()));
+        match p.next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    assert_eq!(seen, want_even);
+}
+
 // ===========================================================================
 // scan / for_each_doc
 // ===========================================================================

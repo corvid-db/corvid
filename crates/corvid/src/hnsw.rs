@@ -7,6 +7,18 @@
 //! from the same inserts is byte-for-byte reproducible — important for stable
 //! tests and, later, for persisting the graph as redb entries.
 //!
+//! Builds stay single-threaded, by measurement (roadmap Task 13): the
+//! deterministic parallelization options — batching layer-search
+//! distance evaluations behind a speculative memo, or pre-computing the
+//! per-vector PQ encode/probe — were implemented and measured SLOWER
+//! than the sequential loop at embedding-scale shapes (the heap loop
+//! consumes distances one at a time, so a fork/join handshake of a few
+//! microseconds outweighs the microseconds of pure work it can batch;
+//! see the Task 13 report for the numbers). What does parallelize
+//! deterministically, and ships, is PQ k-means training (`pq.rs`):
+//! millisecond-scale assignment steps where the same worker-team
+//! handshake amortizes.
+//!
 //! This is the index data structure only; wiring it into the collection's
 //! transactional write path (the `state-in-redb` invariant) is a later step.
 
@@ -102,6 +114,15 @@ impl Scorer {
             _ => f32::INFINITY,
         }
     }
+
+    /// Encode a vector for storage under this storage scheme (PQ codes
+    /// when a codebook is set).
+    fn encode(&self, v: &[f32]) -> StoredVec {
+        match &self.pq {
+            Some(pq) => StoredVec::Packed(pq.encode(v)),
+            None => self.quant.encode(v),
+        }
+    }
 }
 
 /// A distance/id pair, ordered by distance then id.
@@ -130,6 +151,47 @@ impl PartialOrd for Cand {
     }
 }
 
+/// Build/query scratch: the epoch-stamped visited buffer reused across
+/// layer searches so nothing is allocated per search.
+struct Scratch {
+    /// Per-node "visited" epoch stamps for the layer searches.
+    visited: Vec<u32>,
+    epoch: u32,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Scratch {
+            visited: Vec::new(),
+            epoch: 0,
+        }
+    }
+
+    /// Grow the buffer to cover `n` nodes.
+    fn resize(&mut self, n: usize) {
+        if self.visited.len() < n {
+            self.visited.resize(n, 0);
+        }
+    }
+
+    /// Start a fresh search epoch (visited reset on the rare wrap).
+    fn bump_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.visited.iter_mut().for_each(|v| *v = 0);
+            self.epoch = 1;
+        }
+    }
+
+    /// Returns true if `id` was not yet visited this search (and marks it).
+    #[inline]
+    fn newly_visited(&mut self, id: usize) -> bool {
+        let unseen = self.visited[id] != self.epoch;
+        self.visited[id] = self.epoch;
+        unseen
+    }
+}
+
 /// An HNSW index over fixed-dimension vectors under one [`Metric`].
 pub struct Hnsw {
     metric: Metric,
@@ -144,10 +206,9 @@ pub struct Hnsw {
     rng: u64,
     entry: Option<usize>,
     nodes: Vec<Node>,
-    /// Build-time scratch: per-node "visited" epoch stamps, reused across
-    /// inserts to avoid allocating a visited set on every layer search.
-    visited: Vec<u32>,
-    epoch: u32,
+    /// Build-time scratch (the visited-stamp buffer), reused across
+    /// inserts to avoid allocating per layer search.
+    scratch: Scratch,
 }
 
 impl Hnsw {
@@ -206,8 +267,7 @@ impl Hnsw {
             rng: 0x9E3779B97F4A7C15,
             entry: None,
             nodes: Vec::new(),
-            visited: Vec::new(),
-            epoch: 0,
+            scratch: Scratch::new(),
         }
     }
 
@@ -230,14 +290,6 @@ impl Hnsw {
         }
     }
 
-    /// Encode a vector for storage (PQ codes when a codebook is set).
-    fn encode(&self, v: &[f32]) -> StoredVec {
-        match &self.pq {
-            Some(pq) => StoredVec::Packed(pq.encode(v)),
-            None => self.quant.encode(v),
-        }
-    }
-
     /// Insert `vector`, returning its assigned node id (its insertion order).
     pub fn insert(&mut self, vector: Vec<f32>) -> usize {
         let id = self.nodes.len();
@@ -245,7 +297,7 @@ impl Hnsw {
         let scorer = self.scorer();
         let probe = scorer.probe(&vector);
         self.nodes.push(Node {
-            vector: self.encode(&vector),
+            vector: scorer.encode(&vector),
             layers: vec![Vec::new(); level + 1],
         });
 
@@ -262,8 +314,7 @@ impl Hnsw {
             let w = Self::search_layer(
                 &self.nodes,
                 &scorer,
-                &mut self.visited,
-                &mut self.epoch,
+                &mut self.scratch,
                 &probe,
                 &[cur],
                 1,
@@ -278,8 +329,7 @@ impl Hnsw {
             let w = Self::search_layer(
                 &self.nodes,
                 &scorer,
-                &mut self.visited,
-                &mut self.epoch,
+                &mut self.scratch,
                 &probe,
                 &[cur],
                 self.ef_construction,
@@ -320,27 +370,17 @@ impl Hnsw {
         let top = self.nodes[entry].layers.len() - 1;
         // Query-time search uses a local scratch (queries are far rarer than
         // build-time inserts, which reuse the index's scratch).
-        let mut visited = Vec::new();
-        let mut epoch = 0u32;
+        let mut scratch = Scratch::new();
         let probe = scorer.probe(query);
         for layer in (1..=top).rev() {
-            let w = Self::search_layer(
-                &self.nodes,
-                &scorer,
-                &mut visited,
-                &mut epoch,
-                &probe,
-                &[cur],
-                1,
-                layer,
-            );
+            let w =
+                Self::search_layer(&self.nodes, &scorer, &mut scratch, &probe, &[cur], 1, layer);
             cur = w[0].id;
         }
         let w = Self::search_layer(
             &self.nodes,
             &scorer,
-            &mut visited,
-            &mut epoch,
+            &mut scratch,
             &probe,
             &[cur],
             ef_search.max(k),
@@ -351,33 +391,24 @@ impl Hnsw {
 
     /// Greedy best-first search on one layer, returning up to `ef` closest
     /// nodes sorted nearest-first. Uses an epoch-stamped `visited` buffer
-    /// (reused across calls) instead of allocating a set each time.
+    /// (reused across calls) instead of allocating a set each call.
+    ///
+    /// Deliberately sequential — in builds too, see the module docs: the
+    /// distance evaluations feed a data-dependent heap loop one at a time,
+    /// and batching them behind a fork/join handshake measured slower
+    /// than computing them inline (Task 13's report has the numbers).
     #[allow(clippy::too_many_arguments)]
     fn search_layer(
         nodes: &[Node],
         scorer: &Scorer,
-        visited: &mut Vec<u32>,
-        epoch: &mut u32,
+        scratch: &mut Scratch,
         probe: &HProbe,
         entries: &[usize],
         ef: usize,
         layer: usize,
     ) -> Vec<Cand> {
-        if visited.len() < nodes.len() {
-            visited.resize(nodes.len(), 0);
-        }
-        *epoch = epoch.wrapping_add(1);
-        if *epoch == 0 {
-            visited.iter_mut().for_each(|v| *v = 0);
-            *epoch = 1;
-        }
-        let mark = *epoch;
-        // Returns true if `id` was not yet visited this search (and marks it).
-        let mut newly_visited = |id: usize| -> bool {
-            let unseen = visited[id] != mark;
-            visited[id] = mark;
-            unseen
-        };
+        scratch.resize(nodes.len());
+        scratch.bump_epoch();
 
         let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
         let mut results: BinaryHeap<Cand> = BinaryHeap::new();
@@ -387,7 +418,7 @@ impl Hnsw {
             let c = Cand { dist: d, id: ep };
             candidates.push(Reverse(c));
             results.push(c);
-            newly_visited(ep);
+            scratch.newly_visited(ep);
         }
 
         while let Some(Reverse(c)) = candidates.pop() {
@@ -395,7 +426,7 @@ impl Hnsw {
                 break;
             }
             for &nb in &nodes[c.id].layers[layer] {
-                if newly_visited(nb) {
+                if scratch.newly_visited(nb) {
                     let d = scorer.dist(probe, &nodes[nb].vector);
                     let worst = results.peek().map(|w| w.dist).unwrap_or(f32::INFINITY);
                     if results.len() < ef || d < worst {

@@ -45,6 +45,9 @@ pub mod schema;
 pub mod semantic_cache;
 pub mod sketch;
 pub mod store;
+/// Scoped worker-team fork/join for the deterministic parallel paths
+/// (PQ training) — engine-private; see the module docs.
+pub(crate) mod team;
 /// Feature-gated instrumentation shim — engine-private; see the module docs
 /// and the `tracing` feature in `Cargo.toml`.
 pub(crate) mod telemetry;

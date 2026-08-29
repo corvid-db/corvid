@@ -13,9 +13,18 @@
 //!
 //! Training is deterministic (fixed centroid seeding + fixed iterations) so an
 //! index built from the same vectors is reproducible, and the codebook
-//! persists as bytes alongside the index.
+//! persists as bytes alongside the index. Training parallelizes
+//! deterministically too (roadmap Task 13): each Lloyd iteration's
+//! assignment step — every point's nearest centroid, a pure function of the
+//! point and the current codebook — runs as chunk-parallel batches over a
+//! scoped worker team, and the update step consumes those assignments in
+//! input order, exactly as the sequential loop would. Iterations stay
+//! sequential (each depends on the last), so the result is the same
+//! codebook bit-for-bit.
 
 use crate::distance::Metric;
+use crate::team::{Team, parallelism, with_team};
+use std::sync::Arc;
 
 /// A trained product quantizer: `m` subspace codebooks of `k` centroids each.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,6 +40,10 @@ pub struct Pq {
 
 /// Default Lloyd iterations during training.
 const DEFAULT_ITERS: usize = 16;
+
+/// Training samples below this run their k-means sequentially — the team
+/// spawn would not amortize over a small sample.
+const PAR_TRAIN_MIN: usize = 512;
 
 impl Pq {
     /// Number of code bytes per vector.
@@ -51,7 +64,23 @@ impl Pq {
     /// Train a quantizer on `sample` with `m` subspaces and `k` centroids
     /// (`2 ≤ k ≤ 256`). Returns `None` if the parameters or sample are
     /// unusable (empty sample, `dim` not divisible by `m`, ragged vectors).
+    ///
+    /// Large samples train with the assignment steps chunk-parallel over a
+    /// scoped worker team — deterministic, see the module docs; small
+    /// samples (and single-threaded machines) train sequentially. Either
+    /// way the codebook is the same bits.
     pub fn train(sample: &[Vec<f32>], m: usize, k: usize) -> Option<Pq> {
+        Self::train_inner(sample, m, k, true)
+    }
+
+    /// The training core; `allow_team` exists so the equivalence tests can
+    /// force the sequential path against the same corpus.
+    pub(crate) fn train_inner(
+        sample: &[Vec<f32>],
+        m: usize,
+        k: usize,
+        allow_team: bool,
+    ) -> Option<Pq> {
         if sample.is_empty() || m == 0 || !(2..=256).contains(&k) {
             return None;
         }
@@ -60,15 +89,30 @@ impl Pq {
             return None;
         }
         let sub_dim = dim / m;
+        let par = allow_team && parallelism() > 1 && sample.len() >= PAR_TRAIN_MIN;
         let mut codebooks = Vec::with_capacity(m);
-        for s in 0..m {
-            let offset = s * sub_dim;
-            // Gather this subspace's points (slices into the sample).
-            let subs: Vec<&[f32]> = sample
-                .iter()
-                .map(|v| &v[offset..offset + sub_dim])
-                .collect();
-            codebooks.push(kmeans(&subs, k, sub_dim));
+        if par {
+            with_team(parallelism(), |team| {
+                for s in 0..m {
+                    let offset = s * sub_dim;
+                    // Gather this subspace's points (slices into the sample).
+                    let subs: Vec<&[f32]> = sample
+                        .iter()
+                        .map(|v| &v[offset..offset + sub_dim])
+                        .collect();
+                    codebooks.push(kmeans(&subs, k, sub_dim, Some(team)));
+                }
+            });
+        } else {
+            for s in 0..m {
+                let offset = s * sub_dim;
+                // Gather this subspace's points (slices into the sample).
+                let subs: Vec<&[f32]> = sample
+                    .iter()
+                    .map(|v| &v[offset..offset + sub_dim])
+                    .collect();
+                codebooks.push(kmeans(&subs, k, sub_dim, None));
+            }
         }
         Some(Pq {
             m,
@@ -231,7 +275,14 @@ fn nearest_centroid(sub: &[f32], codebook: &[f32], sub_dim: usize) -> usize {
 /// `k * sub_dim`). Centroids are seeded by spreading across the input and
 /// refined with a fixed number of Lloyd iterations; empty clusters keep their
 /// previous centroid.
-fn kmeans(points: &[&[f32]], k: usize, sub_dim: usize) -> Vec<f32> {
+///
+/// With a team, each iteration's assignment step runs chunk-parallel: a
+/// point's nearest centroid is a pure function of the point and the current
+/// codebook, so `Team::map`'s item-indexed outputs are exactly the
+/// sequential loop's assignments. The update step (and the change
+/// detection) consumes them in input order, sequentially — same sums, same
+/// f64-free f32 accumulation order, same codebook bits.
+fn kmeans(points: &[&[f32]], k: usize, sub_dim: usize, mut team: Option<&mut Team>) -> Vec<f32> {
     let n = points.len();
     let mut centroids = vec![0.0f32; k * sub_dim];
     // Seed: spread k picks across the (input-ordered) points. Fewer points than
@@ -250,12 +301,33 @@ fn kmeans(points: &[&[f32]], k: usize, sub_dim: usize) -> Vec<f32> {
         return centroids;
     }
 
+    // The parallel assignment path needs owned point data (the team's job
+    // closures must be self-owned, so they carry copies — cloned once per
+    // subspace and shared by reference across the iterations).
+    let owned: Option<Arc<Vec<Vec<f32>>>> = match team.as_deref_mut() {
+        Some(t) if t.workers() > 0 && n >= t.min_items() => {
+            Some(Arc::new(points.iter().map(|p| p.to_vec()).collect()))
+        }
+        _ => None,
+    };
+
     let mut assign = vec![0usize; n];
     for _ in 0..DEFAULT_ITERS {
-        // Assignment step.
+        // Assignment step (pure per point — parallel with a team, else the
+        // plain sequential map; identical values either way).
+        let next: Vec<usize> = match (&owned, team.as_deref_mut()) {
+            (Some(pts), Some(t)) => {
+                let cbs = centroids.clone();
+                let pts = Arc::clone(pts);
+                crate::team::map_owned(t, n, move |i| nearest_centroid(&pts[i], &cbs, sub_dim))
+            }
+            _ => points
+                .iter()
+                .map(|p| nearest_centroid(p, &centroids, sub_dim))
+                .collect(),
+        };
         let mut changed = false;
-        for (i, p) in points.iter().enumerate() {
-            let a = nearest_centroid(p, &centroids, sub_dim);
+        for (i, &a) in next.iter().enumerate() {
             if a != assign[i] {
                 assign[i] = a;
                 changed = true;
@@ -446,5 +518,24 @@ mod tests {
     #[test]
     fn from_bytes_rejects_garbage() {
         assert!(Pq::from_bytes(&[1, 2, 3]).is_none());
+    }
+
+    // ---- deterministic parallel training (Task 13) ----
+
+    /// Parallel training yields the identical codebook to the sequential
+    /// path on the same corpus (large enough to engage the team), and is
+    /// reproducible run over run.
+    #[test]
+    fn parallel_training_codebook_is_bit_identical_to_sequential() {
+        let data = clustered(900, 32, 8);
+        let seq = Pq::train_inner(&data, 8, 32, false).unwrap();
+        let par = Pq::train(&data, 8, 32).unwrap();
+        let par2 = Pq::train(&data, 8, 32).unwrap();
+        assert_eq!(seq, par);
+        assert_eq!(par, par2);
+        // Identical codebook → identical encodings.
+        for v in data.iter().step_by(97) {
+            assert_eq!(seq.encode(v), par.encode(v));
+        }
     }
 }

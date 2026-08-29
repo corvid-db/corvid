@@ -7,6 +7,24 @@ format and API may change without backward-compatibility guarantees.
 ## [Unreleased]
 
 ### Changed
+- PQ training (`Pq::train`, and therefore `create_vector_index_pq` /
+  `create_vector_index_pq_ondisk` index creation) now parallelizes on
+  machines with more than one usable thread, with no dependency or API
+  change: each k-means iteration's assignment step (every training
+  point's nearest centroid) is split across a scoped team of worker
+  threads, while the iterations themselves and the centroid updates
+  stay sequential and order-preserving — the trained codebook is
+  bit-for-bit identical to the single-threaded path's (same seeds, same
+  values, same accumulation order), so existing indexes and recall
+  behaviour are unchanged. Training is ~2.6× faster at 2000×64d
+  (177 → 67 ms) and ~4.1× at 10000×128d (1465 → 356 ms); small samples
+  (below a few hundred vectors) and single-threaded machines train
+  sequentially, as before. HNSW graph construction deliberately stays
+  single-threaded: the deterministic parallelization options for it
+  were implemented and measured slower than the sequential loop
+  (the per-insert work that can be parallelized without changing the
+  graph is smaller than the thread-dispatch cost), so build times and
+  the reproducible-graph guarantee are exactly as before.
 - `Collection::page` / `Collection::page_where` are now single-snapshot: the
   entire chunked keyset walk executes inside ONE read transaction, so a page
   spanning concurrent writes no longer observes mixed state — the returned

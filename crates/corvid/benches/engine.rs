@@ -102,6 +102,41 @@ fn bench_hnsw(c: &mut Criterion) {
     });
 }
 
+/// PQ training in isolation (roadmap Task 13's shipped parallel path): the
+/// k-means assignment step — each training point's nearest centroid, a
+/// pure per-point function — runs chunk-parallel over a scoped std-only
+/// worker team, while the Lloyd iterations stay sequential (each depends
+/// on the last) and the update step consumes the assignments in input
+/// order, so the trained codebook is bit-identical to the sequential
+/// path's (pinned by pq.rs's equivalence test). Setup (the corpus) is
+/// deterministic and lives outside the timed region.
+///
+/// Literal invocation (audit C10, recorded so before/after numbers are
+/// reproducible):
+///
+/// ```text
+/// cargo bench -p corvid --bench engine -- pq_train
+/// ```
+fn bench_pq_train(c: &mut Criterion) {
+    let mut g = c.benchmark_group("pq_train");
+    g.sample_size(20);
+    {
+        let data = corpus(2_000, 64);
+        g.bench_function("pq_train_2k_64d", |b| {
+            b.iter(|| corvid::pq::Pq::train(std::hint::black_box(&data), 16, 256))
+        });
+    }
+    // The bigger shape: training cost scales with corpus × k; the
+    // assignment step's parallel win holds as it grows.
+    {
+        let data = corpus(10_000, 128);
+        g.bench_function("pq_train_10k_128d", |b| {
+            b.iter(|| corvid::pq::Pq::train(std::hint::black_box(&data), 16, 256))
+        });
+    }
+    g.finish();
+}
+
 fn bench_text(c: &mut Criterion) {
     let db = Db::open_in_memory().unwrap();
     let coll = db.collection("docs");
@@ -582,6 +617,7 @@ criterion_group!(
     bench_compound_prefix_scan,
     bench_delete_heavy,
     bench_selective_window_verify,
-    bench_order_by_indexed
+    bench_order_by_indexed,
+    bench_pq_train
 );
 criterion_main!(benches);

@@ -1436,10 +1436,16 @@ impl QueryBuilder<'_> {
         //
         // Each arm emits its plan-shape choice (feature-gated via telemetry):
         // ONE event per query at the decision point — which source drove,
-        // how many candidates it produced. The labels mirror the
-        // [`PlanShape`] variants, so a subscriber counting these events is
-        // counting index probes per family (the "counters" story in
-        // DESIGN's Observability section).
+        // how many candidates it produced. The labels are named after the
+        // [`PlanShape`] variants with two deliberate divergences:
+        // `indexed_window` carries no family discriminator (the
+        // scalar/compound/geo-or-vector kind is `plan_shape()`/`explain()`'s
+        // to report), and `stream_scan` is intentionally finer than
+        // `PlanShape::Scan`, splitting the bounded streaming filter pass
+        // from the materializing fallback (the walk-vs-pointgets decision
+        // stays visible). Within those two, a subscriber counting these
+        // events is counting index probes per shape (the "counters" story
+        // in DESIGN's Observability section).
         macro_rules! plan_shape {
             ($shape:literal, $coll:expr, $rows:expr) => {
                 crate::telemetry::event!(
