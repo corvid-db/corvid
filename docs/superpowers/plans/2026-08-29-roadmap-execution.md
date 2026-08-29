@@ -126,6 +126,12 @@ to Fixed with the mechanism named.
 
 ## Task 7: Adjacency edge layout (derived indexes)
 
+Prepend (W2 wave review, binding): scalar.rs comparable_entries — also
+treat a NUM-lane key whose payload doesn't unescape to 8 bytes
+(num_value_of == None on a non-empty payload) as Error::CorruptIndex, and
+an empty index key likewise (currently panics at key[0]); one-line closure
+of the remaining malformation shapes (unreachable via the encoder;
+defense-in-depth).
 Prepend (Task 6 fix re-review, binding): scalar.rs mark_compound_complete
 (~951) unconditionally inserts the whole CompoundDef — a concurrent
 miss-write's compound_miss_in_memory(false) landing between the completion
@@ -216,7 +222,7 @@ parallelism is INSIDE one build).
 
 ## Task 14: Program exit
 
-Full gates; all benches recorded AND COMMITTED IN-REPO as docs/BENCHES.md (machine, date, before/after per task — the wave-1 baselines currently live only in git-ignored workspace reports; this file is the durable record);
+Full gates; all benches recorded AND COMMITTED IN-REPO as docs/BENCHES.md (reconcile conservative-stale citations: AUDIT 'this commit' rows get hashes; compound AFTER number unified 232.41 µs; BEFORE provenance noted) (machine, date, before/after per task — the wave-1 baselines currently live only in git-ignored workspace reports; this file is the durable record);
 SYNTAX.md regenerated if surface grew; CHANGELOG complete; AUDIT.md
 Open→Fixed flips verified; DESIGN.md decision-log rows for every shipped
 item; final whole-branch review; ledger close; push.
