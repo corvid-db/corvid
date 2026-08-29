@@ -856,6 +856,12 @@ pub(crate) trait SnapshotReader {
     /// Return all pairs whose key starts with `prefix`, in key order.
     /// Prefix scans (postings, edges) run on this (audit B3).
     fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// The maintained record count for `collection` (O(1), no scan).
+    /// `verify_candidates` (builder.rs) reads it on the same snapshot as
+    /// the candidate fetch as the density signal of its fetch-strategy
+    /// pick — a heuristic signal only; both strategies are correct for
+    /// any count.
+    fn count(&self, collection: &str) -> Result<u64>;
     /// Stream every pair in `collection` to `f` in key order; `f` returns
     /// `false` to stop early. Its slices are valid only for the call.
     #[allow(clippy::type_complexity)]
@@ -894,6 +900,10 @@ impl SnapshotReader for Store {
         Store::scan_prefix(self, collection, prefix)
     }
 
+    fn count(&self, collection: &str) -> Result<u64> {
+        Store::count(self, collection)
+    }
+
     fn for_each(
         &self,
         collection: &str,
@@ -929,6 +939,20 @@ impl SnapshotReader for ReadBatch<'_> {
 
     fn scan_prefix(&self, collection: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         ReadBatch::scan_prefix(self, collection, prefix)
+    }
+
+    /// Mirrors [`Store::count`] on this batch's snapshot (a fresh database
+    /// has no META table yet — count 0).
+    fn count(&self, collection: &str) -> Result<u64> {
+        let meta = match self.txn.open_table(META) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(meta
+            .get(count_key(collection).as_str())?
+            .map(|g| g.value())
+            .unwrap_or(0))
     }
 
     fn for_each(

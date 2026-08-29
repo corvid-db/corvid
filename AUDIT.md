@@ -57,6 +57,7 @@ Wave-5 exit (this commit, with `5134488`, `9704551`, `5b21e61`, `a9aba00`,
 | D4 | Group keys: bare text, tagged non-text, `t:`-escaped ambiguity | `281e6f3` |
 | D5 | DESIGN.md reconciled: layer map, future-spec markers, decision-log dates, closed open-questions, B9/deferred notes | this commit |
 | D6 | AUDIT.md rewritten as this status doc | this commit |
+| Verify-candidates batching | Indexed query verification picks its fetch by window density: `candidates × 17 ≥ collection count` takes ONE ordered `for_each` walk of the records (skipping non-candidates by key, stopping past the last), else the historical per-key point-gets; rows, candidate order, filter verdicts, and snapshot scope identical either way (measured crossover ≈5.8% density, dense windows ~22% faster — `selective_window_verify` bench) | this commit |
 
 ## Open
 
@@ -73,7 +74,6 @@ dropped silently:
 | >4 GiB dump sections | The dump format's length prefixes are u32; a single value/count beyond 4 GiB cannot be represented. A future format version widens to u64 when a workload needs it. |
 | Compound prefix-only windows scan | Declined for soundness after the missing-trailing-field omission bug (fixed `fabfe6e`): the compound index skips docs missing any indexed field, so a query leaving a field unconstrained can match unindexed docs. Sound re-enable needs per-def all-docs-indexed metadata. |
 | Parallel HNSW build / PQ training | All engine hot paths are single-threaded; parallel HNSW construction (and PQ k-means) is the largest raw performance headroom. Taken up in the roadmap-execution program, with build determinism preserved bit-for-bit. |
-| Verify-candidates batching | Indexed query paths fetch each candidate row with an individual point-get — N gets per window; one ordered range read per window preserves exact semantics at a fraction of the transaction overhead. Taken up in the roadmap-execution program. |
 | Sort indexes | `order_by` is an in-memory unbounded sort over the full match set; when a scalar index on the ordered field provably reproduces the documented total order, the index walk can serve it (identical results or decline). Taken up in the roadmap-execution program. |
 | SIMD distance kernels | The distance kernels are manual lane-folds and already memory-bound at current widths; portable `std::simd` buys a constant factor on wide dims. Future, not scheduled this program. |
 

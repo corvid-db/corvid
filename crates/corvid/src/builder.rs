@@ -905,7 +905,32 @@ impl QueryBuilder<'_> {
     /// Fetch each candidate key's document from `reader` (the caller's
     /// snapshot — one point in time for the whole set, audit B3) and keep
     /// those passing every filter.
+    ///
+    /// Internal optimization, invisible to results: a *dense* window
+    /// (candidates vs the collection's maintained count, per
+    /// [`ROWS_PER_POINT_GET`]) fetches in ONE ordered walk of the
+    /// collection; a *sparse* window keeps one point-get per key. Both
+    /// strategies produce identical rows in identical candidate order.
     fn verify_candidates(
+        &self,
+        reader: &dyn SnapshotReader,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Option<Candidates>> {
+        if keys.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let coll = self.collection.name();
+        let len = reader.count(coll)?;
+        if walk_wins(keys.len(), len) {
+            self.verify_candidates_walk(reader, keys, coll)
+        } else {
+            self.verify_candidates_point_gets(reader, keys)
+        }
+    }
+
+    /// The sparse-window strategy: the historical fetch — one snapshot
+    /// point-get per candidate key, in candidate order.
+    fn verify_candidates_point_gets(
         &self,
         reader: &dyn SnapshotReader,
         keys: Vec<Vec<u8>>,
@@ -915,6 +940,65 @@ impl QueryBuilder<'_> {
             if let Some(doc) = self.collection.get_in(reader, &key)?
                 && self.filters.iter().all(|p| p.eval(&doc))
             {
+                out.push((key, doc));
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// The dense-window strategy: ONE ordered walk of the collection's
+    /// records. `for_each` streams key-ordered rows on the caller's
+    /// snapshot without materializing the collection; rows between
+    /// candidates are skipped by key comparison (no copy, no decode) and
+    /// the walk stops past the last candidate — only candidate bytes are
+    /// ever held. Candidates are matched in sorted order, then
+    /// re-sequenced into the caller's candidate order and
+    /// decoded/filtered there, so rows, order (duplicated candidate keys
+    /// included), filter verdicts, and decode-error order are identical
+    /// to [`Self::verify_candidates_point_gets`].
+    fn verify_candidates_walk(
+        &self,
+        reader: &dyn SnapshotReader,
+        keys: Vec<Vec<u8>>,
+        coll: &str,
+    ) -> Result<Option<Candidates>> {
+        // Candidate positions sorted by key (positions, not keys: the
+        // original vector is the output's required order).
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_unstable_by_key(|&i| keys[i].as_slice());
+        let mut next = 0usize; // first unmatched position in `order`
+        let mut fetched: Vec<(usize, Vec<u8>, Vec<u8>)> = Vec::new();
+        reader.for_each(coll, &mut |k, v| {
+            // Candidates the stream has passed are absent from the store.
+            while next < order.len() && keys[order[next]].as_slice() < k {
+                next += 1;
+            }
+            if next == order.len() {
+                return Ok(false); // past the last candidate: stop the walk
+            }
+            if keys[order[next]].as_slice() == k {
+                // One fetch for this key; every duplicate candidate
+                // position shares the bytes (same snapshot, same filter
+                // verdict later), matching the point-get loop's emission.
+                let mut i = next;
+                while i < order.len() && keys[order[i]].as_slice() == k {
+                    fetched.push((order[i], k.to_vec(), v.to_vec()));
+                    i += 1;
+                }
+                next = i;
+                if next == order.len() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })?;
+        // Re-sequence to the caller's candidate order — the exact order
+        // the point-get loop would decode and filter in.
+        fetched.sort_unstable_by_key(|(i, _, _)| *i);
+        let mut out = Vec::with_capacity(fetched.len());
+        for (_, key, bytes) in fetched {
+            let doc = Value::decode(&bytes)?;
+            if self.filters.iter().all(|p| p.eval(&doc)) {
                 out.push((key, doc));
             }
         }
@@ -1496,6 +1580,29 @@ fn keep_smaller(best: &mut Option<Vec<Vec<u8>>>, candidate: Option<Vec<Vec<u8>>>
     }
 }
 
+/// Cost ratio behind [`QueryBuilder::verify_candidates`]' fetch-strategy
+/// pick: one candidate point-get (a catalog lookup, a table open, and a
+/// root-to-leaf tree descent per key) costs roughly this many sequential
+/// row visits of an ordered `for_each` walk, whose between-candidate steps
+/// are key comparisons inside already-resident leaf pages. The walk
+/// replaces `N` point-gets once
+/// `candidates * ROWS_PER_POINT_GET >= collection_len` — a dense window;
+/// a sparse window on a large collection keeps the point-gets, since the
+/// walk would visit up to the whole collection. Measured on the
+/// `selective_window_verify` bench (5k-doc corpus): point-gets win at 1%
+/// and 5% window density (221 µs / 456 µs vs the walk's 413 µs / 487 µs),
+/// the walk wins at 10% (577 µs vs 745 µs); the two cost lines cross at
+/// ~289 candidates of 5k (density ≈ 5.8%, i.e. a ratio of ≈ 17) — see the
+/// roadmap Task 4 report for the table.
+const ROWS_PER_POINT_GET: u64 = 17;
+
+/// The density crossover itself, factored for direct testing:
+/// does a window of `candidates` keys over a collection of
+/// `collection_len` records fetch faster as one ordered walk?
+fn walk_wins(candidates: usize, collection_len: u64) -> bool {
+    (candidates as u64).saturating_mul(ROWS_PER_POINT_GET) >= collection_len
+}
+
 /// Union-with-dedup of candidate key sets under the aggregate cap shared by
 /// the `In` and `OR` index fast paths (audit B10): each *individual* index
 /// window is already capped, but the union across an `In` list's values (or
@@ -1850,6 +1957,125 @@ mod tests {
         // A single oversized push bails too.
         let mut u = KeyUnion::with_cap(1);
         assert!(!u.push(vec![b"x".to_vec(), b"y".to_vec()]));
+    }
+
+    /// The two verify-candidates fetch strategies are observably
+    /// identical: same rows, same candidate order (including a duplicated
+    /// candidate key), same missing-key skips, same filter verdicts. The
+    /// candidate list is deliberately NOT key-sorted and mixes a key
+    /// absent from the records, a duplicated key, and a key whose document
+    /// fails the filter — the walk must reproduce the point-get loop's
+    /// output byte for byte.
+    #[test]
+    fn verify_candidates_walk_matches_point_gets_exactly() {
+        let db = Db::open_in_memory().unwrap();
+        let coll = db.collection("docs");
+        let numbered = |key: &[u8], n: i64| {
+            let mut m = BTreeMap::new();
+            m.insert("n".to_owned(), Value::Int(n));
+            coll.insert(key, &Value::Map(m)).unwrap();
+        };
+        numbered(b"f", 15); // passes n >= 11
+        numbered(b"b", 12); // passes
+        numbered(b"d", 3); // fails the filter
+        numbered(b"g", 20); // passes
+        // (no "zzz" — a candidate the records no longer have)
+
+        let candidates = vec![
+            b"f".to_vec(),
+            b"b".to_vec(),
+            b"zzz".to_vec(),
+            b"d".to_vec(),
+            b"b".to_vec(), // duplicated candidate key
+            b"g".to_vec(),
+        ];
+        let expected_order: Vec<Vec<u8>> =
+            vec![b"f".to_vec(), b"b".to_vec(), b"b".to_vec(), b"g".to_vec()];
+
+        db.store()
+            .read(|r| {
+                let qb = coll.query().filter(field("n").ge(Value::Int(11)));
+                let points = qb
+                    .verify_candidates_point_gets(r, candidates.clone())
+                    .unwrap()
+                    .unwrap();
+                let walk = qb
+                    .verify_candidates_walk(r, candidates.clone(), coll.name())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(points, walk, "strategies must agree exactly");
+                assert_eq!(
+                    points.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+                    expected_order,
+                    "output preserves the caller's candidate order (duplicate emission included)"
+                );
+                // Every emitted pair carries its own decoded document.
+                assert!(
+                    points
+                        .iter()
+                        .all(|(k, doc)| doc.get_path("n").is_some() && !k.is_empty())
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The density crossover picks the measured-cheaper strategy: sparse
+    /// windows keep point-gets, dense windows take the ordered walk, and
+    /// the boundary is the `candidates * ROWS_PER_POINT_GET >= len` line
+    /// (17 from the `selective_window_verify` measurements).
+    #[test]
+    fn verify_fetch_strategy_follows_density_crossover() {
+        // The bench densities: 50 of 5k is sparse (points), 500 of 5k is
+        // dense (walk).
+        assert!(!walk_wins(50, 5_000));
+        assert!(walk_wins(500, 5_000));
+        // Exactly on the line walks (`>=`); one candidate below it does not.
+        assert!(walk_wins(10, 170));
+        assert!(!walk_wins(9, 170));
+        // An empty collection with any candidates (an inconsistent index)
+        // still picks a strategy and stays correct — degenerate arm.
+        assert!(walk_wins(1, 0));
+    }
+
+    /// End-to-end twin (filters.rs convention) at walk-path density: a
+    /// scalar eq window narrowed further by a second AND filter — so the
+    /// window's candidate set is a strict superset of the matches —
+    /// returns exactly what the same query returns with no index (full
+    /// scan), rows and order included. 40 docs with 4 per `cat` value:
+    /// `4 * 17 >= 40` puts verification on the walk path.
+    #[test]
+    fn verify_walk_dense_window_twin_matches_unindexed_scan() {
+        let docs = |db: &Db, indexed: bool| {
+            let coll = db.collection("docs");
+            for i in 0..40u32 {
+                let mut m = BTreeMap::new();
+                m.insert("cat".to_owned(), Value::Int((i % 10) as i64));
+                m.insert("n".to_owned(), Value::Int(i as i64));
+                coll.insert(format!("k{i:02}").as_bytes(), &Value::Map(m))
+                    .unwrap();
+            }
+            if indexed {
+                coll.create_scalar_index("cat").unwrap();
+            }
+            coll.query()
+                .filter(field("cat").eq(Value::Int(7)))
+                .filter(field("n").ge(Value::Int(30)))
+                .run()
+                .unwrap()
+        };
+        let idx = docs(&Db::open_in_memory().unwrap(), true);
+        let scan = docs(&Db::open_in_memory().unwrap(), false);
+        let strip = |rows: Vec<super::ResultRow>| {
+            rows.into_iter()
+                .map(|r| (r.key, r.document))
+                .collect::<Vec<_>>()
+        };
+        let expected = strip(scan);
+        // Sanity: the twin is non-trivial — the window (cat == 7) holds 4
+        // docs (i = 7, 17, 27, 37), the second filter keeps only 1 of them.
+        assert_eq!(expected.len(), 1);
+        assert_eq!(strip(idx), expected);
     }
 
     fn doc(category: &str, body: &str, embedding: Vec<f32>) -> Value {

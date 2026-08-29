@@ -38,6 +38,14 @@ format and API may change without backward-compatibility guarantees.
   instead of falling back to a default.
 
 ### Changed
+- Indexed query verification (a filter served by a scalar/compound/geo/OR
+  index window) now batches its document fetch when the window is dense
+  relative to the collection: instead of one point-get per candidate key,
+  one ordered walk of the records streams the candidates in a single pass
+  (results, order, and snapshot semantics are unchanged — this is purely
+  an execution strategy pick, measured at a ~22% faster end-to-end query
+  on a 10%-density window over a 5k corpus; sparse windows keep the
+  point-gets).
 - `Collection::compare_and_set` now compares the expected value with the
   engine's semantic value equality (the same rule unique constraints use:
   `NaN` equals `NaN` regardless of payload, `-0.0` equals `0.0`, containers

@@ -1,7 +1,7 @@
 //! Microbenchmarks for the perf-sensitive paths: the value codec, HNSW
 //! build/search, indexed vs exact text search, and the roadmap program's
 //! deferred-path baselines (edge churn, compound prefix windows, mixed
-//! delete-heavy churn).
+//! delete-heavy churn, selective eq-window verification).
 
 use std::collections::BTreeMap;
 
@@ -421,6 +421,72 @@ fn bench_delete_heavy(c: &mut Criterion) {
     g.finish();
 }
 
+/// Selective eq-window verification over a scalar index (roadmap Task 4's
+/// target). The planner serves `query().filter(field("cat").eq(..)).run()`
+/// from the index window, then `verify_candidates` fetches every candidate
+/// document — historically one point-get per key, now a batched ordered
+/// walk when the window is dense. Corpus (deterministic index math): 5k
+/// docs, `cat` in 100 distinct values (50 docs per value) plus a realistic
+/// body; the fixed query pins one `cat` value and returns 50 rows of 5k.
+/// `eq_500_of_5k` is the same shape at 10x density (`cat` in 10 values),
+/// bracketing the density crossover of the fetch-strategy heuristic.
+/// Setup happens once outside the measured routine (the workload is
+/// read-only), so default sampling applies.
+///
+/// Literal invocation (audit C10, recorded so before/after numbers are
+/// reproducible):
+///
+/// ```text
+/// cargo bench -p corvid --bench engine -- selective_window_verify
+/// ```
+fn bench_selective_window_verify(c: &mut Criterion) {
+    const DOCS: usize = 5_000;
+
+    let seed = |buckets: i64| {
+        let db = Db::open_in_memory().unwrap();
+        let coll = db.collection("docs");
+        for i in 0..DOCS {
+            let mut m = BTreeMap::new();
+            m.insert("cat".to_owned(), Value::Int((i as i64) % buckets));
+            m.insert(
+                "body".to_owned(),
+                Value::Text("a benchmark document with a realistic body".into()),
+            );
+            coll.insert(format!("k{i:06}").as_bytes(), &Value::Map(m))
+                .unwrap();
+        }
+        coll.create_scalar_index("cat").unwrap();
+        db
+    };
+
+    let mut g = c.benchmark_group("selective_window_verify");
+    {
+        let db = seed(100);
+        let coll = db.collection("docs");
+        g.bench_function("eq_50_of_5k", |b| {
+            b.iter(|| {
+                coll.query()
+                    .filter(field("cat").eq(Value::Int(50)))
+                    .run()
+                    .unwrap()
+            })
+        });
+    }
+    {
+        let db = seed(10);
+        let coll = db.collection("docs");
+        g.bench_function("eq_500_of_5k", |b| {
+            b.iter(|| {
+                coll.query()
+                    .filter(field("cat").eq(Value::Int(5)))
+                    .run()
+                    .unwrap()
+            })
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_codec,
@@ -430,6 +496,7 @@ criterion_group!(
     bench_creation_ondisk,
     bench_edge_churn,
     bench_compound_prefix_scan,
-    bench_delete_heavy
+    bench_delete_heavy,
+    bench_selective_window_verify
 );
 criterion_main!(benches);
