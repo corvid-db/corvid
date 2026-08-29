@@ -6,6 +6,22 @@ format and API may change without backward-compatibility guarantees.
 
 ## [Unreleased]
 
+### Changed
+- `Collection::page` / `Collection::page_where` are now single-snapshot: the
+  entire chunked keyset walk executes inside ONE read transaction, so a page
+  spanning concurrent writes no longer observes mixed state — the returned
+  rows always match some committed point in time (previously each 1024-key
+  chunk opened its own read transaction; per-chunk consistent, the page as a
+  whole was not one snapshot). Results, the `Page { rows, next }` shape, and
+  the cursor contract (`after = b""` skips exactly the empty key; a full page
+  always yields a cursor; short page = end) are unchanged on a static
+  database. The snapshot-holding cost is space, not latency: redb's MVCC
+  never blocks the writer on an open read transaction, but pages freed by
+  commits landing during a walk stay in the file until it ends — temporary
+  growth bounded by the walk (`limit` rows, 1024-key chunk reads), and each
+  page call opens its own snapshot, so successive pages see the
+  then-current state as before.
+
 ### Added
 - Optional `tracing` cargo feature (default OFF) on the `corvid` crate:
   structured instrumentation at the engine's load-bearing points, via the

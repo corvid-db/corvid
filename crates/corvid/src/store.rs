@@ -1725,4 +1725,138 @@ mod tests {
         assert_eq!(s.get("docs", b"doc2").unwrap(), Some(b"v2".to_vec()));
         assert_eq!(s.scan("docs").unwrap().len(), 2);
     }
+
+    /// Task 12's core pin: the CHUNKED `scan_from` walk that
+    /// `Collection::page`/`page_where` runs inside one `read()` closure sees
+    /// NO mid-walk mutation, so the page is one point-in-time view.
+    ///
+    /// Reasoning chain (why this lives at the ReadBatch level):
+    /// `page()` is synchronous and hook-free, so a write cannot be
+    /// deterministically interleaved between its chunk reads from outside —
+    /// the brief's thread/channel shapes would need sleeps. Instead `page`
+    /// now delegates its whole walk to `store().read(|r| ...)` (the same
+    /// discipline as the query builder's `run()` → `run_with(reader)`), and
+    /// THIS test pins the semantics that delegation inherits: writes
+    /// committed BETWEEN two chunk reads of the same `ReadBatch` — insert
+    /// ahead of the cursor, delete ahead, delete behind, overwrite ahead —
+    /// are invisible to the walk's remainder, and the concatenated chunks
+    /// equal the original corpus exactly. `read_batch_is_an_mvcc_snapshot`
+    /// pins the same for `get`/`scan`; this pins it for the paged-walk
+    /// shape. Static equivalence of `ReadBatch::scan_from` and
+    /// `Store::scan_from` is pinned by `read_batch_ops_match_store_versions`
+    /// (so page results on a static db are unchanged), and the page cursor
+    /// contract by the queries.rs suite.
+    ///
+    /// The mutations run on the SAME thread via the same handle while the
+    /// read transaction is open — deterministic ordering, no channels, no
+    /// sleeps — and their commits succeeding at all is itself the
+    /// "snapshot-holding cost" claim made real: redb is MVCC, so an open
+    /// read transaction pins old pages (space, reclaimed once it ends) but
+    /// never blocks the writer.
+    #[test]
+    fn chunked_read_batch_walk_ignores_mid_walk_writes() {
+        let s = mem();
+        // 2500 fixed-width keys = 3 chunks at the page walk's 1024-key step.
+        s.transaction(|tx| {
+            for i in 0..2500u32 {
+                let key = format!("k{i:04}");
+                tx.put("docs", key.as_bytes(), format!("v{i}").as_bytes())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let original = s.scan("docs").unwrap();
+        assert_eq!(original.len(), 2500);
+
+        let walked = s
+            .read(|r| {
+                let mut start = Vec::new();
+                let mut out = Vec::new();
+                let mut chunks = 0;
+                loop {
+                    let page = r.scan_from("docs", &start, 1024)?;
+                    let Some((last, _)) = page.last().cloned() else {
+                        break;
+                    };
+                    out.extend(page);
+                    chunks += 1;
+                    if chunks == 1 {
+                        // Between the first and second chunk read — exactly
+                        // where a per-chunk-transaction walk would pick the
+                        // writer's commits up — commit every mutation shape:
+                        // a key ahead of the cursor (insert), one deleted
+                        // ahead, one overwritten ahead, and one deleted
+                        // behind (already emitted).
+                        s.put("docs", b"k2100zz", b"inserted-mid-walk").unwrap();
+                        s.delete("docs", b"k2000").unwrap();
+                        s.put("docs", b"k1800", b"overwritten-mid-walk").unwrap();
+                        s.delete("docs", b"k0001").unwrap();
+                        // The writes really committed while this read
+                        // transaction stays open (fresh per-op reads see
+                        // them; the shared-snapshot walk below must not).
+                        assert_eq!(
+                            s.get("docs", b"k2100zz").unwrap(),
+                            Some(b"inserted-mid-walk".to_vec())
+                        );
+                        assert_eq!(s.get("docs", b"k2000").unwrap(), None);
+                    }
+                    start = last;
+                    start.push(0);
+                }
+                assert!(chunks >= 3, "walk must cross chunk boundaries");
+                assert_eq!(out, original, "the whole walk is the opening snapshot");
+                Ok(out)
+            })
+            .unwrap();
+
+        // The walk returned the ORIGINAL view; the commits are durable facts
+        // a fresh read transaction observes (not vacuously invisible).
+        assert_eq!(walked, original);
+        let after = s.scan("docs").unwrap();
+        assert_eq!(after.len(), 2499, "2 deletes + 1 insert: 2500 − 1 net");
+        assert_eq!(
+            s.get("docs", b"k2100zz").unwrap(),
+            Some(b"inserted-mid-walk".to_vec())
+        );
+        assert_eq!(s.get("docs", b"k2000").unwrap(), None);
+        assert_eq!(s.get("docs", b"k0001").unwrap(), None);
+        assert_eq!(
+            s.get("docs", b"k1800").unwrap(),
+            Some(b"overwritten-mid-walk".to_vec())
+        );
+
+        // The contrast that makes this pin load-bearing: the SAME mutation
+        // timing against a per-chunk-own-transaction walk (`Store::scan_from`
+        // — page's pre-Task-12 shape) produces the mixed state this task
+        // removes: chunk 2 onwards observe the mid-walk writes, so the
+        // concatenated walk is a state that never existed as a commit.
+        let before = s.scan("docs").unwrap();
+        let mut start = Vec::new();
+        let mut mixed = Vec::new();
+        let mut chunks = 0;
+        loop {
+            let page = s.scan_from("docs", &start, 1024).unwrap();
+            let Some((last, _)) = page.last().cloned() else {
+                break;
+            };
+            mixed.extend(page);
+            chunks += 1;
+            if chunks == 1 {
+                s.put("docs", b"k2200zz", b"second-mid-walk").unwrap();
+                s.delete("docs", b"k1500").unwrap();
+            }
+            start = last;
+            start.push(0);
+        }
+        assert!(chunks >= 3);
+        // Length happens to be preserved (one insert, one delete); the
+        // CONTENT is the mixed state: a row that did not exist when the
+        // walk started, and a hole where one did.
+        assert!(mixed.iter().any(|(k, _)| k == b"k2200zz"));
+        assert!(!mixed.iter().any(|(k, _)| k == b"k1500"));
+        assert_ne!(
+            mixed, before,
+            "per-chunk-transaction walks are NOT one snapshot"
+        );
+    }
 }

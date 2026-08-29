@@ -22,7 +22,8 @@ use crate::value::Value;
 /// ANN cache holds derived graphs rebuilt lazily from a fresh committed
 /// state under the registry lock — never a stale snapshot — so queries never
 /// observe an index behind the documents. Query execution reads one MVCC
-/// snapshot per query.
+/// snapshot per query, and each `page`/`page_where` call walks one snapshot
+/// end to end.
 pub struct Db {
     store: Store,
     indexes: Mutex<IndexState>,
@@ -711,6 +712,11 @@ impl Collection<'_> {
     /// strictly greater than `after` (`None` starts at the beginning), with a
     /// `next` cursor to resume from. Unlike `offset`, this does not rescan
     /// earlier pages — each page resumes exactly where the last ended.
+    ///
+    /// The whole page is read from ONE MVCC snapshot: a writer committing
+    /// mid-walk is invisible to the page in progress, so the returned rows
+    /// always match some committed point in time (see [`Self::page_where`]
+    /// for the snapshot-holding cost).
     pub fn page(&self, after: Option<&[u8]>, limit: usize) -> Result<Page> {
         self.page_inner(after, limit, None)
     }
@@ -718,6 +724,21 @@ impl Collection<'_> {
     /// Like [`Collection::page`] but returning only documents matching
     /// `predicate`. The scan is streamed; the `next` cursor resumes after the
     /// last examined key, so every matching document is paged exactly once.
+    ///
+    /// Single-snapshot like [`Collection::page`]: the entire chunked walk
+    /// runs inside one read transaction.
+    ///
+    /// Snapshot-holding cost: redb is MVCC, so the read transaction pins the
+    /// snapshot but never blocks the (single) writer — writers commit and
+    /// readers proceed concurrently. The pin's cost is space, not latency:
+    /// pages freed by commits landing during the walk stay in the file
+    /// (pending-free) until the transaction ends, so a long-lived walk shows
+    /// up as temporary file growth, reclaimable by a later
+    /// [`Db::compact`]. That exposure is bounded here: the walk stops after
+    /// `limit` rows (and per-chunk reads are capped at 1024 keys), so the
+    /// transaction lives for one page call, never across calls — successive
+    /// pages each see the then-current state (the usual keyset-pagination
+    /// contract).
     pub fn page_where(
         &self,
         after: Option<&[u8]>,
@@ -727,6 +748,18 @@ impl Collection<'_> {
         self.page_inner(after, limit, Some(predicate))
     }
 
+    /// The shared core of [`Collection::page`] / [`Collection::page_where`].
+    ///
+    /// The entire walk — every 1024-key chunk — executes inside ONE
+    /// `store().read()` closure, so the page observes a single MVCC snapshot
+    /// (audit B3 discipline, mirroring the query builder's `run()` →
+    /// `run_with(reader)` split: chunked reads INSIDE the transaction keep
+    /// memory bounded — `ReadBatch::scan_from` pages — while the snapshot
+    /// makes the page point-in-time consistent even under concurrent
+    /// writers). `ReadBatch::scan_from` is byte-identical to
+    /// `Store::scan_from` on a static database (pinned in store.rs), so
+    /// results, `Page` shape, and the cursor contract are unchanged; only
+    /// the consistency guarantee tightens.
     fn page_inner(
         &self,
         after: Option<&[u8]>,
@@ -739,46 +772,48 @@ impl Collection<'_> {
                 next: None,
             });
         }
-        let mut cursor: Vec<u8> = match after {
-            Some(k) => {
-                let mut c = k.to_vec();
-                c.push(0); // strictly greater than `after`
-                c
-            }
-            None => Vec::new(),
-        };
-        let mut rows: Vec<(Vec<u8>, Value)> = Vec::new();
-        let mut last_examined: Option<Vec<u8>> = None;
-        const CHUNK: usize = 1024;
-        'outer: loop {
-            let chunk = self.db.store().scan_from(self.name, &cursor, CHUNK)?;
-            if chunk.is_empty() {
-                break;
-            }
-            for (k, bytes) in &chunk {
-                last_examined = Some(k.clone());
-                let doc = Value::decode(bytes)?;
-                if predicate.as_ref().is_none_or(|p| p.eval(&doc)) {
-                    rows.push((k.clone(), doc));
-                    if rows.len() == limit {
-                        break 'outer;
+        self.db.store().read(|reader| {
+            let mut cursor: Vec<u8> = match after {
+                Some(k) => {
+                    let mut c = k.to_vec();
+                    c.push(0); // strictly greater than `after`
+                    c
+                }
+                None => Vec::new(),
+            };
+            let mut rows: Vec<(Vec<u8>, Value)> = Vec::new();
+            let mut last_examined: Option<Vec<u8>> = None;
+            const CHUNK: usize = 1024;
+            'outer: loop {
+                let chunk = reader.scan_from(self.name, &cursor, CHUNK)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                for (k, bytes) in &chunk {
+                    last_examined = Some(k.clone());
+                    let doc = Value::decode(bytes)?;
+                    if predicate.as_ref().is_none_or(|p| p.eval(&doc)) {
+                        rows.push((k.clone(), doc));
+                        if rows.len() == limit {
+                            break 'outer;
+                        }
                     }
                 }
+                cursor = {
+                    let mut c = chunk.last().unwrap().0.clone();
+                    c.push(0);
+                    c
+                };
             }
-            cursor = {
-                let mut c = chunk.last().unwrap().0.clone();
-                c.push(0);
-                c
+            // A full page implies there may be more; resume after the last key we
+            // looked at. A short page means we reached the end.
+            let next = if rows.len() == limit {
+                last_examined
+            } else {
+                None
             };
-        }
-        // A full page implies there may be more; resume after the last key we
-        // looked at. A short page means we reached the end.
-        let next = if rows.len() == limit {
-            last_examined
-        } else {
-            None
-        };
-        Ok(Page { rows, next })
+            Ok(Page { rows, next })
+        })
     }
 }
 
