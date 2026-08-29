@@ -188,8 +188,11 @@ fn bench_creation_ondisk(c: &mut Criterion) {
 /// reverse row).
 ///
 /// Corpus (deterministic, index math + seeded xorshift — no rand dep):
-/// 1k docs, 10k edges over 3 relations, bimodal degree distribution (every
-/// 4th edge targets one of 16 hub keys; the rest draw targets uniformly).
+/// 1k docs, 10k edges over 3 relations, bimodal in-degree distribution:
+/// every 4th edge targets a hub key — 4 hubs at ~625 in-edges each (the
+/// `i % 4 == 0` guard collapses `i % 16` to {0, 4, 8, 12}; see the
+/// targets comment in the corpus code) — and the rest draw targets
+/// uniformly (~1 in-edge on average).
 /// `edge_link_10k` seeds a fresh in-memory Db per iteration inside the
 /// measured routine (the `index_creation_ondisk` convention — links are ~90%
 /// of that iteration, fine for a relative before/after baseline). Sample
@@ -209,8 +212,11 @@ fn bench_edge_churn(c: &mut Criterion) {
     const RELATIONS: [&str; 3] = ["knows", "likes", "follows"];
 
     let key = |i: usize| format!("k{i:06}");
-    // Targets: hub-skewed — every 4th edge hits one of the HUBS low keys
-    // (~250 in-edges each), the rest draw a seeded-uniform target.
+    // Targets: hub-skewed — every 4th edge is a hub edge whose target is
+    // `i % HUBS`; under the `i % 4 == 0` guard that expression only ever
+    // yields {0, 4, 8, 12}, so the hubs are 4 keys (not HUBS=16) at
+    // 2_500 / 4 = 625 in-edges each. The rest draw a seeded-uniform
+    // target, giving the bimodal distribution described above.
     let targets: Vec<usize> = {
         let mut state: u64 = 0x1234_5678;
         (0..EDGES)
@@ -259,7 +265,8 @@ fn bench_edge_churn(c: &mut Criterion) {
             |db| {
                 let coll = db.collection("docs");
                 // The measured sweep: SWEEP docs that all carry edges (every
-                // doc is the source of ~10, and the first 16 are hubs).
+                // doc is the source of exactly 10, and the four hub keys —
+                // 0, 4, 8, 12 — all sit inside the first SWEEP keys).
                 for i in 0..SWEEP {
                     std::hint::black_box(coll.delete(key(i).as_bytes()).unwrap());
                 }
