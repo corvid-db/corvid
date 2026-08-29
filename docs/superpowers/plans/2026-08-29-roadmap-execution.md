@@ -51,6 +51,13 @@ Run and record baselines in the task report.
 
 ## Task 3: Release workflow dry-run
 
+Prepend (Task 2 review nits, binding): in benches/engine.rs edge_churn: fix
+the hub-count comment (the `i % 4 == 0` guard makes it 4 hubs of ~625, not
+16 of ~250 — either correct the comment or change the corpus to draw hub
+targets without the multiple-of-4 coincidence, pick one and re-run that one
+bench to refresh the baseline number); note the ~9k-distinct-edges fact in
+the report if you touch the corpus.
+
 - Read `.github/workflows/release.yml`. If it has no `workflow_dispatch`,
   add it with a `dry_run` input (default false) that runs the full
   build/checksum matrix but skips the publish/upload step(s).
