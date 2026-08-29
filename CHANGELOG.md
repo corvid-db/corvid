@@ -38,6 +38,19 @@ format and API may change without backward-compatibility guarantees.
   instead of falling back to a default.
 
 ### Changed
+- Compound-index prefix-only equality queries (equality on a leading field
+  with the trailing fields unconstrained) are now served through the index
+  window when the index's def knows every document in the collection has
+  all indexed fields present and encodable (`all_docs_indexed`, maintained
+  at backfill completion and permanently cleared by any write that leaves
+  a field missing/non-encodable; recomputed by re-creating the index).
+  Results are identical to a scan by construction — a matching document
+  necessarily has the leading field, hence is indexed. On a 5k-doc corpus
+  where every doc has both fields, the pinned benchmark drops from
+  ~1.54 ms (full scan) to ~0.24 ms (~6.4x). Indexes over corpora that
+  contain (or ever wrote) missing-field documents keep the previous
+  decline-to-scan behavior, and dumps replay index creation, so the flag
+  is recomputed exactly on load.
 - A filterless `order_by(field)` whose field has a complete scalar index is
   now served by an index order walk instead of materializing and sorting
   every row: rows and their order are identical (the walk enumerates the

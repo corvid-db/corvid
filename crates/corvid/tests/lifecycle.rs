@@ -1249,6 +1249,80 @@ fn lifecycle_dump_of_empty_db_loads_empty_and_io_errors_surface() {
 // Error::CorruptIndex — corrupted on-disk index bytes (Task 11 routing)
 // ===========================================================================
 
+/// The scalar-index order walk's corruption twin: a hand-corrupted KEY (no
+/// value terminator — unreachable via the encoder, exactly what bit-rot
+/// produces) in a persisted scalar index namespace makes the `order_by`
+/// walk error `Error::CorruptIndex` naming the namespace, never a silently
+/// degraded or short result.
+#[test]
+fn lifecycle_corrupt_scalar_index_key_errors_order_walk_with_exact_variant() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corvid.db");
+    {
+        let db = Db::open(&path).unwrap();
+        let c = db.collection("docs");
+        for (k, n) in [(b"a", 3i64), (b"b", 1), (b"c", 2)] {
+            c.insert(k, &doc(std::str::from_utf8(k).unwrap(), n))
+                .unwrap();
+        }
+        c.create_scalar_index("n").unwrap();
+        // Serving correctly before corruption.
+        let rows = c.query().order_by("n", false).run().unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+    // Corrupt the persisted index: insert a malformed key row (numeric-lane
+    // byte 0x02 + payload with NO 0x00 0x00 terminator) into the raw
+    // namespace through the public byte-store API.
+    let ns = {
+        let store = Store::open(&path).unwrap();
+        let ns = store
+            .collections()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.starts_with("__scalar__docs__n"))
+            .expect("the scalar index namespace must exist in the raw catalog");
+        store.put(&ns, &[0x02, 0x05, 0x01], &[]).unwrap();
+        ns
+    };
+    let db = Db::open(&path).unwrap();
+    let err = db.collection("docs").query().order_by("n", false).run();
+    match &err {
+        Err(corvid::Error::CorruptIndex { context }) => {
+            assert!(
+                context.contains("__scalar__docs__n") && context.contains(&ns),
+                "the error must name the corrupt namespace {ns}, got {context:?}"
+            );
+        }
+        other => panic!("corrupt index key must error CorruptIndex, got {other:?}"),
+    }
+    // The documents themselves are untouched — a filtered query still works
+    // (the window scan tolerates rows without a doc key), so the failure is
+    // attributable to the order walk alone.
+    assert_eq!(
+        db.collection("docs")
+            .query()
+            .filter(field("n").ge(Value::Int(1)))
+            .run()
+            .unwrap()
+            .len(),
+        3
+    );
+    drop(db);
+    // Removing the single corrupt row through the raw store restores service.
+    {
+        let store = Store::open(&path).unwrap();
+        store.delete(&ns, &[0x02, 0x05, 0x01]).unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    let rows = db
+        .collection("docs")
+        .query()
+        .order_by("n", false)
+        .run()
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+}
+
 /// `Error::CorruptIndex` driven end-to-end from a REAL database file: build
 /// an on-disk vector index, close, corrupt the index bytes on disk (the
 /// reserved `__dann__*` namespace's row values are garbled through the

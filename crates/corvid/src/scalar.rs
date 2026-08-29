@@ -40,6 +40,48 @@ const LANE_TEXT: u8 = 0x03;
 /// Reserved collection holding persisted compound-index definitions.
 const COMPOUND_DEFS: &str = "__cscalar_indexes__";
 
+/// Reserved collection holding compound-index **miss markers**: one row per
+/// compound def that has ever observed (in backfill or maintenance) a
+/// document leaving an indexed field missing/non-encodable. Presence means
+/// `all_docs_indexed` must be false for that def — see [`CompoundDef`].
+/// A separate namespace (not a def-key suffix) so the def scans never see
+/// phantom definitions.
+const COMPOUND_MISS: &str = "__cscalar_misses__";
+
+/// Compound def kind bytes (the opaque bytes after the creation-state codec,
+/// `index_build::encode_def`). Single byte:
+/// - `Complete` + `[1]`: every document in the collection has ALL the
+///   index's fields present and encodable (`all_docs_indexed`) — the
+///   soundness precondition for prefix-only windows.
+/// - `Complete` + anything else (`[0]`, `[2]`, empty, legacy): not all
+///   indexed. `[2]` is the crash-window value: the backfill driver's own
+///   final transaction writes it before the flag-aware completion rewrites
+///   `[1]`/`[0]` below, so a crash between the two conservatively decodes
+///   false.
+/// - `Building` + `[2]`: this build cycle is **flag-aware** (registered by
+///   the current code; miss markers are authoritative for the whole
+///   corpus). A `Building` row with other kind bytes is a pre-flag legacy
+///   cycle: its early pages counted no misses, so completion must not set
+///   the flag.
+const KIND_ALL_INDEXED: u8 = 1;
+const KIND_FLAG_AWARE: u8 = 2;
+
+/// The per-def compound state kept in memory.
+#[derive(Default)]
+pub(crate) struct CompoundDef {
+    /// Whether the creation backfill is still in flight (an interrupted
+    /// creation). A building index is never served; the first probe (or a
+    /// re-creation) resumes the build.
+    pub(crate) building: bool,
+    /// Whether EVERY document in the collection has all this index's fields
+    /// present and encodable — set at backfill completion iff no miss was
+    /// ever observed (backfill page or maintenance write), and flipped
+    /// false permanently on any miss write. `false` for building defs and
+    /// all legacy defs. Recomputed by re-registration (a fresh cycle clears
+    /// the miss markers and re-walks the corpus).
+    pub(crate) all_docs_indexed: bool,
+}
+
 /// Per-database scalar-index registry.
 #[derive(Default)]
 pub(crate) struct ScalarState {
@@ -47,10 +89,10 @@ pub(crate) struct ScalarState {
     /// still **building** (an interrupted creation). Maintenance iterates all
     /// defs; serviceability requires `building == false`.
     defs: std::collections::HashMap<(String, String), bool>,
-    /// Compound indexes: `(collection, ordered field list)` → whether the
-    /// index is still **building** (an interrupted creation). Maintenance
-    /// iterates all defs; serviceability requires `building == false`.
-    compound: std::collections::HashMap<(String, Vec<String>), bool>,
+    /// Compound indexes: `(collection, ordered field list)` → per-def state
+    /// (building / all-docs-indexed). Maintenance iterates all defs;
+    /// serviceability requires `building == false`.
+    compound: std::collections::HashMap<(String, Vec<String>), CompoundDef>,
 }
 
 pub(crate) fn new_state() -> std::sync::Mutex<ScalarState> {
@@ -345,7 +387,10 @@ fn num_value_of(key: &[u8]) -> Option<f64> {
 /// SKIPPED: NaN is indexed (it is a float) but incomparable, so it belongs
 /// to the post-comparable tail of the order, not the walk. The forward map
 /// (`0x00`-prefixed) and the bool lane sort below the numeric lane and are
-/// never visited.
+/// never visited. A key with no value terminator is malformed (unreachable
+/// via the encoder) and errors [`crate::Error::CorruptIndex`] — the
+/// corruption philosophy is to fail loudly, never silently skip rows the
+/// walk's consumer (the order-index path) would then mis-order.
 pub(crate) fn comparable_entries(
     reader: &dyn SnapshotReader,
     ns: &str,
@@ -364,7 +409,11 @@ pub(crate) fn comparable_entries(
                 break;
             }
             let Some(t) = terminator_pos(key) else {
-                continue; // malformed entry: no doc key to offer
+                return Err(crate::Error::CorruptIndex {
+                    context: format!(
+                        "index key without a value terminator in index namespace '{ns}': {key:02x?}"
+                    ),
+                });
             };
             if key[0] == LANE_NUM && num_value_of(key).is_some_and(f64::is_nan) {
                 continue; // NaN: incomparable (class 1) — tail, not walk
@@ -760,16 +809,22 @@ impl Db {
 
     /// Load persisted compound-index definitions. Called once on open. Legacy
     /// rows without state bytes decode as `Complete`; a `Building` row marks
-    /// the index for lazy resume on first use.
+    /// the index for lazy resume on first use. The `all_docs_indexed` flag
+    /// decodes from the def row's kind byte — legacy/absent bytes read as
+    /// false (backward compatible: a pre-flag database declines prefix-only
+    /// windows until its indexes are re-created).
     pub(crate) fn load_compound_defs(&self) -> Result<()> {
         let mut state = self.scalar().lock().expect("scalar lock");
         for (key, value) in self.store().scan(COMPOUND_DEFS)? {
             if let Some(def) = split_compound_def_key(&key) {
-                // Kind bytes are unused for compound defs (empty).
-                let (_, st) = crate::index_build::decode_def(&value);
+                let (kind, st) = crate::index_build::decode_def(&value);
                 state.compound.insert(
                     def,
-                    matches!(st, crate::index_build::DefState::Building { .. }),
+                    CompoundDef {
+                        building: matches!(st, crate::index_build::DefState::Building { .. }),
+                        all_docs_indexed: matches!(st, crate::index_build::DefState::Complete)
+                            && kind.first() == Some(&KIND_ALL_INDEXED),
+                    },
                 );
             }
         }
@@ -777,10 +832,14 @@ impl Db {
     }
 
     /// Register (or replace) a compound index over `fields` for `collection`:
-    /// the def row becomes `Building` (empty cursor) so a crash between
-    /// registration and backfill completion leaves a never-served, resumable
-    /// state. An in-flight `Building` row keeps its cursor, so a
-    /// re-registration resumes the interrupted backfill instead of rescanning.
+    /// the def row becomes `Building` (empty cursor, kind `KIND_FLAG_AWARE`
+    /// — a flag-aware cycle) so a crash between registration and backfill
+    /// completion leaves a never-served, resumable state. An in-flight
+    /// `Building` row keeps its cursor, so a re-registration resumes the
+    /// interrupted backfill instead of rescanning. A FRESH cycle (complete
+    /// def or none) also clears the def's miss marker in the same
+    /// transaction: a re-registration recomputes `all_docs_indexed` from
+    /// scratch, so miss events from previous cycles must not outlive it.
     pub(crate) fn register_compound_index(
         &self,
         collection: &str,
@@ -790,19 +849,27 @@ impl Db {
         let in_flight =
             crate::index_build::read_building_cursor(self.store(), COMPOUND_DEFS, &key)?.is_some();
         if !in_flight {
-            self.store().put(
-                COMPOUND_DEFS,
-                &key,
-                &crate::index_build::encode_def(
-                    &[],
-                    &crate::index_build::DefState::Building { cursor: vec![] },
-                ),
-            )?;
+            self.store().transaction(|tx| {
+                tx.put(
+                    COMPOUND_DEFS,
+                    &key,
+                    &crate::index_build::encode_def(
+                        &[KIND_FLAG_AWARE],
+                        &crate::index_build::DefState::Building { cursor: vec![] },
+                    ),
+                )?;
+                tx.delete(COMPOUND_MISS, &key)?;
+                Ok(())
+            })?;
         }
         let mut state = self.scalar().lock().expect("scalar lock");
-        state
-            .compound
-            .insert((collection.to_owned(), fields.to_vec()), true);
+        state.compound.insert(
+            (collection.to_owned(), fields.to_vec()),
+            CompoundDef {
+                building: true,
+                all_docs_indexed: false,
+            },
+        );
         Ok(())
     }
 
@@ -830,7 +897,7 @@ impl Db {
         state
             .compound
             .iter()
-            .filter(|((c, _), building)| c == collection && !*building)
+            .filter(|((c, _), d)| c == collection && !d.building)
             .map(|((_, f), _)| f.clone())
             .collect()
     }
@@ -854,16 +921,51 @@ impl Db {
         state
             .compound
             .get(&(collection.to_owned(), fields.to_vec()))
-            .is_some_and(|building| !*building)
+            .is_some_and(|d| !d.building)
+    }
+
+    /// Whether `fields` of `collection` has a complete compound index whose
+    /// `all_docs_indexed` flag is true — the soundness precondition for
+    /// prefix-only windows (see [`CompoundDef`]).
+    pub(crate) fn compound_all_docs_indexed(&self, collection: &str, fields: &[String]) -> bool {
+        let state = self.scalar().lock().expect("scalar lock");
+        state
+            .compound
+            .get(&(collection.to_owned(), fields.to_vec()))
+            .is_some_and(|d| !d.building && d.all_docs_indexed)
     }
 
     /// Flip a compound index's in-memory def to complete after its backfill
-    /// committed `Complete` on disk.
-    pub(crate) fn mark_compound_complete(&self, collection: &str, fields: &[String]) {
+    /// committed `Complete` on disk, with the computed `all_docs_indexed`
+    /// flag.
+    pub(crate) fn mark_compound_complete(
+        &self,
+        collection: &str,
+        fields: &[String],
+        all_indexed: bool,
+    ) {
         let mut state = self.scalar().lock().expect("scalar lock");
-        state
+        state.compound.insert(
+            (collection.to_owned(), fields.to_vec()),
+            CompoundDef {
+                building: false,
+                all_docs_indexed: all_indexed,
+            },
+        );
+    }
+
+    /// Flip a compound index's in-memory `all_docs_indexed` to false — a
+    /// document write just left an indexed field missing/non-encodable, so
+    /// the def is not in the index's coverage from now on (permanent until
+    /// re-registration recomputes it).
+    fn compound_miss_in_memory(&self, collection: &str, fields: &[String]) {
+        let mut state = self.scalar().lock().expect("scalar lock");
+        if let Some(d) = state
             .compound
-            .insert((collection.to_owned(), fields.to_vec()), false);
+            .get_mut(&(collection.to_owned(), fields.to_vec()))
+        {
+            d.all_docs_indexed = false;
+        }
     }
 
     /// Building compound defs of `collection` as `(fields, cursor)` jobs,
@@ -890,8 +992,23 @@ impl Db {
     }
 
     /// (Re-)run the atomic backfill for one compound index from `cursor`,
-    /// then mark it complete — the exact driver invocation
+    /// then complete the def — the exact driver invocation
     /// `create_compound_index` uses, shared with lazy resumes.
+    ///
+    /// `all_docs_indexed` completion: every page that declines to index a
+    /// document (a field missing/non-encodable) commits a miss marker for
+    /// this def in the SAME transaction as the page, so a crash mid-backfill
+    /// never loses a miss. After the driver commits its `Complete` row
+    /// (kind `[KIND_FLAG_AWARE]`, which conservatively decodes as
+    /// not-all-indexed), one final transaction computes the flag —
+    /// `flag-aware cycle AND no miss marker` — reading the marker and
+    /// writing the def in ONE transaction: a concurrent maintenance miss
+    /// either commits before it (marker seen → false) or after it (flips
+    /// the now-complete def's flag to false itself). A crash between the
+    /// driver's completion and this rewrite leaves the conservative `false`
+    /// on disk. A legacy (pre-flag) `Building` row was never marked aware,
+    /// so its flag can only complete false — re-create the index to earn
+    /// the flag.
     pub(crate) fn resume_compound(
         &self,
         collection: &str,
@@ -899,33 +1016,66 @@ impl Db {
         cursor: &[u8],
     ) -> Result<()> {
         let ns = compound_namespace(collection, fields);
-        let kb: Vec<u8> = Vec::new();
+        let key = compound_def_key(collection, fields);
+        // A resumed cycle keeps the awareness its registration wrote; a
+        // legacy cycle (empty kind bytes) stays unaware.
+        let aware = match self.store().get(COMPOUND_DEFS, &key)? {
+            Some(row) => {
+                let (kind, st) = crate::index_build::decode_def(&row);
+                matches!(st, crate::index_build::DefState::Building { .. })
+                    && kind.first() == Some(&KIND_FLAG_AWARE)
+            }
+            None => false,
+        };
+        let kb = vec![KIND_FLAG_AWARE];
         crate::index_build::run_atomic_backfill(
             self.store(),
             collection,
             COMPOUND_DEFS,
-            &compound_def_key(collection, fields),
+            &key,
             &kb,
             cursor,
             &mut |tx, page| {
-                for (key, bytes) in page {
+                for (doc_key, bytes) in page {
                     let doc = Value::decode(bytes)?;
                     let values: Option<Vec<&Value>> =
                         fields.iter().map(|f| doc.get_path(f)).collect();
-                    if let Some(vs) = &values {
-                        compound_insert_in_txn(tx, &ns, key, vs)?;
+                    match &values {
+                        Some(vs) => compound_insert_in_txn(tx, &ns, doc_key, vs)?,
+                        None => tx.put(COMPOUND_MISS, &key, &[])?,
                     }
                 }
                 Ok(())
             },
         )?;
-        self.mark_compound_complete(collection, fields);
+        let all_indexed = aware
+            && self.store().transaction(|tx| {
+                let clean = tx.get(COMPOUND_MISS, &key)?.is_none();
+                if clean {
+                    tx.put(
+                        COMPOUND_DEFS,
+                        &key,
+                        &crate::index_build::encode_def(
+                            &[KIND_ALL_INDEXED],
+                            &crate::index_build::DefState::Complete,
+                        ),
+                    )?;
+                }
+                Ok(clean)
+            })?;
+        self.mark_compound_complete(collection, fields, all_indexed);
         Ok(())
     }
 
-    /// Maintain every compound index on `collection` after a document write.
-    /// Maintain every compound index on `collection` inside the caller's
-    /// write transaction.
+    /// Maintain every compound index on `collection` after a document write,
+    /// inside the caller's write transaction. A document leaving any indexed
+    /// field missing/non-encodable is not indexed — and permanently clears
+    /// that def's `all_docs_indexed`: the miss is persisted in the SAME
+    /// transaction (a miss marker while the def is still `Building`, a
+    /// def-rewrite to flag=false once `Complete`), so a crash can never
+    /// leave a served prefix-only window over an index with unindexed
+    /// matching documents. The flag is never re-flipped true without a
+    /// rebuild — re-registration recomputes it.
     pub(crate) fn compound_on_insert_in_txn(
         &self,
         tx: &mut crate::store::WriteBatch<'_>,
@@ -938,7 +1088,32 @@ impl Db {
             let values: Option<Vec<&Value>> = fields.iter().map(|f| doc.get_path(f)).collect();
             match &values {
                 Some(vs) => compound_insert_in_txn(tx, &ns, key, vs)?,
-                None => compound_remove_in_txn(tx, &ns, key)?,
+                None => {
+                    compound_remove_in_txn(tx, &ns, key)?;
+                    // Persist the miss: disk state decides which shape to
+                    // write (the in-memory `building` bit may lag a
+                    // concurrent re-registration).
+                    let dk = compound_def_key(collection, &fields);
+                    if let Some(row) = tx.get(COMPOUND_DEFS, &dk)? {
+                        let (_, st) = crate::index_build::decode_def(&row);
+                        match st {
+                            crate::index_build::DefState::Complete => {
+                                tx.put(
+                                    COMPOUND_DEFS,
+                                    &dk,
+                                    &crate::index_build::encode_def(
+                                        &[0],
+                                        &crate::index_build::DefState::Complete,
+                                    ),
+                                )?;
+                            }
+                            crate::index_build::DefState::Building { .. } => {
+                                tx.put(COMPOUND_MISS, &dk, &[])?;
+                            }
+                        }
+                    }
+                    self.compound_miss_in_memory(collection, &fields);
+                }
             }
         }
         Ok(())
@@ -964,6 +1139,14 @@ impl Db {
     /// B3). `None` if no such index, the prefix is empty with no tail, or the
     /// candidate set exceeds `cap`. Resume discipline as
     /// [`Db::scalar_candidates`]: the caller resumes before its snapshot.
+    ///
+    /// Soundness gate: a query leaving trailing fields unconstrained
+    /// (prefix-only) is served ONLY when the def's `all_docs_indexed` flag is
+    /// true. When the flag is false, the index may skip documents the filter
+    /// still matches (a missing/non-encodable trailing field), so the window
+    /// would not be a superset — decline. When the flag is true, every
+    /// document in the collection is in the index, so every match is in the
+    /// window.
     pub(crate) fn compound_candidates(
         &self,
         collection: &str,
@@ -975,6 +1158,10 @@ impl Db {
     ) -> Result<Option<Vec<Vec<u8>>>> {
         if !self.has_compound_index(collection, fields) || (eq_prefix.is_empty() && tail.is_empty())
         {
+            return Ok(None);
+        }
+        let covered = eq_prefix.len() + usize::from(!tail.is_empty());
+        if covered < fields.len() && !self.compound_all_docs_indexed(collection, fields) {
             return Ok(None);
         }
         let Some(prefix) = encode_tuple(eq_prefix) else {
@@ -1400,6 +1587,35 @@ mod tests {
         // order is the builder's job), then the text lane; NaN and bool
         // rows absent.
         assert_eq!(got, vec!["y", "w", "x", "z", "s", "t"]);
+    }
+
+    /// A malformed index key (no `0x00 0x00` value terminator — unreachable
+    /// via the encoder, the shape bit-rot or a hand-corrupted row produces)
+    /// makes `comparable_entries` error `Error::CorruptIndex` instead of
+    /// silently skipping the row: the order walk that consumes it would
+    /// otherwise mis-order the result without any signal (audit C1's
+    /// fail-loudly philosophy; the end-to-end twin lives in lifecycle.rs).
+    #[test]
+    fn comparable_entries_errors_on_terminator_less_key() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .transaction(|tx| {
+                insert_in_txn(tx, "ix", b"good", &Value::Int(1))?;
+                // Hand-corrupted row: numeric-lane key with payload but NO
+                // terminator, so `terminator_pos` finds no doc-key boundary.
+                tx.put("ix", &[LANE_NUM, 0x05, 0x01], &[])
+            })
+            .unwrap();
+        let err = comparable_entries(&store, "ix", |_, _| Ok(true)).unwrap_err();
+        match err {
+            crate::Error::CorruptIndex { context } => {
+                assert!(
+                    context.contains("ix"),
+                    "the error must name the corrupt namespace, got {context:?}"
+                );
+            }
+            other => panic!("malformed key must error CorruptIndex, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1913,6 +2129,102 @@ mod tests {
             vec![vec![41u8], vec![43u8], vec![45u8], vec![47u8], vec![49u8]],
             "a completed compound index must serve"
         );
+    }
+
+    /// A miss observed while the def is still BUILDING must survive the
+    /// backfill completion: a document inserted mid-build (before the walk's
+    /// cursor) is never seen by any backfill page, so the maintenance path
+    /// persists a miss marker in the document's own transaction — the
+    /// completion reads it and completes with `all_docs_indexed` = false.
+    /// Forged deterministically (no threads): register a Building def
+    /// exactly as an interrupted creation would, write the corpus through
+    /// the maintenance path, then let the first query resume the build.
+    #[test]
+    fn compound_miss_during_building_survives_completion() {
+        use crate::field;
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        let fields = vec!["a".to_owned(), "b".to_owned()];
+        // Register Building (the interrupted-creation state) BEFORE any
+        // document exists: every insert below takes the maintenance path.
+        db.register_compound_index("docs", &fields).unwrap();
+        for i in 0..20i64 {
+            let mut m = BTreeMap::new();
+            m.insert("a".to_owned(), Value::Text(format!("g{}", i % 2)));
+            m.insert("b".to_owned(), Value::Int(i));
+            c.insert(&[i as u8], &Value::Map(m)).unwrap();
+        }
+        // The miss: matches a g-equality prefix-only filter, missing `b`,
+        // inserted while the def is Building (before the walk's cursor).
+        let mut m = BTreeMap::new();
+        m.insert("a".to_owned(), Value::Text("g0".into()));
+        c.insert(b"z", &Value::Map(m)).unwrap();
+        // A prefix-only query resumes the build and must NOT be served the
+        // window afterwards (the miss marker persisted through completion),
+        // yet stay CORRECT via the scan fallback — including the z doc.
+        let rows = c
+            .query()
+            .filter(field("a").eq(Value::Text("g0".into())))
+            .run()
+            .unwrap();
+        let mut got: Vec<Vec<u8>> = rows.into_iter().map(|r| r.key).collect();
+        got.sort();
+        let mut want: Vec<Vec<u8>> = (0..20i64)
+            .filter(|i| i % 2 == 0)
+            .map(|i| vec![i as u8])
+            .chain(std::iter::once(b"z".to_vec()))
+            .collect();
+        want.sort();
+        assert_eq!(got, want);
+        assert!(
+            !db.compound_all_docs_indexed("docs", &fields),
+            "the mid-build miss must keep the completed flag false"
+        );
+        // The prefix-only probe declines (the planner-visible consequence).
+        assert!(
+            db.compound_candidates(
+                "docs",
+                &fields,
+                &[&Value::Text("g0".into())],
+                &[],
+                1000,
+                db.store()
+            )
+            .unwrap()
+            .is_none(),
+            "prefix-only must decline while the flag is false"
+        );
+    }
+
+    /// The flag-aware completion happy path through the internal probe: an
+    /// all-present corpus (docs inserted BEFORE the index is created, so
+    /// the backfill pages see them) earns the flag and the prefix-only
+    /// probe serves.
+    #[test]
+    fn compound_backfill_computes_all_docs_indexed_flag() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        for i in 0..20i64 {
+            let mut m = BTreeMap::new();
+            m.insert("a".to_owned(), Value::Text(format!("g{}", i % 2)));
+            m.insert("b".to_owned(), Value::Int(i));
+            c.insert(&[i as u8], &Value::Map(m)).unwrap();
+        }
+        c.create_compound_index(&["a", "b"]).unwrap();
+        let fields = vec!["a".to_owned(), "b".to_owned()];
+        assert!(db.compound_all_docs_indexed("docs", &fields));
+        let got = db
+            .compound_candidates(
+                "docs",
+                &fields,
+                &[&Value::Text("g1".into())],
+                &[],
+                1000,
+                db.store(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.len(), 10);
     }
 
     #[test]

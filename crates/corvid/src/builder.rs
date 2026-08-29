@@ -51,7 +51,7 @@
 //! always matches some point in time even while writers commit concurrently.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::db::Collection;
 use crate::distance::Metric;
@@ -813,12 +813,20 @@ impl QueryBuilder<'_> {
     /// from `reader`'s snapshot, else `None`. Picks the index that matches
     /// the longest equality prefix.
     ///
-    /// Soundness gate: the window is a verified superset only when the
-    /// constraints cover EVERY field of the index. The compound index skips
-    /// documents missing any indexed field, so a query leaving a field
-    /// unconstrained — a prefix-only equality, or a tail-only range on the
-    /// leading field — can match such documents while the window cannot
-    /// contain them; those shapes decline to the scan path instead.
+    /// Soundness gate: with trailing fields unconstrained (a prefix-only
+    /// equality), the window is a verified superset ONLY when the def's
+    /// `all_docs_indexed` flag is true. When the flag is false, the compound
+    /// index skips documents missing any indexed field, so the query can
+    /// match such documents while the window cannot contain them — those
+    /// shapes decline to the scan path. When the flag is true, every
+    /// document in the collection has ALL the index's fields present and
+    /// encodable — in particular the leading field — so every document
+    /// MATCHING a prefix-only filter (matching requires the leading field
+    /// present, encodable, and equal to the prefix value) IS in the index,
+    /// and the prefix window contains every match: the window is sound.
+    /// Full-coverage shapes are sound regardless of the flag (a matching
+    /// doc has every field constrained, hence present and encodable, hence
+    /// indexed).
     fn compound_candidate_keys(&self, reader: &dyn SnapshotReader) -> Result<Option<Vec<Vec<u8>>>> {
         const CANDIDATE_CAP: usize = 100_000;
         let db = self.collection.db();
@@ -848,10 +856,14 @@ impl QueryBuilder<'_> {
             }
             // A range/eq on the field right after the prefix extends the window.
             let has_tail = prefix_len < fields.len() && !by_field(&fields[prefix_len]).is_empty();
-            if prefix_len + usize::from(has_tail) < fields.len() {
-                // Some trailing field is unconstrained: documents missing it
-                // match the filters but are not indexed, so the window would
-                // not be a superset — decline and let the scan serve the query.
+            if prefix_len + usize::from(has_tail) < fields.len()
+                && !db.compound_all_docs_indexed(coll, &fields)
+            {
+                // A trailing field is unconstrained AND the def's
+                // `all_docs_indexed` flag is false: documents missing the
+                // trailing field can match the filters while sitting outside
+                // the index — the window would not be a superset, so decline
+                // and let the scan serve the query.
                 continue;
             }
             let score = prefix_len + usize::from(has_tail);
@@ -1141,7 +1153,8 @@ impl QueryBuilder<'_> {
         // 3. A compound index whose EVERY field is covered by the query's
         //    constraints — a full-equality prefix over the fields, or a
         //    prefix plus a tail constraint on the next (last) field; a
-        //    prefix-only query declines to scan — the selection half of
+        //    prefix-only query declines to scan UNLESS the def's
+        //    `all_docs_indexed` flag is true — the selection half of
         //    `compound_candidate_keys`, without reading keys. The real probe
         //    scores every registered index (longest Eq prefix, then tail)
         //    and drives ONLY the winner, so the twin picks the same winner
@@ -1159,9 +1172,12 @@ impl QueryBuilder<'_> {
                 prefix_len += 1;
             }
             let has_tail = prefix_len < fields.len() && !by_field(&fields[prefix_len]).is_empty();
-            if prefix_len + usize::from(has_tail) < fields.len() {
+            if prefix_len + usize::from(has_tail) < fields.len()
+                && !db.compound_all_docs_indexed(coll, &fields)
+            {
                 // Soundness gate mirrored from `compound_candidate_keys`: a
-                // trailing unconstrained field admits unindexed matches.
+                // trailing unconstrained field admits unindexed matches
+                // unless every document is indexed.
                 continue;
             }
             let score = prefix_len + usize::from(has_tail);
@@ -1652,17 +1668,19 @@ impl QueryBuilder<'_> {
             // The buffer therefore holds the window extended back to a
             // bucket boundary (exact within-bucket order needs whole
             // buckets); memory stays bounded by window + largest bucket.
+            // A VecDeque so head eviction is O(1) (a Vec's `remove(0)`
+            // shifted the whole retained tail on every eviction).
             let window = limit.map_or(usize::MAX, |l| self.offset.saturating_add(l));
-            let mut buckets: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+            let mut buckets: VecDeque<(Vec<u8>, Vec<Vec<u8>>)> = VecDeque::new();
             let mut buffered = 0usize;
             crate::scalar::comparable_entries(reader, &ns, |value, doc_key| {
-                match buckets.last_mut() {
+                match buckets.back_mut() {
                     Some((e, b)) if e.as_slice() == value => b.push(doc_key.to_vec()),
-                    _ => buckets.push((value.to_vec(), vec![doc_key.to_vec()])),
+                    _ => buckets.push_back((value.to_vec(), vec![doc_key.to_vec()])),
                 }
                 buffered += 1;
                 while buckets.len() > 1 && buffered - buckets[0].1.len() >= window {
-                    buffered -= buckets.remove(0).1.len();
+                    buffered -= buckets.pop_front().expect("len > 1").1.len();
                 }
                 Ok(true)
             })?;
@@ -3205,9 +3223,27 @@ mod tests {
             PlanShape::IndexedWindow { kind: "compound" },
             "compound window",
         );
-        // A prefix-only query (trailing field unconstrained) must decline:
-        // documents missing the trailing field match the filters but are
-        // not indexed, so the window would not be a verified superset.
+        // The seed corpus has EVERY doc carrying both indexed fields, so the
+        // def completed with `all_docs_indexed` = true: a prefix-only query
+        // (trailing field unconstrained) is now SOUND — every matching doc
+        // has the leading field, hence is indexed — and takes the window.
+        parity(
+            comp.collection("docs")
+                .query()
+                .filter(field("category").eq(Value::Text("blog".into()))),
+            PlanShape::IndexedWindow { kind: "compound" },
+            "compound prefix-only served on an all-indexed corpus",
+        );
+        // The flag is live: one insert missing the trailing field
+        // permanently clears it, and the same prefix-only query declines
+        // again (the new doc matches the filter but sits outside the index).
+        {
+            let mut m = BTreeMap::new();
+            m.insert("category".to_owned(), Value::Text("blog".to_owned()));
+            comp.collection("docs")
+                .insert(b"d", &Value::Map(m))
+                .unwrap(); // no body at all
+        }
         parity(
             comp.collection("docs")
                 .query()
@@ -3215,7 +3251,36 @@ mod tests {
             PlanShape::Scan {
                 collection: "docs".to_owned(),
             },
-            "compound prefix-only declines to scan",
+            "compound prefix-only declines once a doc misses the tail field",
+        );
+        // And the flag recompute: re-creating the index while the
+        // missing-field doc remains keeps the decline (the backfill counts
+        // it as a miss)...
+        comp.collection("docs")
+            .create_compound_index(&["category", "body"])
+            .unwrap();
+        assert_eq!(
+            comp.collection("docs")
+                .query()
+                .filter(field("category").eq(Value::Text("blog".into())))
+                .plan_shape(),
+            PlanShape::Scan {
+                collection: "docs".to_owned()
+            },
+            "re-registration over a corpus with missing docs recomputes false"
+        );
+        // ...while deleting it and re-creating re-earns the flag.
+        comp.collection("docs").delete(b"d").unwrap();
+        comp.collection("docs")
+            .create_compound_index(&["category", "body"])
+            .unwrap();
+        assert_eq!(
+            comp.collection("docs")
+                .query()
+                .filter(field("category").eq(Value::Text("blog".into())))
+                .plan_shape(),
+            PlanShape::IndexedWindow { kind: "compound" },
+            "re-registration over an all-present corpus recomputes true"
         );
 
         // Geo kind: a top-level GeoWithin over a geo index with a real bbox.

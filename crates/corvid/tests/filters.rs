@@ -23,7 +23,9 @@
 
 use std::collections::BTreeMap;
 
-use corvid::{CmpOp, Collection, Db, PlanShape, Predicate, ResultRow, Value, field, haversine_km};
+use corvid::{
+    CmpOp, Collection, Db, PlanShape, Predicate, ResultRow, Store, Value, field, haversine_km,
+};
 
 fn map(pairs: &[(&str, Value)]) -> Value {
     let mut m = BTreeMap::new();
@@ -1454,7 +1456,9 @@ fn filters_indexed_vs_scan_compound_prefix() {
         // PREFIX-ONLY equality (no constraint on n): documents missing n
         // (c6) DO match the filters but are absent from the index (only
         // fully-present docs are indexed) — the window would NOT be a
-        // superset, so the query must NOT use it.
+        // superset, so the query must NOT use it. (The corpus has missing
+        // fields, so the all_docs_indexed flag completed false — the
+        // sound decline this test pins.)
         (field("cat").eq(text("blog")), vec!["c1", "c2", "c6"]),
         (field("cat").eq(text("news")), vec!["c3", "c4"]),
     ];
@@ -1463,6 +1467,280 @@ fn filters_indexed_vs_scan_compound_prefix() {
         assert_eq!(matching_keys(&scan, p), want_keys, "scan side of {p:?}");
         assert_eq!(matching_keys(&idx, p), want_keys, "indexed side of {p:?}");
     }
+}
+
+/// The `all_docs_indexed` re-enable: on a corpus where EVERY document has
+/// both compound fields, the def completes with the flag true and a
+/// PREFIX-ONLY equality (tail unconstrained) is SERVED through
+/// `IndexedWindow { kind: "compound" }` — with results identical to the
+/// scan twin (every matching doc has the leading field, hence is indexed,
+/// so the window is a verified superset).
+#[test]
+fn filters_compound_prefix_served_when_all_docs_indexed() {
+    let docs: Vec<(&[u8], Value)> = vec![
+        (b"c1", map(&[("cat", text("blog")), ("n", Value::Int(5))])),
+        (b"c2", map(&[("cat", text("blog")), ("n", Value::Int(9))])),
+        (b"c3", map(&[("cat", text("news")), ("n", Value::Int(5))])),
+        (b"c4", map(&[("cat", text("news")), ("n", Value::Int(9))])),
+    ];
+    let scan_db = Db::open_in_memory().unwrap();
+    let scan = seed(&scan_db, "compound", &docs);
+    let idx_db = Db::open_in_memory().unwrap();
+    let idx = seed(&idx_db, "compound", &docs);
+    idx.create_compound_index(&["cat", "n"]).unwrap();
+
+    // Prefix-only equality takes the compound window (was Scan before the
+    // flag — compare filters_indexed_vs_scan_compound_prefix, whose corpus
+    // has missing fields and still declines).
+    assert_eq!(
+        idx.query()
+            .filter(field("cat").eq(text("blog")))
+            .plan_shape(),
+        PlanShape::IndexedWindow { kind: "compound" }
+    );
+    assert_eq!(
+        scan.query()
+            .filter(field("cat").eq(text("blog")))
+            .plan_shape(),
+        PlanShape::Scan {
+            collection: "compound".to_owned()
+        }
+    );
+
+    let cases: Vec<(Predicate, Vec<&str>)> = vec![
+        (field("cat").eq(text("blog")), vec!["c1", "c2"]),
+        (field("cat").eq(text("news")), vec!["c3", "c4"]),
+        (
+            field("cat")
+                .eq(text("blog"))
+                .and(field("n").ge(Value::Int(6))),
+            vec!["c2"],
+        ),
+    ];
+    for (p, want) in &cases {
+        let want_keys = ks(want);
+        assert_eq!(matching_keys(&scan, p), want_keys, "scan side of {p:?}");
+        assert_eq!(matching_keys(&idx, p), want_keys, "indexed side of {p:?}");
+    }
+}
+
+/// The flag is LIVE: after the all-present corpus earns the flag, one
+/// insert whose doc leaves the tail field missing permanently clears it —
+/// the prefix-only window declines again, and the scan twin still returns
+/// the full result set including the new doc (the missing-tail doc matches
+/// a prefix-only filter but sits outside the index). Re-creating the index
+/// recomputes the flag: false while the offending doc remains, true again
+/// once it is gone (a fresh cycle re-walks the whole corpus).
+#[test]
+fn filters_compound_prefix_flag_flips_false_on_missing_field_insert() {
+    let idx_db = Db::open_in_memory().unwrap();
+    let idx = idx_db.collection("compound");
+    for (k, cat, n) in [
+        (b"c1", "blog", Value::Int(5)),
+        (b"c2", "blog", Value::Int(9)),
+        (b"c3", "news", Value::Int(5)),
+        (b"c4", "news", Value::Int(9)),
+    ] {
+        idx.insert(k, &map(&[("cat", text(cat)), ("n", n)]))
+            .unwrap();
+    }
+    idx.create_compound_index(&["cat", "n"]).unwrap();
+    assert_eq!(
+        idx.query()
+            .filter(field("cat").eq(text("blog")))
+            .plan_shape(),
+        PlanShape::IndexedWindow { kind: "compound" },
+        "all-present corpus earns the flag"
+    );
+
+    // The offending insert: matches cat=blog, missing the tail field n.
+    idx.insert(b"c5", &map(&[("cat", text("blog"))])).unwrap();
+    assert_eq!(
+        idx.query()
+            .filter(field("cat").eq(text("blog")))
+            .plan_shape(),
+        PlanShape::Scan {
+            collection: "compound".to_owned()
+        },
+        "a missing-tail insert permanently clears the flag"
+    );
+    // Results stay identical to a plain scan twin over the same corpus.
+    let scan_db = Db::open_in_memory().unwrap();
+    let scan = scan_db.collection("compound");
+    for (k, cat, n) in [
+        (b"c1", "blog", Value::Int(5)),
+        (b"c2", "blog", Value::Int(9)),
+        (b"c3", "news", Value::Int(5)),
+        (b"c4", "news", Value::Int(9)),
+    ] {
+        scan.insert(k, &map(&[("cat", text(cat)), ("n", n)]))
+            .unwrap();
+    }
+    scan.insert(b"c5", &map(&[("cat", text("blog"))])).unwrap();
+    let p = field("cat").eq(text("blog"));
+    assert_eq!(matching_keys(&scan, &p), ks(&["c1", "c2", "c5"]));
+    assert_eq!(matching_keys(&idx, &p), ks(&["c1", "c2", "c5"]));
+
+    // Re-registration while the missing-field doc remains: recomputed
+    // false (the backfill counts c5 as a miss).
+    idx.create_compound_index(&["cat", "n"]).unwrap();
+    assert_eq!(
+        idx.query()
+            .filter(field("cat").eq(text("blog")))
+            .plan_shape(),
+        PlanShape::Scan {
+            collection: "compound".to_owned()
+        },
+        "re-registration over a corpus with a missing-field doc recomputes false"
+    );
+    // Deleting it and re-registering re-earns the flag (fresh cycle).
+    idx.delete(b"c5").unwrap();
+    idx.create_compound_index(&["cat", "n"]).unwrap();
+    assert_eq!(
+        idx.query()
+            .filter(field("cat").eq(text("blog")))
+            .plan_shape(),
+        PlanShape::IndexedWindow { kind: "compound" },
+        "re-registration over an all-present corpus recomputes true"
+    );
+}
+
+/// The persisted flag round-trips a reopen in BOTH directions: true stays
+/// true (the def row's kind byte decodes), and a maintenance-cleared flag
+/// stays false.
+#[test]
+fn filters_compound_prefix_flag_persists_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corvid.db");
+    {
+        let db = Db::open(&path).unwrap();
+        let c = db.collection("compound");
+        c.insert(b"c1", &map(&[("cat", text("blog")), ("n", Value::Int(5))]))
+            .unwrap();
+        c.insert(b"c2", &map(&[("cat", text("news")), ("n", Value::Int(9))]))
+            .unwrap();
+        c.create_compound_index(&["cat", "n"]).unwrap();
+    }
+    {
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.collection("compound")
+                .query()
+                .filter(field("cat").eq(text("blog")))
+                .plan_shape(),
+            PlanShape::IndexedWindow { kind: "compound" },
+            "the earned flag decodes on reopen"
+        );
+        // Clear it with a missing-tail insert, then reopen again.
+        db.collection("compound")
+            .insert(b"c3", &map(&[("cat", text("blog"))]))
+            .unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    assert_eq!(
+        db.collection("compound")
+            .query()
+            .filter(field("cat").eq(text("blog")))
+            .plan_shape(),
+        PlanShape::Scan {
+            collection: "compound".to_owned()
+        },
+        "the maintenance-cleared flag decodes on reopen"
+    );
+}
+
+/// Dump→load round-trips the flag WITHOUT serializing it: load replays
+/// `create_compound_index`, a fresh cycle that recomputes the flag from the
+/// loaded corpus — exact, not merely conservative (true corpus → served,
+/// missing-field corpus → declined).
+#[test]
+fn filters_compound_prefix_flag_roundtrips_dump_load() {
+    let dump_of = |with_missing: bool| {
+        let src = Db::open_in_memory().unwrap();
+        let c = src.collection("compound");
+        c.insert(b"c1", &map(&[("cat", text("blog")), ("n", Value::Int(5))]))
+            .unwrap();
+        c.insert(b"c2", &map(&[("cat", text("news")), ("n", Value::Int(9))]))
+            .unwrap();
+        if with_missing {
+            c.insert(b"c3", &map(&[("cat", text("blog"))])).unwrap();
+        }
+        c.create_compound_index(&["cat", "n"]).unwrap();
+        let mut buf = Vec::new();
+        src.dump(&mut buf).unwrap();
+        buf
+    };
+    for (with_missing, want_served) in [(false, true), (true, false)] {
+        let dst = Db::open_in_memory().unwrap();
+        dst.load(dump_of(with_missing).as_slice()).unwrap();
+        let got = dst
+            .collection("compound")
+            .query()
+            .filter(field("cat").eq(text("blog")))
+            .plan_shape();
+        assert_eq!(
+            got,
+            if want_served {
+                PlanShape::IndexedWindow { kind: "compound" }
+            } else {
+                PlanShape::Scan {
+                    collection: "compound".to_owned(),
+                }
+            },
+            "dump/load with missing-field corpus = {with_missing}"
+        );
+    }
+}
+
+/// Legacy def rows (pre-flag, no kind byte) decode as NOT-all-indexed:
+/// even over an all-present corpus, a legacy `Complete` def declines
+/// prefix-only windows until the index is re-created (backward
+/// compatibility: absence of the flag byte reads as false).
+#[test]
+fn filters_legacy_compound_def_without_flag_byte_declines_prefix_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corvid.db");
+    {
+        let db = Db::open(&path).unwrap();
+        let c = db.collection("compound");
+        c.insert(b"c1", &map(&[("cat", text("blog")), ("n", Value::Int(5))]))
+            .unwrap();
+        c.insert(b"c2", &map(&[("cat", text("news")), ("n", Value::Int(9))]))
+            .unwrap();
+        c.create_compound_index(&["cat", "n"]).unwrap();
+    }
+    // Overwrite the def row with the legacy empty form (exactly the
+    // pre-flag on-disk shape) through the public byte-store surface, with
+    // the Db handle dropped so the file lock is free.
+    {
+        let store = Store::open(&path).unwrap();
+        store
+            .put("__cscalar_indexes__", b"compound\x00cat\x00n", b"")
+            .unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    assert_eq!(
+        db.collection("compound")
+            .query()
+            .filter(field("cat").eq(text("blog")))
+            .plan_shape(),
+        PlanShape::Scan {
+            collection: "compound".to_owned()
+        },
+        "legacy def rows decode as not-all-indexed"
+    );
+    // Re-creating the index (a flag-aware cycle) re-earns the flag.
+    db.collection("compound")
+        .create_compound_index(&["cat", "n"])
+        .unwrap();
+    assert_eq!(
+        db.collection("compound")
+            .query()
+            .filter(field("cat").eq(text("blog")))
+            .plan_shape(),
+        PlanShape::IndexedWindow { kind: "compound" },
+        "re-creation earns the flag on an all-present corpus"
+    );
 }
 
 // ===========================================================================
