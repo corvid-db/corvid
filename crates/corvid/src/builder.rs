@@ -1871,7 +1871,7 @@ fn keep_smaller(best: &mut Option<Vec<Vec<u8>>>, candidate: Option<Vec<Vec<u8>>>
 /// and 5% window density (221 µs / 456 µs vs the walk's 413 µs / 487 µs),
 /// the walk wins at 10% (577 µs vs 745 µs); the two cost lines cross at
 /// ~289 candidates of 5k (density ≈ 5.8%, i.e. a ratio of ≈ 17) — see the
-/// roadmap Task 4 report for the table.
+/// docs/BENCHES.md for the table.
 const ROWS_PER_POINT_GET: u64 = 17;
 
 /// The density crossover itself, factored for direct testing:
