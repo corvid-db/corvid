@@ -1042,16 +1042,21 @@ fn vector_inmemory_pq_cross_metrics_orders_and_exact_distances() {
     }
 }
 
-/// Recall vs the exact scan twin on a fixed clustered corpus, with the bound
-/// justified the same way as the direct-API test in `hnsw.rs`: measured
-/// recall on this corpus shape is `ef`-insensitive (the graph recovers the
-/// ADC ranking; the residual gap to exact is the codebook's resolution), and
-/// `m = 8` code bytes for a 16-dim vector (8× compression) recovers a solid
-/// majority of true neighbours. Also pins determinism (two identically built
-/// databases answer identically — training, encoding and the graph's level
-/// RNG are all seeded) and reopen (the trained codebook persists with the
-/// def; the post-reopen lazy rebuild re-encodes under it and answers
-/// identically — the codebook-row pin itself is in `index.rs`'s unit tests).
+/// Recall vs the exact scan twin on a fixed clustered corpus. The bound is
+/// raised to what the public path actually delivers on this shape: measured
+/// recall is 1.0 (300 docs in 10 tight clusters, `m = 8`: the in-memory
+/// index's over-fetch plus the exact rerank from stored documents recovers
+/// the complete top-k — the quantization loss is hidden by candidates the
+/// walk gathers beyond k), and the 0.7 bound leaves room for corpus-shape
+/// sensitivity while staying far above chance (10 clusters → ~0.1). Also
+/// pins determinism (two identically built databases answer identically —
+/// training, encoding and the graph's level RNG are all seeded) and reopen
+/// (the trained codebook persists with the def; the post-reopen lazy
+/// rebuild re-encodes under it and answers identically — the codebook-row
+/// pin itself is in `index.rs`'s unit tests). The `ef`-insensitivity
+/// premise of the direct-API path is pinned separately in `hnsw.rs`'s
+/// `pq_recall_matches_exact_baseline` (this test goes through
+/// `vector_search`, which does not expose `ef`).
 #[test]
 fn vector_inmemory_pq_recall_determinism_and_reopen() {
     let data = pq_clustered(300, 16, 10);
@@ -1086,7 +1091,7 @@ fn vector_inmemory_pq_recall_determinism_and_reopen() {
         total += got.intersection(&want).count() as f64 / k as f64;
     }
     let recall = total / queries.len() as f64;
-    assert!(recall >= 0.5, "in-memory PQ recall {recall} below 0.5");
+    assert!(recall >= 0.7, "in-memory PQ recall {recall} below 0.7");
 
     // Determinism: a second identical build answers identically.
     let twin = build_db("pq-twin");

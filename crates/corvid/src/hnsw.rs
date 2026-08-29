@@ -651,13 +651,15 @@ mod tests {
         }
     }
 
-    /// Recall vs the exact baseline on a fixed clustered corpus, with the
-    /// bound justified from where the loss lives: measured recall on this
-    /// corpus is insensitive to `ef_search` (identical at 100/200/400) — the
-    /// graph recovers essentially the whole ADC ranking, and the residual gap
-    /// to exact is the codebook's resolution, not graph reach. `m=8, k=64`
-    /// measures ~0.56; the 0.5 bound leaves margin for the graph's small
-    /// contribution while staying far above chance (12 clusters → ~0.08).
+    /// Recall vs the exact baseline on a fixed clustered corpus. The bound is
+    /// justified from where the loss lives, and the premise is pinned, not
+    /// just claimed: recall on this corpus is measured identical at
+    /// `ef_search` 100/200/400 (0.56 at each — the loop below asserts both
+    /// the value and the insensitivity), because the graph recovers
+    /// essentially the whole ADC ranking and the residual gap to exact is
+    /// the codebook's resolution, not graph reach. `m=8, k=64`; the 0.55
+    /// bound sits just under the measured 0.56 while staying far above
+    /// chance (12 clusters → ~0.08).
     #[test]
     fn pq_recall_matches_exact_baseline() {
         let data = clustered(400, 16, 12);
@@ -667,15 +669,34 @@ mod tests {
             h.insert(v.clone());
         }
         let k = 10;
-        let mut total_recall = 0.0;
         let queries = clustered(20, 16, 12);
-        for q in &queries {
-            let approx: HashSet<usize> = h.search(q, k, 100).into_iter().map(|(i, _)| i).collect();
-            let exact: HashSet<usize> = exact_knn(&data, q, k, Metric::L2).into_iter().collect();
-            total_recall += approx.intersection(&exact).count() as f64 / k as f64;
+        let recall_at = |ef: usize| {
+            let mut total = 0.0;
+            for q in &queries {
+                let approx: HashSet<usize> = h.search(q, k, ef).into_iter().map(|(i, _)| i).collect();
+                let exact: HashSet<usize> = exact_knn(&data, q, k, Metric::L2).into_iter().collect();
+                total += approx.intersection(&exact).count() as f64 / k as f64;
+            }
+            total / queries.len() as f64
+        };
+        // The ef-insensitivity premise is itself pinned, not just asserted in
+        // prose: recall is identical at 100/200/400 (measured 0.56 at each),
+        // because the graph already recovers essentially the whole ADC
+        // ranking — the residual gap to exact is the codebook's resolution,
+        // not graph reach. Raising ef cannot buy recall that ADC ranking
+        // never contained.
+        let recalls: Vec<f64> = [100usize, 200, 400].iter().map(|&ef| recall_at(ef)).collect();
+        for (i, ef) in [100usize, 200, 400].iter().enumerate() {
+            assert!(
+                recalls[i] >= 0.55,
+                "PQ recall {} at ef={ef} below 0.55",
+                recalls[i]
+            );
         }
-        let recall = total_recall / queries.len() as f64;
-        assert!(recall >= 0.5, "PQ recall {recall} below 0.5");
+        assert!(
+            recalls.windows(2).all(|w| w[0] == w[1]),
+            "PQ recall must be ef-insensitive on this corpus, got {recalls:?}"
+        );
     }
 
     /// PQ build is reproducible end-to-end: training is seeded/fixed-iteration
