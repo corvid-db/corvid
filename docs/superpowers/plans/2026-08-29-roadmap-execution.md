@@ -201,6 +201,11 @@ row → Fixed.
 
 ## Task 10: In-memory PQ
 
+Prepend (W3 wave review, binding): fix the "lazily" wording at graph.rs:14,
+graph.rs:450, CHANGELOG ~84 — adjacency after dump→load is BUILT BY THE END
+OF LOAD via replayed link_weighted (lazy-establishment is the mechanism;
+the timing is not lazy); say that.
+
 Wire `pq.rs` into the in-memory HNSW as a `Quantization` option (new
 variant or flag — public API addition → manifest rows + conformance
 tests: train/encode/search determinism, recall-vs-exact on fixed corpora
@@ -243,7 +248,7 @@ parallelism is INSIDE one build).
 
 ## Task 14: Program exit
 
-Full gates; all benches recorded AND COMMITTED IN-REPO as docs/BENCHES.md (reconcile conservative-stale citations: AUDIT 'this commit' rows get hashes; compound AFTER number unified 232.41 µs; BEFORE provenance noted) (machine, date, before/after per task — the wave-1 baselines currently live only in git-ignored workspace reports; this file is the durable record);
+Full gates; all benches recorded AND COMMITTED IN-REPO as docs/BENCHES.md (reconcile conservative-stale citations: AUDIT 'this commit' rows get hashes; compound AFTER number unified 232.41 µs; BEFORE provenance noted; DESIGN adjacency/a__b decision-row dates 2026-08-28→29; add the one-line v1-PQ fixture exercising count() at the m/k site) (machine, date, before/after per task — the wave-1 baselines currently live only in git-ignored workspace reports; this file is the durable record);
 SYNTAX.md regenerated if surface grew; CHANGELOG complete; AUDIT.md
 Open→Fixed flips verified; DESIGN.md decision-log rows for every shipped
 item; final whole-branch review; ledger close; push.
