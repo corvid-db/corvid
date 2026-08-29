@@ -271,6 +271,19 @@ parallelism is INSIDE one build).
 
 ## Task 14: Program exit
 
+Carry-ins (W4 wave review, binding): (I1) AUDIT.md:63 adjacency row still
+says "rebuilds lazily" — fix to "built by the end of load"; (M1) add
+create_vector_index_pq to the every-family composite round-trip test in
+tests/lifecycle.rs; (M2) update recall citations in AUDIT:66, DESIGN:237,
+DESIGN:556, CHANGELOG to the raised pins (conformance ≥0.7, unit ≥0.55 —
+and note the thin unit margin in BENCHES.md); (M3) unify declined-HNSW
+speedup ranges to the report's numbers (0.21-0.45× @2k×64d, 0.20-0.25×
+@10k×128d) wherever "0.22-0.5×" appears; (M4) the v1-PQ count() fixture;
+(M5) DESIGN residual-risk note: PQ def outliving its training corpus makes
+dump→load fail with EmptyIndexTraining (pre-existing family shape, mode 2
+and 3); (M6) drop the dead cfg_attr(unused_variables) on
+semantic_cache::get.
+
 Full gates; all benches recorded AND COMMITTED IN-REPO as docs/BENCHES.md (reconcile conservative-stale citations: AUDIT 'this commit' rows get hashes; compound AFTER number unified 232.41 µs; BEFORE provenance noted; DESIGN adjacency/a__b decision-row dates 2026-08-28→29; add the one-line v1-PQ fixture exercising count() at the m/k site) (machine, date, before/after per task — the wave-1 baselines currently live only in git-ignored workspace reports; this file is the durable record);
 SYNTAX.md regenerated if surface grew; CHANGELOG complete; AUDIT.md
 Open→Fixed flips verified; DESIGN.md decision-log rows for every shipped
