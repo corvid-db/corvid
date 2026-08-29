@@ -164,6 +164,14 @@ mod tests {
         )
     }
 
+    fn vector_doc(v: Vec<f32>) -> crate::Value {
+        crate::Value::Map(
+            [("embedding".to_owned(), crate::Value::Vector(v))]
+                .into_iter()
+                .collect(),
+        )
+    }
+
     #[test]
     fn tracing_feature_instrumentation_fires_for_build_and_query() {
         let rec = install();
@@ -223,6 +231,44 @@ mod tests {
         assert!(
             log.contains("shape=\"sort_index\""),
             "sort_index shape missing:\n{log}"
+        );
+    }
+
+    /// Task 12 prepend (a): `inmemory_compaction`'s `live` field must count
+    /// nodes still serving searches (total − tombstoned), matching the
+    /// on-disk `ondisk_compaction` event's semantics — NOT
+    /// `node_to_key.len()`, which counts tombstoned slots too. Corpus: one
+    /// document whose vector is overwritten 20 times — each overwrite
+    /// tombstones the old node and adds a new one, so at the trigger the
+    /// graph holds 21 total slots, 20 dead, 1 live (dead-majority → the
+    /// next search compacts). The buggy field reported live=21.
+    #[test]
+    fn inmemory_compaction_event_reports_live_nodes() {
+        let rec = install();
+        let db = crate::Db::open_in_memory().unwrap();
+        let c = db.collection("tr_compact");
+        c.create_vector_index("embedding", crate::Metric::L2)
+            .unwrap();
+        c.insert(b"k", &vector_doc(vec![0.0, 0.0])).unwrap();
+        // First search lazily builds the graph (1 node, 0 dead).
+        let _ = c
+            .vector_search("embedding", &[0.0, 0.0], 1, crate::Metric::L2)
+            .unwrap();
+        for i in 0..20 {
+            c.insert(b"k", &vector_doc(vec![i as f32, 0.0])).unwrap();
+        }
+        rec.0.lock().unwrap().clear();
+        let _ = c
+            .vector_search("embedding", &[0.0, 0.0], 1, crate::Metric::L2)
+            .unwrap();
+        let log = rec.0.lock().unwrap().join("\n");
+        assert!(
+            log.contains("message=\"inmemory_compaction\""),
+            "compaction event missing (trigger should have crossed):\n{log}"
+        );
+        assert!(
+            log.contains("dead=20 live=1"),
+            "live must be live nodes (total − dead), not node_to_key.len():\n{log}"
         );
     }
 }

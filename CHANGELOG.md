@@ -24,8 +24,13 @@ format and API may change without backward-compatibility guarantees.
   actual crossing, and the rebuild outcome); lazy index-build resumes and
   adjacency rebuilds (including whether the adjacency marker was absent
   or stale-shaped); query plan-shape selection (one event per query:
-  which arm drove the candidate set — labels mirroring the public
-  `PlanShape` variants — and how many candidates it produced, making the
+  which arm drove the candidate set — labels named after the public
+  `PlanShape` variants, with two deliberate divergences: `indexed_window`
+  carries no family discriminator (the scalar/compound/geo/or kind is
+  `plan_shape()`/`explain()`'s to report, not the event's) and
+  `stream_scan` is intentionally finer than `PlanShape::Scan` (it splits
+  the bounded streaming filter pass from the materializing fallback) —
+  and how many candidates it produced, making the
   index-walk vs point-get decision visible); the order-index walk's
   on-exhaustion tail scan; the edge-cascade rebuild fallback on a corrupt
   adjacency row; and semantic-cache hit/miss with the deciding distance.

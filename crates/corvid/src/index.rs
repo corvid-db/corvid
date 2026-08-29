@@ -600,20 +600,25 @@ impl Db {
 
             // Compact if more than half the graph is tombstoned. The rebuild
             // reads fresh state under the lock for the same reason as the
-            // first build above.
-            let (dead, live) = state
+            // first build above. `dead * 2 > total` is the documented
+            // in-memory rule (dead-majority of ALL slots — cf. the on-disk
+            // trigger's earlier one-third-of-total crossing); the event's
+            // `live` reports the nodes still serving searches
+            // (total − dead), matching `ondisk_compaction`'s semantics —
+            // NOT `node_to_key.len()`, which counts tombstoned slots too.
+            let (dead, total) = state
                 .built
                 .get(&map_key)
                 .map(|b| (b.dead(), b.node_to_key.len()))
                 .unwrap_or((0, 0));
-            if live > 0 && dead * 2 > live {
+            if total > 0 && dead * 2 > total {
                 crate::telemetry::event!(
                     INFO,
                     message = "inmemory_compaction",
                     collection = crate::telemetry::display(collection),
                     field = crate::telemetry::display(field),
                     dead = dead as u64,
-                    live = live as u64,
+                    live = (total - dead) as u64,
                 );
                 let built = build_index(self.store(), collection, field, def.clone())?;
                 state.built.insert(map_key.clone(), built);
