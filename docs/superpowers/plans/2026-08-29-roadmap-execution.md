@@ -126,6 +126,14 @@ to Fixed with the mechanism named.
 
 ## Task 7: Adjacency edge layout (derived indexes)
 
+Prepend (Task 6 fix re-review, binding): scalar.rs mark_compound_complete
+(~951) unconditionally inserts the whole CompoundDef — a concurrent
+miss-write's compound_miss_in_memory(false) landing between the completion
+txn commit and the in-memory insert leaves memory true over disk [0]
+(reopens self-heal; microscopic window; pre-existing shape). Fix: make the
+in-memory completion merge with current state (never overwrite an existing
+false) or re-check disk under the lock; add a targeted test if the
+interleaving is constructible via the public API.
 Prepend (Task 3 review, binding): fix the remaining corpus-doc numbers in
 benches/engine.rs edge_churn comments (~line 195 "~1 in-edge on average" is
 wrong — non-hub mean in-degree is ~7.5; ~line 218 hub "~625" counts calls,
