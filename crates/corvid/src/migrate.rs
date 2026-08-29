@@ -291,6 +291,11 @@ impl Db {
                         put_u64(&mut buf, m);
                         put_u64(&mut buf, k);
                     }
+                    VectorMode::InMemoryPq { m, k } => {
+                        buf.push(3);
+                        put_u64(&mut buf, m);
+                        put_u64(&mut buf, k);
+                    }
                 }
             }
 
@@ -491,6 +496,11 @@ impl Db {
                     let m = rd.count()?;
                     let k = rd.count()?;
                     c.create_vector_index_ondisk_pq(&field, metric, m, k)?;
+                }
+                3 => {
+                    let m = rd.count()?;
+                    let k = rd.count()?;
+                    c.create_vector_index_pq(&field, metric, m, k)?;
                 }
                 _ => return Err(Error::InvalidDump("bad vector mode".into())),
             }
@@ -734,6 +744,48 @@ mod tests {
         assert!(!c.text_search("body", "item", 5).unwrap().is_empty());
         // TTL restored.
         assert_eq!(c.ttl(&[200u8]).unwrap(), Some(12345));
+    }
+
+    /// An in-memory PQ index dumps as vector mode 3 (`InMemoryPq { m, k }`)
+    /// and load recreates it through `create_vector_index_pq` — retraining
+    /// deterministically on the replayed documents — so the loaded database
+    /// carries the same index kind and serves ANN queries.
+    #[test]
+    fn dump_load_round_trips_inmemory_pq_index() {
+        let src = Db::open_in_memory().unwrap();
+        let c = src.collection("docs");
+        let doc = |v: Vec<f32>| {
+            let mut m = BTreeMap::new();
+            m.insert("v".to_owned(), Value::Vector(v));
+            Value::Map(m)
+        };
+        // Two separated clusters so PQ has structure to learn.
+        for i in 0..40u8 {
+            let base = if i % 2 == 0 { 0.0 } else { 50.0 };
+            c.insert(&[i], &doc(vec![base + i as f32 * 0.01, base, base, base]))
+                .unwrap();
+        }
+        c.create_vector_index_pq("v", Metric::L2, 4, 16).unwrap();
+
+        let mut bytes = Vec::new();
+        src.dump(&mut bytes).unwrap();
+        let dst = Db::open_in_memory().unwrap();
+        dst.load(&bytes[..]).unwrap();
+
+        // The recreated def is the same PQ kind with the same params.
+        let specs = dst.vector_specs();
+        assert!(
+            specs
+                .iter()
+                .any(|s| matches!(s.mode, crate::index::VectorMode::InMemoryPq { m: 4, k: 16 }))
+        );
+        // And it serves: a cluster-A query returns cluster-A keys.
+        let c = dst.collection("docs");
+        let hits = c
+            .vector_search("v", &[0.0, 0.0, 0.0, 0.0], 4, Metric::L2)
+            .unwrap();
+        assert_eq!(hits.len(), 4);
+        assert!(hits.iter().all(|h| h.key[0] % 2 == 0));
     }
 
     #[test]

@@ -984,3 +984,217 @@ fn vector_builder_select_order_limit_offset_interplay() {
     run(false);
     run(true);
 }
+
+// ===========================================================================
+// 9. In-memory PQ (create_vector_index_pq) — the metric×storage matrix
+// ===========================================================================
+
+/// Deterministic clustered vectors (the `pq.rs` suite shape: centers +
+/// noise), so PQ has structure to learn — uniform noise compresses poorly
+/// for any quantizer.
+fn pq_clustered(n: usize, dim: usize, clusters: usize) -> Vec<Vec<f32>> {
+    let mut state: u64 = 0x1357_9BDF_2468_ACE0;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as f32 / u32::MAX as f32
+    };
+    let centers: Vec<Vec<f32>> = (0..clusters)
+        .map(|_| (0..dim).map(|_| next() * 10.0).collect())
+        .collect();
+    (0..n)
+        .map(|i| {
+            let c = &centers[i % clusters];
+            c.iter().map(|&x| x + (next() - 0.5)).collect()
+        })
+        .collect()
+}
+
+/// PQ joins the in-memory quantization modes for EVERY metric: `dim = 2`
+/// splits into `m = 2` subspaces; the same complete-graph + exact-rerank
+/// argument as `vector_metric_quantization_cross_orders_and_exact_distances`
+/// applies (a 5-node graph at `DEFAULT_M` is complete on layer 0, the search
+/// over-fetches past the whole corpus, and quantization perturbs distances,
+/// not reachability), so `k >= corpus` returns the exact order with
+/// bitwise-exact hand-computed distances under each metric.
+#[test]
+fn vector_inmemory_pq_cross_metrics_orders_and_exact_distances() {
+    for metric in all_metrics() {
+        let db = Db::open_in_memory().unwrap();
+        let name = format!("pqx_{metric:?}");
+        let c = seed(&db, &name, &corpus_docs());
+        c.create_vector_index_pq("v", metric, 2, 16).unwrap();
+
+        let (want_keys, want_dists) = expected(metric);
+        let hits = c.vector_search("v", &QUERY, 8, metric).unwrap();
+        assert_eq!(
+            hit_keys(&hits),
+            k(&want_keys),
+            "{metric:?}/PQ: k > corpus must return every doc in exact order"
+        );
+        assert_eq!(hits.len(), 5);
+        for (h, want) in hits.iter().zip(want_dists) {
+            assert_eq!(h.distance, want, "{metric:?}/PQ exact distance");
+            assert!(h.approximate, "{metric:?}/PQ served by the index");
+            assert_eq!(h.document.get("v"), Some(&corpus_vector(&h.key)));
+        }
+    }
+}
+
+/// Recall vs the exact scan twin on a fixed clustered corpus, with the bound
+/// justified the same way as the direct-API test in `hnsw.rs`: measured
+/// recall on this corpus shape is `ef`-insensitive (the graph recovers the
+/// ADC ranking; the residual gap to exact is the codebook's resolution), and
+/// `m = 8` code bytes for a 16-dim vector (8× compression) recovers a solid
+/// majority of true neighbours. Also pins determinism (two identically built
+/// databases answer identically — training, encoding and the graph's level
+/// RNG are all seeded) and reopen (the trained codebook persists with the
+/// def; the post-reopen lazy rebuild re-encodes under it and answers
+/// identically — the codebook-row pin itself is in `index.rs`'s unit tests).
+#[test]
+fn vector_inmemory_pq_recall_determinism_and_reopen() {
+    let data = pq_clustered(300, 16, 10);
+    let query = |c: &corvid::Collection<'_>, q: &[f32], k: usize| {
+        hit_keys(&c.vector_search("v", q, k, Metric::L2).unwrap())
+    };
+
+    let build_db = |name: &str| -> Db {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection(name);
+        for (i, v) in data.iter().enumerate() {
+            c.insert(format!("k{i}").as_bytes(), &doc("t", v.clone()))
+                .unwrap();
+        }
+        c.create_vector_index_pq("v", Metric::L2, 8, 64).unwrap();
+        db
+    };
+
+    // Recall vs the exact twin (an unindexed database of the same docs).
+    let exact = build_db("pq-exact");
+    let indexed = build_db("pq-ix");
+    let queries = pq_clustered(15, 16, 10);
+    let k = 10;
+    let mut total = 0.0;
+    for q in &queries {
+        let got: std::collections::HashSet<Vec<u8>> = query(&indexed.collection("pq-ix"), q, k)
+            .into_iter()
+            .collect();
+        let want: std::collections::HashSet<Vec<u8>> = query(&exact.collection("pq-exact"), q, k)
+            .into_iter()
+            .collect();
+        total += got.intersection(&want).count() as f64 / k as f64;
+    }
+    let recall = total / queries.len() as f64;
+    assert!(recall >= 0.5, "in-memory PQ recall {recall} below 0.5");
+
+    // Determinism: a second identical build answers identically.
+    let twin = build_db("pq-twin");
+    for q in &queries {
+        assert_eq!(
+            query(&indexed.collection("pq-ix"), q, k),
+            query(&twin.collection("pq-twin"), q, k),
+        );
+    }
+
+    // Reopen: identical answers after the post-reopen lazy rebuild.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pq.db");
+    {
+        let db = Db::open(&path).unwrap();
+        let c = db.collection("pq-file");
+        for (i, v) in data.iter().enumerate() {
+            c.insert(format!("k{i}").as_bytes(), &doc("t", v.clone()))
+                .unwrap();
+        }
+        c.create_vector_index_pq("v", Metric::L2, 8, 64).unwrap();
+    }
+    let before = {
+        let db = Db::open(&path).unwrap();
+        queries
+            .iter()
+            .map(|q| query(&db.collection("pq-file"), q, k))
+            .collect::<Vec<_>>()
+    };
+    let after = {
+        let db = Db::open(&path).unwrap();
+        queries
+            .iter()
+            .map(|q| query(&db.collection("pq-file"), q, k))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(before, after, "reopen must rebuild under the same codebook");
+}
+
+/// PQ creation needs something to train on, and `m` must divide the field's
+/// dimension — both surface as the documented `EmptyIndexTraining`.
+#[test]
+fn vector_inmemory_pq_creation_requires_training_documents() {
+    let db = Db::open_in_memory().unwrap();
+    let err = db
+        .collection("pq-none")
+        .create_vector_index_pq("v", Metric::L2, 4, 16);
+    assert!(matches!(err, Err(corvid::Error::EmptyIndexTraining)));
+
+    // dim 2 is not divisible by m = 3.
+    let c = seed(&db, "pq-badm", &corpus_docs());
+    let err = c.create_vector_index_pq("v", Metric::L2, 3, 16);
+    assert!(matches!(err, Err(corvid::Error::EmptyIndexTraining)));
+}
+
+/// The direct `Hnsw::with_pq` API pins the metric×storage plumbing bitwise:
+/// under L2 every reported distance IS the ADC table lookup sum for the
+/// stored code (`Pq::adc_l2` over `Pq::l2_table`), and under cosine it IS
+/// the reconstruct-then-distance value (`Pq::distance`) — the same contract
+/// the on-disk PQ index exposes. Builds are reproducible.
+#[test]
+fn vector_hnsw_direct_pq_adc_and_reconstruction_paths() {
+    use corvid::pq::Pq;
+    use std::sync::Arc;
+
+    let data = pq_clustered(120, 8, 5);
+    let pq = Arc::new(Pq::train(&data, 4, 16).unwrap());
+
+    // L2: the ADC fast path.
+    let mut l2 = Hnsw::with_pq(Metric::L2, pq.clone(), 8, 64);
+    for v in &data {
+        l2.insert(v.clone());
+    }
+    let q = &data[10];
+    let table = pq.l2_table(q).unwrap();
+    for (id, dist) in l2.search(q, 5, 50) {
+        let want = pq.adc_l2(&table, &pq.encode(&data[id]));
+        assert_eq!(dist, want, "L2 must score through the ADC table");
+    }
+
+    // Cosine: the reconstruction path.
+    let mut cos = Hnsw::with_pq(Metric::Cosine, pq.clone(), 8, 64);
+    for v in &data {
+        cos.insert(v.clone());
+    }
+    for (id, dist) in cos.search(q, 5, 50) {
+        let want = pq.distance(Metric::Cosine, q, &pq.encode(&data[id]));
+        assert_eq!(dist, want, "cosine must score by reconstruction");
+    }
+
+    // Dot serves too (same reconstruction path).
+    let mut dot = Hnsw::with_pq(Metric::Dot, pq.clone(), 8, 64);
+    for v in &data {
+        dot.insert(v.clone());
+    }
+    for (id, dist) in dot.search(q, 5, 50) {
+        let want = pq.distance(Metric::Dot, q, &pq.encode(&data[id]));
+        assert_eq!(dist, want, "dot must score by reconstruction");
+    }
+
+    // Reproducibility: identical builds answer identically.
+    let build = || {
+        let pq = Arc::new(Pq::train(&data, 4, 16).unwrap());
+        let mut h = Hnsw::with_pq(Metric::L2, pq, 8, 64);
+        for v in &data {
+            h.insert(v.clone());
+        }
+        h.search(q, 5, 50)
+    };
+    assert_eq!(build(), build());
+}

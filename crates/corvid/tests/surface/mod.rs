@@ -1850,6 +1850,11 @@ static MANIFEST: &[Row] = &[
         &["vector_hnsw_direct_api_extreme_params_and_determinism"],
     ),
     row(
+        "corvid::Hnsw::with_pq",
+        "Vector search",
+        &["vector_hnsw_direct_pq_adc_and_reconstruction_paths"],
+    ),
+    row(
         "corvid::Hnsw::len",
         "Vector search",
         &["vector_hnsw_direct_api_extreme_params_and_determinism"],
@@ -1919,6 +1924,15 @@ static MANIFEST: &[Row] = &[
         &[
             "vector_create_index_overloads_inmemory_ondisk_and_pq",
             "schema_vector_pq_creation_training_error_variants_and_success",
+        ],
+    ),
+    row(
+        "corvid::Collection::create_vector_index_pq",
+        "Schema (ALTER)",
+        &[
+            "vector_inmemory_pq_cross_metrics_orders_and_exact_distances",
+            "vector_inmemory_pq_recall_determinism_and_reopen",
+            "vector_inmemory_pq_creation_requires_training_documents",
         ],
     ),
     // ===== fts.rs — text index creation =====

@@ -7,6 +7,27 @@ format and API may change without backward-compatibility guarantees.
 ## [Unreleased]
 
 ### Added
+- `Collection::create_vector_index_pq(field, metric, m, k)` (and
+  `Hnsw::with_pq(metric, pq, m, ef_construction)` on the direct index API):
+  product quantization for the **in-memory** HNSW — the same compression the
+  on-disk PQ index ships (`m` code bytes per vector instead of `dim * 4`;
+  e.g. 16× at 64 dims with `m = 16`, plus the one-off `m × k × (dim/m)`-float
+  codebook), applied to the RAM-resident graph. The codebook trains
+  deterministically from a bounded sample of existing vectors
+  (`EmptyIndexTraining` without any, or when `m` does not divide the field's
+  dimension) and persists in the index's reserved namespace in the same
+  transaction as the definition — so after a reopen the lazily rebuilt graph
+  re-encodes under the SAME trained codebook, and dump/load round-trips the
+  index as a new vector mode carrying `m`/`k`. Every metric serves, matching
+  the on-disk contract exactly: L2 scores through the asymmetric-distance
+  table (the ADC fast path), cosine and dot through reconstruct-then-distance
+  (ADC tables for non-L2 metrics remain future work). Recall on the fixed
+  clustered conformance corpus is 0.73 vs the exact scan (pinned ≥ 0.5;
+  the number is `ef`-insensitive — the graph recovers the ADC ranking and
+  the residual gap is codebook resolution). Measured on the pinned bench
+  corpus (2000×64d, `m = 16, k = 256`): build 367.9 ms vs 124.9 ms
+  full-precision, search 35.8 µs vs 19.1 µs — the footprint/time trade in
+  two numbers (`hnsw_build_pq_2k_64d`, `hnsw_search_pq_2k_64d`).
 - `Db::load_with_renames(reader, renames)` — the `a__b` migration path:
   loading a dump from a pre-wave-4 database whose collection names contain
   `__` (accepted then, rejected by name validation since) through a
@@ -81,8 +102,9 @@ format and API may change without backward-compatibility guarantees.
   databases written before this change), maintained transactionally by
   `link`/`link_weighted`/`unlink`, self-healing if a derived row is
   corrupt (rebuild from source rows + re-run), and invisible — never
-  listed by `collections()`, never in a dump (dump→load rebuilds it
-  lazily). Public graph behavior is byte-identical. Measured on the
+  listed by `collections()`, never in a dump (dump→load replays every edge
+  through `link_weighted`, so the adjacency is built again by the end of
+  load, not deferred to first use). Public graph behavior is byte-identical. Measured on the
   pinned benchmarks: the hub-heavy 100-doc delete sweep drops 241.0 ms →
   40.5 ms (~5.9×, asymptotically O(degree) vs O(collection edges)) and
   the mixed `delete_heavy` half-delete 566.8 ms → 194.5 ms; pure link

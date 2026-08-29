@@ -12,8 +12,10 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
+use std::sync::Arc;
 
 use crate::distance::Metric;
+use crate::pq::Pq;
 pub use crate::quant::Quantization;
 use crate::quant::{Probe, StoredVec};
 
@@ -26,6 +28,80 @@ pub const DEFAULT_EF_CONSTRUCTION: usize = 128;
 struct Node {
     vector: StoredVec,
     layers: Vec<Vec<usize>>,
+}
+
+/// How a query is scored against stored vectors: a plain [`Quantization`]
+/// probe, a full vector for the PQ reconstruction path, or a precomputed PQ
+/// L2 asymmetric-distance table for the fast path — the in-memory twin of
+/// `DiskParams`' probe logic in `disk_hnsw.rs`, so both indexes expose the
+/// same metric×storage contract.
+enum HProbe {
+    Q(Probe),
+    Pq(Vec<f32>),
+    PqAdc(Vec<f32>),
+}
+
+/// Distance plumbing for one insert/search: the index's storage scheme
+/// (plain quantization, or PQ codes under a trained codebook) and metric.
+/// Owned (the `Arc` codebook is a refcount bump) so an insert can hold a
+/// scorer across `&mut self` calls like `prune`.
+#[derive(Clone)]
+struct Scorer {
+    metric: Metric,
+    quant: Quantization,
+    pq: Option<Arc<Pq>>,
+}
+
+impl Scorer {
+    /// Build the PQ probe for a query: under L2, precompute the asymmetric-
+    /// distance table once (so each node costs `m` table lookups instead of
+    /// an O(dim) reconstruct + distance); other metrics keep the query
+    /// vector for reconstruction distances. This mirrors `DiskParams::
+    /// pq_probe` exactly — the same unreachable-fallback caveat applies
+    /// (dimension-mismatched queries are declined by callers first).
+    fn pq_probe(pq: &Pq, metric: Metric, query: Vec<f32>) -> HProbe {
+        match metric {
+            Metric::L2 => match pq.l2_table(&query) {
+                Some(table) => HProbe::PqAdc(table),
+                None => HProbe::Pq(query),
+            },
+            _ => HProbe::Pq(query),
+        }
+    }
+
+    /// Encode a query vector into the form distances are computed against.
+    fn probe(&self, query: &[f32]) -> HProbe {
+        match &self.pq {
+            Some(pq) => Self::pq_probe(pq, self.metric, query.to_vec()),
+            None => HProbe::Q(self.quant.probe(query)),
+        }
+    }
+
+    /// Build a probe from an already-stored vector (for neighbour pruning).
+    /// Unlike [`Scorer::probe`], the PQ path always keeps the DECODED vector
+    /// rather than an ADC table: pruning scores at most `m0 + 1` candidates,
+    /// where a table build (`k * dim` work) costs more than scoring that
+    /// handful by reconstruction — and for L2 the two score the same
+    /// quantity (`adc_l2` is exactly the squared L2 to the reconstruction,
+    /// so only fp-association can differ). The on-disk twin keeps its table
+    /// shape (its IO dominates); the public contract is identical either way.
+    fn probe_of(&self, stored: &StoredVec) -> HProbe {
+        match (&self.pq, stored) {
+            (Some(pq), StoredVec::Packed(code)) => HProbe::Pq(pq.decode(code)),
+            (Some(_), StoredVec::Full(_)) => HProbe::Pq(Vec::new()),
+            (None, _) => HProbe::Q(self.quant.probe_of(stored)),
+        }
+    }
+
+    /// Distance from a probe to a stored vector.
+    fn dist(&self, probe: &HProbe, stored: &StoredVec) -> f32 {
+        match (probe, &self.pq, stored) {
+            (HProbe::PqAdc(table), Some(pq), StoredVec::Packed(code)) => pq.adc_l2(table, code),
+            (HProbe::Pq(q), Some(pq), StoredVec::Packed(code)) => pq.distance(self.metric, q, code),
+            (HProbe::Q(p), None, _) => self.quant.dist(self.metric, p, stored),
+            _ => f32::INFINITY,
+        }
+    }
 }
 
 /// A distance/id pair, ordered by distance then id.
@@ -58,6 +134,9 @@ impl PartialOrd for Cand {
 pub struct Hnsw {
     metric: Metric,
     quant: Quantization,
+    /// When set, vectors are stored as PQ codes and distances use this
+    /// codebook (overrides `quant`, exactly like `DiskParams::pq`).
+    pq: Option<Arc<Pq>>,
     m: usize,
     m0: usize,
     ef_construction: usize,
@@ -90,10 +169,36 @@ impl Hnsw {
         m: usize,
         ef_construction: usize,
     ) -> Self {
+        Self::with_storage(metric, quant, None, m, ef_construction)
+    }
+
+    /// Create an index whose vectors are stored as product-quantized codes
+    /// under the trained codebook `pq` (see [`Pq::train`]): `m` code bytes
+    /// per vector instead of `dim * 4`. The metric×storage contract matches
+    /// the on-disk PQ index exactly: every metric serves — L2 scores through
+    /// the asymmetric-distance table ([`Pq::l2_table`]/[`Pq::adc_l2`], the
+    /// fast path), cosine and dot through reconstruct-then-distance
+    /// ([`Pq::distance`]). Callers insert vectors of the codebook's
+    /// dimension; a mismatched vector encodes to the all-zero code
+    /// ([`Pq::encode`]'s documented contract), which cannot be matched
+    /// meaningfully.
+    pub fn with_pq(metric: Metric, pq: Arc<Pq>, m: usize, ef_construction: usize) -> Self {
+        Self::with_storage(metric, Quantization::None, Some(pq), m, ef_construction)
+    }
+
+    /// The shared constructor: plain quantization or PQ storage.
+    fn with_storage(
+        metric: Metric,
+        quant: Quantization,
+        pq: Option<Arc<Pq>>,
+        m: usize,
+        ef_construction: usize,
+    ) -> Self {
         let m = m.max(2);
         Self {
             metric,
             quant,
+            pq,
             m,
             m0: m * 2,
             ef_construction: ef_construction.max(m),
@@ -116,13 +221,31 @@ impl Hnsw {
         self.nodes.is_empty()
     }
 
+    /// An owned scorer for this index's storage scheme (Arc refcount bump).
+    fn scorer(&self) -> Scorer {
+        Scorer {
+            metric: self.metric,
+            quant: self.quant,
+            pq: self.pq.clone(),
+        }
+    }
+
+    /// Encode a vector for storage (PQ codes when a codebook is set).
+    fn encode(&self, v: &[f32]) -> StoredVec {
+        match &self.pq {
+            Some(pq) => StoredVec::Packed(pq.encode(v)),
+            None => self.quant.encode(v),
+        }
+    }
+
     /// Insert `vector`, returning its assigned node id (its insertion order).
     pub fn insert(&mut self, vector: Vec<f32>) -> usize {
         let id = self.nodes.len();
         let level = self.random_level();
-        let probe = self.quant.probe(&vector);
+        let scorer = self.scorer();
+        let probe = scorer.probe(&vector);
         self.nodes.push(Node {
-            vector: self.quant.encode(&vector),
+            vector: self.encode(&vector),
             layers: vec![Vec::new(); level + 1],
         });
 
@@ -138,8 +261,7 @@ impl Hnsw {
         for layer in ((level + 1)..=top).rev() {
             let w = Self::search_layer(
                 &self.nodes,
-                self.metric,
-                self.quant,
+                &scorer,
                 &mut self.visited,
                 &mut self.epoch,
                 &probe,
@@ -155,8 +277,7 @@ impl Hnsw {
         for layer in (0..=start).rev() {
             let w = Self::search_layer(
                 &self.nodes,
-                self.metric,
-                self.quant,
+                &scorer,
                 &mut self.visited,
                 &mut self.epoch,
                 &probe,
@@ -194,18 +315,18 @@ impl Hnsw {
             return Vec::new();
         }
 
+        let scorer = self.scorer();
         let mut cur = entry;
         let top = self.nodes[entry].layers.len() - 1;
         // Query-time search uses a local scratch (queries are far rarer than
         // build-time inserts, which reuse the index's scratch).
         let mut visited = Vec::new();
         let mut epoch = 0u32;
-        let probe = self.quant.probe(query);
+        let probe = scorer.probe(query);
         for layer in (1..=top).rev() {
             let w = Self::search_layer(
                 &self.nodes,
-                self.metric,
-                self.quant,
+                &scorer,
                 &mut visited,
                 &mut epoch,
                 &probe,
@@ -217,8 +338,7 @@ impl Hnsw {
         }
         let w = Self::search_layer(
             &self.nodes,
-            self.metric,
-            self.quant,
+            &scorer,
             &mut visited,
             &mut epoch,
             &probe,
@@ -235,11 +355,10 @@ impl Hnsw {
     #[allow(clippy::too_many_arguments)]
     fn search_layer(
         nodes: &[Node],
-        metric: Metric,
-        quant: Quantization,
+        scorer: &Scorer,
         visited: &mut Vec<u32>,
         epoch: &mut u32,
-        probe: &Probe,
+        probe: &HProbe,
         entries: &[usize],
         ef: usize,
         layer: usize,
@@ -264,7 +383,7 @@ impl Hnsw {
         let mut results: BinaryHeap<Cand> = BinaryHeap::new();
 
         for &ep in entries {
-            let d = quant.dist(metric, probe, &nodes[ep].vector);
+            let d = scorer.dist(probe, &nodes[ep].vector);
             let c = Cand { dist: d, id: ep };
             candidates.push(Reverse(c));
             results.push(c);
@@ -277,7 +396,7 @@ impl Hnsw {
             }
             for &nb in &nodes[c.id].layers[layer] {
                 if newly_visited(nb) {
-                    let d = quant.dist(metric, probe, &nodes[nb].vector);
+                    let d = scorer.dist(probe, &nodes[nb].vector);
                     let worst = results.peek().map(|w| w.dist).unwrap_or(f32::INFINITY);
                     if results.len() < ef || d < worst {
                         let cand = Cand { dist: d, id: nb };
@@ -302,16 +421,11 @@ impl Hnsw {
         let ns = std::mem::take(&mut self.nodes[node].layers[layer]);
         // Compute each distance exactly once (not per comparison), with the
         // pruned node itself as the query.
-        let node_probe = self.quant.probe_of(&self.nodes[node].vector);
+        let scorer = self.scorer();
+        let node_probe = scorer.probe_of(&self.nodes[node].vector);
         let mut scored: Vec<(f32, usize)> = ns
             .iter()
-            .map(|&a| {
-                (
-                    self.quant
-                        .dist(self.metric, &node_probe, &self.nodes[a].vector),
-                    a,
-                )
-            })
+            .map(|&a| (scorer.dist(&node_probe, &self.nodes[a].vector), a))
             .collect();
         scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         scored.truncate(m);
@@ -488,5 +602,125 @@ mod tests {
             h.search(&data[7], 5, 30)
         };
         assert_eq!(build(), build());
+    }
+
+    // ---- PQ storage (the in-memory twin of the on-disk PQ contract) ----
+
+    /// Deterministic clustered vectors (the `pq.rs` shape): centers + noise,
+    /// so PQ has structure to learn (uniform noise compresses poorly).
+    fn clustered(n: usize, dim: usize, clusters: usize) -> Vec<Vec<f32>> {
+        let mut state: u64 = 0x0F1E_2D3C_4B5A_6978;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let centers: Vec<Vec<f32>> = (0..clusters)
+            .map(|_| (0..dim).map(|_| next() * 10.0).collect())
+            .collect();
+        (0..n)
+            .map(|i| {
+                let c = &centers[i % clusters];
+                c.iter().map(|&x| x + (next() - 0.5)).collect()
+            })
+            .collect()
+    }
+
+    /// Every metric serves under PQ storage: L2 through the ADC table,
+    /// cosine/dot through reconstruction. A query drawn from a cluster must
+    /// rank that cluster's members nearest under all three.
+    #[test]
+    fn pq_storage_serves_every_metric() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            let data = clustered(240, 16, 8);
+            let pq = Arc::new(Pq::train(&data, 8, 32).unwrap());
+            let mut h = Hnsw::with_pq(metric, pq, 16, 128);
+            for v in &data {
+                h.insert(v.clone());
+            }
+            let target = 100; // cluster 100 % 8 = 4
+            let cluster_of = |i: usize| i % 8;
+            let got = h.search(&data[target], 5, 64);
+            assert!(!got.is_empty(), "{metric:?} served nothing");
+            assert!(
+                got.iter()
+                    .all(|(id, _)| cluster_of(*id) == cluster_of(target)),
+                "{metric:?}: PQ top-5 must share the query's cluster, got {got:?}"
+            );
+        }
+    }
+
+    /// Recall vs the exact baseline on a fixed clustered corpus, with the
+    /// bound justified from where the loss lives: measured recall on this
+    /// corpus is insensitive to `ef_search` (identical at 100/200/400) — the
+    /// graph recovers essentially the whole ADC ranking, and the residual gap
+    /// to exact is the codebook's resolution, not graph reach. `m=8, k=64`
+    /// measures ~0.56; the 0.5 bound leaves margin for the graph's small
+    /// contribution while staying far above chance (12 clusters → ~0.08).
+    #[test]
+    fn pq_recall_matches_exact_baseline() {
+        let data = clustered(400, 16, 12);
+        let pq = Arc::new(Pq::train(&data, 8, 64).unwrap());
+        let mut h = Hnsw::with_pq(Metric::L2, pq, 16, 200);
+        for v in &data {
+            h.insert(v.clone());
+        }
+        let k = 10;
+        let mut total_recall = 0.0;
+        let queries = clustered(20, 16, 12);
+        for q in &queries {
+            let approx: HashSet<usize> = h.search(q, k, 100).into_iter().map(|(i, _)| i).collect();
+            let exact: HashSet<usize> = exact_knn(&data, q, k, Metric::L2).into_iter().collect();
+            total_recall += approx.intersection(&exact).count() as f64 / k as f64;
+        }
+        let recall = total_recall / queries.len() as f64;
+        assert!(recall >= 0.5, "PQ recall {recall} below 0.5");
+    }
+
+    /// PQ build is reproducible end-to-end: training is seeded/fixed-iteration
+    /// (pq.rs) and the graph's level RNG is seeded, so two identical builds
+    /// return identical results — same contract as the unquantized build.
+    #[test]
+    fn pq_build_is_reproducible() {
+        let data = clustered(80, 8, 4);
+        let build = || {
+            let pq = Arc::new(Pq::train(&data, 4, 16).unwrap());
+            let mut h = Hnsw::with_pq(Metric::L2, pq, 8, 64);
+            for v in &data {
+                h.insert(v.clone());
+            }
+            h.search(&data[7], 5, 30)
+        };
+        assert_eq!(build(), build());
+    }
+
+    /// Heap-footprint proxy, as exact arithmetic on the stored
+    /// representations: full precision stores `dim * 4` bytes per vector, PQ
+    /// stores `m` code bytes per vector (no header), at the fixed one-off
+    /// cost of the `m × k × (dim/m)`-float codebook. `dim=16, m=4` → 16×
+    /// smaller vector payload.
+    #[test]
+    fn pq_storage_footprint_is_m_bytes_per_vector() {
+        let data = corpus(100, 16);
+        let pq = Arc::new(Pq::train(&data, 4, 16).unwrap());
+        let mut plain = Hnsw::with_params(Metric::L2, 8, 64);
+        let mut quant = Hnsw::with_pq(Metric::L2, pq, 8, 64);
+        for v in &data {
+            plain.insert(v.clone());
+            quant.insert(v.clone());
+        }
+        let stored = |h: &Hnsw| {
+            h.nodes
+                .iter()
+                .map(|n| match &n.vector {
+                    StoredVec::Full(v) => v.len() * 4,
+                    StoredVec::Packed(b) => b.len(),
+                })
+                .sum::<usize>()
+        };
+        assert_eq!(stored(&plain), 100 * 16 * 4);
+        assert_eq!(stored(&quant), 100 * 4);
+        assert_eq!(stored(&plain) / stored(&quant), 16);
     }
 }

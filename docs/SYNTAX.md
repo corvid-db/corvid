@@ -115,7 +115,7 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::QueryBuilder::group_avg` — `aggregations_group_sum_avg_exact_per_bucket_and_absent_empty_buckets`, `aggregations_group_sum_avg_respect_filters`, `aggregations_ignore_limit_offset_select_order_by_and_sources`, `aggregations_indexed_vs_scan_equivalent_for_every_aggregate`
 - `corvid::Collection::approx_distinct` — `aggregations_approx_distinct_exact_small_counts_and_duplicates`, `aggregations_approx_distinct_distinguishes_encoded_kinds_and_skips_missing`, `aggregations_approx_distinct_bounded_error_on_larger_corpus`
 
-## Vector search — 38 construct(s)
+## Vector search — 39 construct(s)
 
 - `corvid::Metric` — `search_vector_smoke_ranks_nearest_first_exact`, `vector_metric_quantization_cross_orders_and_exact_distances`
 - `corvid::Metric::Cosine` — `search_vector_smoke_ranks_nearest_first_exact`, `vector_metric_quantization_cross_orders_and_exact_distances`, `vector_zero_norm_cosine_dot_l2_ranking`
@@ -139,6 +139,7 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::Hnsw::new` — `vector_hnsw_direct_api_extreme_params_and_determinism`
 - `corvid::Hnsw::with_params` — `vector_hnsw_direct_api_extreme_params_and_determinism`
 - `corvid::Hnsw::with_quant` — `vector_hnsw_direct_api_extreme_params_and_determinism`
+- `corvid::Hnsw::with_pq` — `vector_hnsw_direct_pq_adc_and_reconstruction_paths`
 - `corvid::Hnsw::len` — `vector_hnsw_direct_api_extreme_params_and_determinism`
 - `corvid::Hnsw::is_empty` — `vector_hnsw_direct_api_extreme_params_and_determinism`
 - `corvid::Hnsw::insert` — `vector_hnsw_direct_api_extreme_params_and_determinism`
@@ -193,7 +194,7 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::Collection::geo_nearest` — `search_geo_smoke_within_radius_and_nearest`, `geo_nearest_k_zero_one_n_beyond_and_hit_fields`, `geo_nearest_equidistant_ties_break_by_key`, `geo_nearest_skips_non_points_empty_and_finds_antipodal`
 - `corvid::Collection::geo_within_bbox` — `geo_within_bbox_normal_inclusive_edges_and_key_order`, `geo_within_bbox_degenerate_point_line_pole_and_globe`, `geo_bbox_antimeridian_wrap_matches_both_sides`, `geo_bbox_result_order_is_key_order_on_every_path`, `geo_bbox_validation_exact_error_variants`
 
-## Schema (ALTER) — 35 construct(s)
+## Schema (ALTER) — 36 construct(s)
 
 - `corvid::Error::CorruptIndex` — `lifecycle_corrupt_ondisk_index_bytes_on_disk_error_queries_with_exact_variant`
 - `corvid::Error::ReservedCollection` *(shared across classes: Mutations, Graph, Schema (ALTER))* — `mutations_insert_rejects_reserved_and_invalid_collection_names`, `mutations_write_paths_reject_reserved_and_invalid_collection_names`, `graph_link_unlink_reject_reserved_and_invalid_collection_names`, `schema_index_creation_validates_names_across_families`
@@ -206,6 +207,7 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::Collection::create_vector_index_ondisk` *(shared across classes: Vector search, Schema (ALTER))* — `vector_create_index_overloads_inmemory_ondisk_and_pq`, `schema_vector_index_duplicate_creation_replaces_previous_params`, `schema_vector_index_over_empty_field_then_insert_immediately_searchable`, `schema_vector_index_mixed_dimensions_match_scan_twin`, `schema_vector_dimension_change_on_update_leaves_index`, `schema_vector_index_compaction_after_deletes_keeps_results_exact`
 - `corvid::Collection::create_vector_index_ondisk_quantized` *(shared across classes: Vector search, Schema (ALTER))* — `vector_create_index_overloads_inmemory_ondisk_and_pq`, `schema_vector_index_duplicate_creation_replaces_previous_params`
 - `corvid::Collection::create_vector_index_ondisk_pq` *(shared across classes: Vector search, Schema (ALTER))* — `vector_create_index_overloads_inmemory_ondisk_and_pq`, `schema_vector_pq_creation_training_error_variants_and_success`
+- `corvid::Collection::create_vector_index_pq` — `vector_inmemory_pq_cross_metrics_orders_and_exact_distances`, `vector_inmemory_pq_recall_determinism_and_reopen`, `vector_inmemory_pq_creation_requires_training_documents`
 - `corvid::Collection::create_text_index` *(shared across classes: SELECT shaping, Text search, Schema (ALTER))* — `queries_plan_shape_text_index_for_single_text_source`, `text_search_index_inmemory_ondisk_match_scan_twin`, `text_builder_text_index_arm_matches_scan_arm`, `text_phrase_k_boundaries_empty_phrase_and_index_arms`, `schema_text_index_duplicate_and_non_text_values_excluded`, `schema_text_index_mutations_keep_search_correct`
 - `corvid::Collection::create_text_index_ondisk` *(shared across classes: Text search, Schema (ALTER))* — `text_search_index_inmemory_ondisk_match_scan_twin`, `text_phrase_k_boundaries_empty_phrase_and_index_arms`, `schema_text_index_mutations_keep_search_correct`
 - `corvid::Collection::create_scalar_index` *(shared across classes: Mutations, SELECT shaping, Schema (ALTER))* — `mutations_update_maintains_scalar_index`, `mutations_compare_and_set_maintains_scalar_index`, `mutations_delete_where_exact_with_scalar_index_present`, `mutations_insert_batch_unique_conflict_rolls_back_whole_batch`, `queries_order_by_indexed_vs_scan_equivalent`, `schema_scalar_index_empty_collection_creates_and_serves_later`, `schema_scalar_index_backfill_makes_populated_collection_immediately_queryable`, `schema_scalar_index_duplicate_creation_replaces_without_stale_entries`, `schema_scalar_index_mixed_type_field_lanes_and_missing_docs_match_scan`, `schema_scalar_index_maintenance_contract_under_every_mutation_kind`
@@ -418,8 +420,8 @@ the in-process duplex-I/O suite in `crates/corvid-mcp/tests/tools/`.
 - `mcp::tool::set_schema` — `set_schema_then_get_schema_roundtrips`, `set_schema_unique_enforced_on_stores`, `set_schema_required_and_type_violations`, `set_schema_param_and_name_errors`, `dump_load_preserves_schema_constraints`, `set_schema_flag_type_errors`, `set_schema_declared_empty_vs_undeclared_fields`
 - `mcp::tool::get_schema` — `set_schema_then_get_schema_roundtrips`, `set_schema_param_and_name_errors`, `dump_load_preserves_schema_constraints`, `set_schema_declared_empty_vs_undeclared_fields`
 
-306 engine construct(s) across 13 statement classes, 51 wire construct(s),
-293 distinct covering tests (existence and uniqueness enforced by the
+308 engine construct(s) across 13 statement classes, 51 wire construct(s),
+297 distinct covering tests (existence and uniqueness enforced by the
 radars; the 7 exempt row(s) above are the only uncovered ones, each
 with its justification).
 

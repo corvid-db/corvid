@@ -39,6 +39,10 @@ pub(crate) enum IndexKind {
     /// On-disk HNSW storing product-quantized vectors (a codebook persists
     /// alongside the graph).
     OnDiskPq,
+    /// In-memory HNSW storing product-quantized vectors (a codebook persists
+    /// in the index namespace so a lazy rebuild after reopen re-encodes under
+    /// the SAME trained codebook, never a retrained one).
+    InMemoryPq,
 }
 
 impl IndexKind {
@@ -53,7 +57,9 @@ struct VectorDef {
     metric: Metric,
     quant: Quantization,
     kind: IndexKind,
-    /// PQ codebook for [`IndexKind::OnDiskPq`] (loaded from disk on open).
+    /// PQ codebook for the PQ kinds ([`IndexKind::OnDiskPq`],
+    /// [`IndexKind::InMemoryPq`]); on-disk ones load it from the graph
+    /// namespace on open.
     pq: Option<std::sync::Arc<crate::pq::Pq>>,
     /// Whether an on-disk creation backfill is still **building** (an
     /// interrupted creation). A building index is maintained on every write
@@ -95,8 +101,18 @@ struct BuiltIndex {
 
 impl BuiltIndex {
     fn new(def: VectorDef) -> Self {
+        // PQ kinds store codes under their trained codebook (loaded from the
+        // namespace for in-memory PQ after reopen); everything else uses the
+        // def's plain quantization. A PQ def whose codebook row is missing
+        // (only reachable by tampering with engine-private namespaces — a
+        // re-registration always writes them in one transaction) degrades to
+        // the plain mode, mirroring the on-disk `(OnDiskPq, None)` degrade.
+        let hnsw = match &def.pq {
+            Some(pq) => Hnsw::with_pq(def.metric, pq.clone(), DEFAULT_M, DEFAULT_EF_CONSTRUCTION),
+            None => Hnsw::with_quant(def.metric, def.quant, DEFAULT_M, DEFAULT_EF_CONSTRUCTION),
+        };
         Self {
-            hnsw: Hnsw::with_quant(def.metric, def.quant, DEFAULT_M, DEFAULT_EF_CONSTRUCTION),
+            hnsw,
             node_to_key: Vec::new(),
             key_to_node: HashMap::new(),
             dim: None,
@@ -165,6 +181,7 @@ pub(crate) enum VectorMode {
     InMemory,
     OnDisk,
     OnDiskPq { m: usize, k: usize },
+    InMemoryPq { m: usize, k: usize },
 }
 
 /// A vector index definition in portable form (for dump/migrate).
@@ -192,6 +209,11 @@ impl Db {
                         VectorMode::OnDiskPq { m, k }
                     }
                     (IndexKind::OnDiskPq, None) => VectorMode::OnDisk,
+                    (IndexKind::InMemoryPq, Some(pq)) => {
+                        let (m, k) = pq.params();
+                        VectorMode::InMemoryPq { m, k }
+                    }
+                    (IndexKind::InMemoryPq, None) => VectorMode::InMemory,
                 };
                 VectorSpec {
                     collection: c.clone(),
@@ -229,8 +251,11 @@ impl Db {
                 .and_then(kind_from_byte)
                 .unwrap_or(IndexKind::InMemory);
             let building = matches!(st, crate::index_build::DefState::Building { .. });
-            // A PQ index carries a codebook persisted in its graph namespace.
-            let pq = if kind == IndexKind::OnDiskPq {
+            // A PQ index (either kind) carries a codebook persisted in its
+            // reserved namespace — for the in-memory kind this is what makes
+            // a lazy post-reopen rebuild re-encode under the SAME trained
+            // codebook instead of a retrained one.
+            let pq = if matches!(kind, IndexKind::OnDiskPq | IndexKind::InMemoryPq) {
                 let ns = disk_hnsw::namespace(&coll, &field);
                 disk_hnsw::load_codebook(self.store(), &ns)?.map(std::sync::Arc::new)
             } else {
@@ -361,7 +386,7 @@ impl Db {
                 .defs
                 .iter()
                 .filter(|((c, _), _)| c == collection)
-                .filter(|(.., d)| d.kind == IndexKind::InMemory)
+                .filter(|(.., d)| !d.kind.is_on_disk())
                 .map(|((_, f), d)| (f.clone(), d.clone()))
                 .collect()
         };
@@ -413,7 +438,7 @@ impl Db {
                 .defs
                 .iter()
                 .filter(|((c, _), _)| c == collection)
-                .filter(|(.., d)| d.kind == IndexKind::InMemory)
+                .filter(|(.., d)| !d.kind.is_on_disk())
                 .map(|((_, f), _)| f.clone())
                 .collect()
         };
@@ -928,6 +953,7 @@ fn kind_byte(k: IndexKind) -> u8 {
         IndexKind::InMemory => 0,
         IndexKind::OnDisk => 1,
         IndexKind::OnDiskPq => 2,
+        IndexKind::InMemoryPq => 3,
     }
 }
 
@@ -936,6 +962,7 @@ fn kind_from_byte(b: &u8) -> Option<IndexKind> {
         0 => Some(IndexKind::InMemory),
         1 => Some(IndexKind::OnDisk),
         2 => Some(IndexKind::OnDiskPq),
+        3 => Some(IndexKind::InMemoryPq),
         _ => None,
     }
 }
@@ -1022,6 +1049,59 @@ impl Collection<'_> {
         self.db().resume_vector(self.name(), field, &[])
     }
 
+    /// Create an **in-memory** HNSW index storing **product-quantized**
+    /// vectors: a codebook of `m` subspaces × `k` centroids is trained
+    /// (deterministically) from a bounded sample of existing vectors, then
+    /// each vector is stored as `m` code bytes instead of `dim * 4` — the
+    /// same compression as [`Collection::create_vector_index_ondisk_pq`]
+    /// applied to the RAM-resident index, for collections that want the
+    /// in-memory index's speed at a fraction of its footprint. `field`'s
+    /// dimension must be divisible by `m`.
+    ///
+    /// The metric contract matches the on-disk PQ index exactly: every
+    /// metric serves — L2 scores through the asymmetric-distance table (the
+    /// ADC fast path), cosine and dot through reconstruct-then-distance.
+    /// ADC fast paths for non-L2 metrics remain future work.
+    ///
+    /// The graph is not persisted (like every in-memory index it rebuilds
+    /// lazily from documents), but the TRAINED CODEBOOK is: it persists in
+    /// the index's reserved namespace in the same transaction that installs
+    /// the definition, so a rebuild after reopen re-encodes under the same
+    /// codebook rather than a retrained one. Re-creating the index retrains.
+    ///
+    /// Requires existing documents to train on (a codebook can't be learned
+    /// from nothing); returns [`Error::EmptyIndexTraining`](crate::Error::EmptyIndexTraining) if none have a
+    /// usable vector at `field`.
+    pub fn create_vector_index_pq(
+        &self,
+        field: &str,
+        metric: Metric,
+        m: usize,
+        k: usize,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        crate::db::validate_name(field)?;
+        let sample = pq_training_sample(self, field)?;
+        let pq = crate::pq::Pq::train(&sample, m, k).ok_or(crate::Error::EmptyIndexTraining)?;
+        let pq = std::sync::Arc::new(pq);
+        // Serialize the registration against concurrent lazy resumes,
+        // compactions and creations with the same blocking lock the on-disk
+        // creates take (a replacement can retire a previously on-disk def
+        // for this field, whose resume/compaction must not interleave with
+        // this def's namespace-clearing transaction). One transaction
+        // installs def + codebook; there is no backfill to drive — the
+        // graph builds lazily on first query like every in-memory index.
+        let _guard = self.db().index_resume().lock().expect("index resume lock");
+        self.db().register_vector_index_inner(
+            self.name(),
+            field,
+            metric,
+            Quantization::None,
+            IndexKind::InMemoryPq,
+            Some(pq),
+        )
+    }
+
     /// Create an on-disk HNSW index storing **product-quantized** vectors: a
     /// codebook of `m` subspaces × `k` centroids is trained from up to a sample
     /// of existing vectors, then each vector is stored as `m` code bytes — far
@@ -1044,29 +1124,7 @@ impl Collection<'_> {
     ) -> Result<()> {
         self.ensure_writable()?;
         crate::db::validate_name(field)?;
-        let store = self.db().store();
-        // Gather a training sample (bounded) from existing vectors.
-        const SAMPLE_CAP: usize = 50_000;
-        let mut sample: Vec<Vec<f32>> = Vec::new();
-        let mut cursor: Vec<u8> = Vec::new();
-        'outer: loop {
-            let page = store.scan_from(self.name(), &cursor, 2048)?;
-            let Some((last_key, _)) = page.last() else {
-                break;
-            };
-            let mut next = last_key.clone();
-            next.push(0);
-            for (_, bytes) in &page {
-                let doc = Value::decode(bytes)?;
-                if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
-                    sample.push(v.to_vec());
-                    if sample.len() >= SAMPLE_CAP {
-                        break 'outer;
-                    }
-                }
-            }
-            cursor = next;
-        }
+        let sample = pq_training_sample(self, field)?;
         let pq = crate::pq::Pq::train(&sample, m, k).ok_or(crate::Error::EmptyIndexTraining)?;
         let pq = std::sync::Arc::new(pq);
 
@@ -1090,6 +1148,35 @@ impl Collection<'_> {
         )?;
         self.db().resume_vector(self.name(), field, &[])
     }
+}
+
+/// Gather a bounded training sample of `field`'s vectors for PQ codebook
+/// training (the shared scan of both PQ create fns — bounded, read-only,
+/// deterministic in scan order).
+fn pq_training_sample(c: &Collection<'_>, field: &str) -> Result<Vec<Vec<f32>>> {
+    let store = c.db().store();
+    const SAMPLE_CAP: usize = 50_000;
+    let mut sample: Vec<Vec<f32>> = Vec::new();
+    let mut cursor: Vec<u8> = Vec::new();
+    'outer: loop {
+        let page = store.scan_from(c.name(), &cursor, 2048)?;
+        let Some((last_key, _)) = page.last() else {
+            break;
+        };
+        let mut next = last_key.clone();
+        next.push(0);
+        for (_, bytes) in &page {
+            let doc = Value::decode(bytes)?;
+            if let Some(v) = doc.get_path(field).and_then(Value::as_vector) {
+                sample.push(v.to_vec());
+                if sample.len() >= SAMPLE_CAP {
+                    break 'outer;
+                }
+            }
+        }
+        cursor = next;
+    }
+    Ok(sample)
 }
 
 #[cfg(test)]
@@ -1191,6 +1278,104 @@ mod tests {
         assert!(matches!(err, Err(crate::Error::EmptyIndexTraining)));
     }
 
+    /// The in-memory PQ index serves, and its trained codebook persists in
+    /// the reserved namespace so a post-reopen lazy rebuild re-encodes under
+    /// the SAME codebook (kind byte 3 on the def row; `vector_specs` reports
+    /// the training params back for dump/migrate).
+    #[test]
+    fn inmemory_pq_serves_and_codebook_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvid.db");
+        let data = pq_corpus(300, 16);
+        {
+            let db = Db::open(&path).unwrap();
+            let c = db.collection("docs");
+            for (i, v) in data.iter().enumerate() {
+                c.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                    .unwrap();
+            }
+            c.create_vector_index_pq("embedding", Metric::L2, 8, 64)
+                .unwrap();
+            // Def row is Complete with the InMemoryPq kind byte (in-memory
+            // defs are never Building), and the codebook row is in the
+            // reserved namespace.
+            let kb = db
+                .store()
+                .get(INDEX_DEFS, &def_key("docs", "embedding"))
+                .unwrap()
+                .unwrap();
+            let (kind_bytes, state) = crate::index_build::decode_def(&kb);
+            assert_eq!(kind_bytes[2], kind_byte(IndexKind::InMemoryPq));
+            assert!(matches!(state, crate::index_build::DefState::Complete));
+            let ns = disk_hnsw::namespace("docs", "embedding");
+            let pq = disk_hnsw::load_codebook(db.store(), &ns).unwrap().unwrap();
+            assert_eq!(pq.params(), (8, 64));
+            // Dump/migrate sees the in-memory PQ mode with its params.
+            let specs = db.vector_specs();
+            assert!(
+                specs
+                    .iter()
+                    .any(|s| matches!(s.mode, VectorMode::InMemoryPq { m: 8, k: 64 }))
+            );
+            // Serves: self-recall on the querying vector's top-5.
+            let mut hits = 0;
+            for (i, v) in data.iter().enumerate().take(20) {
+                let got = c.vector_search("embedding", v, 5, Metric::L2).unwrap();
+                if got.iter().any(|h| h.key == format!("k{i}").into_bytes()) {
+                    hits += 1;
+                }
+            }
+            assert!(hits >= 15, "in-memory PQ self-recall {hits}/20 too low");
+        }
+        // Reopen: the def reloads with its codebook and the lazily rebuilt
+        // graph still recalls (no retrain happens — the codebook row is the
+        // one written at creation).
+        let db = Db::open(&path).unwrap();
+        let c = db.collection("docs");
+        let mut hits = 0;
+        for (i, v) in data.iter().enumerate().take(20) {
+            let got = c.vector_search("embedding", v, 5, Metric::L2).unwrap();
+            if got.iter().any(|h| h.key == format!("k{i}").into_bytes()) {
+                hits += 1;
+            }
+        }
+        assert!(hits >= 15, "post-reopen self-recall {hits}/20 too low");
+    }
+
+    /// Re-creating with different PQ params retrains: the namespace codebook
+    /// is replaced atomically with the def row (no stale-codebook window).
+    #[test]
+    fn inmemory_pq_recreate_replaces_codebook() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        let data = pq_corpus(120, 8);
+        for (i, v) in data.iter().enumerate() {
+            c.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                .unwrap();
+        }
+        c.create_vector_index_pq("embedding", Metric::L2, 4, 16)
+            .unwrap();
+        c.create_vector_index_pq("embedding", Metric::L2, 2, 8)
+            .unwrap();
+        let ns = disk_hnsw::namespace("docs", "embedding");
+        let pq = disk_hnsw::load_codebook(db.store(), &ns).unwrap().unwrap();
+        assert_eq!(pq.params(), (2, 8));
+        // And the rebuilt graph serves under the new codebook.
+        let got = c
+            .vector_search("embedding", &data[10], 5, Metric::L2)
+            .unwrap();
+        assert!(!got.is_empty());
+    }
+
+    #[test]
+    fn inmemory_pq_on_empty_collection_errors() {
+        let db = Db::open_in_memory().unwrap();
+        let err = db
+            .collection("docs")
+            .create_vector_index_pq("embedding", Metric::L2, 4, 16);
+        assert!(matches!(err, Err(crate::Error::EmptyIndexTraining)));
+    }
+
     /// A query whose dimension mismatches an on-disk PQ index falls back to the
     /// exact path — same results as an unindexed collection (audit A4 pin).
     #[test]
@@ -1212,6 +1397,42 @@ mod tests {
             .vector_search("embedding", &corpus[0], 5, Metric::L2)
             .unwrap();
         assert!(!hits.is_empty());
+    }
+
+    /// Incremental maintenance of an already-built in-memory PQ graph:
+    /// inserts after the build land in the graph under the existing codebook,
+    /// deletes tombstone (exactly absent), like every in-memory index.
+    #[test]
+    fn inmemory_pq_reflects_incremental_writes_and_deletes() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("docs");
+        let data = pq_corpus(200, 8);
+        for (i, v) in data.iter().enumerate() {
+            c.insert(format!("k{i}").as_bytes(), &doc(v.clone()))
+                .unwrap();
+        }
+        c.create_vector_index_pq("embedding", Metric::L2, 4, 16)
+            .unwrap();
+        // First query builds the graph lazily.
+        let _ = c
+            .vector_search("embedding", &data[0], 5, Metric::L2)
+            .unwrap();
+        // An in-distribution duplicate of data[5] is retrievable near it
+        // (generous k so quantization coarseness doesn't hide it).
+        c.insert(b"new", &doc(data[5].clone())).unwrap();
+        let got = c
+            .vector_search("embedding", &data[5], 50, Metric::L2)
+            .unwrap();
+        assert!(
+            got.iter().any(|h| h.key == b"new".to_vec()),
+            "post-build insert must join the graph"
+        );
+        // Delete is reflected (the tombstoned key never appears).
+        c.delete(b"new").unwrap();
+        let got = c
+            .vector_search("embedding", &data[5], 50, Metric::L2)
+            .unwrap();
+        assert!(!got.iter().any(|h| h.key == b"new".to_vec()));
     }
 
     fn seeded() -> Db {

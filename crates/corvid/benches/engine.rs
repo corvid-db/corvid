@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use corvid::hnsw::Hnsw;
+use corvid::hnsw::{DEFAULT_EF_CONSTRUCTION, DEFAULT_M, Hnsw};
 use corvid::schema::{Field, FieldType, Schema};
 use corvid::{Collection, Db, Metric, Value, field};
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -77,6 +77,28 @@ fn bench_hnsw(c: &mut Criterion) {
     let query = data[0].clone();
     c.bench_function("hnsw_search_2k_64d", |b| {
         b.iter(|| index.search(std::hint::black_box(&query), 10, 64))
+    });
+
+    // The same corpus stored as PQ codes (m=16 code bytes vs 256 f32 bytes —
+    // 16× smaller vector payload; the codebook is trained once outside the
+    // timed region, matching how a collection trains at create time and
+    // reuses the codebook for every insert/search).
+    let pq = std::sync::Arc::new(corvid::pq::Pq::train(&data, 16, 256).unwrap());
+    c.bench_function("hnsw_build_pq_2k_64d", |b| {
+        b.iter(|| {
+            let mut h = Hnsw::with_pq(Metric::L2, pq.clone(), DEFAULT_M, DEFAULT_EF_CONSTRUCTION);
+            for v in &data {
+                h.insert(v.clone());
+            }
+            h
+        })
+    });
+    let mut pq_index = Hnsw::with_pq(Metric::L2, pq, DEFAULT_M, DEFAULT_EF_CONSTRUCTION);
+    for v in &data {
+        pq_index.insert(v.clone());
+    }
+    c.bench_function("hnsw_search_pq_2k_64d", |b| {
+        b.iter(|| pq_index.search(std::hint::black_box(&query), 10, 64))
     });
 }
 
