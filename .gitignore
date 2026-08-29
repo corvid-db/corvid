@@ -13,3 +13,6 @@ lcov.info
 *.swp
 .idea/
 .vscode/
+
+# Local tool scan history
+.mimosa/
