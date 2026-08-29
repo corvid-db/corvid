@@ -1013,3 +1013,294 @@ fn graph_cross_collection_endpoint_key_collision_namespaced() {
     assert!(a.delete(b"x").unwrap());
     assert!(a.neighbors(b"x", "r").unwrap().is_empty());
 }
+
+// ===========================================================================
+// Adjacency-derived delete cascade (Task 7): the cascade resolves a doc's
+// edges through the private `__adj_out__`/`__adj_in__` namespaces (rebuilt
+// lazily from the source edge rows on first use after open, maintained
+// transactionally by link/unlink). Public behavior is identical — these
+// tests pin the derived-state lifecycle the layout makes observable:
+// survive-reopen, rebuild-on-open, exactness on a hub-heavy corpus, and
+// invisibility to collections()/scan/dump.
+// ===========================================================================
+
+/// Edges survive a reopen, and the first delete after the reopen cascades
+/// correctly — whether or not the adjacency had ever been built in the
+/// previous session (link alone maintains the rows but never the
+/// built-marker, so a fresh open lazily rebuilds from the source rows on
+/// first cascade use; a session that already deleted once leaves a built
+/// adjacency that the reopened database must also serve exactly).
+#[test]
+fn graph_adjacency_cascade_correct_across_reopen_both_sessions() {
+    let dir = tempfile_dir();
+    let path = dir.path().join("corvid.db");
+
+    // Session 1: link a web of edges but never delete (adjacency rows exist,
+    // built-marker does not).
+    {
+        let db = Db::open(&path).unwrap();
+        let c = db.collection("nodes");
+        for k in [&b"a"[..], &b"b"[..], &b"c"[..], &b"d"[..]] {
+            c.insert(k, &Value::Int(1)).unwrap();
+        }
+        c.link(b"a", "knows", b"b").unwrap();
+        c.link(b"a", "likes", b"c").unwrap();
+        c.link(b"d", "knows", b"a").unwrap();
+        c.link(b"b", "knows", b"c").unwrap();
+    }
+
+    // Session 2: edges survived; the first delete lazily (re)builds the
+    // adjacency from the source rows and cascades exactly.
+    {
+        let db = Db::open(&path).unwrap();
+        let c = db.collection("nodes");
+        assert_eq!(c.neighbors(b"a", "knows").unwrap(), vec![b"b".to_vec()]);
+        assert_eq!(c.in_neighbors(b"a", "knows").unwrap(), vec![b"d".to_vec()]);
+        assert!(c.delete(b"a").unwrap());
+        assert!(c.neighbors(b"a", "knows").unwrap().is_empty());
+        assert!(c.neighbors(b"a", "likes").unwrap().is_empty());
+        assert!(c.in_neighbors(b"a", "knows").unwrap().is_empty());
+        assert!(c.neighbors(b"d", "knows").unwrap().is_empty());
+        // The bystander stands.
+        assert_eq!(c.neighbors(b"b", "knows").unwrap(), vec![b"c".to_vec()]);
+        // A second delete in the same session (adjacency now built and
+        // maintained transactionally): the survivor's edge cascades too.
+        assert!(c.delete(b"b").unwrap());
+        assert!(c.in_neighbors(b"c", "knows").unwrap().is_empty());
+        assert_eq!(c.get(b"c").unwrap(), Some(Value::Int(1)));
+    }
+}
+
+/// Delete correctness with adjacency present on a hub-heavy corpus: a hub
+/// with many in-edges, sources with a few out-edges each, plus the hub's own
+/// out-edges and self-loop-free bystanders. Deleting the hub must remove
+/// every source's edge to it (observable from the SOURCES' views — adjacency
+/// twin rows updated), and deleting a non-hub afterwards must remove exactly
+/// that non-hub's edges. This is the shape the `edge_churn` bench corpus
+/// uses, shrunk to an exhaustively assertable size.
+#[test]
+fn graph_delete_cascade_via_adjacency_hub_heavy_corpus_exact() {
+    let db = Db::open_in_memory().unwrap();
+    let c = db.collection("nodes");
+    let key = |i: usize| format!("k{i:03}").into_bytes();
+    // 40 docs; every doc sources one edge to the hub (in-degree 40), every
+    // 4th doc also sources a second edge to a rotating non-hub target, and
+    // the hub itself sources edges to the first five docs.
+    c.insert(b"hub", &Value::Int(99)).unwrap();
+    for i in 0..40 {
+        c.insert(&key(i), &Value::Int(i as i64)).unwrap();
+        c.link(&key(i), "rel_a", b"hub").unwrap();
+        if i % 4 == 0 {
+            c.link(&key(i), "rel_b", &key((i + 7) % 40)).unwrap();
+        }
+    }
+    for i in 0..5 {
+        c.link(b"hub", "rel_c", &key(i)).unwrap();
+    }
+    // Force the adjacency to exist (built) before the deletes under test.
+    c.delete(&key(39)).unwrap();
+
+    // Delete the hub: all 39 remaining in-edges go (from the SOURCES' views),
+    // and the hub's own five out-edges go with it.
+    assert!(c.delete(b"hub").unwrap());
+    for i in 0..39 {
+        assert!(
+            c.neighbors(&key(i), "rel_a").unwrap().is_empty(),
+            "source {} still sees a rel_a edge to the deleted hub",
+            i
+        );
+    }
+    for i in 0..5 {
+        assert!(c.in_neighbors(&key(i), "rel_c").unwrap().is_empty());
+    }
+    // The rel_b edges never touched the hub and all survive.
+    for i in (0..40).step_by(4) {
+        let want = if (i + 7) % 40 == 39 {
+            // k039's document was deleted first: its in-edges went then.
+            Vec::new()
+        } else {
+            vec![key((i + 7) % 40)]
+        };
+        assert_eq!(c.neighbors(&key(i), "rel_b").unwrap(), want, "rel_b {i}");
+    }
+
+    // Delete a non-hub source: exactly its own edges go; other sources and
+    // the rel_b targets are untouched.
+    assert!(c.delete(&key(8)).unwrap());
+    assert!(c.neighbors(&key(8), "rel_b").unwrap().is_empty());
+    // k015 was k008's rel_b target; its in-edge from k008 is gone but its
+    // own rel_a edge (to the already-deleted hub) stays empty and its
+    // document survives.
+    assert!(c.in_neighbors(&key(15), "rel_b").unwrap().is_empty());
+    assert_eq!(c.get(&key(15)).unwrap(), Some(Value::Int(15)));
+    assert_eq!(c.neighbors(&key(12), "rel_b").unwrap(), vec![key(19)]);
+
+    // Sweep the rest (0..=38; 39 went first): everything deletes, and the
+    // graph ends up empty in every view (adjacency stayed exact through the
+    // whole churn).
+    for i in 0..39 {
+        let _ = c.delete(&key(i)).unwrap();
+    }
+    for i in 0..40 {
+        for rel in ["rel_a", "rel_b", "rel_c"] {
+            assert!(c.neighbors(&key(i), rel).unwrap().is_empty());
+            assert!(c.in_neighbors(&key(i), rel).unwrap().is_empty());
+        }
+    }
+    assert_eq!(c.len().unwrap(), 0);
+}
+
+/// The adjacency namespaces are as invisible as the edge namespaces:
+/// `collections()` never lists them (before AND after a delete builds the
+/// marker), the user collection's `scan` never sees them, and a dump
+/// contains only source namespaces — a dump→load round-trip rebuilds
+/// adjacency lazily like any fresh database, and the loaded graph cascades
+/// correctly.
+#[test]
+fn graph_adjacency_namespaces_hidden_and_dump_round_trip() {
+    let db = Db::open_in_memory().unwrap();
+    let c = db.collection("nodes");
+    c.insert(b"a", &Value::Int(1)).unwrap();
+    c.insert(b"b", &Value::Int(2)).unwrap();
+    c.insert(b"gone", &Value::Int(3)).unwrap();
+    c.link(b"a", "knows", b"b").unwrap();
+    c.link(b"a", "likes", b"gone").unwrap();
+    c.link(b"gone", "knows", b"a").unwrap();
+    // Build the adjacency (a delete runs the cascade) so the namespaces are
+    // populated before the visibility checks.
+    assert!(c.delete(b"gone").unwrap());
+
+    let mut listed = db.collections().unwrap();
+    listed.sort();
+    assert_eq!(listed, vec!["nodes".to_owned()]);
+    assert_eq!(
+        c.scan().unwrap(),
+        vec![
+            (b"a".to_vec(), Value::Int(1)),
+            (b"b".to_vec(), Value::Int(2))
+        ]
+    );
+
+    // Dump: source namespaces only — the adjacency namespace names never
+    // appear in the bytes.
+    let mut bytes = Vec::new();
+    db.dump(&mut bytes).unwrap();
+    assert!(
+        !bytes.windows(b"__adj".len()).any(|w| w == b"__adj"),
+        "dump must not contain adjacency namespaces"
+    );
+
+    // Round-trip: the loaded database has the surviving edges, and its first
+    // delete cascades through the lazily rebuilt adjacency.
+    let dir = tempfile_dir();
+    let path = dir.path().join("loaded.db");
+    {
+        let db2 = Db::open(&path).unwrap();
+        db2.load(&bytes[..]).unwrap();
+        let c2 = db2.collection("nodes");
+        assert_eq!(c2.neighbors(b"a", "knows").unwrap(), vec![b"b".to_vec()]);
+        assert!(c2.in_neighbors(b"a", "likes").unwrap().is_empty());
+        assert!(c2.delete(b"a").unwrap());
+        assert!(c2.neighbors(b"a", "knows").unwrap().is_empty());
+        assert!(c2.in_neighbors(b"b", "knows").unwrap().is_empty());
+    }
+    // And the loaded+cascaded state persists across one more reopen.
+    let db3 = Db::open(&path).unwrap();
+    assert!(
+        db3.collection("nodes")
+            .neighbors(b"b", "knows")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A tiny helper for file-backed tests (tempfile is a dev-dependency of the
+/// crate's unit tests; the conformance suites use it via the crate too).
+fn tempfile_dir() -> tempfile::TempDir {
+    tempfile::tempdir().unwrap()
+}
+
+/// Concurrent link/unlink/delete churn keeps the adjacency exact: the lazy
+/// build, the maintenance writes, and the cascades all run inside write
+/// transactions, which the store serializes — so no interleaving can leave
+/// an edge row without its adjacency rows (or vice versa). Observable as:
+/// after the churn, deleting EVERY key empties the graph completely (any
+/// desynchronized row would either resurrect a deleted edge in a view or
+/// strand one behind a missing adjacency entry).
+#[test]
+fn graph_adjacency_stays_exact_under_concurrent_link_and_delete_churn() {
+    use std::sync::Arc;
+    use std::thread;
+
+    const RELS: [&str; 2] = ["knows", "likes"];
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let c = db.collection("nodes");
+    let key = |i: usize| format!("n{i:04}").into_bytes();
+    for i in 0..200 {
+        c.insert(&key(i), &Value::Int(i as i64)).unwrap();
+    }
+
+    let mut handles = Vec::new();
+    // Four linkers: each links its own sources to shared targets,
+    // interleaved with unlinks, across both relations.
+    for t in 0..4usize {
+        let db = Arc::clone(&db);
+        handles.push(thread::spawn(move || {
+            let c = db.collection("nodes");
+            for i in 0..250usize {
+                let src = format!("t{t}-{i:03}").into_bytes();
+                let dst = key((i * 7 + t) % 200);
+                c.link(&src, RELS[i % 2], &dst).unwrap();
+                if i % 3 == 0 {
+                    c.unlink(&src, RELS[(i + 1) % 2], &dst).unwrap();
+                }
+            }
+        }));
+    }
+    // One deleter sweeping document keys while the linkers run.
+    {
+        let db = Arc::clone(&db);
+        handles.push(thread::spawn(move || {
+            let c = db.collection("nodes");
+            for round in 0..3 {
+                for i in 0..200 {
+                    let _ = c.delete(&key((i + round * 37) % 200)).unwrap();
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Final sweep: delete every key that ever existed (docs and link
+    // sources), then the graph must be empty in every view.
+    let c = db.collection("nodes");
+    for i in 0..200 {
+        let _ = c.delete(&key(i)).unwrap();
+    }
+    for t in 0..4 {
+        for i in 0..250 {
+            let _ = c.delete(&format!("t{t}-{i:03}").into_bytes()).unwrap();
+        }
+    }
+    for i in 0..200 {
+        for rel in RELS {
+            assert!(
+                c.neighbors(&key(i), rel).unwrap().is_empty(),
+                "stranded out-edge survived the full sweep at {i}/{rel}"
+            );
+            assert!(
+                c.in_neighbors(&key(i), rel).unwrap().is_empty(),
+                "stranded in-edge survived the full sweep at {i}/{rel}"
+            );
+        }
+    }
+    for t in 0..4 {
+        for i in 0..250 {
+            let k = format!("t{t}-{i:03}").into_bytes();
+            assert!(c.neighbors(&k, RELS[0]).unwrap().is_empty());
+            assert!(c.neighbors(&k, RELS[1]).unwrap().is_empty());
+        }
+    }
+}

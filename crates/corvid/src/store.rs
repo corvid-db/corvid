@@ -302,7 +302,10 @@ impl Store {
             txn.set_durability(redb::Durability::None)?;
         }
         let out = {
-            let mut batch = WriteBatch { txn: &txn };
+            let mut batch = WriteBatch {
+                txn: &txn,
+                ids: std::cell::RefCell::new(std::collections::HashMap::new()),
+            };
             f(&mut batch)?
         };
         txn.commit()?;
@@ -515,6 +518,15 @@ pub(crate) fn clear_in_txn(tx: &mut WriteBatch<'_>, collection: &str) -> Result<
 /// uncommitted writes.
 pub struct WriteBatch<'txn> {
     txn: &'txn redb::WriteTransaction,
+    /// Per-transaction cache of resolved collection ids. Every put/delete
+    /// resolves its namespace id through the CATALOG table; a multi-row
+    /// transaction (a graph `link` writes four namespaces) would re-open the
+    /// catalog and re-get the name per row. The cache is per-`WriteBatch`
+    /// (per transaction) and records ids this transaction assigned too, so
+    /// it can never go stale. `RefCell`: id resolution is an implementation
+    /// detail of `&self` reads (a probe `get` warms the cache too), not an
+    /// observable mutation.
+    ids: std::cell::RefCell<std::collections::HashMap<String, u64>>,
 }
 
 impl WriteBatch<'_> {
@@ -531,6 +543,23 @@ impl WriteBatch<'_> {
         if !existed {
             self.adjust_count(collection, 1)?;
         }
+        Ok(())
+    }
+
+    /// [`WriteBatch::put`] without the maintained-count adjustment, for
+    /// engine-private namespaces whose count is never read (the adjacency
+    /// namespaces): skips one META read-modify-write per row, which is the
+    /// dominant per-row cost in bulk maintenance. The namespace's `count`
+    /// is undefined once this is used — callers must never expose it.
+    pub(crate) fn put_uncounted(
+        &mut self,
+        collection: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        let id = self.ensure_id(collection)?;
+        let mut records = self.txn.open_table(RECORDS)?;
+        records.insert(physical_key(id, key).as_slice(), value)?;
         Ok(())
     }
 
@@ -556,9 +585,10 @@ impl WriteBatch<'_> {
     }
 
     /// Remove `key` without touching the maintained count, for callers that
-    /// adjust the count themselves in batch ([`clear_in_txn`]). Returns
-    /// whether a value was removed.
-    fn delete_uncounted(&mut self, collection: &str, key: &[u8]) -> Result<bool> {
+    /// adjust the count themselves in batch ([`clear_in_txn`]) or write
+    /// engine-private namespaces whose count is never read (adjacency).
+    /// Returns whether a value was removed.
+    pub(crate) fn delete_uncounted(&mut self, collection: &str, key: &[u8]) -> Result<bool> {
         // Resolve without creating: deleting from an unknown collection is a no-op.
         let Some(id) = self.lookup_id(collection)? else {
             return Ok(false);
@@ -624,27 +654,52 @@ impl WriteBatch<'_> {
     }
 
     /// Resolve a collection id, assigning a fresh one if the collection is new.
+    /// Resolved ids are cached for this transaction's lifetime (see
+    /// [`WriteBatch`]).
     fn ensure_id(&self, collection: &str) -> Result<u64> {
-        let mut catalog = self.txn.open_table(CATALOG)?;
-        if let Some(id) = catalog.get(collection)?.map(|g| g.value()) {
-            return Ok(id);
+        if let Some(id) = self.ids.borrow().get(collection) {
+            return Ok(*id);
         }
-        let next = {
-            let mut meta = self.txn.open_table(META)?;
-            let next = meta.get(NEXT_ID)?.map(|g| g.value()).unwrap_or(0);
-            meta.insert(NEXT_ID, next + 1)?;
+        let id = {
+            let mut catalog = self.txn.open_table(CATALOG)?;
+            if let Some(id) = catalog.get(collection)?.map(|g| g.value()) {
+                self.cache_id(collection, id);
+                return Ok(id);
+            }
+            let next = {
+                let mut meta = self.txn.open_table(META)?;
+                let next = meta.get(NEXT_ID)?.map(|g| g.value()).unwrap_or(0);
+                meta.insert(NEXT_ID, next + 1)?;
+                next
+            };
+            catalog.insert(collection, next)?;
             next
         };
-        catalog.insert(collection, next)?;
-        Ok(next)
+        self.cache_id(collection, id);
+        Ok(id)
     }
 
     /// Resolve a collection id without creating it. In a write transaction
     /// opening the catalog table always succeeds (it is created on demand),
-    /// so an unknown collection simply has no entry.
+    /// so an unknown collection simply has no entry. Resolved ids are cached
+    /// for this transaction's lifetime.
     fn lookup_id(&self, collection: &str) -> Result<Option<u64>> {
+        if let Some(id) = self.ids.borrow().get(collection) {
+            return Ok(Some(*id));
+        }
         let catalog = self.txn.open_table(CATALOG)?;
-        Ok(catalog.get(collection)?.map(|g| g.value()))
+        match catalog.get(collection)?.map(|g| g.value()) {
+            Some(id) => {
+                self.cache_id(collection, id);
+                Ok(Some(id))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Record a resolved id in the per-transaction cache.
+    fn cache_id(&self, collection: &str, id: u64) {
+        self.ids.borrow_mut().insert(collection.to_owned(), id);
     }
 
     /// Atomically reserve the next monotonic auto-key id for `collection`

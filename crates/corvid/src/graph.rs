@@ -6,6 +6,22 @@
 //! `relation ‖ from ‖ to`, which lets [`Collection::neighbors`] resolve all
 //! targets of a `(from, relation)` pair with a single prefix scan.
 //!
+//! Because that layout orders edges by *relation*, an endpoint is not a key
+//! prefix — the delete cascade used to page through BOTH edge namespaces per
+//! delete (O(E)). Two private adjacency namespaces (`__adj_out__<collection>`,
+//! `__adj_in__<collection>`) now hold the same edges re-keyed *endpoint-first*:
+//! DERIVED state (the edge rows stay the only source of truth; their format is
+//! unchanged), rebuilt lazily from them on first cascade use after open and
+//! maintained transactionally by [`Collection::link`],
+//! [`Collection::link_weighted`] and [`Collection::unlink`] — so the cascade
+//! finds a document's edges directly, in O(edges-of-doc). See
+//! `Db::edges_on_delete_in_txn` for the layout, rebuild and fallback rules.
+//!
+//! All four graph namespaces are engine-private, so their rows are written
+//! with the store's UNCOUNTED put/delete (no maintained record count —
+//! nothing in the engine reads one, and skipping the per-row count
+//! read-modify-write keeps the dual-write cheap).
+//!
 //! Deleting a document cascades (in the delete's own transaction) to every
 //! edge attached to it — see `Db::edges_on_delete_in_txn` (private; every
 //! document-delete path calls it) — and linking/unlinking emits change events
@@ -21,6 +37,94 @@ use crate::db::{Collection, Db};
 use crate::error::Result;
 use crate::reactive::{ChangeEvent, ChangeKind};
 use crate::store::WriteBatch;
+
+/// The reserved collection holding this collection's OUT adjacency rows
+/// (one per edge, keyed by its source endpoint).
+fn adj_out_name(collection: &str) -> String {
+    format!("__adj_out__{collection}")
+}
+
+/// The reserved collection holding this collection's IN adjacency rows
+/// (one per edge, keyed by its target endpoint).
+fn adj_in_name(collection: &str) -> String {
+    format!("__adj_in__{collection}")
+}
+
+/// Adjacency row keys start with this tag; the built-marker uses [`ADJ_TAG_META`]
+/// so it can never collide with (or prefix) a row (the ttl.rs TAG_FWD/TAG_IDX
+/// convention).
+const ADJ_TAG_ROW: u8 = 0x01;
+/// The built-marker's tag — sorts below every row.
+const ADJ_TAG_META: u8 = 0x00;
+
+/// The adjacency build marker's value: the adjacency layout's version. A
+/// marker carrying any other value is stale-shaped and forces a rebuild (the
+/// edge-row format itself never migrates; adjacency is derived state, so a
+/// rebuild — not a file migration — is the whole upgrade story).
+const ADJACENCY_VERSION: &[u8] = b"1";
+
+/// Paged-scan page size for the adjacency build and cascade walks.
+const ADJ_PAGE: usize = 1024;
+
+/// The adjacency namespaces' build-marker key (`ADJ_TAG_META ‖ "adjacency"`).
+fn adjacency_marker_key() -> [u8; 10] {
+    let mut k = [0u8; 10];
+    k[0] = ADJ_TAG_META;
+    k[1..].copy_from_slice(b"adjacency");
+    k
+}
+
+/// Encode an adjacency row key: the edge `(endpoint --relation--> other)`
+/// re-keyed endpoint-first, `ADJ_TAG_ROW ‖ len(endpoint) ‖ endpoint ‖
+/// len(relation) ‖ relation ‖ other` — the same length-prefixed triple as an
+/// edge key with the endpoint moved to the front, so every row of one
+/// endpoint shares a prefix and the cascade reaches them with one scan.
+fn adj_key(endpoint: &[u8], relation: &str, other: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 8 + endpoint.len() + relation.len() + other.len());
+    k.push(ADJ_TAG_ROW);
+    k.extend_from_slice(&(endpoint.len() as u32).to_be_bytes());
+    k.extend_from_slice(endpoint);
+    k.extend_from_slice(&(relation.len() as u32).to_be_bytes());
+    k.extend_from_slice(relation.as_bytes());
+    k.extend_from_slice(other);
+    k
+}
+
+/// The prefix shared by every adjacency row of `endpoint` (inverse of the
+/// endpoint-leading portion of [`adj_key`]).
+fn adj_prefix(endpoint: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 4 + endpoint.len());
+    k.push(ADJ_TAG_ROW);
+    k.extend_from_slice(&(endpoint.len() as u32).to_be_bytes());
+    k.extend_from_slice(endpoint);
+    k
+}
+
+/// Parse an adjacency row key back into `(endpoint, relation, other)`.
+/// Inverse of [`adj_key`]; `None` on a malformed (truncated / non-UTF-8
+/// relation) key — unreachable via the encoder, the corruption-fallback
+/// shape.
+fn decode_adj_key(key: &[u8]) -> Option<(Vec<u8>, String, Vec<u8>)> {
+    if key.first() != Some(&ADJ_TAG_ROW) {
+        return None;
+    }
+    let mut pos = 1usize; // skip the row tag
+    let read_len = |pos: &mut usize| -> Option<u32> {
+        let b = key.get(*pos..*pos + 4)?;
+        *pos += 4;
+        Some(u32::from_be_bytes(b.try_into().unwrap()))
+    };
+    let endpoint_len = read_len(&mut pos)? as usize;
+    let endpoint = key.get(pos..pos + endpoint_len)?.to_vec();
+    pos += endpoint_len;
+    let rel_len = read_len(&mut pos)? as usize;
+    let rel = std::str::from_utf8(key.get(pos..pos + rel_len)?)
+        .ok()?
+        .to_owned();
+    pos += rel_len;
+    let other = key.get(pos..)?.to_vec();
+    Some((endpoint, rel, other))
+}
 
 impl Collection<'_> {
     /// Add a directed edge `from --relation--> to`. Idempotent (re-linking
@@ -43,11 +147,25 @@ impl Collection<'_> {
     pub fn link(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<()> {
         self.ensure_writable()?;
         let (forward, reverse) = (self.edges_name(), self.redges_name());
+        let (adj_out, adj_in) = (adj_out_name(self.name()), adj_in_name(self.name()));
         let (fwd_key, rev_key) = (edge_key(relation, from, to), edge_key(relation, to, from));
-        // Forward and reverse edges commit together — no half-linked state.
+        let (out_adj, in_adj) = (adj_key(from, relation, to), adj_key(to, relation, from));
+        // Forward and reverse edges (plus both adjacency rows — see the
+        // module docs) commit together: no half-linked state. All four rows
+        // are UNCOUNTED: the graph namespaces are engine-private and nothing
+        // reads their maintained counts, so skipping the per-row META
+        // read-modify-write is pure savings. The first link (re)establishes
+        // the adjacency namespaces, keeping the marker invariant "present ⇒
+        // complete for the committed edge rows" true from the first edge on:
+        // on a fresh database the build is an empty no-op, and on a legacy
+        // (pre-adjacency) database it derives the rows from the existing
+        // edge rows exactly once.
         self.db().store().transaction(|tx| {
-            tx.put(&forward, &fwd_key, b"")?;
-            tx.put(&reverse, &rev_key, b"")?;
+            ensure_adjacency_in_txn(tx, self.name())?;
+            tx.put_uncounted(&forward, &fwd_key, b"")?;
+            tx.put_uncounted(&reverse, &rev_key, b"")?;
+            tx.put_uncounted(&adj_out, &out_adj, b"")?;
+            tx.put_uncounted(&adj_in, &in_adj, b"")?;
             Ok(())
         })?;
         self.db().notify(ChangeEvent {
@@ -67,11 +185,16 @@ impl Collection<'_> {
     pub fn link_weighted(&self, from: &[u8], relation: &str, to: &[u8], weight: f64) -> Result<()> {
         self.ensure_writable()?;
         let (forward, reverse) = (self.edges_name(), self.redges_name());
+        let (adj_out, adj_in) = (adj_out_name(self.name()), adj_in_name(self.name()));
         let (fwd_key, rev_key) = (edge_key(relation, from, to), edge_key(relation, to, from));
+        let (out_adj, in_adj) = (adj_key(from, relation, to), adj_key(to, relation, from));
         let value = weight.to_le_bytes();
         self.db().store().transaction(|tx| {
-            tx.put(&forward, &fwd_key, &value)?;
-            tx.put(&reverse, &rev_key, &value)?;
+            ensure_adjacency_in_txn(tx, self.name())?;
+            tx.put_uncounted(&forward, &fwd_key, &value)?;
+            tx.put_uncounted(&reverse, &rev_key, &value)?;
+            tx.put_uncounted(&adj_out, &out_adj, &value)?;
+            tx.put_uncounted(&adj_in, &in_adj, &value)?;
             Ok(())
         })?;
         self.db().notify(ChangeEvent {
@@ -105,10 +228,20 @@ impl Collection<'_> {
     pub fn unlink(&self, from: &[u8], relation: &str, to: &[u8]) -> Result<bool> {
         self.ensure_writable()?;
         let (forward, reverse) = (self.edges_name(), self.redges_name());
+        let (adj_out, adj_in) = (adj_out_name(self.name()), adj_in_name(self.name()));
         let (fwd_key, rev_key) = (edge_key(relation, from, to), edge_key(relation, to, from));
+        let (out_adj, in_adj) = (adj_key(from, relation, to), adj_key(to, relation, from));
         let removed = self.db().store().transaction(|tx| {
-            let removed = tx.delete(&forward, &fwd_key)?;
-            tx.delete(&reverse, &rev_key)?;
+            let removed = tx.delete_uncounted(&forward, &fwd_key)?;
+            tx.delete_uncounted(&reverse, &rev_key)?;
+            // The edge's two adjacency rows go with it. When no adjacency
+            // exists yet (marker absent ⇒ no rows anywhere — see the marker
+            // invariant) the deletes are skipped entirely; once it exists
+            // they are no-op-safe uncounted removals.
+            if adjacency_ready_in_txn(tx, self.name())? {
+                tx.delete_uncounted(&adj_out, &out_adj)?;
+                tx.delete_uncounted(&adj_in, &in_adj)?;
+            }
             Ok(removed)
         })?;
         if removed {
@@ -268,29 +401,54 @@ impl Db {
     /// cascade is part of the delete contract, not conditional on a row
     /// having existed).
     ///
-    /// Edge keys are `len(relation) ‖ relation ‖ len(node) ‖ node ‖ other`, so
-    /// an endpoint is *not* a byte prefix of the key: each namespace is paged
-    /// through with [`WriteBatch::scan_from`] (the batch sees its own deletes,
-    /// so the pages keep advancing) and every row decoded. A forward row whose
-    /// source is `key` also removes its reverse twin, and a reverse row whose
-    /// target is `key` also removes its forward twin, keeping the namespaces
-    /// exact mirrors. Memory stays bounded by the page size; work is
-    /// proportional to the collection's edge count, a no-op when there are
-    /// none.
+    /// The edges are located through the collection's ADJACENCY namespaces —
+    /// endpoint-first re-keyings of the source edge rows (one row per edge
+    /// per endpoint; see [`adj_key`]) — so the work is proportional to the
+    /// deleted key's degree, not the collection's edge count. Adjacency is
+    /// DERIVED state: the edge rows remain the only source of truth and keep
+    /// their format. [`Collection::link`] establishes the adjacency on the
+    /// collection's first edge write; this function covers the remaining
+    /// entry points (the first delete on a legacy pre-adjacency database) by
+    /// lazily (re)building inside the caller's transaction — marker absent
+    /// or stale-shaped (an unrecognized version) — by clearing both
+    /// adjacency namespaces and re-deriving them from the `__edges__` rows.
+    /// Because the build shares the caller's transaction, and
+    /// `link`/`unlink`/every cascade maintain adjacency in their own
+    /// transactions, the build can never race a concurrent edge write (the
+    /// store serializes write transactions — the same discipline
+    /// `index_resume` enforces for lazy index resumes, achieved here by
+    /// keeping the whole lazy build inside one write transaction, which also
+    /// makes it atomic: a crash rolls it back and the next use rebuilds).
+    ///
+    /// If an adjacency ROW fails to decode, the derived state is untrusted:
+    /// it is rebuilt from the source edge rows (the full O(E) scan — the
+    /// pre-adjacency cascade's own fallback cost) and the cascade re-runs
+    /// over the repaired index. Entries removed before the malformed row was
+    /// reached were individually well-formed (every decode is
+    /// self-validating), and the re-run is idempotent, so the result is
+    /// exactly the pre-adjacency two-namespace scan's.
+    ///
+    /// Memory stays bounded by the page size in every walk.
     pub(crate) fn edges_on_delete_in_txn(
         &self,
         tx: &mut WriteBatch<'_>,
         collection: &str,
         key: &[u8],
     ) -> Result<()> {
-        cascade_edges_of(tx, collection, key, true)?;
-        cascade_edges_of(tx, collection, key, false)
+        ensure_adjacency_in_txn(tx, collection)?;
+        if !cascade_edges_via_adjacency(tx, collection, key)? {
+            build_adjacency_in_txn(tx, collection)?;
+            cascade_edges_via_adjacency(tx, collection, key)?;
+        }
+        Ok(())
     }
 
     /// Every edge in the database as
     /// `(collection, relation, from, to, weight)`, for dump/migrate. Edges of
-    /// reserved collections are engine-internal and excluded. Reads the edge
-    /// namespaces (and the catalog walk) through `reader`, so a dump
+    /// reserved collections are engine-internal and excluded — as is the
+    /// derived adjacency (a dump contains only source-of-truth namespaces;
+    /// `load` rebuilds adjacency lazily like any fresh database). Reads the
+    /// edge namespaces (and the catalog walk) through `reader`, so a dump
     /// enumerates them on the same snapshot as its records (audit B8).
     pub(crate) fn all_edges_in(
         &self,
@@ -320,43 +478,55 @@ impl Db {
     }
 }
 
-/// One namespace pass of the delete cascade (audit B4): page through `ns` and
-/// drop every row whose first node is `key`, along with its twin (the same
-/// edge stored with the nodes swapped) in the sibling namespace. With
-/// `forward = true` the first node is the edge's source and the twin lives in
-/// `__redges__`; with `false` it is the target and the twin lives in
-/// `__edges__`.
-fn cascade_edges_of(
-    tx: &mut WriteBatch<'_>,
-    collection: &str,
-    key: &[u8],
-    forward: bool,
-) -> Result<()> {
-    const PAGE: usize = 1024;
-    let ns = if forward {
-        format!("__edges__{collection}")
-    } else {
-        format!("__redges__{collection}")
-    };
-    let twin_ns = if forward {
-        format!("__redges__{collection}")
-    } else {
-        format!("__edges__{collection}")
-    };
+/// Whether `collection`'s adjacency namespaces carry a current built-marker
+/// (one point-get). The marker is written ONLY by a full build
+/// ([`build_adjacency_in_txn`]) and invalidated only by a version change, so
+/// its presence always means "complete for the committed edge rows" — the
+/// invariant every maintenance write (link/unlink/cascade) relies on to skip
+/// its own completeness checks.
+fn adjacency_ready_in_txn(tx: &WriteBatch<'_>, collection: &str) -> Result<bool> {
+    Ok(
+        matches!(tx.get(&adj_out_name(collection), &adjacency_marker_key())?,
+            Some(v) if v.as_slice() == ADJACENCY_VERSION),
+    )
+}
+
+/// Marker present, or build it now (inside the caller's transaction): the
+/// lazy-establishment point shared by `link` (first edge write) and the
+/// delete cascade (a legacy database whose first operation is a delete).
+fn ensure_adjacency_in_txn(tx: &mut WriteBatch<'_>, collection: &str) -> Result<()> {
+    if !adjacency_ready_in_txn(tx, collection)? {
+        build_adjacency_in_txn(tx, collection)?;
+    }
+    Ok(())
+}
+
+/// (Re)derive `collection`'s adjacency namespaces from its source edge rows,
+/// inside the caller's transaction: clear both namespaces, then page through
+/// `__edges__` writing each edge `(rel, from, to)` as an OUT row under `from`
+/// and an IN row under `to` (value = the edge row's value, verbatim — the
+/// adjacency is a pure re-keying). Finally write the built-marker. All in the
+/// ONE transaction: atomic against crashes, and serialized against every
+/// concurrent edge write by the store's write lock.
+fn build_adjacency_in_txn(tx: &mut WriteBatch<'_>, collection: &str) -> Result<()> {
+    let (out_ns, in_ns) = (adj_out_name(collection), adj_in_name(collection));
+    crate::store::clear_in_txn(tx, &out_ns)?;
+    crate::store::clear_in_txn(tx, &in_ns)?;
+    let edges_ns = format!("__edges__{collection}");
     let mut start: Vec<u8> = Vec::new();
     loop {
-        let page = tx.scan_from(&ns, &start, PAGE)?;
+        let page = tx.scan_from(&edges_ns, &start, ADJ_PAGE)?;
         let Some((last, _)) = page.last().cloned() else {
             break;
         };
-        for (row, _) in &page {
-            // Keep only rows whose first node is `key`.
-            if let Some((rel, first, second)) =
-                decode_edge_key(row).filter(|(_, from, _)| from.as_slice() == key)
-            {
-                // The row itself, plus its twin (nodes swapped).
-                tx.delete(&ns, row)?;
-                tx.delete(&twin_ns, &edge_key(&rel, &second, &first))?;
+        for (row, value) in &page {
+            // Undecodable edge rows are skipped — exactly what the scan
+            // cascade and `all_edges_in` do with them (the source of truth
+            // itself is never rewritten here). Uncounted puts: the adjacency
+            // namespaces are engine-private and nothing reads their counts.
+            if let Some((rel, from, to)) = decode_edge_key(row) {
+                tx.put_uncounted(&out_ns, &adj_key(&from, &rel, &to), value)?;
+                tx.put_uncounted(&in_ns, &adj_key(&to, &rel, &from), value)?;
             }
         }
         // Resume strictly past everything examined above (the documented
@@ -364,7 +534,97 @@ fn cascade_edges_of(
         start = last;
         start.push(0);
     }
+    tx.put(&out_ns, &adjacency_marker_key(), ADJACENCY_VERSION)?;
     Ok(())
+}
+
+/// Remove every edge that has `key` as an endpoint, via the adjacency
+/// namespaces: the OUT half lists `key`'s outgoing edges, the IN half its
+/// incoming ones, and each entry deletes the edge row, its twin in the
+/// sibling edge namespace, and BOTH adjacency rows (this one and the twin
+/// endpoint's). A self-loop appears in both halves; the second pass's deletes
+/// are no-ops. Returns `false` if any adjacency row failed to decode (the
+/// caller then rebuilds and re-runs) — everything removed before that point
+/// was individually well-formed, so the re-run completes exactly the same
+/// final state the old two-namespace scan produced.
+fn cascade_edges_via_adjacency(
+    tx: &mut WriteBatch<'_>,
+    collection: &str,
+    key: &[u8],
+) -> Result<bool> {
+    let out_clean = cascade_adj_half(tx, collection, key, true)?;
+    let in_clean = cascade_adj_half(tx, collection, key, false)?;
+    Ok(out_clean && in_clean)
+}
+
+/// One adjacency half of the delete cascade: page through `ns`'s rows under
+/// `key`'s prefix (`out = true` → the OUT namespace, edges FROM `key`;
+/// `false` → the IN namespace, edges TO `key`) and drop each edge, its twin,
+/// and both adjacency rows. Rows past `key`'s prefix range end the walk.
+fn cascade_adj_half(
+    tx: &mut WriteBatch<'_>,
+    collection: &str,
+    key: &[u8],
+    out: bool,
+) -> Result<bool> {
+    let edges_ns = format!("__edges__{collection}");
+    let redges_ns = format!("__redges__{collection}");
+    let (out_ns, in_ns) = (adj_out_name(collection), adj_in_name(collection));
+    let (ns, twin_ns) = if out {
+        (&out_ns, &in_ns)
+    } else {
+        (&in_ns, &out_ns)
+    };
+    let prefix = adj_prefix(key);
+    let mut start = prefix.clone();
+    let mut clean = true;
+    loop {
+        let page = tx.scan_from(ns, &start, ADJ_PAGE)?;
+        if page.is_empty() {
+            break;
+        }
+        let mut last: Option<Vec<u8>> = None;
+        for (row, _) in &page {
+            if !row.starts_with(&prefix) {
+                // Sorted past `key`'s range: this half is done.
+                return Ok(clean);
+            }
+            let Some((_, rel, other)) = decode_adj_key(row) else {
+                // Malformed derived row: skip; the caller rebuilds and
+                // re-runs (entries before this one were well-formed).
+                clean = false;
+                continue;
+            };
+            // The edge row itself and its twin (nodes swapped) in the two
+            // source namespaces (uncounted — see the module docs: the graph
+            // namespaces' maintained counts are write-only bookkeeping).
+            let (fwd, rev) = if out {
+                (edge_key(&rel, key, &other), edge_key(&rel, &other, key))
+            } else {
+                (edge_key(&rel, &other, key), edge_key(&rel, key, &other))
+            };
+            tx.delete_uncounted(&edges_ns, &fwd)?;
+            tx.delete_uncounted(&redges_ns, &rev)?;
+            // Both adjacency rows (uncounted — engine-private namespaces):
+            // this endpoint's and the twin's.
+            tx.delete_uncounted(ns, row)?;
+            tx.delete_uncounted(twin_ns, &adj_key(&other, &rel, key))?;
+            last = Some(row.clone());
+        }
+        match last {
+            // Resume strictly past the last row removed (the batch sees its
+            // own deletes, so the pages keep advancing).
+            Some(mut l) => {
+                l.push(0);
+                start = l;
+            }
+            // A page whose rows were all malformed (none set `last`): the
+            // rebuild-and-re-run the caller performs on `clean = false`
+            // covers whatever follows.
+            None => break,
+        }
+    }
+    Ok(clean)
 }
 
 /// One graph edge in portable form (dump/migrate).
@@ -378,7 +638,10 @@ pub(crate) struct EdgeRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::neighbor_prefix;
+    use super::{
+        ADJ_PAGE, ADJ_TAG_META, ADJ_TAG_ROW, ADJACENCY_VERSION, adj_in_name, adj_key, adj_out_name,
+        adj_prefix, adjacency_marker_key, decode_adj_key, neighbor_prefix,
+    };
     use crate::{Db, Value};
 
     #[test]
@@ -669,5 +932,218 @@ mod tests {
         // A failed unlink (no such edge) emits nothing.
         assert!(!c.unlink(b"a", "knows", b"b").unwrap());
         assert_eq!(events.lock().unwrap().len(), 3);
+    }
+
+    // ---- adjacency-derived cascade (Task 7) ----
+
+    /// The adjacency key codec round-trips every shape: empty endpoint,
+    /// empty relation, empty other, unicode, and byte-prefix pairs — and is
+    /// the exact inverse of `adj_key` (endpoint-first, tag-prefixed).
+    #[test]
+    fn adj_key_round_trips_all_shapes() {
+        for (endpoint, rel, other) in [
+            (&b"a"[..], "knows", &b"b"[..]),
+            (&b""[..], "", &b""[..]),
+            (&b""[..], "r", &b"x"[..]),
+            (&b"x"[..], "", &b""[..]),
+            ("ключ".as_bytes(), "знает", "鍵".as_bytes()),
+            (&b"k"[..], "know", &b"b"[..]),
+            (&b"k"[..], "knows", &b"b"[..]),
+        ] {
+            let k = adj_key(endpoint, rel, other);
+            assert_eq!(
+                decode_adj_key(&k),
+                Some((endpoint.to_vec(), rel.to_owned(), other.to_vec())),
+                "round-trip {endpoint:?}/{rel:?}/{other:?}"
+            );
+            // The endpoint prefix really is a prefix of its own rows only.
+            assert!(k.starts_with(&adj_prefix(endpoint)));
+        }
+        // Truncated and mistagged keys decode to None (the corruption
+        // fallback shape), never panic.
+        for bad in [
+            vec![ADJ_TAG_ROW],
+            vec![ADJ_TAG_ROW, 0, 0, 0, 5, b'a'], // endpoint length overruns
+            vec![ADJ_TAG_ROW, 0, 0, 0, 1, b'a', 0, 0, 0, 9, b'r'], // rel overruns
+            vec![ADJ_TAG_META, 0, 0, 0, 1, b'a', 0, 0, 0, 1, b'r', b'b'], // meta tag
+            vec![ADJ_TAG_ROW, 0, 0, 0, 1, b'a', 0, 0, 0, 1, 0xFF], // non-UTF-8 rel
+        ] {
+            assert!(decode_adj_key(&bad).is_none(), "must be None: {bad:02x?}");
+        }
+    }
+
+    /// One delete builds the adjacency (marker present, rows derived from
+    /// the source edge rows); link/unlink after the build keep it exact
+    /// (their rows land and vanish transactionally), so later cascades —
+    /// including the twin-adjacency rows on OTHER endpoints — stay correct.
+    #[test]
+    fn adjacency_built_once_then_maintained_transactionally() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("nodes");
+        for k in [&b"a"[..], &b"b"[..], &b"c"[..]] {
+            c.insert(k, &Value::Int(1)).unwrap();
+        }
+        c.link(b"a", "r", b"b").unwrap();
+        c.link(b"c", "r", b"a").unwrap();
+        assert!(c.delete(b"b").unwrap()); // builds adjacency + marker
+
+        let (out_ns, in_ns) = (adj_out_name("nodes"), adj_in_name("nodes"));
+        assert_eq!(
+            db.store().get(&out_ns, &adjacency_marker_key()).unwrap(),
+            Some(ADJACENCY_VERSION.to_vec())
+        );
+        // Derived rows exactly mirror the surviving edge.
+        assert_eq!(
+            db.store().scan(&out_ns).unwrap(),
+            vec![
+                (adjacency_marker_key().to_vec(), ADJACENCY_VERSION.to_vec()),
+                (adj_key(b"c", "r", b"a"), Vec::new()),
+            ]
+        );
+        assert_eq!(
+            db.store().scan(&in_ns).unwrap(),
+            vec![(adj_key(b"a", "r", b"c"), Vec::new())]
+        );
+
+        // Post-build maintenance: a new edge lands in adjacency with its
+        // weight value verbatim...
+        c.link_weighted(b"a", "w", b"c", 0.5).unwrap();
+        assert_eq!(
+            db.store().get(&out_ns, &adj_key(b"a", "w", b"c")).unwrap(),
+            Some(0.5f64.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            db.store().get(&in_ns, &adj_key(b"c", "w", b"a")).unwrap(),
+            Some(0.5f64.to_le_bytes().to_vec())
+        );
+        // ...unlink removes both adjacency rows...
+        assert!(c.unlink(b"a", "w", b"c").unwrap());
+        assert_eq!(
+            db.store().get(&out_ns, &adj_key(b"a", "w", b"c")).unwrap(),
+            None
+        );
+        assert_eq!(
+            db.store().get(&in_ns, &adj_key(b"c", "w", b"a")).unwrap(),
+            None
+        );
+
+        // ...and the next cascade removes a's remaining edges from BOTH
+        // endpoints' views (a's IN row for c's edge was maintained, not
+        // rebuilt).
+        assert!(c.delete(b"a").unwrap());
+        assert!(c.neighbors(b"c", "r").unwrap().is_empty());
+        assert_eq!(
+            db.store().scan(&out_ns).unwrap(),
+            vec![(adjacency_marker_key().to_vec(), ADJACENCY_VERSION.to_vec())]
+        );
+        assert!(db.store().scan(&in_ns).unwrap().is_empty());
+    }
+
+    /// A marker carrying an unrecognized version (a stale-shaped adjacency
+    /// from a future layout) forces a rebuild inside the deleting
+    /// transaction; the cascade is still exact.
+    #[test]
+    fn stale_shaped_adjacency_marker_forces_rebuild() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("nodes");
+        c.insert(b"a", &Value::Int(1)).unwrap();
+        c.insert(b"b", &Value::Int(2)).unwrap();
+        c.link(b"a", "r", b"b").unwrap();
+        assert!(c.delete(b"a").unwrap()); // builds marker v1
+        // Forge a future-version marker.
+        db.store()
+            .put(&adj_out_name("nodes"), &adjacency_marker_key(), b"9")
+            .unwrap();
+        // Re-link an edge and delete its endpoint: the stale marker forces
+        // the rebuild, which sees the CURRENT edge rows.
+        c.link(b"b", "r", b"a").unwrap();
+        assert!(c.delete(b"b").unwrap());
+        assert!(c.in_neighbors(b"a", "r").unwrap().is_empty());
+        assert_eq!(
+            db.store()
+                .get(&adj_out_name("nodes"), &adjacency_marker_key())
+                .unwrap(),
+            Some(ADJACENCY_VERSION.to_vec()),
+            "the rebuild must restore the current version marker"
+        );
+    }
+
+    /// A corrupted adjacency row (starts with the endpoint's prefix but does
+    /// not decode) makes the derived state untrusted: the cascade still
+    /// removes EVERY real edge of the endpoint — the malformed row cannot
+    /// hide one — and the adjacency is repaired in the same transaction
+    /// (rebuilt from the source rows; no malformed rows remain).
+    #[test]
+    fn corrupt_adjacency_row_self_heals_and_cascade_stays_exact() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("nodes");
+        c.insert(b"a", &Value::Int(1)).unwrap();
+        c.insert(b"b", &Value::Int(2)).unwrap();
+        c.link(b"a", "r1", b"b").unwrap();
+        c.link(b"a", "r2", b"b").unwrap();
+        c.link(b"b", "r3", b"a").unwrap();
+        // Build the adjacency with an edge-free delete (a no-edge key's
+        // cascade still runs the lazy build).
+        assert!(!c.delete(b"zzz").unwrap());
+        // Corrupt: insert a malformed row under a's OUT prefix that sorts
+        // BEFORE the real rows (a relation length that overruns the key)...
+        let mut bad = adj_prefix(b"a");
+        bad.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xF0]);
+        db.store().put(&adj_out_name("nodes"), &bad, b"").unwrap();
+        // ...and one under a's IN prefix that sorts AFTER them (non-UTF-8
+        // relation bytes).
+        let mut bad2 = adj_prefix(b"a");
+        bad2.extend_from_slice(&[0, 0, 0, 1, b'z', 0xFF]);
+        db.store().put(&adj_in_name("nodes"), &bad2, b"").unwrap();
+
+        assert!(c.delete(b"a").unwrap());
+        // Every real edge of a is gone in both namespaces and both views.
+        assert!(db.store().scan("__edges__nodes").unwrap().is_empty());
+        assert!(db.store().scan("__redges__nodes").unwrap().is_empty());
+        // The adjacency was repaired: only the marker remains.
+        assert_eq!(
+            db.store().scan(&adj_out_name("nodes")).unwrap(),
+            vec![(adjacency_marker_key().to_vec(), ADJACENCY_VERSION.to_vec())]
+        );
+        assert!(db.store().scan(&adj_in_name("nodes")).unwrap().is_empty());
+    }
+
+    /// An endpoint with more than one adjacency PAGE of edges (1024-row
+    /// pages) cascades completely: the paged walk resumes past each deleted
+    /// row and never misses the tail. Relations and directions are mixed so
+    /// both halves page.
+    #[test]
+    fn adjacency_cascades_multi_page_endpoints() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("nodes");
+        c.insert(b"hub", &Value::Int(0)).unwrap();
+        let n = ADJ_PAGE + 37;
+        for i in 0..n {
+            let k = format!("s{i:05}").into_bytes();
+            c.insert(&k, &Value::Int(i as i64)).unwrap();
+            c.link(&k, if i % 2 == 0 { "even" } else { "odd" }, b"hub")
+                .unwrap();
+            if i % 3 == 0 {
+                c.link(b"hub", "back", &k).unwrap();
+            }
+        }
+        // Delete a source first so the adjacency is built before the hub's
+        // multi-page cascade.
+        assert!(c.delete(&format!("s{:05}", 0).into_bytes()).unwrap());
+        // The hub: OUT half pages over the "back" edges; IN half over n-1
+        // rows.
+        assert!(c.delete(b"hub").unwrap());
+        for i in 0..n {
+            let k = format!("s{i:05}").into_bytes();
+            assert!(
+                c.neighbors(&k, "even").unwrap().is_empty()
+                    && c.neighbors(&k, "odd").unwrap().is_empty(),
+                "source {i} still sees its edge to the hub"
+            );
+            assert!(c.in_neighbors(&k, "back").unwrap().is_empty());
+        }
+        // Nothing survives in either source namespace.
+        assert!(db.store().scan("__edges__nodes").unwrap().is_empty());
+        assert!(db.store().scan("__redges__nodes").unwrap().is_empty());
     }
 }

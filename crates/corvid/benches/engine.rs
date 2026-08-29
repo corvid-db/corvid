@@ -188,11 +188,10 @@ fn bench_creation_ondisk(c: &mut Criterion) {
 /// reverse row).
 ///
 /// Corpus (deterministic, index math + seeded xorshift — no rand dep):
-/// 1k docs, 10k edges over 3 relations, bimodal in-degree distribution:
-/// every 4th edge targets a hub key — 4 hubs at ~625 in-edges each (the
-/// `i % 4 == 0` guard collapses `i % 16` to {0, 4, 8, 12}; see the
-/// targets comment in the corpus code) — and the rest draw targets
-/// uniformly (~1 in-edge on average).
+/// 1k docs, 10k edge WRITES over 3 relations (~9.0k distinct rows), bimodal
+/// in-degree distribution: every 4th edge targets a hub key, and the rest
+/// draw targets uniformly over all 1k keys (~7.5 in-edges per key on
+/// average) — see the targets comment for the hub side of the contrast.
 /// `edge_link_10k` seeds a fresh in-memory Db per iteration inside the
 /// measured routine (the `index_creation_ondisk` convention — links are ~90%
 /// of that iteration, fine for a relative before/after baseline). Sample
@@ -215,8 +214,12 @@ fn bench_edge_churn(c: &mut Criterion) {
     // Targets: hub-skewed — every 4th edge is a hub edge whose target is
     // `i % HUBS`; under the `i % 4 == 0` guard that expression only ever
     // yields {0, 4, 8, 12}, so the hubs are 4 keys (not HUBS=16) at
-    // 2_500 / 4 = 625 in-edges each. The rest draw a seeded-uniform
-    // target, giving the bimodal distribution described above.
+    // 2_500 / 4 = 625 hub-edge WRITES each. Those calls are not distinct
+    // rows: writes i and i+6000 produce the same (relation, source, target)
+    // triple (6000 is the lcm of the 16/3/1000 cycles, so ~250 of each
+    // hub's 625 calls collapse), leaving ~375 distinct hub rows plus the
+    // ~7.5 uniform draws that land on each hub key — ~382 distinct in-edges
+    // per hub vs the ~7.5 non-hub mean, a bimodal contrast of ~51:1.
     let targets: Vec<usize> = {
         let mut state: u64 = 0x1234_5678;
         (0..EDGES)

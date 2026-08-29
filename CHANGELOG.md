@@ -38,6 +38,26 @@ format and API may change without backward-compatibility guarantees.
   instead of falling back to a default.
 
 ### Changed
+- Deleting a document (directly, via `compare_and_set`, or through a TTL
+  purge) now resolves its graph edges in O(edges-of-that-document) instead
+  of scanning the collection's entire edge namespaces: two new private
+  `__adj_out__`/`__adj_in__` namespaces hold the edges re-keyed
+  endpoint-first as derived state (the edge rows remain the source of
+  truth; their format is unchanged, no file migration). The adjacency is
+  established inside the first edge write's own transaction (an empty
+  build on fresh databases; a one-time re-derive from the edge rows on
+  databases written before this change), maintained transactionally by
+  `link`/`link_weighted`/`unlink`, self-healing if a derived row is
+  corrupt (rebuild from source rows + re-run), and invisible — never
+  listed by `collections()`, never in a dump (dump→load rebuilds it
+  lazily). Public graph behavior is byte-identical. Measured on the
+  pinned benchmarks: the hub-heavy 100-doc delete sweep drops 241.0 ms →
+  40.5 ms (~5.9×, asymptotically O(degree) vs O(collection edges)) and
+  the mixed `delete_heavy` half-delete 566.8 ms → 194.5 ms; pure link
+  throughput pays the dual-write (two extra rows per edge), ~1.4× on
+  `edge_link_10k` after tuning (graph namespaces no longer maintain
+  record counts — nothing read them — and write transactions cache
+  collection-id lookups).
 - Compound-index prefix-only equality queries (equality on a leading field
   with the trailing fields unconstrained) are now served through the index
   window when the index's def knows every document in the collection has

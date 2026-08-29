@@ -391,10 +391,12 @@ fn num_value_of(key: &[u8]) -> Option<f64> {
 /// SKIPPED: NaN is indexed (it is a float) but incomparable, so it belongs
 /// to the post-comparable tail of the order, not the walk. The forward map
 /// (`0x00`-prefixed) and the bool lane sort below the numeric lane and are
-/// never visited. A key with no value terminator is malformed (unreachable
-/// via the encoder) and errors [`crate::Error::CorruptIndex`] — the
-/// corruption philosophy is to fail loudly, never silently skip rows the
-/// walk's consumer (the order-index path) would then mis-order.
+/// never visited. A key with no value terminator, an EMPTY key, or a NUM-lane
+/// key whose payload does not unescape to the 8-byte IEEE-754 transform is
+/// malformed (all unreachable via the encoder) and errors
+/// [`crate::Error::CorruptIndex`] — the corruption philosophy is to fail
+/// loudly, never silently skip rows the walk's consumer (the order-index
+/// path) would then mis-order.
 pub(crate) fn comparable_entries(
     reader: &dyn SnapshotReader,
     ns: &str,
@@ -408,9 +410,20 @@ pub(crate) fn comparable_entries(
         }
         let mut stop = false;
         for (key, _) in &page {
-            if key[0] > LANE_TEXT {
-                stop = true; // past the text lane: nothing comparable remains
-                break;
+            // `key[0]` on an empty key would panic; an empty index key is
+            // malformed (unreachable via the encoder AND via this scan — it
+            // sorts before the LANE_NUM cursor — so pure defense-in-depth).
+            match key.first() {
+                None => {
+                    return Err(crate::Error::CorruptIndex {
+                        context: format!("empty index key in index namespace '{ns}'"),
+                    });
+                }
+                Some(&lane) if lane > LANE_TEXT => {
+                    stop = true; // past the text lane: nothing comparable remains
+                    break;
+                }
+                Some(_) => {}
             }
             let Some(t) = terminator_pos(key) else {
                 return Err(crate::Error::CorruptIndex {
@@ -419,8 +432,23 @@ pub(crate) fn comparable_entries(
                     ),
                 });
             };
-            if key[0] == LANE_NUM && num_value_of(key).is_some_and(f64::is_nan) {
-                continue; // NaN: incomparable (class 1) — tail, not walk
+            if key[0] == LANE_NUM {
+                match num_value_of(key) {
+                    // NaN: incomparable (class 1) — tail, not walk.
+                    Some(v) if v.is_nan() => continue,
+                    Some(_) => {}
+                    // The terminator exists but the payload is not the 8-byte
+                    // IEEE-754 transform: malformed (unreachable via the
+                    // encoder). Fail loudly rather than stream a fabricated
+                    // value to the order walk.
+                    None => {
+                        return Err(crate::Error::CorruptIndex {
+                            context: format!(
+                                "numeric index key payload is not 8 bytes in index namespace '{ns}': {key:02x?}"
+                            ),
+                        });
+                    }
+                }
             }
             if !f(&key[..t], &key[t + 2..])? {
                 return Ok(());
@@ -948,20 +976,54 @@ impl Db {
     /// Flip a compound index's in-memory def to complete after its backfill
     /// committed `Complete` on disk, with the computed `all_docs_indexed`
     /// flag.
+    ///
+    /// Task 6 fix re-review: the completion must never leave memory claiming
+    /// `true` over a disk `[0]`. Two guards, both under the scalar lock:
+    /// (1) the committed def row is RE-CHECKED from disk — a concurrent
+    /// miss-write that committed between this completion's own commit and
+    /// this in-memory update has already rewritten the row to
+    /// not-all-indexed, and the freshly computed flag is AND-ed with it;
+    /// (2) the insert MERGES with any def already present — an existing
+    /// completed `false` (put there by `compound_miss_in_memory`, however
+    /// interleaved) always wins over the computed value. A `building` def's
+    /// `false` is just the registration default, so completion may set the
+    /// computed-and-disk-checked value there (the fresh-registration path
+    /// earns `true` on an all-present corpus).
     pub(crate) fn mark_compound_complete(
         &self,
         collection: &str,
         fields: &[String],
         all_indexed: bool,
-    ) {
+    ) -> Result<()> {
         let mut state = self.scalar().lock().expect("scalar lock");
-        state.compound.insert(
-            (collection.to_owned(), fields.to_vec()),
-            CompoundDef {
+        // Re-check the committed row under the same lock the insert takes:
+        // disk is what a reopen would load, so memory must not claim more
+        // than it says.
+        let dk = compound_def_key(collection, fields);
+        let disk_all_indexed = match self.store().get(COMPOUND_DEFS, &dk)? {
+            Some(row) => {
+                let (kind, _) = crate::index_build::decode_def(&row);
+                kind.first() == Some(&KIND_ALL_INDEXED)
+            }
+            None => false,
+        };
+        let computed = all_indexed && disk_all_indexed;
+        state
+            .compound
+            .entry((collection.to_owned(), fields.to_vec()))
+            .and_modify(|d| {
+                d.all_docs_indexed = if d.building {
+                    computed
+                } else {
+                    d.all_docs_indexed && computed
+                };
+                d.building = false;
+            })
+            .or_insert(CompoundDef {
                 building: false,
-                all_docs_indexed: all_indexed,
-            },
-        );
+                all_docs_indexed: computed,
+            });
+        Ok(())
     }
 
     /// Flip a compound index's in-memory `all_docs_indexed` to false — a
@@ -1080,7 +1142,7 @@ impl Db {
                 }
                 Ok(clean)
             })?;
-        self.mark_compound_complete(collection, fields, all_indexed);
+        self.mark_compound_complete(collection, fields, all_indexed)?;
         Ok(())
     }
 
@@ -1639,6 +1701,47 @@ mod tests {
                 );
             }
             other => panic!("malformed key must error CorruptIndex, got {other:?}"),
+        }
+    }
+
+    /// The remaining malformation shapes (W2 wave review): a NUM-lane key
+    /// whose payload does not unescape to exactly 8 bytes (`num_value_of`
+    /// returns `None` even though a terminator exists) must error
+    /// `Error::CorruptIndex`, not stream a fabricated "value" to the order
+    /// walk — an empty payload previously fell through to the consumer as a
+    /// one-byte value. Unreachable via the encoder (it always writes the
+    /// 8-byte transform); defense-in-depth closure of the malformation
+    /// lattice, same fail-loudly philosophy as the terminator-less shape.
+    #[test]
+    fn comparable_entries_errors_on_non_8_byte_numeric_payload() {
+        for bad in [
+            vec![LANE_NUM, 0x00, 0x00, b'd'],       // empty payload
+            vec![LANE_NUM, 0x01, 0x00, 0x00, b'd'], // 1-byte payload
+            vec![LANE_NUM, 0x09, 0x00, 0x00, b'd'], // ...
+            {
+                let mut k = vec![LANE_NUM];
+                k.extend_from_slice(&[0x09; 9]); // 9-byte payload
+                k.extend_from_slice(&[0x00, 0x00, b'd']);
+                k
+            },
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            store
+                .transaction(|tx| {
+                    insert_in_txn(tx, "ix", b"good", &Value::Int(1))?;
+                    tx.put("ix", &bad, &[])
+                })
+                .unwrap();
+            let err = comparable_entries(&store, "ix", |_, _| Ok(true)).unwrap_err();
+            match err {
+                crate::Error::CorruptIndex { context } => {
+                    assert!(
+                        context.contains("ix"),
+                        "the error must name the corrupt namespace, got {context:?}"
+                    );
+                }
+                other => panic!("bad payload {bad:02x?} must error CorruptIndex, got {other:?}"),
+            }
         }
     }
 
@@ -2249,6 +2352,79 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.len(), 10);
+    }
+
+    /// The in-memory completion must never leave memory claiming `true` over
+    /// a disk `[0]` (Task 6 fix re-review): the raced interleaving is a
+    /// miss-write committing (rewriting the def row to not-all-indexed and
+    /// flipping the in-memory flag) between the completion's commit and its
+    /// in-memory insert — an unconditional insert of the computed flag would
+    /// then claim true until a reopen self-heals. The interleaving is not
+    /// deterministically constructible via the public API (it needs a commit
+    /// wedged between two statements of `create_compound_index`), so this
+    /// pins the merge/disk-recheck logic directly by replaying the stale
+    /// completion against the forged post-race disk state.
+    #[test]
+    fn mark_compound_complete_does_not_reinflate_a_flipped_flag() {
+        let db = Db::open_in_memory().unwrap();
+        let fields = vec!["a".to_owned(), "b".to_owned()];
+        let dk = compound_def_key("docs", &fields);
+        let complete_all = crate::index_build::encode_def(
+            &[KIND_ALL_INDEXED],
+            &crate::index_build::DefState::Complete,
+        );
+        let complete_not_all = crate::index_build::encode_def(
+            &[KIND_NOT_ALL_INDEXED],
+            &crate::index_build::DefState::Complete,
+        );
+
+        // The ordinary fresh-registration path: def Building in memory
+        // (registration default), disk Completed [1] by the completion's own
+        // transaction — the computed true sticks.
+        db.register_compound_index("docs", &fields).unwrap();
+        db.store().put(COMPOUND_DEFS, &dk, &complete_all).unwrap();
+        db.mark_compound_complete("docs", &fields, true).unwrap();
+        assert!(db.compound_all_docs_indexed("docs", &fields));
+
+        // The raced miss: committed AFTER the completion's transaction (disk
+        // rewritten to [0]) and flipped the in-memory flag, but the def is
+        // still `building` in memory (the completion's insert has not run).
+        // The stale completion replaying its computed `true` must land false.
+        db.register_compound_index("docs", &fields).unwrap(); // building again
+        db.compound_miss_in_memory("docs", &fields);
+        db.store()
+            .put(COMPOUND_DEFS, &dk, &complete_not_all)
+            .unwrap();
+        db.mark_compound_complete("docs", &fields, true).unwrap();
+        assert!(
+            !db.compound_all_docs_indexed("docs", &fields),
+            "completion must never re-inflate a flag a committed miss cleared"
+        );
+
+        // The same guard as a pure merge: a COMPLETED false def (however it
+        // got there) is never re-inflated, even if the disk row says
+        // all-indexed (the miss landed between the row read and the insert).
+        db.store().put(COMPOUND_DEFS, &dk, &complete_all).unwrap();
+        db.mark_compound_complete("docs", &fields, true).unwrap();
+        assert!(
+            !db.compound_all_docs_indexed("docs", &fields),
+            "an existing completed false always wins over the computed value"
+        );
+
+        // Re-completing true over a legitimately-true completed def keeps it
+        // true (disk [1], no miss anywhere).
+        db.register_compound_index("docs", &fields).unwrap();
+        db.store().put(COMPOUND_DEFS, &dk, &complete_all).unwrap();
+        db.mark_compound_complete("docs", &fields, true).unwrap();
+        assert!(db.compound_all_docs_indexed("docs", &fields));
+        db.mark_compound_complete("docs", &fields, true).unwrap();
+        assert!(db.compound_all_docs_indexed("docs", &fields));
+
+        // A completion computing false (miss observed during the backfill,
+        // marker seen by the flag-aware transaction) clears even a def whose
+        // in-memory state was true.
+        db.mark_compound_complete("docs", &fields, false).unwrap();
+        assert!(!db.compound_all_docs_indexed("docs", &fields));
     }
 
     #[test]
