@@ -90,9 +90,12 @@ format and API may change without backward-compatibility guarantees.
   the on-disk contract exactly: L2 scores through the asymmetric-distance
   table (the ADC fast path), cosine and dot through reconstruct-then-distance
   (ADC tables for non-L2 metrics remain future work). Recall on the fixed
-  clustered conformance corpus is 0.73 vs the exact scan (pinned ≥ 0.5;
-  the number is `ef`-insensitive — the graph recovers the ADC ranking and
-  the residual gap is codebook resolution). Measured on the pinned bench
+  clustered conformance corpus measures 1.0 vs the exact scan (pinned
+  ≥ 0.7 — the public path's over-fetch + exact rerank recover the full
+  top-k); the direct-API unit corpus measures 0.56, identical at
+  `ef_search` 100/200/400 (pinned ≥ 0.55 — the thin margin is recorded in
+  docs/BENCHES.md; the graph recovers the ADC ranking and the residual gap
+  is codebook resolution). Measured on the pinned bench
   corpus (2000×64d, `m = 16, k = 256`): build 367.9 ms vs 124.9 ms
   full-precision, search 35.8 µs vs 19.1 µs — the footprint/time trade in
   two numbers (`hnsw_build_pq_2k_64d`, `hnsw_search_pq_2k_64d`).
@@ -189,7 +192,7 @@ format and API may change without backward-compatibility guarantees.
   Results are identical to a scan by construction — a matching document
   necessarily has the leading field, hence is indexed. On a 5k-doc corpus
   where every doc has both fields, the pinned benchmark drops from
-  ~1.54 ms (full scan) to ~0.24 ms (~6.4x). Indexes over corpora that
+  ~1.54 ms (full scan) to 232.41 µs (−84.9%, 6.6×). Indexes over corpora that
   contain (or ever wrote) missing-field documents keep the previous
   decline-to-scan behavior, and dumps replay index creation, so the flag
   is recomputed exactly on load.

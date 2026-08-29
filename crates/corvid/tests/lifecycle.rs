@@ -919,7 +919,7 @@ fn lifecycle_dump_load_roundtrips_every_index_family_ttl_edges_schema_and_autoid
                 .unwrap();
         }
     }
-    // On-disk and PQ vector indexes on dedicated fields.
+    // On-disk and PQ vector indexes (both kinds) on dedicated fields.
     for (i, v) in vectors.iter().enumerate() {
         let mut d = map(&[
             ("n2", Value::Int(i as i64)),
@@ -927,6 +927,10 @@ fn lifecycle_dump_load_roundtrips_every_index_family_ttl_edges_schema_and_autoid
             (
                 "v_pq",
                 Value::Vector((0..8).map(|j| j as f32 + i as f32).collect()),
+            ),
+            (
+                "v_ipq",
+                Value::Vector((0..8).map(|j| j as f32 + 3.0 * i as f32).collect()),
             ),
         ]);
         // The scalar/text/geo lanes key off these docs too.
@@ -950,6 +954,10 @@ fn lifecycle_dump_load_roundtrips_every_index_family_ttl_edges_schema_and_autoid
         .unwrap();
     c.create_vector_index_ondisk_pq("v_pq", Metric::L2, 2, 4)
         .unwrap();
+    // The in-memory PQ twin (W4 carry-in M1): every vector-index FAMILY —
+    // quantized in-memory (Metric × Quantization), on-disk, on-disk PQ,
+    // in-memory PQ — must round-trip the dump.
+    c.create_vector_index_pq("v_ipq", Metric::L2, 2, 4).unwrap();
     // Text (both storage kinds), scalar, compound, geo.
     c.create_text_index("body").unwrap();
     c.create_text_index_ondisk("n2").unwrap(); // int field: empty postings, def still dumps
@@ -1051,7 +1059,7 @@ fn lifecycle_dump_load_roundtrips_every_index_family_ttl_edges_schema_and_autoid
             assert_eq!(from_dst[0].distance, from_src[0].distance);
         }
     }
-    // On-disk and PQ vector indexes serve after the round-trip.
+    // On-disk and both PQ vector indexes serve after the round-trip.
     assert!(
         !d.vector_search("v_disk", &[1.0, 0.0], 2, Metric::Cosine)
             .unwrap()
@@ -1067,6 +1075,21 @@ fn lifecycle_dump_load_roundtrips_every_index_family_ttl_edges_schema_and_autoid
         .unwrap()
         .is_empty()
     );
+    // The in-memory PQ index serves too, and ranks identically to the
+    // source db (dump vector mode 3 recreated via create_vector_index_pq).
+    let ipq_query = [7.0f32, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0];
+    let ipq_src = src
+        .collection("rich")
+        .vector_search("v_ipq", &ipq_query, 4, Metric::L2)
+        .unwrap();
+    let ipq_dst = d.vector_search("v_ipq", &ipq_query, 4, Metric::L2).unwrap();
+    assert_eq!(ipq_dst.len(), 4, "all corpus docs carry v_ipq");
+    assert_eq!(
+        ipq_src.iter().map(|h| h.key.clone()).collect::<Vec<_>>(),
+        ipq_dst.iter().map(|h| h.key.clone()).collect::<Vec<_>>(),
+        "loaded in-memory PQ ranking must equal source"
+    );
+    assert_eq!(ipq_dst[0].distance, ipq_src[0].distance);
 
     // Schema restored and enforced: duplicate unique value and missing
     // required field are both rejected with the exact variant.

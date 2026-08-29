@@ -63,7 +63,6 @@ impl SemanticCache<'_> {
     /// distance, under any index mode: `vector_search` reranks ANN hits with
     /// exact distances, so a quantized index on the embedding field does not
     /// rescale the threshold's units (audit B6).
-    #[cfg_attr(not(feature = "tracing"), allow(unused_variables))]
     pub fn get(&self, query: &[f32]) -> Result<Option<Value>> {
         let hits = self
             .collection
@@ -83,13 +82,16 @@ impl SemanticCache<'_> {
                 Ok(hit.document.get(&self.value_field).cloned())
             }
             // Miss: nearest entry too far (`distance`), or the cache is
-            // empty (`-1.0` — there was no distance to compare).
-            other => {
+            // empty (`-1.0` — there was no distance to compare). The
+            // binding is underscore-prefixed because it is read only by the
+            // (feature-gated) event above — the off-feature build needs no
+            // `allow(unused_variables)` on `get`.
+            _other => {
                 crate::telemetry::event!(
                     DEBUG,
                     message = "semantic_cache_miss",
                     collection = crate::telemetry::display(self.collection.name()),
-                    distance = other.as_ref().map(|h| h.distance as f64).unwrap_or(-1.0),
+                    distance = _other.as_ref().map(|h| h.distance as f64).unwrap_or(-1.0),
                 );
                 Ok(None)
             }

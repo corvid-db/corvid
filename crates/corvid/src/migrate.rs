@@ -1579,6 +1579,9 @@ mod tests {
     /// `CORVIDDUMPv1` stream (u32 length prefixes, u32 def field counts)
     /// replays its records, definitions, TTL, auto-id counter, and edge.
     /// The compat matrix's load-side half, pinned at the format's home.
+    /// The on-disk-PQ def (vector mode 2) exercises the `m`/`k` reads as
+    /// v1-u32 `count()`s at the m/k site — the one count()-at-u32 shape a
+    /// real v1 dump can carry (mode 3 postdates v2).
     #[test]
     fn load_accepts_a_hand_crafted_v1_dump() {
         let doc = {
@@ -1586,13 +1589,28 @@ mod tests {
             m.insert("n".to_owned(), Value::Int(7));
             Value::Map(m)
         };
+        let vecdoc = {
+            let mut m = BTreeMap::new();
+            m.insert("q".to_owned(), Value::Vector(vec![1.0f32, 0.0, 1.0, 0.0]));
+            Value::Map(m)
+        };
         let mut b = Vec::new();
         b.extend_from_slice(MAGIC_V1);
-        put_u64(&mut b, 1); // one record
+        put_u64(&mut b, 2); // two records (scalar doc + PQ training doc)
         v1_str(&mut b, "old");
         v1_bytes(&mut b, b"k");
         v1_bytes(&mut b, &doc.encode());
-        put_u64(&mut b, 0); // vectors
+        v1_str(&mut b, "old");
+        v1_bytes(&mut b, b"v");
+        v1_bytes(&mut b, &vecdoc.encode());
+        put_u64(&mut b, 1); // one vector index: on-disk PQ (mode 2, u32 m/k)
+        v1_str(&mut b, "old");
+        v1_str(&mut b, "q");
+        b.push(2); // Metric::L2
+        b.push(0); // Quantization::None
+        b.push(2); // mode: on-disk PQ — m/k below are u32 counts in v1
+        put_u32(&mut b, 2); // m (divides the 4-dim field)
+        put_u32(&mut b, 2); // k
         put_u64(&mut b, 0); // texts
         put_u64(&mut b, 1); // one scalar index
         v1_str(&mut b, "old");
@@ -1632,6 +1650,13 @@ mod tests {
             .map(|r| r.key)
             .collect();
         assert_eq!(hits, vec![b"k".to_vec()]);
+        // The PQ def replayed with u32 m/k counts: recreated via
+        // create_vector_index_ondisk_pq and serviceable.
+        let vhits = c
+            .vector_search("q", &[1.0, 0.0, 1.0, 0.0], 1, crate::Metric::L2)
+            .unwrap();
+        assert_eq!(vhits.len(), 1);
+        assert_eq!(vhits[0].key, b"v".to_vec());
         assert_eq!(c.ttl(b"k").unwrap(), Some(4242));
         assert_eq!(c.neighbors(b"a", "knows").unwrap(), vec![b"b".to_vec()]);
         assert_eq!(
