@@ -107,6 +107,16 @@ flips (was "specified, not implemented").
 
 ## Task 6: Decision ledger + program exit
 
+Prepend (Task 5 review nits, binding): (a) move the 0xFF-reservation and
+backup-cross-config caveats to their discovery points — one sentence in
+Store::put's doc (raw 0xFF-prefixed bytes in user namespaces are
+force-compressed under the feature) and one in Db::backup/Store::backup
+(ON-written backups restored into OFF binaries fail per-row with clean
+Decode errors; dump/load is the migration path) + CHANGELOG residual
+line; (b) note in tests/compression.rs that the raw-encoding needle IS
+the cross-config dump-portability pin; (c) add the
+len == THRESHOLD compressible pin.
+
 Every remaining DESIGN-future item gets an explicit controller decision
 recorded in DESIGN.md's decision log (table row or dated entry):
 - Browser/OPFS: KEEPS its 2026-05-29 deferral (desktop/server focus
