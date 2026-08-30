@@ -257,6 +257,18 @@ runs spread 67-71 ms / 356-458 ms), and `value_decode` −6.8% (faster,
 untouched). **No regression attributable to code; the guard holds.**
 
 
+## Ledger-closure Task 4 note — bm25_exact residual
+
+CJK bigram tokenization (ledger-closure Task 4, `a197976` fast path)
+leaves `bm25_exact_2k` at 7.60–7.66 ms vs the 7.42 ms same-session
+pre-change baseline (**+2.5–3.2%**): the CJK-aware tokenize pass costs a
+little on the latin-only bench corpus even with the ASCII fast path —
+inside the 5% guard (recorded here because Task 4 deliberately left
+BENCHES.md untouched at the time; regression-guard verification, not a
+shipped perf claim; the same commit's "indexed improved ~8%" reading was
+within historical variance — the indexed bench re-tokenizes only the
+ASCII query, no mechanism).
+
 ## Ledger-closure Task 1 — endpoint-direct graph reads: measured PARITY
 
 `neighbors`/`in_neighbors`/`neighbors_weighted`/`traverse`'s frontier
