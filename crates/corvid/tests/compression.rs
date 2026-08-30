@@ -190,6 +190,13 @@ fn reopen_backup_and_dump_load_roundtrip() {
     // Dump: the raw encoding appears VERBATIM in the stream (dump reads
     // through the store, i.e. decompressed — format-stable v2 with the
     // feature on), and no marker-prefixed row leaks into it.
+    //
+    // This needle IS the cross-config dump-portability pin: because the
+    // dump stream carries raw value encodings (never the compressed
+    // stored row), a dump taken under the feature loads into an OFF
+    // binary and vice versa — dump/load is the migration path between
+    // feature configurations that a physical `backup` deliberately is
+    // not (see Store::backup's doc).
     let mut dump = Vec::new();
     db.dump(&mut dump).unwrap();
     let needle = doc.encode();

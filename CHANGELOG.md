@@ -23,7 +23,14 @@ format and API may change without backward-compatibility guarantees.
   Measured: structured-text documents shrink to ~8.3% of raw size;
   f32 vector payloads barely compress (~91%), so this is a text/document
   feature rather than a vector one; ~5 µs extra per 8 KiB write and
-  ~2.6 µs per read (docs/BENCHES.md). No public API changes.
+  ~2.6 µs per read (docs/BENCHES.md). No public API changes. Two
+  residuals, documented at their discovery points: direct `Store`
+  users' raw `0xFF`-prefixed bytes in user namespaces are reserved
+  (force-compressed under the feature, possibly slightly larger), and
+  backups are physical copies — NOT portable across feature
+  configurations (an ON-written backup read by an OFF binary fails
+  per-row with clean `Decode` errors; `dump`/`load`, which carries raw
+  encodings either way, is the migration path).
 - CJK text search: runs of CJK characters now tokenize as sliding BIGRAMS
   (single-character run → that character), the standard dictionary-free
   segmentation fallback for the unspaced CJK scripts — no dictionary data,

@@ -225,6 +225,31 @@ mod tests {
 
     #[cfg(feature = "zstd")]
     #[test]
+    fn at_threshold_compressible_stored_marked() {
+        // The boundary is inclusive: len == THRESHOLD is a candidate (the
+        // check is `< THRESHOLD`), so compressible input at exactly the
+        // threshold must store the strictly-smaller marked form — the
+        // len == THRESHOLD - 32 pin above and this one bracket the edge.
+        let v = compressible(THRESHOLD);
+        assert_eq!(v.len(), THRESHOLD);
+        let stored = compress("docs", &v).unwrap();
+        let Cow::Owned(buf) = &stored else {
+            panic!("compressible input at exactly THRESHOLD must compress");
+        };
+        assert_eq!(buf[0], MARKER, "stored form must be marker-prefixed");
+        assert!(
+            buf.len() < v.len(),
+            "marked form must be strictly smaller: {} vs {}",
+            buf.len(),
+            v.len()
+        );
+        // Round trip.
+        let back = decompress("docs", buf).unwrap();
+        assert_eq!(back.as_ref(), &v[..]);
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
     fn compressible_above_threshold_stored_marked_and_smaller() {
         let big = compressible(8192);
         let stored = compress("docs", &big).unwrap();

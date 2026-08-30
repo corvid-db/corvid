@@ -95,6 +95,13 @@ impl Db {
     /// (documents, indexes, graph, all reserved state) to a fresh file at
     /// `path`. Safe to call while writers are active — the copy is taken from
     /// one read snapshot. Reopen it with [`Db::open`].
+    ///
+    /// The copy is physical (raw stored rows), so it is NOT portable across
+    /// feature configurations: with the `zstd` feature on, the backup's
+    /// compressed rows fail per-row with clean `Decode` errors when read by a
+    /// feature-off binary. `dump`/`load` is the migration path between
+    /// configurations (the dump stream carries raw value encodings either
+    /// way).
     pub fn backup(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
         self.store.backup(path)
     }

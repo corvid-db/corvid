@@ -244,6 +244,14 @@ impl Store {
     /// `exists()` and `Database::create`) is accepted: corvid is a
     /// single-process embedded engine, so concurrent backups of one store
     /// are the caller's responsibility to serialize.
+    ///
+    /// The copy is physical (raw stored rows, verbatim), so it is NOT
+    /// portable across feature configurations: rows written by a `zstd`
+    /// feature-on binary fail per-row with clean `Decode` errors when read
+    /// by a feature-off binary (and never misparse — the marker byte is
+    /// outside the value codec's tag space). `dump`/`load` is the
+    /// migration path between configurations: the dump stream reads
+    /// through the store, so it carries raw value encodings either way.
     pub fn backup(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         if path.exists() {
@@ -329,6 +337,13 @@ impl Store {
     }
 
     /// Insert or overwrite `value` at `key` within `collection`.
+    ///
+    /// With the `zstd` feature on, a user-namespace `value` whose raw bytes
+    /// begin with `0xFF` is force-compressed (possibly slightly larger): the
+    /// compression marker byte is reserved in user namespaces under the
+    /// feature, so a raw stored row can never begin with it — engine-written
+    /// value encodings can never start with `0xFF` (tags `0..=8`), so this
+    /// only binds direct [`Store`] users.
     pub fn put(&self, collection: &str, key: &[u8], value: &[u8]) -> Result<()> {
         self.transaction(|tx| tx.put(collection, key, value))
     }
