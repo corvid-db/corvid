@@ -2235,6 +2235,47 @@ fn lifecycle_cuckoo_filter_overflow_rejects_and_rollback_preserves_admitted() {
     );
 }
 
+/// Delete-churn no-false-negatives pin (review hardening): after deleting
+/// HALF of a filled filter, every surviving item is still found. Deleting
+/// removes one fingerprint slot and never disturbs a different slot, so
+/// survivors are unconditionally contained — the one documented exception
+/// is a survivor that fully aliases a deleted item (same fingerprint in
+/// the same bucket pair, an expected birthday collision at 2^17
+/// fingerprints; expected alias count across the 500×500 cross pairs here
+/// is ≈ 0.004, and the fixed DefaultHasher makes the run deterministic
+/// either way). The deleted half gets NO absence claim: a deleted item may
+/// legitimately alias a survivor's fingerprint. Freed capacity must remain
+/// usable — a re-added deleted item is found again.
+#[test]
+fn lifecycle_cuckoo_delete_half_then_all_survivors_found() {
+    // 17-bit fingerprints (fp_rate 1e-4) keep full (fingerprint, bucket)
+    // aliasing between the two halves astronomically unlikely.
+    let mut f = CuckooFilter::new(1000, 0.0001);
+    for i in 0..1000u32 {
+        assert!(
+            f.add_bytes(format!("k{i}").as_bytes()),
+            "k{i} must be admitted"
+        );
+    }
+    // Delete the first half; every delete must find its fingerprint.
+    for i in 0..500u32 {
+        assert!(
+            f.delete_bytes(format!("k{i}").as_bytes()),
+            "admitted k{i} must be deletable"
+        );
+    }
+    // The pin: every survivor is found — deletion never costs a neighbor.
+    for i in 500..1000u32 {
+        assert!(
+            f.contains_bytes(format!("k{i}").as_bytes()),
+            "survivor k{i} lost to unrelated deletes"
+        );
+    }
+    // Churn does not corrupt capacity: a re-added deleted item sticks.
+    assert!(f.add_bytes(b"k0"));
+    assert!(f.contains_bytes(b"k0"));
+}
+
 // ===========================================================================
 // TDigest
 // ===========================================================================
@@ -2440,12 +2481,24 @@ fn lifecycle_minhash_signature_invariance_and_jaccard_bounds() {
 /// LshIndex banding on a fixed corpus: 20 sets in 10 similar pairs (true
 /// J = 35/45 ≈ 0.78) plus a 5-token shared base making every dissimilar
 /// pair's true J = 5/75 ≈ 0.067. With 16 bands × 4 rows the banding curve
-/// 1 − (1 − J^rows)^bands gives: similar pair ≈ 0.999 (all 10 found —
-/// each pair's miss probability is 8×10⁻⁴), identical signature ≈ 1
-/// (self always found), dissimilar pair ≈ 3.2×10⁻⁴ (expected cross links
-/// over the 190 dissimilar pairs ≈ 0.06 — pinned ≤ 3, a generous margin
-/// over the math). Also pins the length contract: inserts and queries
-/// whose signature length differs from bands × rows are rejected empty.
+/// 1 − (1 − J^rows)^bands gives: similar pair ≈ 0.999, identical signature
+/// ≈ 1 (self always found — that one is deterministic, not probabilistic),
+/// dissimilar pair ≈ 3.2×10⁻⁴.
+///
+/// Recall-pin fragility (review-hardened): each twin pair's miss
+/// probability is 8×10⁻⁴, so an all-10 assertion carries ~0.7% exposure
+/// per hasher redraw (1 − (1 − 8×10⁻⁴)¹⁰) — deterministic for any one
+/// binary but a silent break-in-waiting across std `DefaultHasher`
+/// changes. The pin allows ONE miss (≥ 9 of 10; two simultaneous misses
+/// sit at ≈ 3×10⁻⁵) rather than growing the corpus: recall is the
+/// property, not the number 10.
+///
+/// Skew arithmetic: C(20,2) = 190 total unordered pairs − 10 twin pairs =
+/// 180 dissimilar unordered pairs; the counting loop below counts ORDERED
+/// links (each direction separately), so the expected cross-link count is
+/// 2 × 180 × 3.2×10⁻⁴ ≈ 0.115 — pinned ≤ 3, a generous margin over the
+/// math. Also pins the length contract: inserts and queries whose
+/// signature length differs from bands × rows are rejected empty.
 #[test]
 fn lifecycle_lsh_banding_recall_and_skew_fixed_corpus() {
     let mh = MinHash::new(64); // 16 bands × 4 rows
@@ -2470,18 +2523,24 @@ fn lifecycle_lsh_banding_recall_and_skew_fixed_corpus() {
         );
     }
 
-    // Recall: every similar twin is a candidate of its partner, and every
-    // set is a candidate of itself (identical signature → every band hits).
+    // Recall: at least 9 of 10 twin pairs are candidates of their partner
+    // — one miss allowed (the fragility note above); recall is the
+    // property, not the count. Self-matches stay a hard pin: identical
+    // signatures share every band, deterministically.
     let key = |i: usize| format!("set-{i}").into_bytes();
+    let mut recalled = 0usize;
     for p in 0..10usize {
         let (a, b) = (2 * p, 2 * p + 1);
         let cands = idx.candidates(&sigs[a]);
-        assert!(
-            cands.iter().any(|k| *k == key(b)),
-            "similar twin {b} not found from {a}"
-        );
+        if cands.iter().any(|k| *k == key(b)) {
+            recalled += 1;
+        }
         assert!(cands.iter().any(|k| *k == key(a)), "self must always match");
     }
+    assert!(
+        recalled >= 9,
+        "only {recalled}/10 twin pairs recalled — one-miss slack exceeded"
+    );
 
     // Skew: dissimilar pairs almost never share a band bucket.
     let mut cross = 0usize;
