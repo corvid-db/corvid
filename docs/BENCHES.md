@@ -370,9 +370,14 @@ copies, never shipped):
 
 Sixteen lanes changes the per-lane summation order (lane j accumulates
 {j, j+16, …} and the 16 partials reduce in a different tree), so the
-result is not bit-identical — declined by the exactness oracle (the
-exact-value kernel tests and the deterministic HNSW/recall corpora are
-the pinned results). `mul_add` computes a different rounding (one
+result is not bit-identical — declined by the exactness oracle, whose
+load-bearing pins are named, not gestured at: the direct-API PQ recall
+floor (≥0.55, measured 0.56 identically at ef 100/200/400 — `hnsw.rs`
+unit corpus), the HNSW/on-disk recall corpora (`hnsw.rs` ≥0.9,
+`disk_hnsw.rs` ≥0.85, `search_vector.rs` ≥0.7 against exact-KNN
+twins), and the exact-eq reproducibility asserts (`pq.rs`: same corpus
+trains a bit-identical codebook; twin HNSW builds answer identically).
+`mul_add` computes a different rounding (one
 instead of two) AND de-vectorizes: LLVM emits scalar `fmadd` chains
 (assembly-checked), so the fused loop is slower than the 4-wide mul+add
 it would replace. Explicit SIMD cannot beat the emitted code without
@@ -397,8 +402,9 @@ The scan is the stable measurement here (±2% across four runs); the u64
 DRAM probe swung 43.3→57.9 GB/s between same-session runs, so the
 ceiling is quoted as a band. Per evaluation the scan runs at 72.5–74.8
 ns ≈ the hot kernel's own rate, and wherever the corpus exceeds cache
-the sustained rate sits inside the streaming band — memory-side, not
-kernel-side. A 29%-faster kernel (the declined shape) cannot lift a
+the sustained rate sits at/just below the low end of the streaming band
+(41–42 vs 43.3–57.9 GB/s) — memory-side, not kernel-side. A
+29%-faster kernel (the declined shape) cannot lift a
 DRAM-resident scan past that band.
 
 **Quantized scans — the actual volume lever** (`quantized_scan`; same
