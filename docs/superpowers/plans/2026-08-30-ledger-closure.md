@@ -69,6 +69,15 @@ DESIGN future row flips.
 
 ## Task 4: CJK bigram analysis
 
+Prepend (Task 3 review hardening, binding): (a) LSH recall pin: add the
+per-test fragility note AND slack (≥9 of 10 twin pairs or more pairs — the
+current all-10 assertion carries ~0.7% hasher-redraw exposure); (b) add
+the delete-half-then-verify-all-survivors cuckoo pin; (c) fix the LSH
+comment arithmetic (180 dissimilar unordered pairs, ordered-link count
+≈0.115); (d) DESIGN note: TDigest's Clone derive is need-driven
+(merge-commutativity clones); Bloom/HLL stay bare — recorded decision, no
+symmetry churn.
+
 text.rs analyzer extension: when text contains CJK codepoints, tokenize by
 bigram (standard CJK segmentation fallback for search); no external deps;
 mixed CJK+latin strings handled (latin words tokenized as today, CJK runs
