@@ -409,6 +409,34 @@ let maybe = bloom.contains_bytes(b"seen");
 
 `Collection::approx_distinct(field)` estimates a field's distinct count via HLL.
 
+The sketch family grew in the 2026-08-30 closure pass, same conventions
+(deterministic, no dependencies):
+
+```rust
+use corvid::{CuckooFilter, TDigest, MinHash, LshIndex};
+
+// Membership with deletion (the cuckoo differentiator vs Bloom).
+let mut cuckoo = CuckooFilter::new(10_000, 0.01);
+cuckoo.add_bytes(b"session-7");
+assert!(cuckoo.contains_bytes(b"session-7"));
+cuckoo.delete_bytes(b"session-7"); // really gone — only delete what you added
+
+// Streaming quantiles.
+let mut td = TDigest::new(100.0);
+for latency in [12.0, 45.0, 51.0, 80.0] { td.add(latency); }
+let p99 = td.quantile(0.99); // Option<f64>; 0.0/1.0 are exact min/max
+
+// Set similarity + candidate lookup.
+let mh = MinHash::new(64);
+let sig_a = mh.signature(&[b"tag:x", b"tag:y", b"tag:z"]);
+let sig_b = mh.signature(&[b"tag:y", b"tag:z", b"tag:w"]);
+let similarity = MinHash::jaccard_estimate(&sig_a, &sig_b); // ~0.5
+let mut lsh = LshIndex::new(16, 4); // bands × rows = signature length
+lsh.insert(b"doc-a", &sig_a);
+let similar = lsh.candidates(&sig_b); // keys sharing a full band
+# let _ = (p99, similarity, similar);
+```
+
 ## Operations
 
 ```rust

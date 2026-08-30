@@ -255,7 +255,7 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::JoinRow` — `joins_smoke_left_outer_resolves_and_misses`, `joins_happy_path_join_row_shape_is_exact`, `joins_missing_fk_field_and_dangling_reference_retain_rows_with_none`, `joins_foreign_key_kinds_text_bytes_int_and_unusable_shapes`, `joins_self_join_references_within_one_collection`, `joins_empty_left_empty_right_and_unknown_right_collection`, `joins_rows_follow_left_collection_key_order`, `joins_non_map_left_documents_retained_with_none`
 - `corvid::Collection::join` — `joins_smoke_left_outer_resolves_and_misses`, `joins_happy_path_join_row_shape_is_exact`, `joins_dotted_foreign_key_path_resolves_nested_maps`, `joins_missing_fk_field_and_dangling_reference_retain_rows_with_none`, `joins_foreign_key_kinds_text_bytes_int_and_unusable_shapes`, `joins_self_join_references_within_one_collection`, `joins_empty_left_empty_right_and_unknown_right_collection`, `joins_rows_follow_left_collection_key_order`, `joins_track_right_and_left_side_mutations`, `joins_non_map_left_documents_retained_with_none`
 
-## Lifecycle — 104 construct(s)
+## Lifecycle — 123 construct(s)
 
 - `corvid::value::MAX_NESTING` — `lifecycle_value_decode_enforces_max_nesting_bound`
 - `corvid::Value::encode` — `lifecycle_dump_load_roundtrips_every_value_variant_bytes_exact`, `lifecycle_value_decode_enforces_max_nesting_bound`
@@ -349,6 +349,25 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::BloomFilter::new` — `lifecycle_bloom_filter_no_false_negatives_and_bounded_fp_rate`
 - `corvid::BloomFilter::add_bytes` — `lifecycle_bloom_filter_no_false_negatives_and_bounded_fp_rate`
 - `corvid::BloomFilter::contains_bytes` — `lifecycle_bloom_filter_no_false_negatives_and_bounded_fp_rate`
+- `corvid::CuckooFilter` — `lifecycle_cuckoo_filter_membership_delete_and_bounded_fp`, `lifecycle_cuckoo_filter_overflow_rejects_and_rollback_preserves_admitted`
+- `corvid::CuckooFilter::new` — `lifecycle_cuckoo_filter_membership_delete_and_bounded_fp`, `lifecycle_cuckoo_filter_overflow_rejects_and_rollback_preserves_admitted`
+- `corvid::CuckooFilter::add_bytes` — `lifecycle_cuckoo_filter_membership_delete_and_bounded_fp`, `lifecycle_cuckoo_filter_overflow_rejects_and_rollback_preserves_admitted`
+- `corvid::CuckooFilter::contains_bytes` — `lifecycle_cuckoo_filter_membership_delete_and_bounded_fp`, `lifecycle_cuckoo_filter_overflow_rejects_and_rollback_preserves_admitted`
+- `corvid::CuckooFilter::delete_bytes` — `lifecycle_cuckoo_filter_membership_delete_and_bounded_fp`
+- `corvid::TDigest` — `lifecycle_tdigest_exact_boundaries_nan_and_monotone_cdf`, `lifecycle_tdigest_merge_algebra_and_bounded_error`
+- `corvid::TDigest::new` — `lifecycle_tdigest_exact_boundaries_nan_and_monotone_cdf`, `lifecycle_tdigest_merge_algebra_and_bounded_error`
+- `corvid::TDigest::add` — `lifecycle_tdigest_exact_boundaries_nan_and_monotone_cdf`, `lifecycle_tdigest_merge_algebra_and_bounded_error`
+- `corvid::TDigest::merge` — `lifecycle_tdigest_merge_algebra_and_bounded_error`
+- `corvid::TDigest::quantile` — `lifecycle_tdigest_exact_boundaries_nan_and_monotone_cdf`, `lifecycle_tdigest_merge_algebra_and_bounded_error`
+- `corvid::TDigest::cdf` — `lifecycle_tdigest_exact_boundaries_nan_and_monotone_cdf`
+- `corvid::MinHash` — `lifecycle_minhash_signature_invariance_and_jaccard_bounds`
+- `corvid::MinHash::new` — `lifecycle_minhash_signature_invariance_and_jaccard_bounds`
+- `corvid::MinHash::signature` — `lifecycle_minhash_signature_invariance_and_jaccard_bounds`
+- `corvid::MinHash::jaccard_estimate` — `lifecycle_minhash_signature_invariance_and_jaccard_bounds`
+- `corvid::LshIndex` — `lifecycle_lsh_banding_recall_and_skew_fixed_corpus`
+- `corvid::LshIndex::new` — `lifecycle_lsh_banding_recall_and_skew_fixed_corpus`
+- `corvid::LshIndex::insert` — `lifecycle_lsh_banding_recall_and_skew_fixed_corpus`
+- `corvid::LshIndex::candidates` — `lifecycle_lsh_banding_recall_and_skew_fixed_corpus`
 - `corvid::Db::dump` — `lifecycle_smoke_dump_load_roundtrips_documents`, `lifecycle_dump_load_roundtrips_every_value_variant_bytes_exact`, `lifecycle_dump_load_roundtrips_every_index_family_ttl_edges_schema_and_autoids`, `lifecycle_dump_load_into_nonempty_db_merges_records_and_counters`, `lifecycle_dump_of_empty_db_loads_empty_and_io_errors_surface`
 - `corvid::Db::load` — `lifecycle_smoke_dump_load_roundtrips_documents`, `lifecycle_dump_load_roundtrips_every_value_variant_bytes_exact`, `lifecycle_dump_load_roundtrips_every_index_family_ttl_edges_schema_and_autoids`, `lifecycle_dump_load_into_nonempty_db_merges_records_and_counters`, `lifecycle_load_rejects_reserved_names_and_malformed_streams`, `lifecycle_dump_of_empty_db_loads_empty_and_io_errors_surface`
 - `corvid::Db::load_with_renames` — `lifecycle_load_with_renames_migrates_a_legacy_pre_wave4_dump`, `lifecycle_load_with_renames_error_contract_invalid_target_collisions_and_noops`
@@ -420,8 +439,8 @@ the in-process duplex-I/O suite in `crates/corvid-mcp/tests/tools/`.
 - `mcp::tool::set_schema` — `set_schema_then_get_schema_roundtrips`, `set_schema_unique_enforced_on_stores`, `set_schema_required_and_type_violations`, `set_schema_param_and_name_errors`, `dump_load_preserves_schema_constraints`, `set_schema_flag_type_errors`, `set_schema_declared_empty_vs_undeclared_fields`
 - `mcp::tool::get_schema` — `set_schema_then_get_schema_roundtrips`, `set_schema_param_and_name_errors`, `dump_load_preserves_schema_constraints`, `set_schema_declared_empty_vs_undeclared_fields`
 
-308 engine construct(s) across 13 statement classes, 51 wire construct(s),
-297 distinct covering tests (existence and uniqueness enforced by the
+327 engine construct(s) across 13 statement classes, 51 wire construct(s),
+303 distinct covering tests (existence and uniqueness enforced by the
 radars; the 7 exempt row(s) above are the only uncovered ones, each
 with its justification).
 

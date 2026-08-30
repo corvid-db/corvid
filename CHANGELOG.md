@@ -6,6 +6,29 @@ format and API may change without backward-compatibility guarantees.
 
 ## [Unreleased]
 
+### Added
+- Three new probabilistic sketches join `HyperLogLog`/`BloomFilter` as
+  public engine surface (same conventions: no dependencies, deterministic
+  std `DefaultHasher` hashing, no `rand` — identical inputs produce
+  identical sketches):
+  - `CuckooFilter::new(expected_items, fp_rate)` — approximate set
+    membership with `delete_bytes` (the differentiator vs Bloom). No
+    false negatives for admitted items; when the table exhausts its
+    displacement budget, `add_bytes` returns `false` and the whole
+    eviction chain is rolled back, so a rejected insert leaves the filter
+    byte-identical (the paper's variant silently drops one previously
+    admitted item; this divergence is pinned by conformance tests).
+  - `TDigest::new(compression)` — approximate quantiles/CDF over a
+    stream of `f64` observations: `add` (NaN and ±infinity rejected),
+    `merge`, `quantile(0..=1)` (0.0/1.0 are the exact min/max, out-of-range
+    and NaN return `None`), and a monotone `cdf`. Deterministic given a
+    fixed add/merge history.
+  - `MinHash::new(k)` with `signature(&[items])` and
+    `jaccard_estimate(a, b)` (exactly 1.0 for identical sets, 0.0 for
+    disjoint, `None` on length mismatch), plus `LshIndex::new(bands,
+    rows)` banding (`insert`/`candidates`) for candidate lookup with the
+    `1 − (1 − J^rows)^bands` recall curve.
+
 ### Changed
 - PQ training (`Pq::train`, and therefore `create_vector_index_pq` /
   `create_vector_index_pq_ondisk` index creation) now parallelizes on

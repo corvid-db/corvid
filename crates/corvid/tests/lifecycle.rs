@@ -12,7 +12,10 @@
 
 use std::collections::BTreeMap;
 
-use corvid::{BloomFilter, Db, HyperLogLog, Metric, Quantization, Store, Value, field};
+use corvid::{
+    BloomFilter, CuckooFilter, Db, HyperLogLog, LshIndex, Metric, MinHash, Quantization, Store,
+    TDigest, Value, field,
+};
 
 fn doc(name: &str, n: i64) -> Value {
     let mut m = BTreeMap::new();
@@ -2123,6 +2126,403 @@ fn lifecycle_bloom_filter_no_false_negatives_and_bounded_fp_rate() {
     tiny.add_bytes(b"only");
     assert!(tiny.contains_bytes(b"only"));
     assert!(!tiny.contains_bytes(b"absent"));
+}
+
+// ===========================================================================
+// CuckooFilter
+// ===========================================================================
+
+/// CuckooFilter pins the Bloom contract plus the deletion differentiator:
+/// every admitted item is always found (no false negatives — the pin);
+/// `delete_bytes` makes the deleted item absent while every other admitted
+/// item stays found, and deleting again (or deleting a never-added item)
+/// reports `false` without touching anything; the observed false-positive
+/// rate on absent items honors the paper's ε ≈ 2·b/2^f bound with the same
+/// generous-slack convention as the Bloom test (configured 1%, pinned
+/// < 5% observed over 10 000 trials).
+///
+/// Bound fragility: fingerprints and buckets come from std's
+/// `DefaultHasher` (SipHash-1-3, fixed keys today). A std upgrade that
+/// swaps it changes which absent items alias an occupied slot, moving the
+/// observed rate within its expected spread — the 5× slack over the
+/// configured rate covers any reasonable hasher; re-derive only if a std
+/// change pushes the rate past it.
+#[test]
+fn lifecycle_cuckoo_filter_membership_delete_and_bounded_fp() {
+    let mut f = CuckooFilter::new(1000, 0.01);
+    for i in 0..1000u32 {
+        assert!(
+            f.add_bytes(format!("k{i}").as_bytes()),
+            "k{i} must be admitted"
+        );
+    }
+    // The no-false-negatives pin: every accepted item is found.
+    for i in 0..1000u32 {
+        assert!(f.contains_bytes(format!("k{i}").as_bytes()));
+    }
+
+    // Deletion — the differentiator vs Bloom.
+    assert!(f.delete_bytes(b"k0"));
+    assert!(!f.contains_bytes(b"k0"), "deleted item must be absent");
+    assert!(f.contains_bytes(b"k1"), "neighbors survive the delete");
+    assert!(
+        !f.delete_bytes(b"k0"),
+        "second delete reports nothing to remove"
+    );
+    assert!(!f.delete_bytes(b"never-added"), "absent item reports false");
+    // Re-adding the deleted item works.
+    assert!(f.add_bytes(b"k0"));
+    assert!(f.contains_bytes(b"k0"));
+
+    // False-positive rate on absent items: 10-bit fingerprints, b = 4
+    // slots, two candidate buckets → ε ≈ 8/2^10 ≈ 0.8%; generous slack.
+    let mut fp = 0;
+    const TRIALS: u32 = 10_000;
+    for i in 0..TRIALS {
+        if f.contains_bytes(format!("absent-{i}").as_bytes()) {
+            fp += 1;
+        }
+    }
+    let rate = fp as f64 / TRIALS as f64;
+    assert!(
+        rate < 0.05,
+        "configured 1% must stay under 5% observed, got {rate}"
+    );
+
+    // Out-of-range configuration clamps like Bloom: fp >= 0.5 → 0.5.
+    let mut loose = CuckooFilter::new(1000, 0.99);
+    for i in 0..1000u32 {
+        assert!(loose.add_bytes(format!("k{i}").as_bytes()));
+    }
+    for i in 0..1000u32 {
+        assert!(loose.contains_bytes(format!("k{i}").as_bytes()));
+    }
+}
+
+/// Victim-slot semantics under overflow: a table sized for 10 items (4
+/// buckets × 4 slots) must eventually reject (`add_bytes` → `false`), and
+/// the pinned rejection contract holds — the rejected item is NOT
+/// contained, and the displacement chain is rolled back so every
+/// previously admitted item survives unchanged (the paper's variant drops
+/// the last evicted fingerprint, silently losing an admitted item; the
+/// rollback is this engine's documented, strictly safer divergence).
+#[test]
+fn lifecycle_cuckoo_filter_overflow_rejects_and_rollback_preserves_admitted() {
+    let mut f = CuckooFilter::new(10, 0.01);
+    let mut admitted: Vec<Vec<u8>> = Vec::new();
+    let mut rejected = 0;
+    for i in 0..500u32 {
+        let bytes = format!("x{i}").into_bytes();
+        if f.add_bytes(&bytes) {
+            admitted.push(bytes);
+        } else {
+            rejected += 1;
+            assert!(
+                !f.contains_bytes(&bytes),
+                "rejected item must not be contained"
+            );
+            // Rollback pin: rejection never costs a previously admitted item.
+            for a in &admitted {
+                assert!(f.contains_bytes(a), "admitted item lost after rejected add");
+            }
+        }
+    }
+    assert!(rejected > 0, "500 items into 16 slots must overflow");
+    assert!(
+        admitted.len() >= 12,
+        "16 slots should still admit most items, got {}",
+        admitted.len()
+    );
+}
+
+// ===========================================================================
+// TDigest
+// ===========================================================================
+
+/// TDigest exactness and boundaries on hand-readable corpora: distinct
+/// evenly-spaced values stay unmerged at δ = 10 so quartiles are the exact
+/// order statistics; duplicate values collapse to one weighted centroid
+/// whose quantiles are that value at every q; `quantile(0.0)`/`(1.0)` are
+/// the exact min/max; non-finite observations (NaN, ±inf) are rejected
+/// with the digest bit-unchanged; out-of-range and NaN quantile requests
+/// return `None`; the empty digest answers `None`/0.0; `cdf` is monotone
+/// non-decreasing over a sweep, pinned at its 0.0/1.0 ends.
+#[test]
+fn lifecycle_tdigest_exact_boundaries_nan_and_monotone_cdf() {
+    // δ = 10 keeps 1,2,3,4 as singleton centroids (a quarter of the mass
+    // has k1-width > 1/10), so interpolation between centers recovers the
+    // exact quartiles of four evenly spaced values.
+    let mut d = TDigest::new(10.0);
+    for x in [1.0, 2.0, 3.0, 4.0] {
+        d.add(x);
+    }
+    assert_eq!(d.quantile(0.0), Some(1.0));
+    assert_eq!(d.quantile(0.25), Some(1.5));
+    assert_eq!(d.quantile(0.5), Some(2.5));
+    assert_eq!(d.quantile(0.75), Some(3.5));
+    assert_eq!(d.quantile(1.0), Some(4.0));
+
+    // Identical values: one weighted centroid, every quantile exact.
+    let mut d = TDigest::new(10.0);
+    for _ in 0..3 {
+        d.add(5.0);
+    }
+    assert_eq!(d.quantile(0.0), Some(5.0));
+    assert_eq!(d.quantile(0.5), Some(5.0));
+    assert_eq!(d.quantile(1.0), Some(5.0));
+    assert_eq!(d.cdf(4.999), 0.0);
+    assert_eq!(d.cdf(5.0), 1.0);
+
+    // NaN and ±inf are rejected: the digest is left exactly as it was.
+    let before = d.quantile(0.5);
+    d.add(f64::NAN);
+    d.add(f64::INFINITY);
+    d.add(f64::NEG_INFINITY);
+    assert_eq!(d.quantile(0.5), before, "non-finite adds must be dropped");
+    assert_eq!(d.cdf(4.999), 0.0, "no non-finite mass entered the digest");
+
+    // Out-of-range and NaN quantile arguments → None (0 and 1 stay valid).
+    assert_eq!(d.quantile(-0.1), None);
+    assert_eq!(d.quantile(1.1), None);
+    assert_eq!(d.quantile(f64::NAN), None);
+
+    // Empty digest.
+    assert_eq!(TDigest::new(10.0).quantile(0.5), None);
+    assert_eq!(TDigest::new(10.0).cdf(0.0), 0.0);
+
+    // Monotone cdf over a mixed corpus (aggressive δ so centroids merge).
+    let mut d = TDigest::new(4.0);
+    for i in 0..200u32 {
+        d.add((i % 17) as f64);
+    }
+    let mut prev = 0.0;
+    let mut x = -1.0;
+    while x < 20.0 {
+        let c = d.cdf(x);
+        assert!((0.0..=1.0).contains(&c), "cdf out of range at {x}: {c}");
+        assert!(c >= prev, "cdf decreased at {x}");
+        prev = c;
+        x += 0.5;
+    }
+    assert_eq!(d.cdf(-1.0), 0.0);
+    assert_eq!(d.cdf(100.0), 1.0);
+}
+
+/// TDigest merge algebra and accuracy: merging is commutative (identical
+/// quantiles both directions — same multiset of centroids, same sort, same
+/// arithmetic; pinned with a tolerance that only guards f64/libm
+/// association drift) and associative within the compression budget;
+/// on a fixed 10 000-value corpus at δ = 100 every probed quantile sits
+/// within the documented 1/δ = 1% rank bound of the true quantile
+/// (observed error is 0 on this uniform corpus — the bound is the
+/// documented guarantee, not the measurement). Deterministic given the
+/// fixed input order: no sampling anywhere, plain f64 arithmetic, and a
+/// total-order sort on means.
+#[test]
+fn lifecycle_tdigest_merge_algebra_and_bounded_error() {
+    // Fixed larger corpus: values 0..10_000 in order, δ = 100.
+    let mut d = TDigest::new(100.0);
+    for i in 0..10_000i64 {
+        d.add(i as f64);
+    }
+    let n = 10_000.0;
+    for q in [0.01f64, 0.25, 0.5, 0.75, 0.99] {
+        let got = d.quantile(q).unwrap();
+        // Same convention as the exactness pins: true quantile of the
+        // evenly spaced corpus under linear interpolation.
+        let true_q = q * n - 0.5;
+        assert!(
+            (got - true_q).abs() <= 0.01 * n,
+            "q={q}: got {got}, true {true_q}, outside the 1/δ rank bound"
+        );
+    }
+
+    // Commutativity: a.merge(b) and b.merge(a) answer identically.
+    let build = |rem: u64| -> TDigest {
+        let mut t = TDigest::new(50.0);
+        for i in 0..3000i64 {
+            if (i as u64) % 3 == rem {
+                t.add(i as f64);
+            }
+        }
+        t
+    };
+    let (a, b, c) = (build(0), build(1), build(2));
+    let mut ab = a.clone();
+    ab.merge(&b);
+    let mut ba = b.clone();
+    ba.merge(&a);
+    for q in [0.1f64, 0.5, 0.9] {
+        let (x, y) = (ab.quantile(q).unwrap(), ba.quantile(q).unwrap());
+        assert!(
+            (x - y).abs() <= 1e-9,
+            "commutativity broke at q={q}: {x} vs {y}"
+        );
+    }
+
+    // Associativity: both association orders stay within the δ = 50
+    // compression budget (1/δ = 2% rank → <= 60 value units on 0..3000)
+    // of the true quantile and within 2 units of each other (observed
+    // spread ~0.2: the two orders compress at different moments).
+    let mut ab_c = ab.clone();
+    ab_c.merge(&c);
+    let mut bc = b.clone();
+    bc.merge(&c);
+    let mut a_bc = a.clone();
+    a_bc.merge(&bc);
+    for q in [0.1f64, 0.5, 0.9] {
+        let true_q = q * 3000.0 - 0.5;
+        let x = ab_c.quantile(q).unwrap();
+        let y = a_bc.quantile(q).unwrap();
+        assert!(
+            (x - true_q).abs() <= 60.0,
+            "(a⊕b)⊕c outside the 1/δ budget at q={q}: {x} vs {true_q}"
+        );
+        assert!(
+            (y - true_q).abs() <= 60.0,
+            "a⊕(b⊕c) outside the 1/δ budget at q={q}: {y} vs {true_q}"
+        );
+        assert!(
+            (x - y).abs() <= 2.0,
+            "association orders diverged at q={q}: {x} vs {y}"
+        );
+    }
+}
+
+// ===========================================================================
+// MinHash / LshIndex
+// ===========================================================================
+
+/// MinHash signatures are a function of the SET: permutations and repeated
+/// items produce byte-identical signatures. `jaccard_estimate` is exactly
+/// 1.0 for identical sets, exactly 0.0 for disjoint sets, `None` for
+/// mismatched lengths or empty signatures, and within 3σ of the true
+/// Jaccard on a fixed partially-overlapping pair (σ = sqrt(J(1−J)/k), the
+/// sampling error of k exchangeable hash comparisons — deterministic
+/// under the fixed `DefaultHasher`, so the 3σ window holds with huge
+/// margin or fails identically every run).
+#[test]
+fn lifecycle_minhash_signature_invariance_and_jaccard_bounds() {
+    let mh = MinHash::new(128);
+    let a = mh.signature(&[b"apple", b"banana", b"cherry"]);
+    let shuffled = mh.signature(&[b"cherry", b"apple", b"banana", b"apple", b"banana"]);
+    assert_eq!(
+        a, shuffled,
+        "order and duplicates must not change the signature"
+    );
+    assert_eq!(a.len(), 128);
+
+    // Exact endpoints.
+    assert_eq!(MinHash::jaccard_estimate(&a, &a), Some(1.0));
+    let disjoint = mh.signature(&[b"dog", b"elephant", b"fox"]);
+    assert_eq!(MinHash::jaccard_estimate(&a, &disjoint), Some(0.0));
+
+    // Mismatched lengths and empty signatures are rejected.
+    assert_eq!(MinHash::jaccard_estimate(&a, &a[..3]), None);
+    assert_eq!(MinHash::jaccard_estimate(&a, &[]), None);
+
+    // Fixed pair: |A| = |B| = 40, overlap 30 → J = 30/50 = 0.6.
+    let a_items: Vec<String> = (0..40).map(|i| format!("a{i}")).collect();
+    let b_items: Vec<String> = (10..50).map(|i| format!("a{i}")).collect();
+    let a_refs: Vec<&[u8]> = a_items.iter().map(|s| s.as_bytes()).collect();
+    let b_refs: Vec<&[u8]> = b_items.iter().map(|s| s.as_bytes()).collect();
+    let est = MinHash::jaccard_estimate(&mh.signature(&a_refs), &mh.signature(&b_refs)).unwrap();
+    let sigma = (0.6 * 0.4 / 128.0_f64).sqrt();
+    assert!(
+        (est - 0.6).abs() <= 3.0 * sigma,
+        "estimate {est} outside 3σ of 0.6 (σ = {sigma})"
+    );
+
+    // k clamps to at least one component.
+    assert_eq!(MinHash::new(0).signature(&[b"x"]).len(), 1);
+}
+
+/// LshIndex banding on a fixed corpus: 20 sets in 10 similar pairs (true
+/// J = 35/45 ≈ 0.78) plus a 5-token shared base making every dissimilar
+/// pair's true J = 5/75 ≈ 0.067. With 16 bands × 4 rows the banding curve
+/// 1 − (1 − J^rows)^bands gives: similar pair ≈ 0.999 (all 10 found —
+/// each pair's miss probability is 8×10⁻⁴), identical signature ≈ 1
+/// (self always found), dissimilar pair ≈ 3.2×10⁻⁴ (expected cross links
+/// over the 190 dissimilar pairs ≈ 0.06 — pinned ≤ 3, a generous margin
+/// over the math). Also pins the length contract: inserts and queries
+/// whose signature length differs from bands × rows are rejected empty.
+#[test]
+fn lifecycle_lsh_banding_recall_and_skew_fixed_corpus() {
+    let mh = MinHash::new(64); // 16 bands × 4 rows
+    let mut idx = LshIndex::new(16, 4);
+
+    let mut sigs = Vec::new();
+    for p in 0..10usize {
+        for which in 0..2usize {
+            // 5 tokens shared by EVERY set + 35 of a 40-token pair pool,
+            // offset so twins share 30 of them: J(twins) = 35/45.
+            let mut items: Vec<String> = (0..5).map(|i| format!("shared-{i}")).collect();
+            let lo = if which == 0 { 0 } else { 5 };
+            items.extend((lo..lo + 35).map(|i| format!("pair-{p}-u{i}")));
+            let refs: Vec<&[u8]> = items.iter().map(|s| s.as_bytes()).collect();
+            sigs.push(mh.signature(&refs));
+        }
+    }
+    for (i, sig) in sigs.iter().enumerate() {
+        assert!(
+            idx.insert(format!("set-{i}").as_bytes(), sig),
+            "length matches"
+        );
+    }
+
+    // Recall: every similar twin is a candidate of its partner, and every
+    // set is a candidate of itself (identical signature → every band hits).
+    let key = |i: usize| format!("set-{i}").into_bytes();
+    for p in 0..10usize {
+        let (a, b) = (2 * p, 2 * p + 1);
+        let cands = idx.candidates(&sigs[a]);
+        assert!(
+            cands.iter().any(|k| *k == key(b)),
+            "similar twin {b} not found from {a}"
+        );
+        assert!(cands.iter().any(|k| *k == key(a)), "self must always match");
+    }
+
+    // Skew: dissimilar pairs almost never share a band bucket.
+    let mut cross = 0usize;
+    for (i, sig) in sigs.iter().enumerate() {
+        for k in idx.candidates(sig) {
+            let j = String::from_utf8(k).unwrap();
+            let j: usize = j["set-".len()..].parse().unwrap();
+            if j != i && j / 2 != i / 2 {
+                cross += 1;
+            }
+        }
+    }
+    assert!(
+        cross <= 3,
+        "dissimilar candidate links {cross} exceed the banding margin"
+    );
+
+    // Length contract: wrong-length signatures are rejected on both paths.
+    assert!(
+        !idx.insert(b"bad", &sigs[0][..10]),
+        "wrong length must be rejected"
+    );
+    assert!(idx.candidates(&sigs[0][..10]).is_empty());
+    assert!(
+        !idx.candidates(&sigs[0])
+            .iter()
+            .any(|k| k.as_slice() == b"bad"),
+        "rejected insert must not be queryable"
+    );
+
+    // Candidates are deduplicated and byte-ordered.
+    let cands = idx.candidates(&sigs[0]);
+    let mut sorted = cands.clone();
+    sorted.sort();
+    assert_eq!(cands, sorted);
+    let unique: std::collections::BTreeSet<_> = idx.candidates(&sigs[0]).into_iter().collect();
+    assert_eq!(
+        unique.len(),
+        idx.candidates(&sigs[0]).len(),
+        "no duplicates"
+    );
 }
 
 // ===========================================================================

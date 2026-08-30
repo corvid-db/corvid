@@ -69,6 +69,6 @@ pub use quant::Quantization;
 pub use query::{Hit, TextHit};
 pub use reactive::{ChangeEvent, ChangeKind, SubscriptionId};
 pub use semantic_cache::SemanticCache;
-pub use sketch::{BloomFilter, HyperLogLog};
+pub use sketch::{BloomFilter, CuckooFilter, HyperLogLog, LshIndex, MinHash, TDigest};
 pub use store::Store;
 pub use value::Value;

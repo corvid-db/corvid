@@ -1,10 +1,22 @@
-//! Probabilistic sketches: HyperLogLog (approximate distinct counts) and a
-//! Bloom filter (approximate set membership).
+//! Probabilistic sketches: HyperLogLog (approximate distinct counts),
+//! Bloom and cuckoo filters (approximate set membership), a t-digest
+//! (approximate quantiles/CDF), and MinHash signatures with LSH banding
+//! (approximate set similarity and candidate lookup).
 //!
-//! Both trade a bounded, tunable error for tiny, fixed memory. Hashing uses the
-//! standard library's `DefaultHasher`, which is deterministic, so a sketch
-//! built from the same inputs is reproducible. [`Collection::approx_distinct`]
-//! wires HyperLogLog over a document field.
+//! All of them trade a bounded, tunable error for tiny memory and share one
+//! determinism discipline: hashing goes through the standard library's
+//! `DefaultHasher` (or fixed integer mixers derived from it) — no `rand`,
+//! no dependencies — so a sketch built from the same inputs in the same
+//! order is reproducible run to run. [`Collection::approx_distinct`] wires
+//! HyperLogLog over a document field.
+
+mod cuckoo;
+mod minhash;
+mod tdigest;
+
+pub use cuckoo::CuckooFilter;
+pub use minhash::{LshIndex, MinHash};
+pub use tdigest::TDigest;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

@@ -111,7 +111,7 @@ full **[API reference](https://i-rocky.github.io/corvid/api/corvid/)**.
 | Spatial index (`create_geo_index`): sub-linear radius/bbox | ✅ on disk, persists |
 | Cross-collection lookup joins | ✅ |
 | Semantic (vector-keyed) cache | ✅ |
-| Probabilistic sketches (HyperLogLog, Bloom) | ✅ |
+| Probabilistic sketches (HyperLogLog, Bloom, cuckoo, t-digest, MinHash + LSH) | ✅ |
 | Reactive change feeds | ✅ |
 | Online consistent backup (`Db::backup`) | ✅ |
 | Optional declared schema (`set_schema`): types/required/unique | ✅ |
