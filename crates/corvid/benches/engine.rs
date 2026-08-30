@@ -981,6 +981,63 @@ fn bench_neighbors_hub(c: &mut Criterion) {
     g.finish();
 }
 
+/// Value-store I/O for one 8 KiB document through the public API, in both
+/// feature configurations (ledger-closure Task 5). Run the suite with
+/// default features and again with `--features zstd`; the pair of runs is
+/// the compression overhead record in docs/BENCHES.md. The random-bytes
+/// pair is the control: incompressible values are stored raw under the
+/// feature too, so its two configs must agree within noise.
+///
+/// `cargo bench -p corvid --bench engine -- value_store_io`
+/// (zstd run: `cargo bench -p corvid --features zstd --bench engine -- value_store_io`)
+fn bench_value_store_io(c: &mut Criterion) {
+    let base =
+        "the quick brown fox jumps over the lazy dog; pack my box with five dozen liquor jugs. ";
+    let text_doc = {
+        let body: String = (0..8192)
+            .map(|i| base.as_bytes()[i % base.len()] as char)
+            .collect();
+        let mut m = BTreeMap::new();
+        m.insert("id".to_owned(), Value::Int(1));
+        m.insert("body".to_owned(), Value::Text(body));
+        Value::Map(m)
+    };
+    let random_doc = {
+        // Deterministic xorshift bytes — incompressible in practice.
+        let mut state = 0xBADC0DEu64;
+        let mut bytes = Vec::with_capacity(8192);
+        for _ in 0..8192 {
+            state = xorshift(state);
+            bytes.push((state >> 33) as u8);
+        }
+        let mut m = BTreeMap::new();
+        m.insert("id".to_owned(), Value::Int(2));
+        m.insert("blob".to_owned(), Value::Bytes(bytes));
+        Value::Map(m)
+    };
+
+    let db = Db::open_in_memory().unwrap();
+    let coll = db.collection("bench_docs");
+    let mut g = c.benchmark_group("value_store_io");
+    g.bench_function("insert_8kib_text", |b| {
+        b.iter(|| coll.insert(std::hint::black_box(b"k"), &text_doc).unwrap())
+    });
+    g.bench_function("get_8kib_text", |b| {
+        b.iter(|| coll.get(std::hint::black_box(b"k")).unwrap())
+    });
+    coll.insert(b"r", &random_doc).unwrap();
+    g.bench_function("insert_8kib_random", |b| {
+        b.iter(|| {
+            coll.insert(std::hint::black_box(b"r"), &random_doc)
+                .unwrap()
+        })
+    });
+    g.bench_function("get_8kib_random", |b| {
+        b.iter(|| coll.get(std::hint::black_box(b"r")).unwrap())
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_codec,
@@ -999,6 +1056,7 @@ criterion_group!(
     bench_declined_probes,
     bench_bandwidth,
     bench_kernel_stream,
-    bench_quantized_scan
+    bench_quantized_scan,
+    bench_value_store_io
 );
 criterion_main!(benches);

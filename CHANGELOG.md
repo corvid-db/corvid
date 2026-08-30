@@ -7,6 +7,23 @@ format and API may change without backward-compatibility guarantees.
 ## [Unreleased]
 
 ### Added
+- Optional zstd compression of stored documents, behind a non-default
+  `zstd` cargo feature: with the feature on, values in user collections
+  whose encoding is at least 1 KiB are transparently compressed (zstd
+  level 3) when written and decompressed on every read path — queries,
+  scans, paging, indexes, TTL, edges, dump/load, and backup all behave
+  identically, just smaller on disk. Stored rows are self-describing (a
+  reserved leading marker byte no value encoding can produce), so
+  databases written by default (feature-off) builds read fine under a
+  feature-on build, and `dump` output is format-stable v2 either way.
+  Incompressible values are stored raw (never larger), engine-internal
+  index/edge/TTL namespaces are not compressed, and the default build is
+  byte-identical to before — the zstd dependency (C FFI) enters only via
+  `--features zstd` (CI enforces the default and WASM graphs stay clean).
+  Measured: structured-text documents shrink to ~8.3% of raw size;
+  f32 vector payloads barely compress (~91%), so this is a text/document
+  feature rather than a vector one; ~5 µs extra per 8 KiB write and
+  ~2.6 µs per read (docs/BENCHES.md). No public API changes.
 - CJK text search: runs of CJK characters now tokenize as sliding BIGRAMS
   (single-character run → that character), the standard dictionary-free
   segmentation fallback for the unspaced CJK scripts — no dictionary data,

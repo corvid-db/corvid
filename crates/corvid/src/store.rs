@@ -7,6 +7,12 @@
 //! `id.to_be_bytes() ++ user_key`. Big-endian ids keep collections
 //! contiguous and ordered, so a collection scan is a single prefix range.
 //!
+//! With the optional `zstd` cargo feature, user-collection values are
+//! transparently compressed on write and decompressed on every read at
+//! this seam (see [`crate::compression`] for the on-disk marker scheme);
+//! engine-reserved `__` namespaces and the default build store bytes
+//! verbatim.
+//!
 //! Writes go through [`Store::transaction`], which exposes a [`WriteBatch`]
 //! and commits once at the end — every operation in the closure lands
 //! atomically or not at all. This underpins atomic multi-key writes such as a
@@ -394,7 +400,10 @@ impl Store {
                 break;
             }
             let (k, v) = entry?;
-            out.push((user_key(k.value()), v.value().to_vec()));
+            out.push((
+                user_key(k.value()),
+                crate::compression::decompress(collection, v.value())?.into_owned(),
+            ));
         }
         Ok(out)
     }
@@ -443,7 +452,8 @@ impl Store {
         for entry in records.range::<&[u8]>(bounds)? {
             let (k, v) = entry?;
             let key = k.value();
-            if !f(key.get(8..).unwrap_or(&[]), v.value())? {
+            let value = crate::compression::decompress(collection, v.value())?;
+            if !f(key.get(8..).unwrap_or(&[]), value.as_ref())? {
                 break;
             }
         }
@@ -477,7 +487,10 @@ impl Store {
         let mut out = Vec::new();
         for entry in records.range::<&[u8]>(bounds)? {
             let (k, v) = entry?;
-            out.push((user_key(k.value()), v.value().to_vec()));
+            out.push((
+                user_key(k.value()),
+                crate::compression::decompress(collection, v.value())?.into_owned(),
+            ));
         }
         Ok(out)
     }
@@ -534,10 +547,14 @@ impl WriteBatch<'_> {
     /// collection on first use.
     pub fn put(&mut self, collection: &str, key: &[u8], value: &[u8]) -> Result<()> {
         let id = self.ensure_id(collection)?;
+        // Feature `zstd`: user-collection values may be stored compressed
+        // (self-describing marker; see `compression`). Engine-reserved
+        // namespaces and the OFF build store bytes verbatim.
+        let value = crate::compression::compress(collection, value)?;
         let existed = {
             let mut records = self.txn.open_table(RECORDS)?;
             records
-                .insert(physical_key(id, key).as_slice(), value)?
+                .insert(physical_key(id, key).as_slice(), value.as_ref())?
                 .is_some()
         };
         if !existed {
@@ -558,8 +575,9 @@ impl WriteBatch<'_> {
         value: &[u8],
     ) -> Result<()> {
         let id = self.ensure_id(collection)?;
+        let value = crate::compression::compress(collection, value)?;
         let mut records = self.txn.open_table(RECORDS)?;
-        records.insert(physical_key(id, key).as_slice(), value)?;
+        records.insert(physical_key(id, key).as_slice(), value.as_ref())?;
         Ok(())
     }
 
@@ -570,9 +588,12 @@ impl WriteBatch<'_> {
             return Ok(None);
         };
         let records = self.txn.open_table(RECORDS)?;
-        Ok(records
-            .get(physical_key(id, key).as_slice())?
-            .map(|g| g.value().to_vec()))
+        match records.get(physical_key(id, key).as_slice())? {
+            Some(g) => Ok(Some(
+                crate::compression::decompress(collection, g.value())?.into_owned(),
+            )),
+            None => Ok(None),
+        }
     }
 
     /// Remove `key` from `collection`. Returns whether a value was removed.
@@ -613,7 +634,7 @@ impl WriteBatch<'_> {
             return Ok(Vec::new());
         };
         let records = self.txn.open_table(RECORDS)?;
-        collect_collection(&records, id)
+        collect_collection(&records, collection, id)
     }
 
     /// Return up to `limit` `(key, value)` pairs whose key is `>= start`,
@@ -648,7 +669,10 @@ impl WriteBatch<'_> {
                 break;
             }
             let (k, v) = entry?;
-            out.push((user_key(k.value()), v.value().to_vec()));
+            out.push((
+                user_key(k.value()),
+                crate::compression::decompress(collection, v.value())?.into_owned(),
+            ));
         }
         Ok(out)
     }
@@ -770,9 +794,12 @@ impl ReadBatch<'_> {
             return Ok(None);
         };
         let records = self.txn.open_table(RECORDS)?;
-        Ok(records
-            .get(physical_key(id, key).as_slice())?
-            .map(|g| g.value().to_vec()))
+        match records.get(physical_key(id, key).as_slice())? {
+            Some(g) => Ok(Some(
+                crate::compression::decompress(collection, g.value())?.into_owned(),
+            )),
+            None => Ok(None),
+        }
     }
 
     /// Return all `(key, value)` pairs in `collection`, in key order.
@@ -781,7 +808,7 @@ impl ReadBatch<'_> {
             return Ok(Vec::new());
         };
         let records = self.txn.open_table(RECORDS)?;
-        collect_collection(&records, id)
+        collect_collection(&records, collection, id)
     }
 
     /// Return up to `limit` `(key, value)` pairs in `collection` whose key is
@@ -814,7 +841,10 @@ impl ReadBatch<'_> {
                 break;
             }
             let (k, v) = entry?;
-            out.push((user_key(k.value()), v.value().to_vec()));
+            out.push((
+                user_key(k.value()),
+                crate::compression::decompress(collection, v.value())?.into_owned(),
+            ));
         }
         Ok(out)
     }
@@ -837,7 +867,10 @@ impl ReadBatch<'_> {
         let mut out = Vec::new();
         for entry in records.range::<&[u8]>(bounds)? {
             let (k, v) = entry?;
-            out.push((user_key(k.value()), v.value().to_vec()));
+            out.push((
+                user_key(k.value()),
+                crate::compression::decompress(collection, v.value())?.into_owned(),
+            ));
         }
         Ok(out)
     }
@@ -867,7 +900,8 @@ impl ReadBatch<'_> {
         for entry in records.range::<&[u8]>(bounds)? {
             let (k, v) = entry?;
             let key = k.value();
-            if !f(key.get(8..).unwrap_or(&[]), v.value())? {
+            let value = crate::compression::decompress(collection, v.value())?;
+            if !f(key.get(8..).unwrap_or(&[]), value.as_ref())? {
                 break;
             }
         }
@@ -1023,7 +1057,7 @@ impl SnapshotReader for ReadBatch<'_> {
 
 /// Collect every record belonging to collection `id` from an open records
 /// table, stripping the id prefix back to user keys.
-fn collect_collection<T>(records: &T, id: u64) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
+fn collect_collection<T>(records: &T, collection: &str, id: u64) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
 where
     T: ReadableTable<&'static [u8], &'static [u8]>,
 {
@@ -1038,7 +1072,10 @@ where
     let mut out = Vec::new();
     for entry in records.range::<&[u8]>(bounds)? {
         let (k, v) = entry?;
-        out.push((user_key(k.value()), v.value().to_vec()));
+        out.push((
+            user_key(k.value()),
+            crate::compression::decompress(collection, v.value())?.into_owned(),
+        ));
     }
     Ok(out)
 }
@@ -1676,6 +1713,135 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// Task 5 (feature `zstd`) physical-row pins: what actually lands in
+    /// the RECORDS table. These read the raw redb row directly (bypassing
+    /// every decompressing helper) through the store's own fields, so they
+    /// pin the ON-DISK form, not just the round-trip.
+    mod compression_layout {
+        use super::super::*;
+        use super::mem;
+
+        /// Repetitive text: compresses well at zstd level 3.
+        fn blob(n: usize) -> Vec<u8> {
+            let base = b"the quick brown fox jumps over the lazy dog; ";
+            (0..n).map(|i| base[i % base.len()]).collect()
+        }
+
+        /// Read the physical stored row for (collection, key) straight from
+        /// the RECORDS table — no compression helpers in the path.
+        fn raw_row(s: &Store, collection: &str, key: &[u8]) -> Vec<u8> {
+            let txn = s.db.begin_read().unwrap();
+            let id = {
+                let catalog = txn.open_table(CATALOG).unwrap();
+                catalog.get(collection).unwrap().unwrap().value()
+            };
+            let records = txn.open_table(RECORDS).unwrap();
+            records
+                .get(physical_key(id, key).as_slice())
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec()
+        }
+
+        /// Insert `value` at (collection, key) as a LEGACY row — written
+        /// straight into RECORDS, exactly as a pre-feature (OFF) binary
+        /// would have — leaving the count untouched.
+        #[cfg(feature = "zstd")]
+        fn raw_put(s: &Store, collection: &str, key: &[u8], value: &[u8]) {
+            s.put(collection, b"seed", b"").unwrap(); // ensure the catalog entry
+            let txn = s.db.begin_write().unwrap();
+            {
+                let id = {
+                    let catalog = txn.open_table(CATALOG).unwrap();
+                    catalog.get(collection).unwrap().unwrap().value()
+                };
+                let mut records = txn.open_table(RECORDS).unwrap();
+                records
+                    .insert(physical_key(id, key).as_slice(), value)
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        /// Every Store read path agrees on a compressible above-threshold
+        /// value: point get, full scan, window scan, prefix scan, stream.
+        #[test]
+        fn roundtrips_through_every_read_path() {
+            let s = mem();
+            let big = blob(8192);
+            s.put("docs", b"k", &big).unwrap();
+            assert_eq!(s.get("docs", b"k").unwrap(), Some(big.clone()));
+            assert_eq!(s.scan("docs").unwrap(), vec![(b"k".to_vec(), big.clone())]);
+            assert_eq!(
+                s.scan_from("docs", b"", 10).unwrap(),
+                vec![(b"k".to_vec(), big.clone())]
+            );
+            assert_eq!(
+                s.scan_prefix("docs", b"k").unwrap(),
+                vec![(b"k".to_vec(), big.clone())]
+            );
+            let mut streamed = Vec::new();
+            s.for_each("docs", |k, v| {
+                streamed.push((k.to_vec(), v.to_vec()));
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(streamed, vec![(b"k".to_vec(), big)]);
+        }
+
+        /// With the feature ON, a user-collection value at/above the
+        /// threshold is stored marker-prefixed and strictly smaller; the
+        /// same value in an engine-reserved namespace is stored verbatim.
+        #[cfg(feature = "zstd")]
+        #[test]
+        fn user_rows_store_marked_reserved_rows_store_raw() {
+            let s = mem();
+            let big = blob(4096);
+            s.put("docs", b"k", &big).unwrap();
+            let row = raw_row(&s, "docs", b"k");
+            assert_eq!(row[0], crate::compression::MARKER);
+            assert!(row.len() < big.len(), "must shrink, got {}", row.len());
+
+            s.put("__edges__docs", b"k", &big).unwrap();
+            assert_eq!(raw_row(&s, "__edges__docs", b"k"), big);
+        }
+
+        /// With the feature OFF, stored bytes are byte-identical to the
+        /// written value regardless of size or namespace — today's exact
+        /// behavior, pinned.
+        #[cfg(not(feature = "zstd"))]
+        #[test]
+        fn off_build_stores_values_verbatim() {
+            let s = mem();
+            let big = blob(4096);
+            s.put("docs", b"k", &big).unwrap();
+            assert_eq!(raw_row(&s, "docs", b"k"), big);
+        }
+
+        /// Legacy rows (written raw by an OFF binary, above threshold and
+        /// starting with a value-codec tag) read fine under an ON binary:
+        /// only marker-prefixed rows are ever interpreted as frames.
+        #[cfg(feature = "zstd")]
+        #[test]
+        fn legacy_raw_rows_read_fine_under_the_feature() {
+            let s = mem();
+            // A Value encoding far above the threshold: TAG_TEXT + len + text.
+            let text = String::from_utf8(blob(8192)).unwrap();
+            let encoded = crate::value::Value::Text(text).encode();
+            assert!(encoded.len() > crate::compression::THRESHOLD);
+            raw_put(&s, "docs", b"legacy", &encoded);
+            // Reads back verbatim (no marker → identity) and decodes.
+            assert_eq!(s.get("docs", b"legacy").unwrap(), Some(encoded));
+            // And a fresh engine-level write of the same value compresses,
+            // reading back equal through the normal path.
+            let text2 = String::from_utf8(blob(8192)).unwrap();
+            let v = crate::value::Value::Text(text2);
+            s.put("docs", b"fresh", &v.encode()).unwrap();
+            assert_eq!(s.get("docs", b"fresh").unwrap(), Some(v.encode()));
+        }
     }
 
     /// The pin the whole B3 wave rests on: one `ReadBatch` is one MVCC

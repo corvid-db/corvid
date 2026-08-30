@@ -19,6 +19,9 @@
 #![forbid(unsafe_code)]
 
 pub mod builder;
+/// Feature-gated value compression — engine-private; see the module docs
+/// and the `zstd` feature in `Cargo.toml`.
+pub(crate) mod compression;
 pub mod db;
 pub mod disk_fts;
 pub mod disk_hnsw;

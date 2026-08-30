@@ -28,11 +28,15 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --all-targets --workspace -- -D warnings
-      - name: Zero-dep posture (Task 11)
+      - name: Zero-dep posture (Task 11 + Task 5)
         run: |
           cargo build -p corvid --no-default-features
           if cargo tree -p corvid --edges normal | grep -qE '(^|[^a-z-])tracing v'; then
             echo "::error::tracing must not be in the default dependency graph (feature leak)"
+            exit 1
+          fi
+          if cargo tree -p corvid --edges normal | grep -qE '(^|[^a-z-])zstd v'; then
+            echo "::error::zstd must not be in the default dependency graph (feature leak)"
             exit 1
           fi
       - name: Feature-gated tracing (clippy + doc + test with the feature on)
@@ -40,6 +44,15 @@ jobs:
           cargo clippy -p corvid --features tracing --all-targets -- -D warnings
           RUSTDOCFLAGS="-D warnings" cargo doc -p corvid --features tracing --no-deps
           cargo test -p corvid --features tracing
+      - name: Feature-gated zstd (clippy + doc + test with the feature on)
+        run: |
+          cargo clippy -p corvid --features zstd --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc -p corvid --features zstd --no-deps
+          cargo test -p corvid --features zstd
+      - name: Feature composition (tracing + zstd together)
+        run: |
+          cargo clippy -p corvid --features tracing,zstd --all-targets -- -D warnings
+          cargo test -p corvid --features tracing,zstd
       - name: Docs
         run: cargo doc --no-deps --workspace
         env:
@@ -73,10 +86,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build WASM bundle
         run: cargo build -p corvid-wasm --target wasm32-unknown-unknown --profile wasm-release
-      - name: WASM graph excludes tracing (Task 11)
+      - name: WASM graph excludes tracing and zstd (Task 11 + Task 5)
         run: |
           if cargo tree -p corvid-wasm --target wasm32-unknown-unknown --edges normal | grep -qE '(^|[^a-z-])tracing v'; then
             echo "::error::tracing must never reach the wasm dependency graph"
+            exit 1
+          fi
+          if cargo tree -p corvid-wasm --target wasm32-unknown-unknown --edges normal | grep -qE '(^|[^a-z-])zstd v'; then
+            echo "::error::zstd must never reach the wasm dependency graph (C FFI via cc)"
             exit 1
           fi
       - name: Enforce bundle-size budget

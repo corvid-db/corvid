@@ -36,6 +36,9 @@ cargo bench -p corvid --bench engine -- declined_probes
 cargo bench -p corvid --bench engine -- bandwidth
 cargo bench -p corvid --bench engine -- kernel_stream
 cargo bench -p corvid --bench engine -- quantized_scan
+cargo bench -p corvid --bench engine -- value_store_io
+# zstd-feature twin of the same group (ledger-closure Task 5):
+cargo bench -p corvid --features zstd --bench engine -- value_store_io
 ```
 
 The same literal commands live in the bench file's doc comments (one per
@@ -441,3 +444,47 @@ de-vectorized on stable Rust), which the bit-exactness oracle declines;
 volume scans are memory-side; portable SIMD is nightly-only and unsafe
 intrinsics are out of posture. The available throughput lever already
 ships: Binary quantization, 50.8× at 768d.
+
+## Ledger-closure Task 5 — zstd value compression: ratios and overheads
+
+Opt-in `zstd` feature (OFF by default; default build byte-identical to
+before, CI cargo-tree greps keep the crate out of the default and wasm
+graphs). With it ON, user-collection document values at/above 1 KiB
+compress at zstd level 3 behind a self-describing leading marker (0xFF —
+outside the value codec's tag space); engine-reserved `__` namespaces
+stay raw; incompressible values are stored raw (never balloon).
+
+**Ratios** (exact byte counts, `ratios_for_representative_documents`
+unit test, deterministic corpora):
+
+| Document (encoded size) | Stored | Ratio |
+|---|---|---|
+| Structured-text map — sentence frames with varying numbers (50,975 B) | 4,242 B | **8.3% (12×)** |
+| f32 vector array, smooth sin values, 16k dims (65,541 B) | 59,933 B | 91.4% (~1.1×) |
+| Random bytes (64 KiB) | raw | — (stored raw by rule) |
+
+The embedding-shaped row is the honest headline: IEEE-754 mantissas of
+even smooth sequences are near-full entropy, so VECTOR PAYLOADS BARELY
+COMPRESS — the feature is a text/document play, not a vector-space one
+(Binary/Scalar/PQ quantization remain the real vector footprint levers,
+50.8×/16× class). Highly-repetitive text (one repeated pangram) reaches
+~0.1%, but that shape is cited only as the ceiling.
+
+**Per-op overhead** (`value_store_io` bench, one 8 KiB document through
+`Collection::insert`/`get`, in-memory Db; means [95% CI]; BEFORE = the
+same bench in the default OFF build, AFTER = `--features zstd`):
+
+| Bench | OFF | ON (zstd) | Δ |
+|---|---|---|---|
+| insert_8kib_text | 13.28 µs [13.23, 13.37] | 18.14 µs [18.07, 18.23] | +4.9 µs/write (compress) |
+| get_8kib_text | 1.59 µs [1.59, 1.60] | 4.21 µs [4.20, 4.23] | +2.6 µs/read (decompress) |
+| insert_8kib_random | 14.96 µs [14.87, 15.09] | 21.81 µs [21.73, 21.95] | +6.9 µs/write — the must-compress-to-know attempt, then stored raw |
+| get_8kib_random | 1.34 µs [1.34, 1.35] | 1.32 µs [1.32, 1.33] | parity — raw rows skip decompression entirely |
+
+The random-write row is the feature's known tax: compressed size cannot
+be known without compressing, so incompressible ≥1 KiB values pay the
+level-3 attempt (~0.85 µs/KiB) and store raw anyway. A compressibility
+heuristic was considered and declined — it would mispredict on the mixed
+corpora where the feature matters. The existing default-config benches
+are untouched by the feature (OFF compiles to identity; verified by the
+default suite, 1000 green).

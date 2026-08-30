@@ -24,6 +24,13 @@ serde_json = "1"
 # tracing gates behind `std` (this pulls `once_cell` into the feature's
 # graph only — the default build and the WASM target never see any of it).
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# OPTIONAL value compression (ledger-closure Task 5): never in the default
+# build, the WASM budget, or the zero-dependency posture — pulled in only by
+# `-p corvid --features zstd` (see crates/corvid/Cargo.toml `[features]` and
+# `src/compression.rs`). Defaults trimmed to the one-shot bulk codec: the
+# `legacy` (old-format frames) and `zdict_builder` features stay out — corvid
+# reads only frames it wrote itself and trains no dictionaries.
+zstd = { version = "0.13", default-features = false }
 corvid = { path = "crates/corvid" }
 
 # Size-optimized profile for the WASM bundle (keeps it under the 2 MB gzipped
