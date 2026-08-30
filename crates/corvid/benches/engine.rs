@@ -172,6 +172,276 @@ fn bench_distance(c: &mut Criterion) {
     c.bench_function("cosine_768d", |bn| bn.iter(|| cosine_distance(&a, &b)));
 }
 
+// ---- Ledger-closure Task 2: distance-kernel closure measurements ----
+//
+// Five groups settle the AUDIT "SIMD distance kernels" row with numbers
+// instead of assumptions (docs/BENCHES.md holds the verdict table):
+//
+// 1. `kernel_scaling` — the shipped kernels at dims 64..3072 in the
+//    HNSW per-evaluation shape (both operands cache-hot), with criterion
+//    throughput = bytes touched (2 x dim x 4), so the printed element/s IS
+//    the kernel's effective GB/s.
+// 2. `declined_probes` — BENCH-LOCAL kernel copies that quantify what
+//    the exactness contract declines (see their doc comments): they are
+//    measurements, not shipped code.
+// 3. `bandwidth` — same-shape read ceilings: an independent-accumulator
+//    `u64` fold over the exact operand sizes the kernels see (wrapping
+//    integer add is associative, so LLVM vectorizes the probe freely —
+//    it measures load bandwidth, not add latency) for the L1-resident
+//    shapes, plus one 192 MiB single-pass fold (4x the 48 MiB system
+//    cache) for the DRAM streaming ceiling.
+// 4. `kernel_stream` — the volume shape: an exact scan (dot against a
+//    fixed query over an N-vector corpus) at cache-residency steps
+//    (L2-ish / system-cache / DRAM), throughput = corpus bytes.
+// 5. `quantized_scan` — where the real volume is: HNSW search at 768d
+//    under None vs Binary vs Scalar storage on the same corpus and graph
+//    parameters (Binary's per-eval kernel is the packed-byte Hamming
+//    distance in quant.rs).
+//
+// Literal invocations (audit C10):
+//
+// ```text
+// cargo bench -p corvid --bench engine -- kernel_scaling
+// cargo bench -p corvid --bench engine -- declined_probes
+// cargo bench -p corvid --bench engine -- bandwidth
+// cargo bench -p corvid --bench engine -- kernel_stream
+// cargo bench -p corvid --bench engine -- quantized_scan
+// ```
+
+/// BENCH-LOCAL declined-shape probe: 16 accumulator lanes instead of the
+/// shipped 8. Twice the independent FP-add chains — but lane j now
+/// accumulates elements {j, j+16, j+32, ...} instead of {j, j+8, j+16,
+/// ...} and the 16 partials reduce in a different tree, so the `f32`
+/// result is NOT bit-identical to `distance::dot`. The exactness oracle
+/// (bit-identical kernels) declines it; this copy exists only to measure
+/// what that decline costs.
+fn probe_dot_16acc(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 16];
+    let (ca, ra) = a.as_chunks::<16>();
+    let (cb, rb) = b.as_chunks::<16>();
+    for (x, y) in ca.iter().zip(cb) {
+        for j in 0..16 {
+            acc[j] += x[j] * y[j];
+        }
+    }
+    let mut sum: f32 = acc.iter().sum();
+    for (x, y) in ra.iter().zip(rb) {
+        sum += x * y;
+    }
+    sum
+}
+
+/// BENCH-LOCAL declined-shape probe: the shipped 8-lane order computed
+/// with `mul_add` (fused multiply-add, one rounding instead of two). This
+/// is what fp-contract/explicit `fmla` SIMD would compute — provably a
+/// DIFFERENT rounding than the shipped `acc += x * y`, so the exactness
+/// oracle declines it; measuring it bounds the headroom fusion leaves on
+/// the table.
+fn probe_dot_mul_add(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (x, y) in ca.iter().zip(cb) {
+        for j in 0..8 {
+            acc[j] = x[j].mul_add(y[j], acc[j]);
+        }
+    }
+    let mut sum: f32 = acc.iter().sum();
+    for (x, y) in ra.iter().zip(rb) {
+        sum = x.mul_add(*y, sum);
+    }
+    sum
+}
+
+/// Deterministic non-zero filler for the bandwidth probes (a zero-filled
+/// buffer would time identically on real hardware, but a data-dependent
+/// pattern forecloses any doubt).
+fn probe_fill(n: usize) -> Vec<u64> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        state = xorshift(state);
+        v.push(state | 1);
+    }
+    v
+}
+
+/// Read-bandwidth probe: fold two `u64` buffers with 8 independent
+/// wrapping-add accumulators (same chunk-of-8 shape as the kernels).
+/// Wrapping integer addition is associative, so LLVM may vectorize and
+/// reassociate freely — the probe saturates load bandwidth, which is the
+/// point: it is the honest ceiling the same-shape kernels are compared
+/// against.
+fn probe_read2(a: &[u64], b: &[u64]) -> u64 {
+    let mut acc = [0u64; 8];
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (x, y) in ca.iter().zip(cb) {
+        for j in 0..8 {
+            acc[j] = acc[j].wrapping_add(x[j]).wrapping_add(y[j]);
+        }
+    }
+    let mut s = acc.iter().copied().fold(0u64, u64::wrapping_add);
+    for (x, y) in ra.iter().zip(rb) {
+        s = s.wrapping_add(*x).wrapping_add(*y);
+    }
+    s
+}
+
+fn bench_kernel_scaling(c: &mut Criterion) {
+    use corvid::distance::{dot, l2_squared};
+    use criterion::Throughput;
+    let mut g = c.benchmark_group("kernel_scaling");
+    for &dim in &[64usize, 256, 768, 1536, 3072] {
+        let a: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.013).sin()).collect();
+        let b: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.017).cos()).collect();
+        g.throughput(Throughput::Bytes((2 * dim * 4) as u64));
+        g.bench_function(format!("dot_{dim}d"), |bn| {
+            bn.iter(|| dot(std::hint::black_box(&a), std::hint::black_box(&b)))
+        });
+        g.bench_function(format!("l2_{dim}d"), |bn| {
+            bn.iter(|| l2_squared(std::hint::black_box(&a), std::hint::black_box(&b)))
+        });
+    }
+    // The declined levers live in their own group (`declined_probes`) —
+    // time comparisons against the dot rows above, no throughput column.
+    g.finish();
+}
+
+/// The two declined-shape probes (see their doc comments): what the
+/// exactness oracle forbits, measured so the decline is a number, not a
+/// guess.
+fn bench_declined_probes(c: &mut Criterion) {
+    use corvid::distance::dot;
+    let mut g = c.benchmark_group("declined_probes");
+    for &dim in &[64usize, 768] {
+        let a: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.013).sin()).collect();
+        let b: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.017).cos()).collect();
+        g.bench_function(format!("shipped_dot_{dim}d"), |bn| {
+            bn.iter(|| dot(std::hint::black_box(&a), std::hint::black_box(&b)))
+        });
+        g.bench_function(format!("probe_dot_16acc_{dim}d"), |bn| {
+            bn.iter(|| probe_dot_16acc(std::hint::black_box(&a), std::hint::black_box(&b)))
+        });
+        g.bench_function(format!("probe_dot_mul_add_{dim}d"), |bn| {
+            bn.iter(|| probe_dot_mul_add(std::hint::black_box(&a), std::hint::black_box(&b)))
+        });
+    }
+    g.finish();
+}
+
+fn bench_bandwidth(c: &mut Criterion) {
+    use criterion::Throughput;
+    let mut g = c.benchmark_group("bandwidth");
+
+    // L1-resident ceilings at the kernels' exact operand shapes: per
+    // operand dim*4 bytes (256 B .. 12 KiB), 64 passes per iteration over
+    // the same two buffers so per-call overhead is amortized and the
+    // working set stays cached — the max sustainable read rate at that
+    // shape. Throughput = one pass's bytes.
+    const PASSES: usize = 64;
+    for &(dim, name) in &[
+        (64usize, "256b"),
+        (256, "1kib"),
+        (768, "3kib"),
+        (1536, "6kib"),
+        (3072, "12kib"),
+    ] {
+        let words = dim / 2; // dim*4 bytes of u64 per operand
+        let a = probe_fill(words);
+        let b = probe_fill(words);
+        // Throughput = ALL bytes read per iteration (PASSES passes over
+        // both operands), so criterion's printed rate is the ceiling.
+        g.throughput(Throughput::Bytes((2 * dim * 4 * PASSES) as u64));
+        g.bench_function(format!("l1_read_{name}"), |bn| {
+            bn.iter(|| {
+                let mut s = 0u64;
+                for _ in 0..PASSES {
+                    s = s.wrapping_add(probe_read2(
+                        std::hint::black_box(&a),
+                        std::hint::black_box(&b),
+                    ));
+                }
+                s
+            })
+        });
+    }
+
+    // DRAM streaming ceiling: one pass over 192 MiB (4x the 48 MiB system
+    // level cache), same 8-accumulator fold shape.
+    const DRAM_WORDS: usize = 192 * 1024 * 1024 / 8;
+    let big = probe_fill(DRAM_WORDS);
+    g.throughput(Throughput::Bytes((DRAM_WORDS * 8) as u64));
+    g.bench_function("dram_read_192mib", |bn| {
+        bn.iter(|| {
+            let mut acc = [0u64; 8];
+            let (chunks, rem) = std::hint::black_box(&big).as_chunks::<8>();
+            for ch in chunks {
+                for j in 0..8 {
+                    acc[j] = acc[j].wrapping_add(ch[j]);
+                }
+            }
+            let mut s = acc.iter().copied().fold(0u64, u64::wrapping_add);
+            for &x in rem {
+                s = s.wrapping_add(x);
+            }
+            s
+        })
+    });
+    g.finish();
+}
+
+fn bench_kernel_stream(c: &mut Criterion) {
+    use corvid::distance::dot;
+    use criterion::Throughput;
+    const DIM: usize = 768;
+    let q: Vec<f32> = (0..DIM).map(|i| (i as f32 * 0.013).sin()).collect();
+    let mut g = c.benchmark_group("kernel_stream");
+    // Corpus working sets: ~0.75 MiB (cache-resident), ~12 MiB (system
+    // cache), ~96 MiB (DRAM) — the exact-scan shape a large corpus
+    // actually pays. Throughput = corpus bytes (the query is L1-hot).
+    for &n in &[256usize, 4096, 32768] {
+        let data = corpus(n, DIM);
+        g.throughput(Throughput::Bytes((n * DIM * 4) as u64));
+        g.bench_function(format!("dot_scan_768d_n{n}"), |bn| {
+            bn.iter(|| {
+                let mut s = 0f32;
+                for v in std::hint::black_box(&data) {
+                    s += dot(std::hint::black_box(&q), v);
+                }
+                s
+            })
+        });
+    }
+    g.finish();
+}
+
+fn bench_quantized_scan(c: &mut Criterion) {
+    // Same corpus, same graph parameters, three storage modes: None runs
+    // the full-precision kernel per hop, Binary runs the packed-byte
+    // Hamming distance (768d -> 96 bytes, ~32x less traffic), Scalar
+    // reconstructs to f32 then runs the full metric. This is the real
+    // volume lever the kernel verdict points at.
+    const DIM: usize = 768;
+    let data = corpus(2000, DIM);
+    let query = data[0].clone();
+    let mut g = c.benchmark_group("quantized_scan");
+    for &(mode, name) in &[
+        (corvid::Quantization::None, "none"),
+        (corvid::Quantization::Binary, "binary"),
+        (corvid::Quantization::Scalar, "scalar"),
+    ] {
+        let mut index = Hnsw::with_quant(Metric::Cosine, mode, DEFAULT_M, DEFAULT_EF_CONSTRUCTION);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        g.bench_function(format!("hnsw_search_{name}_2k_768d"), |bn| {
+            bn.iter(|| index.search(std::hint::black_box(&query), 10, 64))
+        });
+    }
+    g.finish();
+}
+
 /// On-disk index-creation baselines (audit wave-2 perf rule). Each iteration
 /// seeds a fresh in-memory Db and then creates the index — creation is
 /// once-per-db, so the per-iteration seeding cost is deliberately inside the
@@ -724,6 +994,11 @@ criterion_group!(
     bench_selective_window_verify,
     bench_order_by_indexed,
     bench_pq_train,
-    bench_neighbors_hub
+    bench_neighbors_hub,
+    bench_kernel_scaling,
+    bench_declined_probes,
+    bench_bandwidth,
+    bench_kernel_stream,
+    bench_quantized_scan
 );
 criterion_main!(benches);

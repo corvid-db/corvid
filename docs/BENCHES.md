@@ -31,6 +31,11 @@ cargo bench -p corvid --bench engine -- delete_heavy
 cargo bench -p corvid --bench engine -- selective_window_verify
 cargo bench -p corvid --bench engine -- order_by_indexed_5k
 cargo bench -p corvid --bench engine -- neighbors_hub_10k
+cargo bench -p corvid --bench engine -- kernel_scaling
+cargo bench -p corvid --bench engine -- declined_probes
+cargo bench -p corvid --bench engine -- bandwidth
+cargo bench -p corvid --bench engine -- kernel_stream
+cargo bench -p corvid --bench engine -- quantized_scan
 ```
 
 The same literal commands live in the bench file's doc comments (one per
@@ -294,3 +299,127 @@ one extra point-get (marker), and a read on a legacy pre-adjacency
 database pays one empty adjacency seek + the marker point-get before the
 source scan — both disappear at that collection's first edge write or
 cascade (which establishes adjacency permanently).
+
+## Ledger-closure Task 2 — distance-kernel closure (the SIMD verdict)
+
+Does the AUDIT's "SIMD headroom" row hide real wins? Settled by
+measurement (same machine/toolchain as every table above; means [95% CI]
+unless quoted as a band) across five new groups — `kernel_scaling`,
+`declined_probes`, `bandwidth`, `kernel_stream`, `quantized_scan`
+(invocations in the list at the top) — plus a release-assembly
+inspection of the kernels. **No kernel code changed**; the legacy
+`distance` group re-ran flat after the bench additions (dot +1.2%, l2
++1.4%, cosine +0.2% vs the exit baseline — guard holds).
+
+**Assembly (release rlib, aarch64; `ar x` + `objdump -d` on the CGU
+object):** both `dot` and `l2_squared` ALREADY auto-vectorize to 4-wide
+NEON — `ldp q` 32-byte operand loads feeding `fmul.4s` + `fadd.4s` (l2
+adds `fsub.4s`), scalar unrolled tails, and the horizontal reduction
+emits exactly the source summation order (8 lane partials, then
+left-to-right). No fused `fmla` anywhere: Rust does not contract FP, so
+`acc += x * y` is two rounded ops by contract.
+
+**Ceilings** (`bandwidth` group): independent 8-accumulator `u64`
+wrapping-add folds over the kernels' exact operand shapes. Wrapping
+integer addition is associative, so the probe vectorizes and
+reassociates freely — it saturates LOAD bandwidth, which is the point:
+the ceiling is reachable only by reassociating, precisely what the
+`f32` exactness oracle forbids. L1-resident probes run 64 passes per
+iteration (call overhead amortized, working set cached; the throughput
+column prints full per-iteration bytes):
+
+| Probe | Same shape as | Rate |
+|---|---|---|
+| l1_read_256b | 64d operands | 111.9 GB/s |
+| l1_read_1kib | 256d | 130.9 GB/s |
+| l1_read_3kib | 768d | 121.9 GB/s |
+| l1_read_6kib | 1536d | 108.9 GB/s |
+| l1_read_12kib | 3072d | 100.8 GB/s |
+| dram_read_192mib (one pass, 4× the 48 MiB system cache) | — | 43.3–57.9 GB/s (two runs; machine-state-dependent, see streaming below) |
+
+**Kernel scaling** (`kernel_scaling`; hot criterion shape — both
+operands L1-resident, as in a cached HNSW graph walk; effective rate =
+2·dim·4 bytes / time):
+
+| dim | dot | eff. | % ceiling | l2 | eff. | % ceiling |
+|---|---|---|---|---|---|---|
+| 64d | 5.53 ns | 92.7 GB/s | 83% | 6.01 ns | 85.1 GB/s | 76% |
+| 256d | 24.60 ns | 83.3 GB/s | 64% | 25.13 ns | 81.5 GB/s | 62% |
+| 768d | 78.16 ns | 78.6 GB/s | 64% | 79.31 ns | 77.5 GB/s | 64% |
+| 1536d | 171.25 ns | 71.7 GB/s | 66% | 172.69 ns | 71.2 GB/s | 65% |
+| 3072d | 357.06 ns | 68.8 GB/s | 68% | 358.34 ns | 68.6 GB/s | 68% |
+
+Per-element cost is flat-to-falling toward small dims (0.086 ns/f32 at
+64d vs 0.102 at 768d): there is NO latency-bound small-dim cliff to
+rescue — 64d already runs at 83% of its same-shape ceiling.
+
+**The declined levers, measured** (`declined_probes`; bench-local
+copies, never shipped):
+
+| 768d | time | vs shipped |
+|---|---|---|
+| shipped dot (8 lanes, mul+add) | 78.15 ns | — |
+| 16 accumulator lanes | 55.36 ns | **−29%** |
+| `mul_add` (fused, stable) | 97.01 ns | **+24% slower** |
+
+| 64d | time | vs shipped |
+|---|---|---|
+| shipped dot | 5.63 ns | — |
+| 16 lanes | 6.42 ns | +14% (wider reduction tail hurts) |
+| `mul_add` | 5.69 ns | +1% (parity) |
+
+Sixteen lanes changes the per-lane summation order (lane j accumulates
+{j, j+16, …} and the 16 partials reduce in a different tree), so the
+result is not bit-identical — declined by the exactness oracle (the
+exact-value kernel tests and the deterministic HNSW/recall corpora are
+the pinned results). `mul_add` computes a different rounding (one
+instead of two) AND de-vectorizes: LLVM emits scalar `fmadd` chains
+(assembly-checked), so the fused loop is slower than the 4-wide mul+add
+it would replace. Explicit SIMD cannot beat the emitted code without
+reaching for exactly these two levers (more lanes, or fusion) — both
+change results; `portable_simd` is nightly-only and unsafe intrinsics
+are out of posture. **The kernels sit at the exactness-preserving
+envelope**; at 768d the 16-lane shape would reach 111 GB/s (91% of
+ceiling), i.e. the residual ceiling gap IS the forbidden
+reassociation.
+
+**Streaming — the volume shape** (`kernel_stream`; exact scan, dot vs a
+fixed query over an N×768d corpus; query L1-hot; rate = corpus
+bytes/time):
+
+| Corpus | time | corpus rate |
+|---|---|---|
+| 256 × 768d (0.75 MiB, cache) | 18.55 µs | 42.4 GB/s |
+| 4 096 × 768d (12 MiB, system cache) | 307.0 µs | 41.0 GB/s |
+| 32 768 × 768d (96 MiB, beyond cache) | 2.412–2.450 ms | 41.1–41.7 GB/s |
+
+The scan is the stable measurement here (±2% across four runs); the u64
+DRAM probe swung 43.3→57.9 GB/s between same-session runs, so the
+ceiling is quoted as a band. Per evaluation the scan runs at 72.5–74.8
+ns ≈ the hot kernel's own rate, and wherever the corpus exceeds cache
+the sustained rate sits inside the streaming band — memory-side, not
+kernel-side. A 29%-faster kernel (the declined shape) cannot lift a
+DRAM-resident scan past that band.
+
+**Quantized scans — the actual volume lever** (`quantized_scan`; same
+2 000×768d corpus, same graph params, cosine, k=10, ef=64):
+
+| Storage | search | vs None |
+|---|---|---|
+| None (f32) | 239.8 µs | — |
+| Binary (96 packed bytes; Hamming) | 4.72 µs | **50.8× faster** |
+| Scalar (reconstruct to f32) | 306.8 µs | 1.28× slower |
+
+Binary's packed-byte Hamming path (quant.rs) is the throughput answer
+for big corpora — ~32× less traffic and a cheaper kernel; Scalar pays a
+per-eval decode (with allocation) and lands slower than full precision
+at this dim.
+
+**Verdict (flips the AUDIT row Fixed):** LLVM already vectorizes both
+kernels 4-wide; hot kernels hold 62–83% of the same-shape read ceiling
+across 64–3072d with no small-dim cliff; every measured faster shape
+changes `f32` summation (16 lanes −29%; fusion +24% slower AND
+de-vectorized on stable Rust), which the bit-exactness oracle declines;
+volume scans are memory-side; portable SIMD is nightly-only and unsafe
+intrinsics are out of posture. The available throughput lever already
+ships: Binary quantization, 50.8× at 768d.
