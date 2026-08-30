@@ -5,6 +5,10 @@ based on [Keep a Changelog](https://keepachangelog.com/). Until 1.0 the on-disk
 format and API may change without backward-compatibility guarantees.
 
 ## [Unreleased]
+### Design ledger
+
+- Closed the design ledger: every previously "future" item now carries an explicit dated disposition (shipped, deferred with a falsifiable trigger, declined, or never) — see DESIGN.md's decision log (2026-08-30 rows).
+
 
 ### Added
 - Optional zstd compression of stored documents, behind a non-default
