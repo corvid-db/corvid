@@ -125,6 +125,19 @@ fn push_cjk_bigrams(run: &[char], out: &mut Vec<String>) {
 /// [`analyze`] for the pipeline used by the search indexes (and note the
 /// pipeline never stems CJK tokens).
 pub fn tokenize(text: &str) -> Vec<String> {
+    // Fast path — no CJK codepoint anywhere (the overwhelming case for this
+    // engine's corpora): the historical split + lowercase, unchanged and
+    // allocation-lean. ASCII text cannot contain CJK, so the common case
+    // pays only a byte-level `is_ascii` sweep; non-ASCII text adds the
+    // one CJK scan that guards the split.
+    if text.is_ascii() || !text.chars().any(is_cjk) {
+        return text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+            .collect();
+    }
+
     let mut tokens = Vec::new();
     let mut latin = String::new();
     let mut cjk: Vec<char> = Vec::new();
