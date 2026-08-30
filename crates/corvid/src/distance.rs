@@ -1,8 +1,10 @@
 //! Vector distance metrics.
 //!
 //! The kernels are written as straight fold loops over slices, which the
-//! compiler auto-vectorizes well; explicit SIMD specializations can replace
-//! them later behind the same functions without touching callers.
+//! compiler auto-vectorizes well (4-wide NEON, release-assembly-verified).
+//! Explicit SIMD was measured and DECLINED (2026-08-30): every faster shape
+//! reassociates `f32` summation, which the bit-exact results here are pinned
+//! against — the measurements and ceilings live in docs/BENCHES.md.
 //!
 //! Every metric is expressed so that **lower means nearer**, which lets the
 //! search layer treat all metrics uniformly (sort ascending, keep smallest).
