@@ -44,7 +44,13 @@ Fixed with the outcome (likely "bandwidth-bound; quantized scans are the
 real lever; no stable-Rust SIMD without unsafe/nightly" — but the
 measurements decide, not the assumption). No unsafe, no nightly.
 
-## Task 3: Sketches trio — cuckoo filter, t-digest, MinHash+LSH
+## Task 3: Sketches trio
+
+Prepend (Task 2 review wording fixes, binding): BENCHES.md verdict — (a)
+"sits inside the streaming band" → "at/just below the low end (41-42 vs
+43.3-57.9 GB/s)"; (b) "exact-value kernel tests" → name the actual
+load-bearing pins (PQ recall floor, hnsw/disk recall corpora, exact-eq
+reproducibility asserts). — cuckoo filter, t-digest, MinHash+LSH
 
 Three bounded data structures joining Bloom/HLL as public surface
 (conventions from sketch.rs; conformance conventions from tests/pq.rs and
