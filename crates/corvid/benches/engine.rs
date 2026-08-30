@@ -606,6 +606,111 @@ fn bench_order_by_indexed(c: &mut Criterion) {
     g.finish();
 }
 
+/// Endpoint-direct neighbor reads (ledger-closure Task 1). The adjacency
+/// namespaces already key edges endpoint-first; `neighbors`/
+/// `in_neighbors`/`neighbors_weighted`/`traverse` prefix-scan the SOURCE
+/// edge namespaces by (relation, endpoint) instead. This group is the
+/// before/after ruler for serving those reads endpoint-direct: a hub-heavy
+/// corpus (the edge_churn family's shape — many edges on few endpoints)
+/// plus the uniform-degree case.
+///
+/// Corpus (deterministic index math, no rand): 2_001 docs (`d000000`..
+/// `d002000`, the first four are hubs), 10_000 edge writes in three
+/// families over 3 relations:
+/// * fan-in — `doc[4 + i % 1997] --RELS[i%3]--> hub[i % 4]`: for a fixed
+///   hub the writes differ in (source, relation) only at i ≡ 0 mod 5991
+///   (1997 is prime), so all 938 writes per hub are distinct rows — ~313
+///   per (hub, relation);
+/// * fan-out — `hub[i % 4] --RELS[i%3]--> doc[4 + 7i % 1997]` via
+///   `link_weighted` (weights exercise the value-carrying rows), the same
+///   distinctness argument → ~313 distinct out-edges per (hub, relation);
+/// * uniform — `doc[4 + i % 1997] --RELS[i%3]--> doc[4 + 11i+13 % 1997]`:
+///   degree ~1.25 writes per doc, ≤ 1 per (doc, relation), the contrast
+///   case where every read returns a couple of rows.
+///
+/// The measured routines are read-only; the corpus is seeded once outside
+/// the timing (setup also asserts the corpus math above, so a drifted
+/// corpus cannot silently invalidate recorded numbers). Default sampling.
+///
+/// Literal invocation (audit C10, recorded so before/after numbers are
+/// reproducible):
+///
+/// ```text
+/// cargo bench -p corvid --bench engine -- neighbors_hub_10k
+/// ```
+fn bench_neighbors_hub(c: &mut Criterion) {
+    const NON_HUBS: usize = 1_997; // docs 4..=2000
+    const FAN: usize = 3_750; // per hub family
+    const UNIFORM: usize = 2_500;
+    const RELATIONS: [&str; 3] = ["knows", "likes", "follows"];
+
+    let key = |i: usize| format!("d{i:06}");
+    let db = Db::open_in_memory().unwrap();
+    let coll = db.collection("docs");
+    for i in 0..(4 + NON_HUBS) {
+        let mut m = BTreeMap::new();
+        m.insert("v".to_owned(), Value::Int(i as i64));
+        coll.insert(key(i).as_bytes(), &Value::Map(m)).unwrap();
+    }
+    for i in 0..FAN {
+        coll.link(
+            key(4 + i % NON_HUBS).as_bytes(),
+            RELATIONS[i % RELATIONS.len()],
+            key(i % 4).as_bytes(),
+        )
+        .unwrap();
+    }
+    for i in 0..FAN {
+        coll.link_weighted(
+            key(i % 4).as_bytes(),
+            RELATIONS[i % RELATIONS.len()],
+            key(4 + (i * 7) % NON_HUBS).as_bytes(),
+            (i as f64) * 0.25,
+        )
+        .unwrap();
+    }
+    for i in 0..UNIFORM {
+        coll.link(
+            key(4 + i % NON_HUBS).as_bytes(),
+            RELATIONS[i % RELATIONS.len()],
+            key(4 + (i * 11 + 13) % NON_HUBS).as_bytes(),
+        )
+        .unwrap();
+    }
+    // Corpus-math pins (see the doc comment): the hub carries ~313 distinct
+    // edges per relation in each direction, and the probe doc exactly two
+    // "knows" out-edges (hub0 via fan-in i=0, d000017 via uniform i=0).
+    debug_assert_eq!(
+        coll.neighbors(key(0).as_bytes(), "knows").unwrap().len(),
+        313
+    );
+    debug_assert_eq!(
+        coll.in_neighbors(key(0).as_bytes(), "knows").unwrap().len(),
+        313
+    );
+    debug_assert_eq!(coll.neighbors(key(4).as_bytes(), "knows").unwrap().len(), 2);
+    debug_assert!(coll.traverse(key(0).as_bytes(), "knows", 2).unwrap().len() > 313);
+
+    let hub0 = key(0).into_bytes();
+    let mut g = c.benchmark_group("neighbors_hub_10k");
+    g.bench_function("hub_out_knows", |b| {
+        b.iter(|| coll.neighbors(&hub0, "knows").unwrap())
+    });
+    g.bench_function("hub_in_knows", |b| {
+        b.iter(|| coll.in_neighbors(&hub0, "knows").unwrap())
+    });
+    g.bench_function("hub_weighted_knows", |b| {
+        b.iter(|| coll.neighbors_weighted(&hub0, "knows").unwrap())
+    });
+    g.bench_function("uniform_deg1", |b| {
+        b.iter(|| coll.neighbors(key(4).as_bytes(), "knows").unwrap())
+    });
+    g.bench_function("traverse_hub_2hops", |b| {
+        b.iter(|| coll.traverse(&hub0, "knows", 2).unwrap())
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_codec,
@@ -618,6 +723,7 @@ criterion_group!(
     bench_delete_heavy,
     bench_selective_window_verify,
     bench_order_by_indexed,
-    bench_pq_train
+    bench_pq_train,
+    bench_neighbors_hub
 );
 criterion_main!(benches);

@@ -21,6 +21,14 @@
 //! finds a document's edges directly, in O(edges-of-doc). See
 //! `Db::edges_on_delete_in_txn` for the layout, rebuild and fallback rules.
 //!
+//! The endpoint-direct READS (`neighbors`, `in_neighbors`,
+//! `neighbors_weighted`, and `traverse`'s frontier expansion) are served from
+//! the adjacency too, via the `(endpoint, relation)` pair prefix —
+//! byte-identical order to the source scan (see `endpoint_rows_in`), weights
+//! carried verbatim in the adjacency values, with a source-scan fallback when
+//! the adjacency is not built on the read's snapshot (a legacy pre-adjacency
+//! database, or a collection never linked).
+//!
 //! All four graph namespaces are engine-private, so their rows are written
 //! with the store's UNCOUNTED put/delete (no maintained record count —
 //! nothing in the engine reads one, and skipping the per-row count
@@ -101,6 +109,19 @@ fn adj_prefix(endpoint: &[u8]) -> Vec<u8> {
     k.push(ADJ_TAG_ROW);
     k.extend_from_slice(&(endpoint.len() as u32).to_be_bytes());
     k.extend_from_slice(endpoint);
+    k
+}
+
+/// The prefix shared by every adjacency row of one `(endpoint, relation)`
+/// pair — [`adj_key`] minus the trailing `other`. Both fields are
+/// length-prefixed, so the prefix is EXACT: a row of any other endpoint or
+/// relation differs at a length byte before its `other` field begins, and
+/// the built-marker (tag [`ADJ_TAG_META`]) sorts below it — the
+/// endpoint-direct read prefix of [`endpoint_rows_in`].
+fn adj_pair_prefix(endpoint: &[u8], relation: &str) -> Vec<u8> {
+    let mut k = adj_prefix(endpoint);
+    k.extend_from_slice(&(relation.len() as u32).to_be_bytes());
+    k.extend_from_slice(relation.as_bytes());
     k
 }
 
@@ -211,16 +232,27 @@ impl Collection<'_> {
 
     /// Return `(target, weight)` for every `from --relation--> ?` edge.
     /// Unweighted edges report a weight of `1.0`.
+    ///
+    /// Served endpoint-direct from the OUT adjacency when it is built on the
+    /// read's snapshot — the adjacency values carry the edge's weight bytes
+    /// verbatim — with the source edge-namespace scan as the fallback (see
+    /// `endpoint_rows_in`); results are byte-identical either way.
     pub fn neighbors_weighted(&self, from: &[u8], relation: &str) -> Result<Vec<(Vec<u8>, f64)>> {
-        let prefix = neighbor_prefix(relation, from);
-        let edges = self.db().store().scan_prefix(&self.edges_name(), &prefix)?;
-        Ok(edges
+        self.db().store().read(|r| {
+            let adj_ns = adj_out_name(self.name());
+            Ok(endpoint_rows_in(
+                r,
+                &adj_ns,
+                &self.edges_name(),
+                &adj_ns,
+                from,
+                relation,
+                None,
+            )?
             .into_iter()
-            .map(|(key, value)| {
-                let to = key.get(prefix.len()..).unwrap_or(&[]).to_vec();
-                (to, decode_weight(&value))
-            })
+            .map(|(to, value)| (to, decode_weight(&value)))
             .collect())
+        })
     }
 
     /// Remove the edge `from --relation--> to` (and its reverse), atomically.
@@ -259,27 +291,52 @@ impl Collection<'_> {
     }
 
     /// Return the targets of every `from --relation--> ?` edge, in key order.
+    ///
+    /// Served endpoint-direct from the OUT adjacency namespace when it is
+    /// built on the read's snapshot, else by the source edge-namespace prefix
+    /// scan — byte-identical results either way (see `endpoint_rows_in`).
     pub fn neighbors(&self, from: &[u8], relation: &str) -> Result<Vec<Vec<u8>>> {
-        let prefix = neighbor_prefix(relation, from);
-        let edges = self.db().store().scan_prefix(&self.edges_name(), &prefix)?;
-        Ok(edges
+        self.db().store().read(|r| {
+            let adj_ns = adj_out_name(self.name());
+            Ok(endpoint_rows_in(
+                r,
+                &adj_ns,
+                &self.edges_name(),
+                &adj_ns,
+                from,
+                relation,
+                None,
+            )?
             .into_iter()
-            .map(|(key, _)| key.get(prefix.len()..).unwrap_or(&[]).to_vec())
+            .map(|(to, _)| to)
             .collect())
+        })
     }
 
     /// Return the sources of every `? --relation--> to` edge, in key order
     /// (incoming edges).
+    ///
+    /// Served endpoint-direct from the IN adjacency namespace when it is
+    /// built on the read's snapshot, else by the reverse edge-namespace
+    /// prefix scan — byte-identical results either way (see
+    /// `endpoint_rows_in`).
     pub fn in_neighbors(&self, to: &[u8], relation: &str) -> Result<Vec<Vec<u8>>> {
-        let prefix = neighbor_prefix(relation, to);
-        let edges = self
-            .db()
-            .store()
-            .scan_prefix(&self.redges_name(), &prefix)?;
-        Ok(edges
+        self.db().store().read(|r| {
+            let adj_ns = adj_in_name(self.name());
+            let marker_ns = adj_out_name(self.name());
+            Ok(endpoint_rows_in(
+                r,
+                &adj_ns,
+                &self.redges_name(),
+                &marker_ns,
+                to,
+                relation,
+                None,
+            )?
             .into_iter()
-            .map(|(key, _)| key.get(prefix.len()..).unwrap_or(&[]).to_vec())
+            .map(|(from, _)| from)
             .collect())
+        })
     }
 
     /// Breadth-first traversal following `relation` up to `hops` hops from
@@ -289,9 +346,17 @@ impl Collection<'_> {
     /// The whole traversal runs on ONE read snapshot (audit B3): every hop's
     /// neighbor scan observes a single point in time, so the reachable set
     /// always matches some committed state even while writers link/unlink
-    /// concurrently.
+    /// concurrently. Frontier expansion goes through `endpoint_rows_in` —
+    /// endpoint-direct when the adjacency is built on that snapshot, the
+    /// source scan otherwise — with the marker resolved ONCE for the whole
+    /// walk (it cannot change mid-snapshot), so per-hop expansion is a
+    /// single prefix scan and per-hop ordering (which the BFS result order
+    /// is derived from) is byte-identical either way.
     pub fn traverse(&self, start: &[u8], relation: &str, hops: usize) -> Result<Vec<Vec<u8>>> {
         self.db().store().read(|r| {
+            let adj_ns = adj_out_name(self.name());
+            let src_ns = self.edges_name();
+            let adj_ready = adjacency_ready_in(r, &adj_ns)?;
             let mut visited: HashSet<Vec<u8>> = HashSet::new();
             visited.insert(start.to_vec());
             let mut frontier = vec![start.to_vec()];
@@ -300,7 +365,18 @@ impl Collection<'_> {
             for _ in 0..hops {
                 let mut next = Vec::new();
                 for node in &frontier {
-                    for to in self.neighbors_in(r, node, relation)? {
+                    for to in endpoint_rows_in(
+                        r,
+                        &adj_ns,
+                        &src_ns,
+                        &adj_ns,
+                        node,
+                        relation,
+                        Some(adj_ready),
+                    )?
+                    .into_iter()
+                    .map(|(to, _)| to)
+                    {
                         if visited.insert(to.clone()) {
                             result.push(to.clone());
                             next.push(to);
@@ -316,24 +392,6 @@ impl Collection<'_> {
         })
     }
 
-    /// Snapshot-scoped twin of [`Collection::neighbors`]: the targets of
-    /// every `from --relation--> ?` edge, in key order, read from `reader`'s
-    /// snapshot (audit B3 — used by [`Collection::traverse`] so a whole
-    /// traversal sees one point in time).
-    fn neighbors_in(
-        &self,
-        reader: &dyn crate::store::SnapshotReader,
-        from: &[u8],
-        relation: &str,
-    ) -> Result<Vec<Vec<u8>>> {
-        let prefix = neighbor_prefix(relation, from);
-        let edges = reader.scan_prefix(&self.edges_name(), &prefix)?;
-        Ok(edges
-            .into_iter()
-            .map(|(key, _)| key.get(prefix.len()..).unwrap_or(&[]).to_vec())
-            .collect())
-    }
-
     /// The sibling collection holding this collection's forward edges.
     fn edges_name(&self) -> String {
         format!("__edges__{}", self.name())
@@ -343,6 +401,103 @@ impl Collection<'_> {
     fn redges_name(&self) -> String {
         format!("__redges__{}", self.name())
     }
+}
+
+/// Serve one `(endpoint, relation)` read ENDPOINT-DIRECT from the adjacency
+/// namespaces when they are built on `reader`'s snapshot, else by the source
+/// edge-namespace `(relation, endpoint)` prefix scan (the pre-adjacency
+/// path). `adj_ns`/`src_ns` select the direction: the OUT adjacency and
+/// `__edges__` for out-edges (`other` = the target), the IN adjacency and
+/// `__redges__` for in-edges (`other` = the source). Returns `(other,
+/// value)` pairs with the edge's value bytes verbatim (the weight for a
+/// weighted edge, empty otherwise). Both backings produce the SAME rows in
+/// the SAME order:
+///
+/// * ORDER: within the source prefix `len(rel) ‖ rel ‖ len(endpoint) ‖
+///   endpoint` rows sort by the remaining `to`/`from` bytes, and within the
+///   adjacency prefix [`adj_pair_prefix`] (`TAG ‖ len(endpoint) ‖ endpoint ‖
+///   len(rel) ‖ rel`) by the remaining `other` bytes — the same row set
+///   (the adjacency is a bijective re-keying of the edge rows carrying each
+///   value verbatim) under raw-byte order of the same trailing field, so
+///   the sequences are byte-identical. The BFS order of
+///   [`Collection::traverse`] is derived from this order and is unchanged.
+/// * EXACTNESS: the pair prefix is length-delimited on both fields (see
+///   [`adj_pair_prefix`]), so exactly the pair's rows match — no other
+///   relation's rows leak in and none must be skipped or filtered — and a
+///   matching row always decodes: its trailing bytes ARE the `other` field,
+///   so the cascade's malformed-row fallback cannot surface on this path.
+///
+/// `adj_ready` is the marker state the CALLER already resolved on this
+/// snapshot, if any: `None` (the single-read wrappers) lets the empty-scan
+/// path resolve it lazily with one point-get against `marker_ns`, while
+/// `Some(_)` ([`Collection::traverse`], which resolves it once and shares it
+/// across every hop of the walk) both skips that point-get per hop and —
+/// when `Some(false)` — skips the adjacency scan outright (not built ⇒ no
+/// rows). `adj_ns`/`src_ns`/`marker_ns` are the collection's adjacency
+/// half, source twin, and marker namespace for this direction — passed in
+/// pre-resolved because a traversal reuses them across every hop (per-hop
+/// string formatting is measurable at ~5% of the walk); the single-read
+/// wrappers resolve them per call, exactly the one `edges_name()` format
+/// the pre-adjacency readers paid.
+///
+/// The adjacency is served without a marker point-get on the happy path:
+/// any snapshot carrying adjacency ROWS for the pair also carries a current
+/// built-marker, because the establishing build writes rows and marker in
+/// ONE transaction and every maintenance write (link/unlink/cascade) runs
+/// only with the marker already present and keeps it — so non-empty rows on
+/// `reader`'s snapshot mean the "marker present ⇒ complete for the
+/// committed edge rows" invariant holds there. (A version-skewed adjacency
+/// — rows from a newer layout under this binary — is out of the engine's
+/// one-way upgrade contract — dump old, load new — and self-heals on the
+/// first edge write/cascade via the stale-marker rebuild; the empty-scan
+/// path below treats a stale marker as not-ready and reads the source
+/// namespaces instead.) An EMPTY adjacency scan cannot distinguish "no
+/// edges" from "not built" (a legacy pre-adjacency database, or a
+/// collection never linked), so it resolves the ambiguity with the marker
+/// point-get: current marker ⇒ genuinely empty, absent ⇒ the
+/// source-of-truth edge namespaces answer.
+fn endpoint_rows_in(
+    reader: &dyn crate::store::SnapshotReader,
+    adj_ns: &str,
+    src_ns: &str,
+    marker_ns: &str,
+    endpoint: &[u8],
+    relation: &str,
+    adj_ready: Option<bool>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if adj_ready != Some(false) {
+        let prefix = adj_pair_prefix(endpoint, relation);
+        let rows = reader.scan_prefix(adj_ns, &prefix)?;
+        if !rows.is_empty() {
+            return Ok(rows
+                .into_iter()
+                .map(|(key, value)| (key.get(prefix.len()..).unwrap_or(&[]).to_vec(), value))
+                .collect());
+        }
+    }
+    let ready = match adj_ready {
+        Some(b) => b,
+        None => adjacency_ready_in(reader, marker_ns)?,
+    };
+    if ready {
+        return Ok(Vec::new());
+    }
+    let src_prefix = neighbor_prefix(relation, endpoint);
+    Ok(reader
+        .scan_prefix(src_ns, &src_prefix)?
+        .into_iter()
+        .map(|(key, value)| (key.get(src_prefix.len()..).unwrap_or(&[]).to_vec(), value))
+        .collect())
+}
+
+/// The read-snapshot twin of [`adjacency_ready_in_txn`]: whether the
+/// adjacency namespace `marker_ns` carries a current built-marker on THIS
+/// snapshot (one point-get). Called once per traversal up front, and on the
+/// empty-scan path of [`endpoint_rows_in`] — a non-empty adjacency scan
+/// needs no check (see its docs).
+fn adjacency_ready_in(reader: &dyn crate::store::SnapshotReader, marker_ns: &str) -> Result<bool> {
+    Ok(matches!(reader.get(marker_ns, &adjacency_marker_key())?,
+            Some(v) if v.as_slice() == ADJACENCY_VERSION))
 }
 
 /// Decode an edge weight value: an 8-byte little-endian f64, or `1.0` if the
@@ -675,7 +830,8 @@ pub(crate) struct EdgeRecord {
 mod tests {
     use super::{
         ADJ_PAGE, ADJ_TAG_META, ADJ_TAG_ROW, ADJACENCY_VERSION, adj_in_name, adj_key, adj_out_name,
-        adj_prefix, adjacency_marker_key, decode_adj_key, neighbor_prefix,
+        adj_pair_prefix, adj_prefix, adjacency_marker_key, decode_adj_key, edge_key,
+        neighbor_prefix,
     };
     use crate::{Db, Value};
 
@@ -1141,6 +1297,182 @@ mod tests {
             vec![(adjacency_marker_key().to_vec(), ADJACENCY_VERSION.to_vec())]
         );
         assert!(db.store().scan(&adj_in_name("nodes")).unwrap().is_empty());
+    }
+
+    // ---- endpoint-direct reads (ledger-closure Task 1) ----
+
+    /// Reads serve the ADJACENCY while it is built: a source-only row
+    /// forged past the maintenance discipline (a raw store write with no
+    /// adjacency twin) is invisible to every reader — the non-empty
+    /// adjacency scan answers without consulting the source rows, and the
+    /// EMPTY result for the forged (endpoint, relation) pair comes from the
+    /// marker-present branch, not a fallback (a wrong fallback would
+    /// surface the forged row). Removing the marker (the not-built shape)
+    /// puts the same forged row back in view through the source-scan
+    /// fallback.
+    #[test]
+    fn endpoint_direct_reads_serve_adjacency_and_fall_back_only_when_unbuilt() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("nodes");
+        c.link(b"a", "knows", b"b").unwrap(); // establishes adjacency + marker
+
+        // Forge a complete source-row pair under a relation the adjacency
+        // has NO rows for (link would have maintained both).
+        for (ns, key) in [
+            (&c.edges_name(), edge_key("likes", b"a", b"zz")),
+            (&c.redges_name(), edge_key("likes", b"zz", b"a")),
+        ] {
+            db.store().put(ns, &key, b"").unwrap();
+        }
+
+        // Adjacency built: the forged pair reads EMPTY (marker-present
+        // branch), and the maintained pair reads exactly as before.
+        assert!(c.neighbors(b"a", "likes").unwrap().is_empty());
+        assert!(c.in_neighbors(b"zz", "likes").unwrap().is_empty());
+        assert_eq!(c.neighbors(b"a", "knows").unwrap(), vec![b"b".to_vec()]);
+
+        // Not-built shape (marker gone): the same reads fall back to the
+        // source namespaces and see the forged rows — including the
+        // maintained edge, which is still in the source rows.
+        db.store()
+            .delete(&adj_out_name("nodes"), &adjacency_marker_key())
+            .unwrap();
+        assert_eq!(c.neighbors(b"a", "likes").unwrap(), vec![b"zz".to_vec()]);
+        assert_eq!(c.in_neighbors(b"zz", "likes").unwrap(), vec![b"a".to_vec()]);
+        assert_eq!(c.neighbors(b"a", "knows").unwrap(), vec![b"b".to_vec()]);
+    }
+
+    /// The legacy-database shape: edge rows written by a pre-adjacency
+    /// binary (forged here through the raw store — the public API always
+    /// establishes adjacency on the first link), so no adjacency namespaces
+    /// exist at all. Every reader answers from the source namespaces with
+    /// byte-identical results — ordering, relation isolation, weights,
+    /// traverse BFS order, self-loops — and the first real edge write
+    /// establishes the adjacency (deriving rows for the legacy edges too)
+    /// without changing a single read.
+    #[test]
+    fn reads_fall_back_to_source_on_legacy_edges_without_adjacency() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("nodes");
+        // Targets inserted out of byte order; weighted + unweighted; a
+        // cycle; a same-pair edge under another relation; a self-loop.
+        let rows = [
+            ("knows", b"a" as &[u8], b"b" as &[u8], Some(0.5f64)),
+            ("knows", b"a", b"d", None),
+            ("knows", b"a", b"c", None),
+            ("knows", b"b", b"a", None),
+            ("likes", b"a", b"b", Some(2.5)),
+            ("knows", b"x", b"x", None),
+        ];
+        for (rel, from, to, w) in rows {
+            let value = w.map(f64::to_le_bytes);
+            let value: &[u8] = value.as_ref().map_or(&[], |v| v);
+            db.store()
+                .put(&c.edges_name(), &edge_key(rel, from, to), value)
+                .unwrap();
+            db.store()
+                .put(&c.redges_name(), &edge_key(rel, to, from), value)
+                .unwrap();
+        }
+        // No adjacency namespace was ever created: the marker is absent.
+        assert!(
+            db.store()
+                .get(&adj_out_name("nodes"), &adjacency_marker_key())
+                .unwrap()
+                .is_none()
+        );
+
+        // Source-scan fallback: exact results in byte order, relation
+        // isolation, weights, BFS order, self-loop visibility.
+        assert_eq!(
+            c.neighbors(b"a", "knows").unwrap(),
+            vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+        );
+        assert_eq!(c.neighbors(b"a", "likes").unwrap(), vec![b"b".to_vec()]);
+        assert_eq!(c.in_neighbors(b"b", "knows").unwrap(), vec![b"a".to_vec()]);
+        assert_eq!(c.in_neighbors(b"a", "knows").unwrap(), vec![b"b".to_vec()]);
+        assert_eq!(
+            c.neighbors_weighted(b"a", "knows").unwrap(),
+            vec![
+                (b"b".to_vec(), 0.5),
+                (b"c".to_vec(), 1.0),
+                (b"d".to_vec(), 1.0)
+            ]
+        );
+        assert_eq!(
+            c.traverse(b"a", "knows", 5).unwrap(),
+            vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+        );
+        assert_eq!(c.neighbors(b"x", "knows").unwrap(), vec![b"x".to_vec()]);
+
+        // The first real edge write establishes the adjacency from ALL
+        // source rows — the forged legacy edges included — and every read
+        // above still returns the same answer (plus the new edge where it
+        // belongs), now served endpoint-direct.
+        c.link(b"a", "knows", b"e").unwrap();
+        assert_eq!(
+            c.neighbors(b"a", "knows").unwrap(),
+            vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec(), b"e".to_vec()]
+        );
+        assert_eq!(c.in_neighbors(b"b", "knows").unwrap(), vec![b"a".to_vec()]);
+        assert_eq!(
+            c.neighbors_weighted(b"a", "knows").unwrap(),
+            vec![
+                (b"b".to_vec(), 0.5),
+                (b"c".to_vec(), 1.0),
+                (b"d".to_vec(), 1.0),
+                (b"e".to_vec(), 1.0)
+            ]
+        );
+        assert_eq!(
+            c.traverse(b"a", "knows", 5).unwrap(),
+            vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec(), b"e".to_vec()]
+        );
+    }
+
+    /// The `(endpoint, relation)` adjacency prefix is EXACT: relations that
+    /// are byte-prefixes of one another (and the empty relation, and the
+    /// empty endpoint) never bleed into a pair's read, in either direction,
+    /// and results within a pair stay in byte order — the equivalence the
+    /// endpoint-direct readers rely on (both backings walk the same rows).
+    #[test]
+    fn endpoint_direct_pair_prefix_exact_across_prefix_relations() {
+        let db = Db::open_in_memory().unwrap();
+        let c = db.collection("nodes");
+        // Relations "r" and "rr" on endpoints "" and "a": the length
+        // prefixes must keep all pairs isolated however their bytes align.
+        c.link(b"", "r", b"x").unwrap();
+        c.link(b"", "rr", b"y").unwrap();
+        c.link(b"a", "", b"z").unwrap();
+        c.link(b"a", "r", b"x").unwrap();
+        c.link(b"a", "rr", b"x2").unwrap();
+        c.link(b"a", "rr", b"x1").unwrap();
+
+        assert_eq!(c.neighbors(b"", "r").unwrap(), vec![b"x".to_vec()]);
+        assert_eq!(c.neighbors(b"", "rr").unwrap(), vec![b"y".to_vec()]);
+        assert_eq!(c.neighbors(b"a", "").unwrap(), vec![b"z".to_vec()]);
+        assert_eq!(c.neighbors(b"a", "r").unwrap(), vec![b"x".to_vec()]);
+        assert_eq!(
+            c.neighbors(b"a", "rr").unwrap(),
+            vec![b"x1".to_vec(), b"x2".to_vec()]
+        );
+        // The incoming mirror, crossing the empty-endpoint boundary.
+        assert_eq!(
+            c.in_neighbors(b"x", "r").unwrap(),
+            vec![b"".to_vec(), b"a".to_vec()]
+        );
+        assert_eq!(c.in_neighbors(b"y", "rr").unwrap(), vec![b"".to_vec()]);
+        assert_eq!(c.in_neighbors(b"z", "").unwrap(), vec![b"a".to_vec()]);
+        // And the pair-prefix codec agrees with adj_key on every shape.
+        for (endpoint, rel, other) in [
+            (&b"a"[..], "r", &b"b"[..]),
+            (&b""[..], "", &b""[..]),
+            (&b""[..], "rr", &b"y"[..]),
+            ("ключ".as_bytes(), "знает", "鍵".as_bytes()),
+        ] {
+            let k = adj_key(endpoint, rel, other);
+            assert!(k.starts_with(&adj_pair_prefix(endpoint, rel)));
+        }
     }
 
     /// An endpoint with more than one adjacency PAGE of edges (1024-row

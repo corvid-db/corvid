@@ -30,6 +30,7 @@ cargo bench -p corvid --bench engine -- compound_prefix_scan
 cargo bench -p corvid --bench engine -- delete_heavy
 cargo bench -p corvid --bench engine -- selective_window_verify
 cargo bench -p corvid --bench engine -- order_by_indexed_5k
+cargo bench -p corvid --bench engine -- neighbors_hub_10k
 ```
 
 The same literal commands live in the bench file's doc comments (one per
@@ -250,3 +251,46 @@ than its recorded AFTER (−23%/−12% — run-context; Task 13's own probe
 runs spread 67-71 ms / 356-458 ms), and `value_decode` −6.8% (faster,
 untouched). **No regression attributable to code; the guard holds.**
 
+
+## Ledger-closure Task 1 — endpoint-direct graph reads: measured PARITY
+
+`neighbors`/`in_neighbors`/`neighbors_weighted`/`traverse`'s frontier
+expansion now serve from the adjacency namespaces via the exact
+length-delimited `(endpoint, relation)` pair prefix (byte-identical order,
+weights verbatim in the adjacency values; empty adjacency scan → one
+marker point-get → current marker means genuinely empty, absent means the
+source edge-namespace scan answers). BEFORE provenance: the
+`neighbors_hub_10k` group was added to the pre-change tree and run there
+(current code = the source-namespace `(relation, endpoint)` prefix scans);
+AFTER on the implementation, same session/machine. Corpus: 2_001 docs,
+10k edge writes — 4 hubs × ~938 distinct fan-in edges + ~938 weighted
+fan-out edges (~313 per (hub, relation) per direction), plus 2_500
+uniform degree-~1 edges (the contrast case). Means [95% CI];
+`cargo bench -p corvid --bench engine -- neighbors_hub_10k`:
+
+| Bench | BEFORE (mean) | AFTER (mean) | Δ |
+|---|---|---|---|
+| hub_out_knows (313 rows) | 37.08 µs [36.91, 37.34] | 37.12 µs [37.04, 37.24] | +0.1% |
+| hub_in_knows (313 rows) | 29.58 µs [29.45, 29.77] | 29.96 µs [29.89, 30.05] | +1.3% |
+| hub_weighted_knows (313 rows) | 37.46 µs [37.32, 37.66] | 37.27 µs [37.15, 37.48] | −0.5% |
+| uniform_deg1 (2 rows) | 1.708 µs [1.700, 1.718] | 1.708 µs [1.702, 1.717] | ±0.0% |
+| traverse_hub_2hops (~630 per-hop scans) | 570.5 µs [569.1, 572.1] | 581.4 µs [578.0, 585.7] | +1.9% |
+
+**Verdict: parity** (every reader within ±2%, guard ≤5%). The asymptotic
+analysis holds — the source prefix was ALREADY one contiguous B-tree
+range per fixed-`relation` pair, so endpoint-major clustering buys a
+fixed-relation read nothing. Kept anyway: results are provably
+byte-identical (so the pinned orderings, traverse's BFS order included,
+are untouched), reads and the delete cascade now share one endpoint-keyed
+layout, and any endpoint-wide neighbor API (the old AUDIT row's own reopen
+trigger) is pre-served. Two intermediate shapes were measured and fixed
+BEFORE landing (never shipped): a per-hop marker point-get cost **+28%**
+on traverse (`ReadBatch` has no collection-id cache — each point-get is a
+catalog seek + a records seek), fixed by resolving the marker once per
+traversal; per-hop namespace-name formatting cost ~5% (the 610 µs
+intermediate), fixed by hoisting the name strings out of the hop loop.
+Residual bounded cost, by design: an EMPTY read on a built adjacency pays
+one extra point-get (marker), and a read on a legacy pre-adjacency
+database pays one empty adjacency seek + the marker point-get before the
+source scan — both disappear at that collection's first edge write or
+cascade (which establishes adjacency permanently).
