@@ -1589,7 +1589,10 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::text::tokenize",
         "Text search",
-        &["text_tokenize_case_punct_unicode_numbers_and_empties"],
+        &[
+            "text_tokenize_case_punct_unicode_numbers_and_empties",
+            "text_tokenize_cjk_bigrams_boundary_and_mixed_strings",
+        ],
     ),
     row(
         "corvid::text::s_stem",
@@ -1609,12 +1612,18 @@ static MANIFEST: &[Row] = &[
     row(
         "corvid::text::Analyzer::analyze",
         "Text search",
-        &["text_analyzer_default_raw_and_flag_combinations"],
+        &[
+            "text_analyzer_default_raw_and_flag_combinations",
+            "text_analyze_cjk_no_stopwords_no_stemming",
+        ],
     ),
     row(
         "corvid::text::analyze",
         "Text search",
-        &["text_analyzer_default_raw_and_flag_combinations"],
+        &[
+            "text_analyzer_default_raw_and_flag_combinations",
+            "text_analyze_cjk_no_stopwords_no_stemming",
+        ],
     ),
     row(
         "corvid::text::idf",

@@ -7,6 +7,23 @@ format and API may change without backward-compatibility guarantees.
 ## [Unreleased]
 
 ### Added
+- CJK text search: runs of CJK characters now tokenize as sliding BIGRAMS
+  (single-character run → that character), the standard dictionary-free
+  segmentation fallback for the unspaced CJK scripts — no dictionary data,
+  no dependencies. The boundary (documented on the tokenizer): hiragana +
+  katakana U+3040–30FF (prolonged sound mark included), Han ideographs
+  U+3400–4DBF, U+4E00–9FFF, U+F900–FAFF, and U+20000–323AF. Hangul and
+  halfwidth katakana are deliberately outside the set (Korean is
+  space-separated, so whole runs remain its tokens); the Han↔kana script
+  transition inside one run does not restart the window; a CJK↔non-CJK
+  transition splits the run. Stemming and case folding never apply to CJK
+  tokens (東京 never merges with 東), the same analyzer feeds index and
+  query on every path, and phrase search is order-correct over bigrams
+  (東京タワー matches, タワー東京 does not). Latin corpora behave exactly
+  as before (the existing conformance pins are the regression oracle);
+  CJK behavior previously indexed whole runs as single tokens, so text
+  indexes created before this change should be re-created to pick up
+  bigram postings for CJK fields.
 - Three new probabilistic sketches join `HyperLogLog`/`BloomFilter` as
   public engine surface (same conventions: no dependencies, deterministic
   std `DefaultHasher` hashing, no `rand` — identical inputs produce

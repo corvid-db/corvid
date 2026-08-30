@@ -166,12 +166,12 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::text::Bm25Params` — `text_bm25_params_new_and_validate_error_variants`, `text_term_score_zero_saturation_length_and_b_zero`
 - `corvid::text::Bm25Params::new` — `text_bm25_params_new_and_validate_error_variants`
 - `corvid::text::Bm25Params::validate` — `text_bm25_params_new_and_validate_error_variants`
-- `corvid::text::tokenize` — `text_tokenize_case_punct_unicode_numbers_and_empties`
+- `corvid::text::tokenize` — `text_tokenize_case_punct_unicode_numbers_and_empties`, `text_tokenize_cjk_bigrams_boundary_and_mixed_strings`
 - `corvid::text::s_stem` — `text_s_stem_pins_conservative_plural_algorithm`
 - `corvid::text::Analyzer` — `text_analyzer_default_raw_and_flag_combinations`
 - `corvid::text::Analyzer::raw` — `text_analyzer_default_raw_and_flag_combinations`
-- `corvid::text::Analyzer::analyze` — `text_analyzer_default_raw_and_flag_combinations`
-- `corvid::text::analyze` — `text_analyzer_default_raw_and_flag_combinations`
+- `corvid::text::Analyzer::analyze` — `text_analyzer_default_raw_and_flag_combinations`, `text_analyze_cjk_no_stopwords_no_stemming`
+- `corvid::text::analyze` — `text_analyzer_default_raw_and_flag_combinations`, `text_analyze_cjk_no_stopwords_no_stemming`
 - `corvid::text::idf` — `text_idf_values_monotonicity_and_nonnegativity`
 - `corvid::text::term_score` — `text_term_score_zero_saturation_length_and_b_zero`
 
@@ -440,7 +440,7 @@ the in-process duplex-I/O suite in `crates/corvid-mcp/tests/tools/`.
 - `mcp::tool::get_schema` — `set_schema_then_get_schema_roundtrips`, `set_schema_param_and_name_errors`, `dump_load_preserves_schema_constraints`, `set_schema_declared_empty_vs_undeclared_fields`
 
 327 engine construct(s) across 13 statement classes, 51 wire construct(s),
-303 distinct covering tests (existence and uniqueness enforced by the
+305 distinct covering tests (existence and uniqueness enforced by the
 radars; the 7 exempt row(s) above are the only uncovered ones, each
 with its justification).
 

@@ -8,11 +8,21 @@
 //! Contracts pinned by these tests (read from `src/text.rs`, `src/fts.rs`,
 //! `src/disk_fts.rs`, `src/query.rs`, and `src/builder.rs` first):
 //!
-//! * `tokenize` splits on non-alphanumeric runs and lowercases; `s_stem` is
+//! * `tokenize` splits on non-alphanumeric runs and lowercases; a run
+//!   containing CJK characters (hiragana/katakana U+3040–30FF, Han
+//!   U+3400–4DBF / U+4E00–9FFF / U+F900–FAFF / U+20000–323AF — the
+//!   boundary documented in `src/text.rs`; hangul and halfwidth kana are
+//!   deliberately OUTSIDE it) is emitted as sliding BIGRAMS of adjacent
+//!   CJK characters instead of the whole run (single-char run → that
+//!   char; the Han↔kana script transition inside one run does NOT break
+//!   the window), and CJK/non-CJK transitions inside one alphanumeric
+//!   run split it into separate tokens. `s_stem` is
 //!   Harman's S-stemmer (plural normalization only — no `-ing` stripping),
-//!   ASCII-only, leaving `...us`/`...ss`/len<=3 words alone. `analyze` =
-//!   tokenize + stop-word removal + stemming; `Analyzer::raw` keeps
-//!   everything; the pub fields toggle the two stages independently.
+//!   ASCII-only, leaving `...us`/`...ss`/len<=3 words alone — and
+//!   therefore a no-op on CJK bigrams (stemming is never applied to CJK).
+//!   `analyze` = tokenize + stop-word removal + stemming;
+//!   `Analyzer::raw` keeps everything; the pub fields toggle the two
+//!   stages independently.
 //! * BM25: score(doc) = Σ over distinct query terms of
 //!   `term_score(tf, doc_len, avg_len, idf(n, df), defaults)` with
 //!   whole-corpus stats over the documents that HAVE the text field — the
@@ -129,7 +139,12 @@ fn text_tokenize_case_punct_unicode_numbers_and_empties() {
     );
     // Unicode words are kept, incl. uppercase-to-lowercase folding.
     assert_eq!(tokenize("café NAÏVE"), vec!["café", "naïve"]);
-    assert_eq!(tokenize("日本語 テキスト"), vec!["日本語", "テキスト"]);
+    // CJK runs bigram (ledger-closure Task 4): 日本語 and テキスト are
+    // space-separated runs here, each emitted as its sliding bigrams.
+    assert_eq!(
+        tokenize("日本語 テキスト"),
+        vec!["日本", "本語", "テキ", "キス", "スト"]
+    );
     // Empty and separator-only inputs.
     assert!(tokenize("").is_empty());
     assert!(tokenize("   \t\n").is_empty());
@@ -958,4 +973,264 @@ fn text_phrase_k_boundaries_empty_phrase_and_index_arms() {
             "{arm} scores"
         );
     }
+}
+
+// ===========================================================================
+// 7. CJK bigram tokenization, ranking, phrases (ledger-closure Task 4)
+// ===========================================================================
+
+/// The CJK bigram rule on crafted strings, pinning the boundary documented
+/// in `src/text.rs`: hiragana + katakana (U+3040–30FF, prolonged sound
+/// mark included), Han ideographs (U+3400–4DBF, U+4E00–9FFF, U+F900–FAFF,
+/// U+20000–323AF) bigram; hangul and halfwidth katakana are OUTSIDE the
+/// set (whole-run tokens, the latin behavior); a CJK/non-CJK transition
+/// inside one alphanumeric run splits it, but a Han↔kana transition inside
+/// a CJK run does NOT restart the window; CJK punctuation is a separator
+/// like any other non-alphanumeric.
+#[test]
+fn text_tokenize_cjk_bigrams_boundary_and_mixed_strings() {
+    // Pure Han runs: sliding bigrams; 3 chars → 2 tokens.
+    assert_eq!(tokenize("日本語"), vec!["日本", "本語"]);
+    // 2-char run → exactly one bigram; single char → the char itself.
+    assert_eq!(tokenize("東京"), vec!["東京"]);
+    assert_eq!(tokenize("東"), vec!["東"]);
+    assert_eq!(tokenize("東 京"), vec!["東", "京"]);
+    // Kana bigrams the same way.
+    assert_eq!(tokenize("あいう"), vec!["あい", "いう"]);
+    // Han→katakana script transition inside ONE run: the window slides
+    // across it (東京タワー = 東,京,タ,ワ,ー → 4 bigrams).
+    assert_eq!(tokenize("東京タワー"), vec!["東京", "京タ", "タワ", "ワー"]);
+    // CJK punctuation (、 U+3001) is a separator, exactly like latin
+    // punctuation.
+    assert_eq!(tokenize("東京、大阪"), vec!["東京", "大阪"]);
+    // Mixed latin + CJK: each side tokenizes its own way, in stream order.
+    assert_eq!(tokenize("rustで検索"), vec!["rust", "で検", "検索"]);
+    // A CJK/non-CJK transition inside one alphanumeric run SPLITS it.
+    assert_eq!(tokenize("abc東京def"), vec!["abc", "東京", "def"]);
+    // Extension B (supplementary plane) is inside the set.
+    assert_eq!(tokenize("𠀀𠀁𠀂"), vec!["𠀀𠀁", "𠀁𠀂"]);
+    // Hangul is OUTSIDE the bigram set: Korean is space-separated, so
+    // whole runs are the right token (the latin behavior).
+    assert_eq!(tokenize("한국어 검색"), vec!["한국어", "검색"]);
+    // Halfwidth katakana (U+FF66..FF9F) is outside too: compatibility
+    // forms stay whole-run (NFKC-normalize upstream if bigrams are
+    // wanted).
+    assert_eq!(tokenize("ﾃｷｽﾄ"), vec!["ﾃｷｽﾄ"]);
+    // Case folding is N/A for CJK (no case mappings exist); latin
+    // neighbors still fold.
+    assert_eq!(tokenize("Tokyo駅"), vec!["tokyo", "駅"]);
+    // Combining dakuten (U+3099/U+309A) are non-alphanumeric separators
+    // per std's Unicode tables — NFD text splits at them, deterministically
+    // (no normalization is applied anywhere; NFC is the recommended
+    // storage form, and index/query consistency holds either way because
+    // both sides run this same tokenizer).
+    assert_eq!(tokenize("か\u{3099}き"), vec!["か", "き"]);
+    // Separator-only CJK input is empty, like latin.
+    assert!(tokenize("、、。").is_empty());
+}
+
+/// Stemming is never applied to CJK tokens and CJK never hits the English
+/// stop-word list: `analyze` on pure-CJK text is exactly `tokenize` output
+/// (default and raw analyzers agree), the stem stage is provably a no-op
+/// at the primitive level (`s_stem` passes non-ASCII through untouched),
+/// and in mixed text each stage touches only its own script's tokens.
+#[test]
+fn text_analyze_cjk_no_stopwords_no_stemming() {
+    // One 8-char run → 7 bigrams; no stage modifies any of them.
+    assert_eq!(
+        corvid::text::analyze("東京タワーは高い"),
+        vec!["東京", "京タ", "タワ", "ワー", "ーは", "は高", "高い"]
+    );
+    // s_stem is ASCII-only: CJK bigrams pass through unchanged.
+    assert_eq!(s_stem("東京"), "東京");
+    assert_eq!(s_stem("たち"), "たち");
+    // Default == raw == tokenize for pure CJK (no stop words in CJK, no
+    // stemming in CJK).
+    assert_eq!(
+        Analyzer::raw().analyze("日本語の検索"),
+        corvid::text::analyze("日本語の検索")
+    );
+    assert_eq!(
+        corvid::text::analyze("日本語の検索"),
+        tokenize("日本語の検索")
+    );
+    // Mixed pipeline: stop word dropped, latin stemmed, CJK untouched.
+    assert_eq!(
+        corvid::text::analyze("the running 東京 dogs"),
+        vec!["running", "東京", "dog"]
+    );
+}
+
+/// BM25 over a CJK corpus: bigram tokens feed the scorer unchanged, so the
+/// ranking math is the latin one verbatim. `d2` (len 2) beats `d1` (len 4)
+/// on the single bigram 東京 — same tf=1, df=2 of n=3, avg_len 7/3, the
+/// shorter document wins on the length norm; the whole-word query
+/// 東京タワー (4 bigrams) ranks the doc containing all four first; and
+/// 東京 does NOT stem to 東 (no cross-token merges in CJK).
+#[test]
+fn text_search_cjk_bm25_ranking_and_scores() {
+    let db = Db::open_in_memory().unwrap();
+    let c = seed(
+        &db,
+        "cjk-rank",
+        &[
+            (b"d1", doc("東京タワー")),
+            (b"d2", doc("東京駅")),
+            (b"d3", doc("京都")),
+        ],
+    );
+    // Analyzed lengths: d1 = 4 bigrams, d2 = 2, d3 = 1 → avg = 7/3;
+    // df(東京) = 2 of n = 3.
+    let avg = 7.0f32 / 3.0f32;
+    let hits = c.text_search("body", "東京", 10).unwrap();
+    assert_eq!(hit_keys(&hits), k(&["d2", "d1"]));
+    assert_eq!(hits[0].score, bm25_term(1, 2, avg, 3, 2));
+    assert_eq!(hits[1].score, bm25_term(1, 4, avg, 3, 2));
+    assert!(hits[0].score > hits[1].score);
+    assert!(hits.iter().all(|h| h.score > 0.0));
+
+    // Whole-word query: d1 contains all 4 bigrams of 東京タワー, d2 only
+    // 東京 — term count decides.
+    let hits = c.text_search("body", "東京タワー", 10).unwrap();
+    assert_eq!(hit_keys(&hits), k(&["d1", "d2"]));
+
+    // The no-stem pin at query level: 東 and 東京 are distinct tokens, so
+    // each query matches exactly the doc holding that token.
+    let db = Db::open_in_memory().unwrap();
+    let c = seed(
+        &db,
+        "cjk-nostem",
+        &[(b"one", doc("東")), (b"two", doc("東京"))],
+    );
+    assert_eq!(
+        hit_keys(&c.text_search("body", "東京", 10).unwrap()),
+        k(&["two"])
+    );
+    assert_eq!(
+        hit_keys(&c.text_search("body", "東", 10).unwrap()),
+        k(&["one"])
+    );
+}
+
+/// Phrase search over the bigram stream: the phrase's bigrams must occur
+/// at consecutive positions, in order — 東京タワー (4 bigrams) matches
+/// `pc1` (東京タワー is here, the stop word `is` collapsing out of
+/// adjacency) but NOT `pc2` (タワー東京 — same characters, wrong order),
+/// and the reversed phrase matches only the reversed doc. A 3-char Han
+/// phrase is two adjacent bigrams. Scores are the BM25 sum over the
+/// phrase's bigram terms, bitwise against the public-primitive helper.
+#[test]
+fn text_phrase_cjk_bigram_adjacency_and_order() {
+    let db = Db::open_in_memory().unwrap();
+    let c = seed(
+        &db,
+        "cjk-phrase",
+        &[
+            (b"pc1", doc("東京タワー is here")),
+            (b"pc2", doc("タワー東京")),
+        ],
+    );
+    // pc1 analyzes to [東京, 京タ, タワ, ワー, here] (len 5, `is` dropped);
+    // pc2 to [タワ, ワー, ー東, 東京] (len 4). n = 2, avg = 4.5; df(東京) = 2,
+    // df(タワ) = df(ワー) = 2 (pc2 holds them too), df(京タ) = 1.
+    let avg = 4.5f32;
+    let hits = c.phrase_search("body", "東京タワー", 10).unwrap();
+    assert_eq!(hit_keys(&hits), k(&["pc1"]));
+    assert_eq!(
+        hits[0].score,
+        bm25_term(1, 5, avg, 2, 2)
+            + bm25_term(1, 5, avg, 2, 1)
+            + bm25_term(1, 5, avg, 2, 2)
+            + bm25_term(1, 5, avg, 2, 2)
+    );
+    // Reversed order: only pc2 holds the reversed bigram run.
+    assert_eq!(
+        hit_keys(&c.phrase_search("body", "タワー東京", 10).unwrap()),
+        k(&["pc2"])
+    );
+    // A single-bigram phrase is order-free by construction: both docs hold
+    // 東京 somewhere (pc2 first — shorter doc, same tf/df).
+    assert_eq!(
+        hit_keys(&c.phrase_search("body", "東京", 10).unwrap()),
+        k(&["pc2", "pc1"])
+    );
+    // k bounds behave exactly like the latin pins.
+    assert!(c.phrase_search("body", "東京タワー", 0).unwrap().is_empty());
+    assert_eq!(
+        hit_keys(&c.phrase_search("body", "東京タワー", 1).unwrap()),
+        k(&["pc1"])
+    );
+
+    // A 3-char Han phrase = two adjacent bigrams at consecutive positions.
+    let db = Db::open_in_memory().unwrap();
+    let c = seed(
+        &db,
+        "cjk-phrase3",
+        &[(b"p3a", doc("日本語の本")), (b"p3b", doc("語日本"))],
+    );
+    // p3a → [日本, 本語, 語の, の本] (query 日本語 = [日本, 本語] at 0,1);
+    // p3b → [語日, 日本] (本語 absent — no match).
+    assert_eq!(
+        hit_keys(&c.phrase_search("body", "日本語", 10).unwrap()),
+        k(&["p3a"])
+    );
+}
+
+/// Index-vs-scan equivalence for CJK text (audit B7's twin discipline, CJK
+/// arm): in-memory and on-disk text indexes return exactly the scan's
+/// ranked keys AND scores for bigram term queries and phrases alike — the
+/// bigram change lives entirely inside the shared analyzer, so every
+/// serving path sees the same token stream.
+#[test]
+fn text_search_cjk_index_inmemory_ondisk_match_scan_twin() {
+    let corpus = || {
+        vec![
+            (b"c1".as_slice(), doc("東京タワーは高い")),
+            (b"c2".as_slice(), doc("東京駅の地図")),
+            (b"c3".as_slice(), doc("京都の寺")),
+            (b"c4".as_slice(), doc("rust で検索")),
+        ]
+    };
+    let make = |name: &str, index: u8| {
+        let db = Db::open_in_memory().unwrap();
+        let c = seed(&db, name, &corpus());
+        if index == 1 {
+            c.create_text_index("body").unwrap();
+        } else if index == 2 {
+            c.create_text_index_ondisk("body").unwrap();
+        }
+        db
+    };
+    let scan_db = make("cjk-twin-scan", 0);
+    let mem_db = make("cjk-twin-mem", 1);
+    let disk_db = make("cjk-twin-disk", 2);
+    let scan = scan_db.collection("cjk-twin-scan");
+    let mem = mem_db.collection("cjk-twin-mem");
+    let disk = disk_db.collection("cjk-twin-disk");
+
+    for q in ["東京", "東京タワー", "京都", "検索", "タワ東京"] {
+        let base = scan.text_search("body", q, 10).unwrap();
+        for (arm, col) in [("mem", &mem), ("disk", &disk)] {
+            let got = col.text_search("body", q, 10).unwrap();
+            assert_eq!(hit_keys(&got), hit_keys(&base), "{arm} keys, q={q}");
+            assert_eq!(
+                got.iter().map(|h| h.score).collect::<Vec<_>>(),
+                base.iter().map(|h| h.score).collect::<Vec<_>>(),
+                "{arm} scores, q={q}"
+            );
+        }
+    }
+    // Phrases through both index kinds match the scan exactly.
+    let base = scan.phrase_search("body", "東京タワー", 10).unwrap();
+    for (arm, col) in [("mem", &mem), ("disk", &disk)] {
+        let got = col.phrase_search("body", "東京タワー", 10).unwrap();
+        assert_eq!(hit_keys(&got), hit_keys(&base), "{arm} phrase keys");
+        assert_eq!(
+            got.iter().map(|h| h.score).collect::<Vec<_>>(),
+            base.iter().map(|h| h.score).collect::<Vec<_>>(),
+            "{arm} phrase scores"
+        );
+    }
+    // The arms actually matched something (non-vacuous equivalence).
+    assert!(!hit_keys(&base).is_empty());
 }

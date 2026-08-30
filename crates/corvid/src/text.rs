@@ -4,6 +4,23 @@
 //! search that uses them lives in [`crate::query`]. Like the vector path, the
 //! v0.1 search scores by scanning the corpus; a persistent inverted index can
 //! replace the scan later without changing the scoring math here.
+//!
+//! # CJK segmentation (ledger-closure Task 4)
+//!
+//! Runs of CJK characters — hiragana/katakana, the Han ideograph blocks, the
+//! exact boundary documented on the private `is_cjk` predicate below — are
+//! tokenized as sliding
+//! BIGRAMS of adjacent characters (single-character run → that character),
+//! the standard dictionary-free fallback for the unspaced CJK scripts: no
+//! segmentation dictionaries, no dependencies. Latin behavior is unchanged,
+//! and in mixed text the two coexist in one token stream. The same
+//! [`analyze`] feeds index build and query on every serving path (scan,
+//! in-memory index, on-disk index), so bigram positions line up and phrase
+//! search works over bigrams naturally (a 3-character phrase is two adjacent
+//! bigrams at consecutive positions). Stemming and case folding never apply
+//! to CJK tokens — the S-stemmer is ASCII-only and CJK has no case — and
+//! hangul is deliberately outside the bigram set (Korean is space-separated;
+//! whole runs are its tokens, like latin).
 
 /// BM25 tuning parameters.
 #[derive(Debug, Clone, Copy)]
@@ -53,17 +70,94 @@ impl Bm25Params {
     }
 }
 
+/// The CJK codepoint set tokenized by bigram (the boundary is a recorded
+/// decision, see the module docs):
+///
+/// * U+3040–30FF — hiragana + katakana, prolonged sound mark `ー`
+///   (U+30FC) included. The combining dakuten U+3099/309A never reach
+///   this check: std classifies them non-alphanumeric, so they are
+///   separators like any other mark (the documented combining edge — no
+///   normalization is applied; NFC is the recommended storage form).
+/// * U+3400–4DBF — CJK Unified Ideographs Extension A.
+/// * U+4E00–9FFF — CJK Unified Ideographs (the main block).
+/// * U+F900–FAFF — CJK Compatibility Ideographs.
+/// * U+20000–323AF — the supplementary-plane extensions (B–H).
+///
+/// Deliberately OUTSIDE: hangul (Korean is space-separated, so whole-run
+/// tokens — the latin behavior — already segment it) and halfwidth
+/// katakana U+FF66–FF9F (compatibility forms; NFKC-normalize upstream if
+/// bigrams are wanted). CJK punctuation (、。」 etc.) is non-alphanumeric
+/// and therefore a separator, as before.
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c,
+        '\u{3040}'..='\u{30FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{323AF}'
+    )
+}
+
+/// Append the bigram tokens of one CJK run: the sliding window over
+/// adjacent characters (a 3-char run yields 2 bigrams). A single-character
+/// run yields that character.
+fn push_cjk_bigrams(run: &[char], out: &mut Vec<String>) {
+    if run.len() == 1 {
+        out.push(run[0].to_string());
+    } else {
+        out.extend(run.windows(2).map(|w| w.iter().collect()));
+    }
+}
+
 /// Split text into lowercased alphanumeric tokens.
 ///
 /// Tokens are maximal runs of alphanumeric characters; everything else is a
-/// separator. Unicode alphanumerics are kept. This is the raw split with no
-/// stop-word removal or stemming — see [`Analyzer`] / [`analyze`] for the
-/// pipeline used by the search indexes.
+/// separator. Unicode alphanumerics are kept. Within an alphanumeric run,
+/// a maximal sub-run of CJK characters (see the `is_cjk` boundary's
+/// documented ranges) is emitted as sliding BIGRAMS of adjacent characters instead
+/// of one whole token — the standard dictionary-free CJK segmentation
+/// fallback for search — while a CJK↔non-CJK transition splits the run
+/// (latin pieces keep today's whole-token + lowercase behavior). The
+/// Han↔kana script transition inside a CJK run does NOT restart the
+/// window: `東京タワー` bigrams as one 5-character run. This is the raw
+/// split with no stop-word removal or stemming — see [`Analyzer`] /
+/// [`analyze`] for the pipeline used by the search indexes (and note the
+/// pipeline never stems CJK tokens).
 pub fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
-        .collect()
+    let mut tokens = Vec::new();
+    let mut latin = String::new();
+    let mut cjk: Vec<char> = Vec::new();
+
+    let flush_latin = |latin: &mut String, tokens: &mut Vec<String>| {
+        if !latin.is_empty() {
+            // Case folding applies to the non-CJK pieces only; CJK has no
+            // case mappings, so the bigrams are stored as written.
+            tokens.push(std::mem::take(latin).to_lowercase());
+        }
+    };
+    let flush_cjk = |cjk: &mut Vec<char>, tokens: &mut Vec<String>| {
+        if !cjk.is_empty() {
+            push_cjk_bigrams(cjk, tokens);
+            cjk.clear();
+        }
+    };
+
+    for c in text.chars() {
+        if !c.is_alphanumeric() {
+            flush_latin(&mut latin, &mut tokens);
+            flush_cjk(&mut cjk, &mut tokens);
+        } else if is_cjk(c) {
+            flush_latin(&mut latin, &mut tokens);
+            cjk.push(c);
+        } else {
+            flush_cjk(&mut cjk, &mut tokens);
+            latin.push(c);
+        }
+    }
+    flush_latin(&mut latin, &mut tokens);
+    flush_cjk(&mut cjk, &mut tokens);
+    tokens
 }
 
 /// Common English stop words removed by the default analyzer. Kept small and
@@ -142,6 +236,11 @@ impl Analyzer {
     }
 
     /// Analyze `text` into the terms used for indexing and matching.
+    ///
+    /// CJK runs arrive here as bigrams (see [`tokenize`]) and pass through
+    /// both stages untouched: the stop-word list is English-only and the
+    /// S-stemmer is ASCII-only, so stemming never applies to CJK tokens —
+    /// `東京` never merges with `東` (pinned by conformance).
     pub fn analyze(&self, text: &str) -> Vec<String> {
         tokenize(text)
             .into_iter()
@@ -204,6 +303,62 @@ mod tests {
     fn tokenize_empty_and_punctuation_only() {
         assert!(tokenize("").is_empty());
         assert!(tokenize(",.-!! ??").is_empty());
+    }
+
+    /// The CJK bigram rule at unit level: the documented boundary in, the
+    /// exact token stream out (mixed strings, script transitions, single
+    /// chars, the hangul/halfwidth exclusions, the combining-dakuten edge).
+    #[test]
+    fn tokenize_cjk_runs_bigram_with_documented_boundary() {
+        assert_eq!(tokenize("日本語"), vec!["日本", "本語"]);
+        assert_eq!(tokenize("東京"), vec!["東京"]);
+        assert_eq!(tokenize("東"), vec!["東"]);
+        assert_eq!(tokenize("あいう"), vec!["あい", "いう"]);
+        // One run across the Han↔katakana transition; ー is in the set.
+        assert_eq!(tokenize("東京タワー"), vec!["東京", "京タ", "タワ", "ワー"]);
+        // CJK/non-CJK transitions split; latin still folds.
+        assert_eq!(tokenize("abc東京def"), vec!["abc", "東京", "def"]);
+        assert_eq!(tokenize("Tokyo駅"), vec!["tokyo", "駅"]);
+        assert_eq!(tokenize("rustで検索"), vec!["rust", "で検", "検索"]);
+        // Extension B is inside the set; hangul and halfwidth kana are not.
+        assert_eq!(tokenize("𠀀𠀁𠀂"), vec!["𠀀𠀁", "𠀁𠀂"]);
+        assert_eq!(tokenize("한국어"), vec!["한국어"]);
+        assert_eq!(tokenize("ﾃｷｽﾄ"), vec!["ﾃｷｽﾄ"]);
+        // Combining dakuten are non-alphanumeric separators (std tables):
+        // NFD text splits at them; no normalization is applied here.
+        assert_eq!(tokenize("か\u{3099}き"), vec!["か", "き"]);
+    }
+
+    /// The boundary predicate itself: every range endpoint is in, the
+    /// nearest codepoints outside each range are out.
+    #[test]
+    fn cjk_boundary_range_endpoints() {
+        for c in [
+            '\u{3040}',
+            '\u{30FF}',
+            '\u{3400}',
+            '\u{4DBF}',
+            '\u{4E00}',
+            '\u{9FFF}',
+            '\u{F900}',
+            '\u{FAFF}',
+            '\u{20000}',
+            '\u{323AF}',
+        ] {
+            assert!(is_cjk(c), "U+{:04X} must be inside the set", c as u32);
+        }
+        for c in [
+            '\u{303F}', // CJK punctuation edge below hiragana
+            '\u{3100}', // below Ext A
+            '\u{4DC0}', // Yijing hexagrams between Ext A and URO
+            '\u{A000}', // Yi syllables above URO
+            '\u{FB00}', // latin ligatures below compat ideographs
+            '\u{AC00}', // hangul syllables — outside by decision
+            '\u{D7AF}', '\u{FF66}', // halfwidth katakana — outside by decision
+            '\u{FF9F}',
+        ] {
+            assert!(!is_cjk(c), "U+{:04X} must be outside the set", c as u32);
+        }
     }
 
     #[test]
