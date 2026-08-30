@@ -7,10 +7,10 @@
 //!
 //! # CJK segmentation (ledger-closure Task 4)
 //!
-//! Runs of CJK characters — hiragana/katakana, the Han ideograph blocks, the
-//! exact boundary documented on the private `is_cjk` predicate below — are
-//! tokenized as sliding
-//! BIGRAMS of adjacent characters (single-character run → that character),
+//! Runs of CJK characters — hiragana/katakana, the Han ideograph blocks,
+//! the exact boundary documented on the private `is_cjk` predicate below —
+//! are tokenized as sliding BIGRAMS of adjacent characters
+//! (single-character run → that character),
 //! the standard dictionary-free fallback for the unspaced CJK scripts: no
 //! segmentation dictionaries, no dependencies. Latin behavior is unchanged,
 //! and in mixed text the two coexist in one token stream. The same
