@@ -9,9 +9,9 @@
 //!
 //! With the optional `zstd` cargo feature, user-collection values are
 //! transparently compressed on write and decompressed on every read at
-//! this seam (see [`crate::compression`] for the on-disk marker scheme);
-//! engine-reserved `__` namespaces and the default build store bytes
-//! verbatim.
+//! this seam (the private `compression` module holds the on-disk marker
+//! scheme); engine-reserved `__` namespaces and the default build store
+//! bytes verbatim.
 //!
 //! Writes go through [`Store::transaction`], which exposes a [`WriteBatch`]
 //! and commits once at the end — every operation in the closure lands
