@@ -87,6 +87,15 @@ to CJK. DESIGN future row flips.
 
 ## Task 5: zstd value compression (feature-gated)
 
+Prepend (Task 4 review nits, binding): (a) correct task-4-report.md and
+commit-message attribution: the indexed ~8% reading is within historical
+variance, not an improvement (the indexed bench re-tokenizes only the
+ASCII query — no mechanism); (b) DESIGN boundary note gains the
+U+3005/U+3006/U+3031-3035 class (iteration marks split CJK runs;
+index/query self-consistent); (c) BENCHES.md one-line note on the
++2.5-3.2% bm25_exact residual (CJK-aware tokenize costs on the latin
+bench, inside guard).
+
 Optional cargo feature `zstd` (default OFF; `zstd` crate via FFI — same
 discipline as tracing: default/wasm graphs stay clean, CI greps enforce,
 feature-on gates in CI). Compression at the value layer: threshold-sized
