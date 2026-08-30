@@ -39,6 +39,14 @@ corvid = { git = "https://github.com/i-rocky/corvid" }
 
 Requires stable Rust (2024 edition, MSRV 1.88). The engine has no required
 features to enable; it is `#![forbid(unsafe_code)]` and pulls in only `redb`.
+Two optional cargo features exist, both OFF by default so the default build
+stays dependency-minimal:
+
+- `zstd` — transparent compression of stored documents at/above 1 KiB
+  (queries, scans, indexes, dump/load all behave identically, just smaller
+  on disk; a deployment opts in with `corvid = { features = ["zstd"] }`).
+- `tracing` — structured instrumentation events at the engine's
+  load-bearing points for any `tracing`-compatible subscriber.
 
 ## Core concepts
 
@@ -245,6 +253,14 @@ let phrase = c.phrase_search("body", "embedded database", 10)?; // exact, in ord
 # let _ = (hits, phrase);
 # Ok::<(), corvid::Error>(())
 ```
+
+Text containing CJK (Han ideographs, hiragana, katakana) tokenizes as
+sliding bigrams — the standard dictionary-free segmentation fallback for
+the unspaced scripts — with no dependencies: `東京タワー` is indexed so
+that phrase search matches in order (`タワー東京` does not), stemming and
+case folding never apply to CJK tokens, and Korean stays on the
+whole-run (space-separated) behavior. Index and query share the one
+tokenizer, so a CJK field searches consistently on every path.
 
 ## Indexes
 

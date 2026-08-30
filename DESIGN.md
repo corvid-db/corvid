@@ -43,6 +43,8 @@ Implication for sequencing: the engine's v0.1 core (vector + FTS + filter + fusi
 - Cloud sync, hosted service
 - Differential dataflow / Materialize-tier reactive
 - General-purpose tensor ops (users plug in candle/burn)
+- Arrow `RecordBatch` result paths — users convert to Arrow at the boundary (DECLINED, decision log 2026-08-30)
+- A JSON path language (`$.a[0].b`-style) — dotted paths + `select` cover the surface (DECLINED, decision log 2026-08-30)
 - Backward-compatible file format migrations (manual reimport, full stop)
 - "World's best" on any single component — match within 2–5×, never claim leadership
 
@@ -75,14 +77,15 @@ Same Rust core. The storage backend is abstracted behind redb's `StorageBackend`
 
 Bottom-up. Each layer depends only on those below. L0–L4 shipped in v0.1; L5
 partially shipped (graph, geo, sketches, reactive feeds, semantic cache, TTL —
-see the L5 section for what remains future). Layers are a conceptual map, not
+see the L5 section: every remaining item carries its decision-log
+disposition). Layers are a conceptual map, not
 a build order: the L5 features that shipped did so against the stable L4 API.
 
 ### L0 — storage backend
 
-**v0.1 (wrapping redb):** this layer is redb's `pread/pwrite` file backend on desktop/mobile. The OPFS-SAHPool backend (WASM, runs in a Worker) is specified, not implemented — future, and the remaining blocker for browser persistence (see *Deliberately deferred*). redb does **not** require mmap, which is what makes the OPFS path tractable. Checksums, group commit, page format, and crash recovery are **redb's concern**, not ours, as long as we wrap it.
+**v0.1 (wrapping redb):** this layer is redb's `pread/pwrite` file backend on desktop/mobile. The OPFS-SAHPool backend (WASM, runs in a Worker) is specified, not implemented — deferred (the 2026-05-29 deferral stands; decision log, 2026-08-30: reopening needs product signal, not engineering appetite), and the remaining blocker for browser persistence (see *Deliberately deferred*). redb does **not** require mmap, which is what makes the OPFS path tractable. Checksums, group commit, page format, and crash recovery are **redb's concern**, not ours, as long as we wrap it.
 
-**Future (from-scratch engine, post-v1):** if we ever replace redb, *this* layer grows to own the page format — big pages (16K–64K), prefix-compressed keys, whole-block CRC32C (hardware CRC), group commit, fsync coalescing. Listed here so the seam is documented, not because v0.1 builds it.
+**Only if redb is ever replaced (post-v1):** the owned page format is **never** while redb is the substrate (decision log, 2026-08-30 — the seam below is documented, not scheduled); if we ever replace redb, *this* layer grows to own the page format — big pages (16K–64K), prefix-compressed keys, whole-block CRC32C (hardware CRC), group commit, fsync coalescing.
 
 ### L1 — Storage substrate
 
@@ -97,7 +100,7 @@ a build order: the L5 features that shipped did so against the stable L4 API.
 - Primitive types: bool, i32, i64, f32, f64, bytes, string, timestamp, decimal
 - Container types: array, map, struct, JSON (typed-on-write where possible)
 - Embedding type: fixed-dimension f32/f16/u8/binary vector with declared metric
-- Tensor type: deferred (consider in L4+)
+- Tensor type: deferred (the L4+ deferral stands; general tensor ops are a non-goal — decision log, 2026-08-30)
 
 ### L3 — Indexes
 
@@ -105,11 +108,11 @@ All indexes update transactionally with row writes. Same WAL.
 
 - **Primary**: B+-tree on primary key (from redb)
 - **Secondary scalar**: B+-tree, supports range, prefix, equality
-- **Vector**: HNSW algorithm (reference: [hnswlib-rs](https://github.com/jean-pierreBoth/hnswlib-rs)), graph state stored as redb entries — not the library's own persistence (invariant). Quantization: binary, scalar, PQ (on-disk and, since the roadmap program, in-memory). Path to LM-DiskANN later when working set exceeds RAM.
+- **Vector**: HNSW algorithm (reference: [hnswlib-rs](https://github.com/jean-pierreBoth/hnswlib-rs)), graph state stored as redb entries — not the library's own persistence (invariant). Quantization: binary, scalar, PQ (on-disk and, since the roadmap program, in-memory). LM-DiskANN: deferred with trigger — on-disk HNSW measurably insufficient on a real workload (decision log, 2026-08-30).
 - **Full-text**: BM25 over posting lists stored as redb entries. Stripped tokenizer (Unicode + ASCII fold + light stemming). Borrow tokenizer/Levenshtein-automaton ideas from [tantivy](https://github.com/quickwit-oss/tantivy); reference [bm25 crate](https://docs.rs/bm25/latest/bm25/). Do not adopt tantivy's segment storage.
 - **Graph adjacency**: deferred to L5
 - **Spatial (R-tree)**: deferred to L5
-- **JSON path**: deferred to L5
+- **JSON path**: **DECLINED** (decision log, 2026-08-30) — dotted paths + `select` cover the surface; a path language adds SQL-ish surface area
 
 ### L4 — Query algebra (the most important layer)
 
@@ -126,21 +129,22 @@ This is what survives across rewrites of everything below. Design carefully.
 Shipped: graph (native adjacency storage, `traverse`), spatial (grid-cell
 index for radius/bbox/nearest), probabilistic sketches (HyperLogLog, Bloom,
 cuckoo, t-digest, MinHash + LSH), reactive subscriptions on the write path,
-semantic cache, per-record TTL. Future items are marked below.
+semantic cache, per-record TTL. Deferred items are marked below, each with
+its decision-log disposition (2026-08-30 program exit).
 
 - Graph: native adjacency storage, BFS/DFS, multi-hop traversal with vector-similarity-as-edge-predicate — *shipped* (`link`/`neighbors`/`traverse`)
-- Spatial: R-tree (via [rstar](https://crates.io/crates/rstar)) and H3 (via [h3o](https://crates.io/crates/h3o)) — *future; shipped instead: fixed-resolution grid cells (`create_geo_index`)*
-- Time-series patterns: append-only tables, delta encoding, Gorilla compression, sliding window aggregations — *future (per-record TTL shipped)*
+- Spatial: R-tree (via [rstar](https://crates.io/crates/rstar)) and H3 (via [h3o](https://crates.io/crates/h3o)) — *deferred (grid cells serve the current geo workload; decision log, 2026-08-30); shipped instead: fixed-resolution grid cells (`create_geo_index`)*
+- Time-series patterns: append-only tables, delta encoding, Gorilla compression, sliding window aggregations — *deferred with trigger: a real time-series workload (decision log, 2026-08-30; per-record TTL shipped)*
 - Probabilistic sketches: bloom, cuckoo, HLL, t-digest, MinHash + LSH — *shipped in full (cuckoo/t-digest/MinHash+LSH closed 2026-08-30, ledger-closure Task 3)*
 - Reactive: subscriptions on tables and queries via WAL change capture — *shipped (in-process change feeds)*
 - Semantic cache: vector-keyed cache layer for LLM responses — *shipped*
-- Embedding pipeline as column type: declare model, auto-embed + auto-index on insert — *future*
-- Approximate top-K with metadata filter pushdown — *partial: `.approx()` serves filtered ANN as over-fetch-then-filter (not a pushdown into the graph walk); true pushdown future*
+- Embedding pipeline as column type: declare model, auto-embed + auto-index on insert — *deferred (model-dependency policy undecided; users embed at the boundary; decision log, 2026-08-30)*
+- Approximate top-K with metadata filter pushdown — *partial: `.approx()` serves filtered ANN as over-fetch-then-filter (not a pushdown into the graph walk); true pushdown deferred with trigger: filtered ANN becomes hot (decision log, 2026-08-30)*
 
 ### L6 — API surface
 
 - Fluent builder, sync API surface (async wrapper available)
-- Zero-copy result paths where possible (return Arrow `RecordBatch` for analytical paths, native Rust types for transactional)
+- Native Rust result types everywhere; an Arrow `RecordBatch` analytical path is **DECLINED** (decision log, 2026-08-30 — heavy dependency against the embedded posture; users convert at the boundary)
 - One canonical host: Rust. Other-language bindings considered later, never first-class.
 
 ---
@@ -162,10 +166,10 @@ semantic cache, per-record TTL. Future items are marked below.
 | Query planner / executor | **Build** | Same. |
 | AI operators (MMR, RRF, semantic cache) | **Build** | Field is young; integration is the value. |
 | Graph adjacency | **Build** (post-v0.1) | Custom storage, fits cross-modal model. |
-| Spatial | **Wrap** rstar + h3o (post-v0.1) | Well-solved by these crates. |
+| Spatial | **Defer** — grid cells serve the current workload (decision log, 2026-08-30); would wrap rstar + h3o if a workload needs true spatial hierarchy | Well-solved by these crates. |
 | Probabilistic sketches | **Build** (all shipped; closed 2026-08-30) | The wrap plan lost to the zero-dependency posture and the deterministic-`DefaultHasher` discipline; Bloom/HLL/cuckoo/t-digest/MinHash+LSH are in-house (`src/sketch/`, decision log 2026-08-30) |
 | Reactive | **Build** (post-v0.1) | WAL change capture, in-process subscribers. |
-| Tensor ops | **Skip** | Out of scope. Bring your own (candle/burn). |
+| Tensor ops | **Skip** | Out of scope (non-goal; the storage-only tensor deferral stands, decision log 2026-08-30). Bring your own (candle/burn). |
 | SQL | **Skip** | Permanently. |
 | Replication / network | **Skip** | Permanently. |
 
@@ -177,31 +181,32 @@ Smallest coherent thing that's usable for my own AI work. Target: usable within 
 
 ### In v0.1
 
-- L0 VFS: pread/pwrite via redb on desktop/mobile (the OPFS-SAHPool backend for WASM is specified, not implemented — future; see *Deliberately deferred*)
+- L0 VFS: pread/pwrite via redb on desktop/mobile (the OPFS-SAHPool backend for WASM is specified, not implemented — deferred, decision log 2026-08-30; see *Deliberately deferred*)
 - L1 storage (redb wrap)
 - L2 schema with primitives + array + struct + JSON + embedding type
 - L3 indexes: primary B+-tree, secondary scalar B+-tree, HNSW vector with binary quantization, BM25 FTS
 - L4 algebra: scan, filter, project, join (single-field key-lookup left-outer), group, sort, limit, vector_search, text_search, rrf, mmr
 - L5 (shipped beyond the original cut): graph, grid-cell spatial index, sketches, reactive feeds, semantic cache, TTL
 - L6: sync fluent builder API, native Rust result types
-- WASM: engine compiles to wasm32; the Worker + OPFS-SAHPool runtime is future
+- WASM: engine compiles to wasm32; the Worker + OPFS-SAHPool runtime is deferred (decision log, 2026-08-30)
 
 ### Out of v0.1 (back-burner, in roughly this priority order)
 
 Status: items 1, 3, and 6 shipped in full; 2, 5, and 8 partially
-(subscriptions / grid-cell spatial index / on-disk PQ); 4, 7, 9, and 10
-remain future.
+(subscriptions / grid-cell spatial index / on-disk PQ); every remaining
+item — 4, 7, 9, and 10 — carries an explicit 2026-08-30 decision-log
+disposition. Nothing on this list is unprioritized.
 
 1. Graph adjacency + multi-hop traversal — shipped
-2. Reactive: in-process subscriptions and materialized views — subscriptions shipped; materialized views future
+2. Reactive: in-process subscriptions and materialized views — subscriptions shipped; materialized views deferred with trigger (API/product intent; decision log, 2026-08-30)
 3. Semantic cache as a primitive — shipped
-4. Embedding-as-column-type with automatic pipeline — future
-5. Spatial (R-tree + H3) — shipped as grid-cell spatial index; R-tree/H3 future
+4. Embedding-as-column-type with automatic pipeline — deferred (decision log, 2026-08-30)
+5. Spatial (R-tree + H3) — shipped as grid-cell spatial index; R-tree/H3 deferred (decision log, 2026-08-30)
 6. Probabilistic sketches as first-class index types — shipped (Bloom, HLL)
-7. Time-series compression — future
-8. PQ vector quantization, DiskANN path for large indexes — PQ shipped (on-disk and in-memory); DiskANN future
-9. Approximate top-K with metadata pushdown — future (`.approx()` is over-fetch-then-filter)
-10. Arrow `RecordBatch` zero-copy result path for analytical queries — future
+7. Time-series compression — deferred with trigger (decision log, 2026-08-30)
+8. PQ vector quantization, DiskANN path for large indexes — PQ shipped (on-disk and in-memory); DiskANN deferred with trigger (decision log, 2026-08-30)
+9. Approximate top-K with metadata pushdown — deferred with trigger (decision log, 2026-08-30; `.approx()` is over-fetch-then-filter)
+10. Arrow `RecordBatch` zero-copy result path for analytical queries — **DECLINED** (decision log, 2026-08-30; users convert at the boundary)
 
 ---
 
@@ -238,10 +243,10 @@ As of the first build pass. All code is tested (≥90% line coverage, mostly ~99
 
 **Deliberately deferred (large subsystems, with reasons):**
 - **ADC fast path for non-L2 metrics under PQ**: PQ storage serves every metric on both indexes, but only L2 has the table-based asymmetric-distance fast path — cosine and dot score by reconstruction (decode + metric). Asymmetric inner-product/cosine tables are future work if ever measured hot.
-- **Browser support (OPFS StorageBackend + wasm-bindgen)** — *deferred by decision (2026-05-29)*. The engine is wasm-ready and size-validated (≈0.2 MB gzipped, CI-enforced) and runs in-memory on wasm; the browser-persistence layer (OPFS-SAHPool VFS, Worker RPC, JS bindings) is explicitly out of scope for now. Desktop + server is the focus.
-- **Streaming cursor over ranked result sets**: keyset (cursor) pagination over a collection shipped (`page`/`page_where`, with a `next` cursor, no offset rescans); single-source ranked queries are bounded (index fast paths + streaming top-k) and filter-only queries stream. What remains is a public streaming *cursor* over arbitrary *ranked* result sets (incremental pull) — multi-source RRF fusion still materializes the candidate set.
+- **Browser support (OPFS StorageBackend + wasm-bindgen)** — *deferred by decision (2026-05-29; the deferral KEEPS standing per the 2026-08-30 program-exit decision — reopening needs product signal, not engineering appetite)*. The engine is wasm-ready and size-validated (≈0.2 MB gzipped, CI-enforced) and runs in-memory on wasm; the browser-persistence layer (OPFS-SAHPool VFS, Worker RPC, JS bindings) is explicitly out of scope for now. Desktop + server is the focus.
+- **Streaming cursor over ranked result sets** — *deferred with trigger: a workload whose ranked sets are too large to materialize (decision log, 2026-08-30)*: keyset (cursor) pagination over a collection shipped (`page`/`page_where`, with a `next` cursor, no offset rescans); single-source ranked queries are bounded (index fast paths + streaming top-k) and filter-only queries stream. What remains is a public streaming *cursor* over arbitrary *ranked* result sets (incremental pull) — multi-source RRF fusion still materializes the candidate set.
 - **CJK / positional analysis** — *shipped in full (CJK bigrams closed 2026-08-30, ledger-closure Task 4)*: phrase / positional text search shipped earlier (`phrase_search`, positions stored in both the in-memory and on-disk inverted indexes; the analyzer does stop-word removal + S-stemming, shared by index and query), and CJK runs now tokenize as sliding BIGRAMS — single-char run → that char; the Han↔kana script transition inside one run does not restart the window; boundary: hiragana/katakana U+3040–30FF (prolonged mark ー included), Han U+3400–4DBF / U+4E00–9FFF / U+F900–FAFF / U+20000–323AF; hangul and halfwidth kana deliberately outside (Korean is space-separated, so whole runs are its tokens — the latin behavior); the iteration-mark class (々 U+3005, 〆 U+3006, 〱–〵 U+3031–3035) is likewise outside — std-alphanumeric but not in the CJK ranges, so a mark SPLITS the surrounding CJK run (the mark itself joins the non-CJK whole-token piece, like any latin run) — index and query share the one tokenizer, so both sides split identically at marks (NFKC upstream if bigram segmentation across them is wanted); no dictionary segmentation, no dependencies. Stemming and case folding never apply to CJK; the one shared analyzer feeds index and query on every serving path, so bigram positions line up and phrases over bigrams match in order (`東京タワー` matches, `タワー東京` does not — pinned).
-- **Statistics-driven cost-based planning**: selectivity-driven index selection shipped — the builder probes every serviceable index (each capped) and drives on the smallest candidate set, so the most selective index wins without persisted statistics; `.plan()` gives an identity-hashable [`QueryPlan`] and `PlanCache` keys prepared work by shape. Choosing between viable index paths by an estimated *cost model* over persisted statistics is still future.
+- **Statistics-driven cost-based planning**: selectivity-driven index selection shipped — the builder probes every serviceable index (each capped) and drives on the smallest candidate set, so the most selective index wins without persisted statistics; `.plan()` gives an identity-hashable [`QueryPlan`] and `PlanCache` keys prepared work by shape. Choosing between viable index paths by an estimated *cost model* over persisted statistics is deferred (decision log, 2026-08-30: selectivity probing serves the current scale).
 - **Page-level single-snapshot for `page`/`page_where`** — *shipped (roadmap Task 12, 2026-08-29)*: the entire chunked walk runs inside ONE read transaction (the builder's `run()` → `run_with(reader)` discipline; chunked reads inside the txn keep memory bounded), so each page is one MVCC snapshot — identical results, `Page{rows,next}` shape, and cursor contract on a static database (only the consistency guarantee tightened). Snapshot-holding cost is space, not latency: redb never blocks the writer on a read txn, but the walk pins pages freed by concurrent commits until it ends — bounded by `limit` rows; successive page calls each see the then-current state.
 - **`geo_nearest` per-radius snapshots**: the expanding-radius search re-runs `geo_within_radius` (its own read snapshot) per radius step; results are exact per step, but the k-nearest answer as a whole is not one snapshot.
 - **`bulk` panic skips the closing flush**: `Db::bulk` flushes (fsyncs) only on normal return — a panic inside the closure unwinds past the flush; the next durable commit on any thread makes the writes durable. Rebulk or reopen if you must not rely on that.
@@ -375,7 +380,7 @@ The invariant says *one committed state, one WAL*. But hnswlib-rs and tantivy ea
 
 ### Known availability characteristics (audit B9, documented — not fixed)
 
-- **One global index-registry mutex during builds/compaction.** A lazy in-memory build or a compaction runs under the single registry mutex; vector searches on *any* collection block behind it for the build's duration. A per-collection lock split is a deferred future decision (recorded here, not silently dropped).
+- **One global index-registry mutex during builds/compaction.** A lazy in-memory build or a compaction runs under the single registry mutex; vector searches on *any* collection block behind it for the build's duration. A per-collection lock split is deferred with trigger — build-vs-search contention observed on a real workload (decision log, 2026-08-30).
 - **Registration/compaction holds the write lock while clearing a namespace.** Re-registering or compacting an on-disk index clears its whole namespace in one write transaction; for a large index, redb's single database-wide write lock is held for that clear, so writers db-wide wait. Splitting the clear into bounded batches is the follow-up if re-registration of very large indexes becomes routine.
 - **Graph edge cascade is O(edges-of-document) per delete, and the first
   cascade (or first link) on a legacy database builds the adjacency.**
@@ -427,7 +432,7 @@ db.table("docs")
 - Each method returns a `Plan` node. The chain builds a tree.
 - The tree is identity-hashable for plan cache lookup.
 - Predicate pushdown applies before execution (filters move into vector_search and text_search candidate generation when possible).
-- No closures in the public API for predicates. Filters are expression nodes (`col(...).eq(...)`). User-defined functions are a separate, opt-in mechanism (deferred past v0.1).
+- No closures in the public API for predicates. Filters are expression nodes (`col(...).eq(...)`). User-defined functions are a separate, opt-in mechanism (deferral past v0.1 stands; decision log, 2026-08-30).
 - Sync by default. Async wrapper is shallow.
 
 ### What this rejects
@@ -466,8 +471,8 @@ db.table("docs")
 
 ### Memory
 
-- Query-scope arenas (`bumpalo`) on hot paths, zero allocations during query execution where possible — *specified, not implemented (future)*
-- One global buffer pool, sized per VFS backend — *future*
+- Query-scope arenas (`bumpalo`) on hot paths, zero allocations during query execution where possible — **DECLINED** (decision log, 2026-08-30: Task 2's measurements show the hot paths are bandwidth-bound; arena allocation buys nothing the numbers support)
+- One global buffer pool, sized per VFS backend — deferred with redb, its page cache serving the layer (decision log, 2026-08-30)
 - Cache-line-aligned hot structures.
 
 ### Async vs sync
@@ -478,7 +483,7 @@ db.table("docs")
 ### Zero-copy
 
 - Native result paths return owned Rust types in v0.1.
-- Arrow `RecordBatch` path is post-v0.1 for analytical queries.
+- Arrow `RecordBatch` path for analytical queries: **DECLINED** (decision log, 2026-08-30) — users convert at the boundary.
 - Bytes from disk → query result without intermediate decoding where the data type permits.
 
 ### Error model
@@ -488,9 +493,9 @@ db.table("docs")
 
 ### Observability
 
-- Built-in query trace (`.explain()` and `.profile()`) — `.explain()` shipped; `.profile()` future
+- Built-in query trace (`.explain()` and `.profile()`) — `.explain()` shipped; `.profile()` deferred: the `tracing` feature's per-operation events (plan-shape selection, backfill pages, compactions) already carry what a profiler would report, so a separate profiler reopens only if a need outgrows them
 - Structured logging via `tracing` — **implemented behind the non-default `tracing` cargo feature** (Task 11). Off by default so the zero-dependency posture and the WASM size budget stay contracts, not trade-offs; enabling adds the `tracing` facade (default features trimmed — `span!`/`event!` only, no `attributes` proc-macro tree; the footprint is tracing + tracing-core + pin-project-lite) and no public API. All call sites go through the private `telemetry` shim (`src/telemetry.rs`), which compiles to nothing when the feature is off — no code, no field evaluation, no dependency (CI asserts both the default graph and the wasm graph never contain `tracing`). Instrumented at per-operation/per-page granularity (never per-document): index backfill pages and completion (collection, index family, cursor, page size), compaction trigger math and outcome (dead/live counts, in-memory and on-disk), lazy index resumes and adjacency rebuilds (including stale-vs-absent marker reason), query plan-shape selection (the arm that drove candidates, its row count — labels are named after the `PlanShape` variants with two deliberate divergences: `indexed_window` carries no family discriminator, the scalar/compound/geo/or kind is `plan_shape()`/`explain()`'s to report, and `stream_scan` is intentionally finer than `PlanShape::Scan`, splitting the bounded streaming filter pass from the materializing fallback), the order-index walk's tail-scan fallback, the edge-cascade corrupt-row fallback, and semantic-cache hit/miss.
-- Counters for cache hits, index probes, plan cache hits — **subsumed by the tracing events above**: a subscriber counting `plan_shape` events per `shape` is the index-probe counter per shape (families within `indexed_window` — scalar/compound/geo/or — split via `plan_shape()`/`explain()`, not the event); `semantic_cache_hit`/`semantic_cache_miss` are the cache-hit-rate counters. Explicitly still future: plan-cache hit counters (`PlanCache` is host-side state — the engine sees no get/miss traffic to count) and any metrics export subsystem.
+- Counters for cache hits, index probes, plan cache hits — **subsumed by the tracing events above**: a subscriber counting `plan_shape` events per `shape` is the index-probe counter per shape (families within `indexed_window` — scalar/compound/geo/or — split via `plan_shape()`/`explain()`, not the event); `semantic_cache_hit`/`semantic_cache_miss` are the cache-hit-rate counters. Explicitly deferred: plan-cache hit counters (`PlanCache` is host-side state — the engine sees no get/miss traffic to count; no trigger until that changes) and any metrics-export subsystem (non-goal below; no workload has asked).
 - No metrics export to external systems in v0.1.
 
 ### Documentation discipline
@@ -509,7 +514,7 @@ These need answers before specific layers can be implemented. Listed in rough or
 2. **redb's behavior on OPFS-SAHPool.** Does it work out of the box? CoW B+-tree should be fine with single fd + sync I/O in Worker, but verify with a spike. Blocks: WASM build.
 3. **Cross-modal commit semantics — decided and implemented** (see *Critical tension*): destination (b) state-in-redb, contract (b) from day one. The former "remaining concrete work" (redb layout for HNSW nodes and posting lists; commit ordering inside one write txn) is done — persisted index maintenance commits inside the document's transaction, and creation runs the `Building{cursor}`→`Complete` state machine (decision log, 2026-08-27 wave-2 row).
 7. **JSON parsing — decided.** One pure-Rust path behind a `JsonParser` trait for all targets in v0.1 (portable SIMD128 on WASM for free, no C++ FFI, smallest bundle). Clean seam to drop in C++ simdjson via FFI on **native only** *if and when* profiling shows JSON parsing is a real hot path. No premature optimization of a replaceable component. (General note: "SIMD everywhere" degrades on WASM — no AVX-512/NEON, only SIMD128.)
-8. **Filtered vector search — decided (semantics), partially implemented.** `.filter()` on a vector source is a **true predicate**: the result is the top-k rows satisfying the filter, never top-k-then-drop. Shipped: the default filtered path runs exact (a bounded scan over matching rows — correct at any selectivity), and `.approx()` opts into the index (over-fetch then filter, which may return fewer than `limit` on a highly selective filter). Still future: pushing the predicate into the graph walk itself (filtered-HNSW) so the *indexed* path stays a true predicate without the full scan.
+8. **Filtered vector search — decided (semantics), partially implemented.** `.filter()` on a vector source is a **true predicate**: the result is the top-k rows satisfying the filter, never top-k-then-drop. Shipped: the default filtered path runs exact (a bounded scan over matching rows — correct at any selectivity), and `.approx()` opts into the index (over-fetch then filter, which may return fewer than `limit` on a highly selective filter). Pushing the predicate into the graph walk itself (filtered-HNSW) is deferred with trigger — filtered ANN becomes hot (decision log, 2026-08-30) — so the *indexed* path stays over-fetch-then-filter until then.
 4. **Plan cache identity hashing.** AST nodes need stable `Hash` impls that ignore allocator addresses. Closures cannot appear in the AST (already decided); but constants embed user data — design the hash to treat structural identity, not value identity, where appropriate.
 5. **Schema migration story.** "No backward compat" doesn't mean "no migration." Need a one-shot dump/load utility from format N to format N+1. Design it before declaring v1.0.
 6. **The first real app.** Which one? It shapes everything. Likely candidates: a personal RAG / second-brain system; a code-aware AI assistant memory store; an agent's working memory layer. Pick one, build it in parallel with v0.1.
@@ -573,3 +578,23 @@ These need answers before specific layers can be implemented. Listed in rough or
 | 2026-08-30 | Sketch derive-symmetry: `TDigest`'s `Clone` derive stays (need-driven — the merge-commutativity/associativity conformance pins exercise `a.merge(&b)` vs `b.merge(&a)` on cloned operands); `BloomFilter`/`HyperLogLog`/`CuckooFilter` stay bare | Derives follow need, not symmetry: cloning is not part of any sketch's contract surface, so adding `Clone` everywhere would grow the API without a caller. A future need reopens the row; no symmetry churn until then (recorded review decision, ledger-closure Task 4) |
 | 2026-08-30 | CJK segmentation = sliding BIGRAMS over CJK runs inside the shared tokenizer (no dictionary, no deps); boundary: hiragana/katakana U+3040–30FF ( prolonged mark ー included), Han U+3400–4DBF / U+4E00–9FFF / U+F900–FAFF / U+20000–323AF; hangul + halfwidth kana deliberately OUTSIDE; the Han↔kana script transition does not restart the window; stemming and case folding never apply to CJK; signature unchanged (`tokenize`/`analyze` still `Vec<String>`), so every serving path (scan, in-memory index, on-disk index, phrase positions) inherits bigrams for free | Bigram indexing is the standard embedded-engine fallback for the unspaced CJK scripts (dictionary segmentation drags lexicon data and licensing, against the zero-dependency posture); hangul stays out because Korean is space-separated, so whole-run tokens already segment it — bigramming would only halve term granularity; positions come out consecutive by construction, so `phrase_search` is order-correct over bigrams (`東京タワー` ≠ `タワー東京`, pinned); combining dakuten U+3099/309A are std-non-alphanumeric separators, so NFD text splits at them deterministically — no normalization is applied, NFC is the documented storage recommendation. Closes the DESIGN future row (CJK segmentation) |
 | 2026-08-30 | Value compression shipped as the opt-in `zstd` cargo feature: user-collection documents at/above 1 KiB compress at zstd level 3 on write and decompress on every read path, stored as `0xFF ++ zstd frame` (0xFF outside the value codec's tag space `0..=8`, so each stored row is self-describing with no format-version bump); marked form stored only when strictly smaller (incompressible data never balloons) or when the raw value itself begins with 0xFF (forced — a raw stored row can never begin with the marker, keeping read-side disambiguation exact); engine-reserved `__` namespaces are never compressed; OFF builds store bytes byte-identical to the pre-feature engine (CI cargo-tree greps keep the zstd crate — C FFI via cc — out of the default and wasm graphs, exactly the tracing discipline) | Opt-in because the default build's zero-dependency posture and the WASM <2 MB budget are contracts, and zstd drags a C toolchain into every build that enables it — a deployment that wants compression trades compile-time FFI for ~12× smaller text documents (measured: structured-text map 8.3%, BENCHES.md); 1 KiB threshold because a frame's fixed overhead eats the win below it and small values are the common write; level 3 because it is zstd's own default (fast end of the general-purpose band — embedded writes favor latency over the last percent of ratio); the marker is per-VALUE rather than per-file so OFF-written rows read fine under ON (their encodings start with a tag) and `dump` stays format-stable v2 either way (dump reads through the store, i.e. decompressed — pinned); honest limitation recorded: f32 vector payloads barely compress (91.4% — IEEE mantissas are near-full entropy), so this is a text/document lever, not a vector one (quantization remains the vector footprint lever), and incompressible ≥1 KiB writes pay the must-compress-to-know attempt (~0.85 µs/KiB) while storing raw. Closes the DESIGN future row (compression) |
+| 2026-08-30 | **Ledger-closure program exit (Task 6): every remaining DESIGN-future item carries an explicit controller decision.** The 18 rows below are those decisions, one line of rationale + trigger each; the body's "future" markers point here | After this row, nothing on any ledger sits unprioritized: each item is SHIPPED, deferred with a trigger, or DECLINED with the reason recorded where the next reader will look for it |
+| 2026-08-30 | Browser/OPFS persistence (OPFS-SAHPool `StorageBackend` + wasm-bindgen + Worker RPC): KEEPS its 2026-05-29 deferral | Desktop/server focus stands; the engine is wasm-ready and size-validated (in-memory works on wasm today). Reopening needs product signal — someone actually building the browser runtime — not engineering appetite |
+| 2026-08-30 | DiskANN (LM-DiskANN path for very large indexes): DEFER, trigger = on-disk HNSW measurably insufficient on a real workload | The quantized/PQ on-disk indexes currently serve the billions-of-vectors path (bounded memory, persists); swap the substrate only when a real workload shows the graph walk failing |
+| 2026-08-30 | Filtered-HNSW pushdown (predicate pushed into the graph walk): DEFER, trigger = filtered ANN becomes hot | `.approx()` (over-fetch-then-filter) and the exact bounded scan both serve filtered vector search today and the true-predicate contract holds on every non-approx path; the pushdown buys latency, not correctness |
+| 2026-08-30 | Materialized views: DEFER, trigger = API/product intent for them | In-process subscriptions already cover the reactive case (change feeds on the write path); views add a maintained-state contract nobody has asked for yet |
+| 2026-08-30 | Embedding pipeline as a column type (declare model, auto-embed + auto-index): DEFER, trigger = a decided model-dependency policy | Which model, what footprint, what posture is undecided (and cuts against the zero-dependency default); users embed at the boundary today and store `$vector` — the engine stays model-free by design |
+| 2026-08-30 | Streaming ranked cursors (incremental pull over arbitrary ranked sets): DEFER, trigger = a workload whose ranked sets are too large to materialize | Single-source ranked queries are already bounded (index fast paths + streaming top-k) and filter-only queries stream; only multi-source RRF fusion materializes, and no workload has outgrown it |
+| 2026-08-30 | Cost-based planner (cost model over persisted statistics): DEFER, trigger = selectivity probing measurably insufficient at scale | The probe-every-serviceable-index-and-drive-on-the-smallest strategy needs no persisted statistics and serves the current scale; a cost model adds state to persist, invalidate, and explain |
+| 2026-08-30 | Time-series patterns (append-only tables, delta encoding, Gorilla compression, sliding-window aggregates): DEFER, trigger = a real time-series workload | Per-record TTL shipped and covers the expiry-shaped needs; the rest is a storage layout nobody currently writes |
+| 2026-08-30 | R-tree/H3 spatial backends: DEFER, trigger = a geo workload the fixed-resolution grid demonstrably fails | Grid cells (`create_geo_index`) serve the current workload sub-linearly with exact verification and cap-fallback; revisit only with hierarchy-shaped queries (large-scale containment, precision bands) |
+| 2026-08-30 | Arrow `RecordBatch` result path: **DECLINE** | A heavy dependency against the embedded zero-dependency posture and the WASM budget (the 2026-05-29 "Arrow later" lean is closed as no); users convert to Arrow at the boundary where an analytical workload actually wants it |
+| 2026-08-30 | JSON path language (`$.a[0].b`-style): **DECLINE** | Dotted paths (`field("a.b")`, `select`) cover the surface; a path language drags SQL-ish syntax and semantics in through a side door, against the builder-only posture |
+| 2026-08-30 | User-defined functions: the deferral past v0.1 STANDS, trigger = a concrete caller need that expression nodes cannot express | Predicates are expression nodes (no closures in the public API) so plans stay identity-hashable and cacheable; an opt-in UDF mechanism reopens only against a real workload |
+| 2026-08-30 | bumpalo query-scope arenas: **DECLINE** | Task 2's closure measurements show the hot paths are bandwidth-bound (kernels hold 62–83% of the read ceiling; volume scans sit at the streaming band) — arena allocation buys nothing the numbers support |
+| 2026-08-30 | Owned buffer pool: DEFER with redb, trigger = redb's page cache measurably failing the layer | While redb is the substrate its page cache serves the layer; a corvid-owned pool is part of the owned-page-format seam that only a redb replacement opens |
+| 2026-08-30 | Per-collection lock split (audit B9's global registry mutex): DEFER, trigger = build-vs-search contention observed on a real workload | A lazy build or compaction holding the registry mutex blocks searches today — documented as an availability characteristic; split the lock only when a real workload measures the contention |
+| 2026-08-30 | Tensor type: the L4+ deferral STANDS; general tensor ops remain a non-goal | Bring candle/burn; a stored tensor type reopens only if a first-class workload wants tensor storage without engine-side ops |
+| 2026-08-30 | Owned page format: **NEVER** for the redb engine — the L0 seam is documented, not scheduled | Checksums/commit/recovery are redb's while we wrap it; only a redb replacement opens this (the standing condition of the 2026-05-29 row and L0's future-engine paragraph) |
+| 2026-08-30 | MCP framing stays hand-rolled stdio (no MCP SDK / rmcp dependency): DEFER, trigger = protocol features the hand-rolled transport cannot carry | The stdio framing is tested (the 78-test wire matrix) and working; adopting an SDK is a dependency against the sidecar's zero-friction build, unmotivated until the protocol outgrows JSON-RPC-over-stdio |
+| 2026-08-30 | Adjacency version-skew rule (routed from the Task-1 review): bumping `ADJACENCY_VERSION` must either bump `FORMAT_VERSION` (older binaries refuse the file outright) or keep the adjacency rows decodable by older markers — a marker with an unrecognized value is stale-shaped and forces a derived-state rebuild, never a misparse | Adjacency is derived state: its upgrade story is rebuild-from-source-rows, not file migration; the rule pins that a layout change can never make an older binary silently misread newer rows as current |

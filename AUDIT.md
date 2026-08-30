@@ -77,7 +77,7 @@ dropped silently:
 
 | Item | Rationale / follow-up |
 |---|---|
-| (none — the last Open row, SIMD distance kernels, closed 2026-08-30 by measurement; see Fixed) | |
+| (none — the audit ledger is closed. The last Open row, SIMD distance kernels, closed 2026-08-30 by measurement, and endpoint-direct reads closed at parity the same day; both are in Fixed. Every deferral that surfaced during remediation — the per-collection lock split (B9), plan-cache counters, metrics export — now carries a dated disposition in DESIGN.md's decision log, program-exit sweep 2026-08-30) | |
 
 ---
 

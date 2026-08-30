@@ -10,7 +10,7 @@ call.
 > line by line. It is not a product, has no roadmap, and comes with no support
 > promises.
 >
-> **What it isn't.** A toy. The code is solid and genuinely usable: ~510
+> **What it isn't.** A toy. The code is solid and genuinely usable: ~1,000
 > tests, >90% line coverage, zero-warning clippy, criterion benchmarks on the
 > hot paths, and a correctness-first design (filters are true predicates,
 > indexes are never stale, writes are transactional). If a corner is rough,
@@ -97,6 +97,7 @@ full **[API reference](https://i-rocky.github.io/corvid/api/corvid/)**.
 | Nested/dotted-path field indexing | ✅ |
 | patch / update / compare-and-set; delete-by-query | ✅ |
 | Phrase / positional text search | ✅ |
+| CJK text tokenization (Han + kana runs → sliding bigrams, dictionary-free; phrase-order-correct) | ✅ |
 | k-nearest geo (`geo_nearest`) | ✅ |
 | Keyset (cursor) pagination (`page`) | ✅ |
 | Compound (multi-field) scalar index | ✅ |
@@ -116,6 +117,8 @@ full **[API reference](https://i-rocky.github.io/corvid/api/corvid/)**.
 | Online consistent backup (`Db::backup`) | ✅ |
 | Optional declared schema (`set_schema`): types/required/unique | ✅ |
 | Per-record TTL / expiry (`insert_with_ttl`, `purge_expired`) | ✅ injected clock |
+| Optional zstd compression of stored documents (`zstd` cargo feature, OFF by default; ~12× smaller text docs, transparent reads, default build unchanged) | ✅ opt-in feature |
+| Optional structured instrumentation (`tracing` cargo feature, OFF by default) | ✅ opt-in feature |
 | MCP sidecar over stdio | ✅ |
 | WASM build (engine, ≈0.2 MB gzipped; CI prints the measured size and enforces a 2 MB budget) | ✅ in-memory; OPFS persistence ⏳ |
 | Mobile cross-compile (aarch64 iOS/Android) | ✅ engine builds |
@@ -156,7 +159,12 @@ cargo test            # all tests
 cargo run -p corvid-mcp   # start the MCP sidecar (in-memory)
 ```
 
-Requires a recent stable Rust (2024 edition).
+Requires a recent stable Rust (2024 edition). Two optional cargo features,
+both OFF by default so the zero-dependency default build and the WASM size
+budget stay contracts: `tracing` (structured instrumentation events) and
+`zstd` (transparent compression of stored documents ≥1 KiB — enable with
+`corvid = { features = ["zstd"] }`; databases stay readable, and `dump`/
+`load` moves data between feature configurations).
 
 ## License
 
