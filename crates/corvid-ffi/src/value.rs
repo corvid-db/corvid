@@ -13,17 +13,20 @@
 //! * **BORROWED** — `corvid_value_array_get` / `corvid_value_map_get`
 //!   return interior pointers straight into the parent value's `Vec` /
 //!   `BTreeMap` storage: a lightweight borrowed-view handle, not a new
-//!   allocation (the plan allowed a parent-held child registry instead;
-//!   the interior view won because it is zero-cost on the
-//!   build-a-document hot path and its lifetime IS the spec's wording —
-//!   the child "rides the parent").
+//!   allocation (a parent-held child registry was the alternative
+//!   considered here — the plan itself only asked for "owned-vs-borrowed
+//!   children", which the interior view satisfies as written; it won
+//!   because it is zero-cost on the build-a-document hot path and its
+//!   lifetime IS the spec's wording — the child "rides the parent").
 //!
 //! Consequences, bold per the plan's §4.6:
 //!
 //! * A borrowed child (or a `_ref` buffer) is valid until the parent's
 //!   **next mutation** (`corvid_value_array_push` may reallocate the
-//!   Vec; `corvid_value_map_put` drops a replaced child) **or free**.
-//!   Using it after either is **undefined behavior**.
+//!   Vec; `corvid_value_map_put` drops a replaced child, and a new-key
+//!   put can split a B-tree node that relocates existing entries — the
+//!   conservative rule) **or free**. Using it after either is
+//!   **undefined behavior**.
 //! * **Calling `corvid_value_free` on a borrowed child is undefined
 //!   behavior** — it is not a box pointer; the free corrupts the
 //!   allocator. Passing a borrowed child where an owned value is
@@ -115,7 +118,16 @@ fn tag_of(v: &Value) -> corvid_value_type {
 /// Borrow `len` bytes at `ptr` for a non-nullable pointer parameter, or
 /// `None` (having recorded `CORVID_E_ARGUMENT`) when it is NULL — at any
 /// length, per spec §1.5's "empty is a non-NULL pointer with length 0".
-fn borrowed_bytes<'a>(fn_name: &str, param: &str, ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+///
+/// The shared §1.5/§7 NULL-checked slice constructor for every family
+/// that takes borrowed bytes (the Task 3 report's note: reuse, don't
+/// re-derive).
+pub(crate) fn borrowed_bytes<'a>(
+    fn_name: &str,
+    param: &str,
+    ptr: *const u8,
+    len: usize,
+) -> Option<&'a [u8]> {
     if ptr.is_null() {
         record_argument(&format!(
             "{fn_name}: {param} is NULL (empty is a non-NULL pointer with \
@@ -126,6 +138,51 @@ fn borrowed_bytes<'a>(fn_name: &str, param: &str, ptr: *const u8, len: usize) ->
     // SAFETY: ptr is non-NULL (checked) and the caller guarantees it is
     // valid for len reads — spec §1.5's borrowed-bytes contract.
     Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+/// Borrow `len` bytes at `ptr` as a `&str` for a non-nullable UTF-8
+/// string parameter (spec §1.5 — engine strings are Rust `&str`/`String`),
+/// or `None` (having recorded `CORVID_E_ARGUMENT`) when it is NULL or not
+/// valid UTF-8. Shared by every family with a string parameter, alongside
+/// [`borrowed_bytes`].
+pub(crate) fn borrowed_utf8<'a>(
+    fn_name: &str,
+    param: &str,
+    ptr: *const c_char,
+    len: usize,
+) -> Option<&'a str> {
+    // borrowed_bytes performs the NULL check (§7) and the SAFETY-noted
+    // raw-parts borrow (§1.5); from_utf8 is checked, never UB.
+    let bytes = borrowed_bytes(fn_name, param, ptr as *const u8, len)?;
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some(text),
+        Err(_) => {
+            record_argument(&format!(
+                "{fn_name}: {param} is not valid UTF-8 (spec §1.5)"
+            ));
+            None
+        }
+    }
+}
+
+/// Borrow the engine value behind a REQUIRED-non-NULL
+/// `const corvid_value*` input, or `None` (having recorded
+/// `CORVID_E_ARGUMENT`) when the pointer is NULL. The §5 rule-3 read
+/// half: such inputs are cloned by their consumer when ownership enters
+/// a tree or the engine; this helper only performs the §7 NULL check
+/// and the SAFETY-noted borrow.
+pub(crate) fn borrowed_value<'a>(
+    fn_name: &str,
+    param: &str,
+    v: *const corvid_value,
+) -> Option<&'a corvid::Value> {
+    if v.is_null() {
+        record_argument(format!("{fn_name}: {param} is NULL").as_str());
+        return None;
+    }
+    // SAFETY: v is non-NULL (checked) and contractually an owned handle
+    // or a live borrowed child (spec §2/§4.4) on this thread.
+    unsafe { borrow_value(v) }
 }
 
 // --- §4.3 construction ------------------------------------------------------
@@ -218,7 +275,9 @@ pub extern "C" fn corvid_value_array_new() -> *mut corvid_value {
 /// `corvid_value_array_new` (or cloned from one) — any other value fails
 /// with `CORVID_ERR` + `CORVID_E_ARGUMENT`. Pushing **invalidates every
 /// child and `_ref` buffer previously borrowed from `arr`** (spec §5
-/// rule 6: the Vec may reallocate) — using them after is UB.
+/// rule 6: the Vec may reallocate) — using them after is UB. On the
+/// self-insertion rejection path (`item == arr`) the shared handle has
+/// already been consumed by the call — free neither pointer afterwards.
 #[unsafe(no_mangle)]
 pub extern "C" fn corvid_value_array_push(
     arr: *mut corvid_value,
@@ -278,10 +337,16 @@ pub extern "C" fn corvid_value_map_new() -> *mut corvid_value {
 /// unconditionally (spec §8 — a failed put has still dropped it; do not
 /// free it afterwards). `key` is borrowed, non-NULL at any length (the
 /// empty key is legal), and must be valid UTF-8 (spec §1.5 — map keys
-/// are Rust `String`s). A duplicate key REPLACES the previous entry
-/// (engine `BTreeMap::insert`, last write wins), **invalidating children
-/// and `_ref` buffers borrowed from the replaced child** (spec §5 rule
-/// 6). `map` must be an OWNED map value built by `corvid_value_map_new`
+/// are Rust `String`s). A put **invalidates every child and `_ref`
+/// buffer previously borrowed from `map`** (spec §5 rule 6), whatever
+/// the key: a duplicate key REPLACES the previous entry (engine
+/// `BTreeMap::insert`, last write wins — the replaced child is dropped),
+/// and a NEW key can split a B-tree node, relocating even untouched
+/// existing entries — the conservative rule, same as `array_push`'s.
+/// Using a previously borrowed child after any put is UB. On the
+/// self-insertion rejection path (`val == map`) the shared handle has
+/// already been consumed by the call — free neither pointer afterwards.
+/// `map` must be an OWNED map value built by `corvid_value_map_new`
 /// (or cloned from one).
 #[unsafe(no_mangle)]
 pub extern "C" fn corvid_value_map_put(

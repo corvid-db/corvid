@@ -11,12 +11,13 @@
 //! cross-family frees are UB by contract (spec §2) because the marker
 //! cast is only valid for the owning family.
 //!
-//! The one family that departs from the wrapper-struct shape is the
-//! value family (spec §4.3/§4.4): a `corvid_value*` is a pointer at a
-//! bare `corvid::Value`, boxed directly (`into_value`), because the
-//! value has no cursor or counter state to carry. That family also has
-//! the ABI's second handle provenance — borrowed children — documented
-//! with its plumbing below.
+//! The families that depart from the wrapper-struct shape are the value
+//! and predicate families (spec §4.3–§4.5): a `corvid_value*` and a
+//! `corvid_pred*` are pointers at the bare engine types (`Value`,
+//! `filter::Predicate`), boxed directly (`into_value` / `into_pred`),
+//! because neither carries cursor or counter state. The value family
+//! additionally has the ABI's second handle provenance — borrowed
+//! children — documented with its plumbing below.
 //!
 //! # The derived-handle counter
 //!
@@ -30,26 +31,39 @@
 //! deterministic because this layer is the only `Arc` cloner — bindings
 //! never see the `Arc`.
 //!
-//! **Wiring:** the increment is added by each family that creates
-//! engine-backed handles as those families land (collection handles with
-//! Task 4, query handles with Task 5) — none exist yet, so
-//! `DbHandle::retain_derived` currently has no production caller.
+//! **Wiring:** the increment lives at each derived-handle constructor —
+//! collection handles (`corvid_collection`) are wired; query handles
+//! follow with Task 5. The decrement lives at each family's `_free`,
+//! which may run AFTER `corvid_close` has already dropped the
+//! `DbHandle` box (spec §2: a collection handle legitimately outlives
+//! its db handle) — the counter is therefore an `Arc<AtomicUsize>`
+//! shared with every derived handle, not a field the box owns alone.
 //! Cursors that own only materialized data and hold no engine reference
 //! (`rows`, `strs`, `geohits`, `groupiter`, `schemaiter` — the spec §2
 //! backing table) do **not** increment: they cannot keep the engine
 //! working and so cannot block exclusive compaction.
 
+use std::ffi::c_char;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use corvid::Db;
+use corvid::ResultRow;
+use corvid::filter::Predicate;
 
 /// The opaque `corvid_db*` handle type (spec §1.1). Zero-sized and never
 /// constructed — a pointer to it is a typed alias for the interior
 /// `DbHandle` box (see the module docs for the provenance contract).
 #[repr(C)]
 pub struct corvid_db {
+    _unused: [u8; 0],
+}
+
+/// The opaque `corvid_coll*` handle type (spec §1.1). Backed by
+/// `CollHandle`.
+#[repr(C)]
+pub struct corvid_coll {
     _unused: [u8; 0],
 }
 
@@ -69,16 +83,35 @@ pub struct corvid_value {
     _unused: [u8; 0],
 }
 
+/// The opaque `corvid_pred*` handle type (spec §1.1). Backed by a bare
+/// boxed `corvid::filter::Predicate` (`into_pred`) — like the value
+/// family, a predicate carries no cursor or counter state, so it skips a
+/// wrapper struct and boxes the engine type directly.
+#[repr(C)]
+pub struct corvid_pred {
+    _unused: [u8; 0],
+}
+
+/// The opaque `corvid_rows*` handle type (spec §1.1). Backed by
+/// `RowsHandle` — materialized rows plus a cursor, no engine reference.
+#[repr(C)]
+pub struct corvid_rows {
+    _unused: [u8; 0],
+}
+
 /// Interior state behind a `corvid_db*`: the engine handle (shared with
 /// derived handles as `Arc` clones) and the derived-handle counter.
 pub(crate) struct DbHandle {
     db: Arc<Db>,
     /// Live handles holding a clone of `db`, this handle included — see
-    /// the module docs. `Relaxed` orderings would suffice (the count only
+    /// the module docs. An `Arc` (not an inline field) because a derived
+    /// handle's `_free` decrements it after `corvid_close` may have
+    /// dropped this box: the counter must outlive every handle that can
+    /// touch it. `Relaxed` orderings would suffice (the count only
     /// gates a quiescence check, not data publication), but the
     /// acquire/release pair matches §6's cross-thread contract in the
     /// most conservative reading.
-    derived: AtomicUsize,
+    derived: Arc<AtomicUsize>,
 }
 
 impl DbHandle {
@@ -87,7 +120,7 @@ impl DbHandle {
     pub(crate) fn new(db: Db) -> Self {
         Self {
             db: Arc::new(db),
-            derived: AtomicUsize::new(1),
+            derived: Arc::new(AtomicUsize::new(1)),
         }
     }
 
@@ -96,26 +129,22 @@ impl DbHandle {
         &self.db
     }
 
-    // The counter surface below has no production caller until the
-    // derived-handle families land (collection: Task 4, query: Task 5,
-    // compact's gate: Task 6); the unit tests pin its arithmetic now.
-    #[allow(dead_code)] // wired by Tasks 4–6 (see the module docs)
+    /// A clone of the engine `Arc`, for a derived handle to hold (spec
+    /// §2: a `corvid_coll` keeps its `corvid_db` alive).
     pub(crate) fn db(&self) -> Arc<Db> {
         self.db.clone()
     }
 
-    /// Count a newly created derived engine handle (module docs).
-    #[allow(dead_code)] // wired by Tasks 4–6 (see the module docs)
-    pub(crate) fn retain_derived(&self) {
-        self.derived.fetch_add(1, Ordering::Release);
+    /// The derived-handle counter, for a derived handle's `_free` (which
+    /// may outlive this box — see the field docs).
+    pub(crate) fn counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.derived)
     }
 
-    /// Count a freed derived engine handle — called by the family's
-    /// `_free`, never by `corvid_close` (which drops the counter with the
-    /// handle).
-    #[allow(dead_code)] // wired by Tasks 4–6 (see the module docs)
-    pub(crate) fn release_derived(&self) {
-        self.derived.fetch_sub(1, Ordering::Release);
+    /// Count a newly created derived engine handle (module docs). Wired
+    /// at `corvid_collection`; the query family (Task 5) follows.
+    pub(crate) fn retain_derived(&self) {
+        self.derived.fetch_add(1, Ordering::Release);
     }
 
     /// `corvid_compact`'s quiescence check: exactly the db handle itself
@@ -123,6 +152,94 @@ impl DbHandle {
     #[allow(dead_code)] // wired by Task 6 (corvid_compact)
     pub(crate) fn is_exclusive(&self) -> bool {
         self.derived.load(Ordering::Acquire) == 1
+    }
+}
+
+/// Interior state behind a `corvid_coll*` (spec §2: "`Arc<Db>` +
+/// collection name", thread-safe): the shared engine, the stored name,
+/// and the counter clone its `_free` releases.
+pub(crate) struct CollHandle {
+    db: Arc<Db>,
+    /// The name exactly as given — engine `Db::collection` validates
+    /// nothing (lazily created on first write), so this may hold a
+    /// would-be-invalid name that fails at write time (spec §4.2).
+    name: String,
+    /// `name`'s bytes plus one trailing NUL, for
+    /// `corvid_collection_name`'s NUL-terminated borrowed view (an
+    /// interior-NUL name truncates the C view; `*len_out` carries the
+    /// exact byte length — spec §4.2).
+    name_z: Vec<u8>,
+    /// The db's derived-handle counter clone — released exactly once by
+    /// `corvid_collection_free`, whenever that runs.
+    derived: Arc<AtomicUsize>,
+}
+
+impl CollHandle {
+    /// Wrap a derived engine reference. The caller owns the matching
+    /// `retain_derived` on the db handle (spec §4.13 — the count and the
+    /// handle are born together in `corvid_collection`).
+    pub(crate) fn new(db: Arc<Db>, name: String, derived: Arc<AtomicUsize>) -> Self {
+        let mut name_z = Vec::with_capacity(name.len() + 1);
+        name_z.extend_from_slice(name.as_bytes());
+        name_z.push(0);
+        Self {
+            db,
+            name,
+            name_z,
+            derived,
+        }
+    }
+
+    /// The engine collection handle (a cheap copyable borrow — db.rs
+    /// `Collection`), for one call.
+    pub(crate) fn collection(&self) -> corvid::Collection<'_> {
+        self.db.collection(&self.name)
+    }
+
+    /// The stored name, for `*len_out`.
+    pub(crate) fn name_len(&self) -> usize {
+        self.name.len()
+    }
+
+    /// The NUL-terminated name view, for the borrowed return (valid
+    /// until `corvid_collection_free` — the buffer never moves after
+    /// construction).
+    pub(crate) fn name_ptr(&self) -> *const c_char {
+        self.name_z.as_ptr() as *const c_char
+    }
+
+    /// The release half of the derived-handle count (spec §4.13) — the
+    /// single decrement this handle owes, run by
+    /// `corvid_collection_free`.
+    pub(crate) fn release_derived(&self) {
+        self.derived.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Interior state behind a `corvid_rows*` (spec §2: "materialized
+/// `Vec<corvid::ResultRow>` + cursor", read-only, single-threaded use).
+/// Holds no engine reference, so it does not touch the derived-handle
+/// counter (spec §4.13 — see the module docs).
+pub(crate) struct RowsHandle {
+    rows: Vec<ResultRow>,
+    cursor: usize,
+}
+
+impl RowsHandle {
+    pub(crate) fn new(rows: Vec<ResultRow>) -> Self {
+        Self { rows, cursor: 0 }
+    }
+
+    /// Borrow the row at the cursor and advance it; `None` at exhaustion
+    /// (the cursor stays, so exhaustion is sticky).
+    #[allow(dead_code)] // wired by Task 5 (corvid_rows_next); Task 4's
+    // corvid_page produces the handles and its tests walk them in-crate.
+    pub(crate) fn next(&mut self) -> Option<&ResultRow> {
+        let row = self.rows.get(self.cursor);
+        if row.is_some() {
+            self.cursor += 1;
+        }
+        row
     }
 }
 
@@ -222,6 +339,119 @@ pub(crate) unsafe fn reclaim_strs(ptr: *mut corvid_strs) -> Option<Box<StrsHandl
     Some(unsafe { Box::from_raw(ptr as *mut StrsHandle) })
 }
 
+// --- coll handle plumbing ---------------------------------------------------
+
+/// Box a coll body and hand out its opaque ABI pointer. The caller has
+/// already run `DbHandle::retain_derived` (the count and the handle are
+/// born together — spec §4.13).
+pub(crate) fn into_coll(body: CollHandle) -> *mut corvid_coll {
+    Box::into_raw(Box::new(body)) as *mut corvid_coll
+}
+
+/// Shared borrow of a coll body, or `None` on NULL.
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_coll`] and not yet reclaimed
+/// by [`reclaim_coll`]; `corvid_coll` is the thread-safe family (spec
+/// §2 — it shares the engine `Arc`), so concurrent shared borrows are
+/// fine and a concurrent reclaim is not.
+pub(crate) unsafe fn borrow_coll<'a>(ptr: *mut corvid_coll) -> Option<&'a CollHandle> {
+    // SAFETY: caller guarantees provenance (doc comment above); the box
+    // pointer round-trips through the zero-sized marker with the body's
+    // original alignment, so the reference is valid.
+    unsafe { (ptr as *mut CollHandle).as_ref() }
+}
+
+/// Take a coll body back for `corvid_collection_free`, or `None` on
+/// NULL. The caller owes the counter release (spec §4.13).
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_coll`], exactly once, and
+/// not yet reclaimed.
+pub(crate) unsafe fn reclaim_coll(ptr: *mut corvid_coll) -> Option<Box<CollHandle>> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees this is the single reclaim of a pointer
+    // produced by into_coll (doc comment above).
+    Some(unsafe { Box::from_raw(ptr as *mut CollHandle) })
+}
+
+// --- pred handle plumbing ---------------------------------------------------
+
+/// Box a predicate and hand out its opaque ABI pointer: an OWNED
+/// `corvid_pred*` (spec §4.5 — the constructors' return shape). Like a
+/// value handle, a pred points at the bare engine type; unlike a value,
+/// it has no borrowed provenance — the ABI never reads a pred's
+/// interior (no `pred_*` reader exists), so every live `corvid_pred*`
+/// is either a never-consumed root or a dangling post-consumption
+/// pointer whose use is the documented UB of spec §4.5. That also means
+/// this family has a `borrow`-free plumbing pair: `into_pred` and the
+/// consuming `reclaim_pred` below are all there is.
+pub(crate) fn into_pred(body: Predicate) -> *mut corvid_pred {
+    Box::into_raw(Box::new(body)) as *mut corvid_pred
+}
+
+/// Take a predicate body back — the consumption that `pred_free` and
+/// every consuming call (`and`/`or`/`not`, later `query_filter` and
+/// `delete_where`) perform exactly once, or `None` on NULL.
+///
+/// # Safety
+///
+/// `ptr` is NULL or an OWNED handle produced by [`into_pred`], exactly
+/// once, and not yet consumed. Consuming an already-consumed pred (a
+/// double free) is UB — spec §4.5.
+pub(crate) unsafe fn reclaim_pred(ptr: *mut corvid_pred) -> Option<Box<Predicate>> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees this is the single reclaim of an
+    // into_pred product (doc comment above).
+    Some(unsafe { Box::from_raw(ptr as *mut Predicate) })
+}
+
+// --- rows handle plumbing ---------------------------------------------------
+
+/// Box a rows body and hand out its opaque ABI pointer (spec §4.9's
+/// `corvid_page` produces these; Task 5's `corvid_query_run` follows).
+pub(crate) fn into_rows(body: RowsHandle) -> *mut corvid_rows {
+    Box::into_raw(Box::new(body)) as *mut corvid_rows
+}
+
+/// Exclusive borrow of a rows body, or `None` on NULL.
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_rows`] and not yet reclaimed
+/// by [`reclaim_rows`]; cursors are single-threaded by contract (spec
+/// §2/§6), so this is the only borrow.
+#[allow(dead_code)] // wired by Task 5 (corvid_rows_next); Task 4's page
+// tests walk the handle in-crate to verify rows before the cursor lands.
+pub(crate) unsafe fn borrow_rows_mut<'a>(ptr: *mut corvid_rows) -> Option<&'a mut RowsHandle> {
+    // SAFETY: caller guarantees provenance and exclusivity (doc comment
+    // above); the box pointer round-trips through the marker.
+    unsafe { (ptr as *mut RowsHandle).as_mut() }
+}
+
+/// Take a rows body back, or `None` on NULL.
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_rows`], exactly once, and
+/// not yet reclaimed.
+#[allow(dead_code)] // wired by Task 5 (corvid_rows_free); Task 4's page
+// tests reclaim in-crate so the handles do not leak before then.
+pub(crate) unsafe fn reclaim_rows(ptr: *mut corvid_rows) -> Option<Box<RowsHandle>> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees this is the single reclaim of a pointer
+    // produced by into_rows (doc comment above).
+    Some(unsafe { Box::from_raw(ptr as *mut RowsHandle) })
+}
+
 // --- value handle plumbing --------------------------------------------------
 //
 // A `corvid_value*` has TWO provenances (spec §2/§4.4/§5 rule 6), both
@@ -235,11 +465,12 @@ pub(crate) unsafe fn reclaim_strs(ptr: *mut corvid_strs) -> Option<Box<StrsHandl
 //   interior pointers straight into a live parent Value's `Vec` /
 //   `BTreeMap` storage: a lightweight borrowed-view handle, valid until
 //   the parent's next mutation (`array_push` / `map_put`) or free. A
-//   parent-held child registry was the alternative design (the plan
-//   allowed either); it lost because it would tax every child read on
-//   the document hot path with bookkeeping for a guarantee C cannot
-//   check anyway — the interior view is zero-cost and its lifetime is
-//   exactly the spec's "rides the parent" wording.
+//   parent-held child registry was an alternative design weighed here
+//   (the plan itself only requires "value children are borrowed" — the
+//   interior view satisfies it as written); it lost because it would
+//   tax every child read on the document hot path with bookkeeping for
+//   a guarantee C cannot check anyway — the interior view is zero-cost
+//   and its lifetime is exactly the spec's "rides the parent" wording.
 //
 // The two are indistinguishable by pointer VALUE (an interior pointer's
 // bits are unremarkable), so misuse — freeing a borrowed child, or
@@ -305,8 +536,9 @@ mod tests {
 
     /// The counter's lifecycle: 1 at open, +1 per derived handle, back to
     /// 1 at release; `is_exclusive` is the compaction gate (spec §4.13).
-    /// The production retain/release call sites land with the collection
-    /// (Task 4) and query (Task 5) families; this pins the arithmetic.
+    /// The production retain call site is `corvid_collection`
+    /// (collection.rs); the query family (Task 5) follows; this pins the
+    /// arithmetic.
     #[test]
     fn derived_counter_gates_exclusive_compaction() {
         let db = DbHandle::new(corvid::Db::open_in_memory().unwrap());
@@ -319,11 +551,32 @@ mod tests {
         assert!(!db.is_exclusive(), "one derived handle blocks compact");
 
         db.retain_derived();
-        db.release_derived();
+        let counter = db.counter(); // the coll-side release handle
+        counter.fetch_sub(1, Ordering::Release);
         assert!(!db.is_exclusive(), "still one derived handle live");
 
-        db.release_derived();
+        counter.fetch_sub(1, Ordering::Release);
         assert!(db.is_exclusive(), "last release returns to exactly 1");
+    }
+
+    /// The release half must work AFTER the db handle box is gone (spec
+    /// §2: a collection handle legitimately outlives `corvid_close`) —
+    /// the `Arc<AtomicUsize>` counter outlives the `DbHandle` that
+    /// seeded it. Dropping the last reference (the `CollHandle`'s
+    /// release + drop) is the crash test.
+    #[test]
+    fn derived_release_survives_the_db_handle() {
+        let db = DbHandle::new(corvid::Db::open_in_memory().unwrap());
+        db.retain_derived();
+        let counter = db.counter();
+        let engine = db.db();
+        drop(db); // the corvid_close side
+
+        // The coll-side release, after the box is gone.
+        counter.fetch_sub(1, Ordering::Release);
+        assert_eq!(counter.load(Ordering::Acquire), 1, "back to exactly 1");
+        drop(counter);
+        drop(engine); // and the engine Arc goes last — nothing dangles.
     }
 
     /// The engine `Arc` the counter guards: a derived clone keeps the
@@ -338,6 +591,57 @@ mod tests {
         // The engine reference still resolves collections — nothing
         // touched the file lock or state.
         assert!(engine.collections().unwrap().is_empty());
+    }
+
+    /// The `CollHandle`'s name view: NUL-terminated for C, exact length
+    /// for `*len_out`, stable across calls (the buffer never moves).
+    #[test]
+    fn coll_handle_carries_the_name_and_its_nul_terminated_view() {
+        let engine = Arc::new(corvid::Db::open_in_memory().unwrap());
+        let counter = Arc::new(AtomicUsize::new(1));
+        let coll = CollHandle::new(Arc::clone(&engine), "docs".to_owned(), counter);
+
+        assert_eq!(coll.name_len(), 4);
+        // SAFETY: name_ptr borrows the handle's own buffer; the handle
+        // outlives this read.
+        let view = coll.name_ptr();
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(view) }.to_bytes(),
+            b"docs"
+        );
+        // Stability: repeated calls hand out the same pointer.
+        assert_eq!(coll.name_ptr(), view);
+
+        // The engine-collection bridge works off the stored name (a real
+        // engine call through Collection's public surface).
+        assert_eq!(coll.collection().len().unwrap(), 0);
+        // An interior-NUL name (invalid at write time, fine at handle
+        // time — spec §4.2's lazy validation) truncates only the C view;
+        // the exact length is kept.
+        let odd = CollHandle::new(engine, "a\0b".to_owned(), AtomicUsize::new(1).into());
+        assert_eq!(odd.name_len(), 3);
+        // SAFETY: same provenance as above.
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(odd.name_ptr()) }.to_bytes(),
+            b"a"
+        );
+    }
+
+    #[test]
+    fn rows_cursor_walks_and_sticks_at_exhaustion() {
+        let row = |key: &[u8], n: i64| ResultRow {
+            key: key.to_vec(),
+            score: 0.0,
+            document: corvid::Value::Int(n),
+        };
+        let mut rows = RowsHandle::new(vec![row(b"a", 1), row(b"b", 2)]);
+        assert_eq!(rows.next().unwrap().document, corvid::Value::Int(1));
+        assert_eq!(rows.next().unwrap().key, b"b".to_vec());
+        assert!(rows.next().is_none());
+        assert!(rows.next().is_none(), "exhaustion is sticky");
+
+        let mut empty = RowsHandle::new(Vec::new());
+        assert!(empty.next().is_none());
     }
 
     #[test]

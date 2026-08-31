@@ -41,8 +41,11 @@ after_includes = """
  * or corvid_close for the db) and cross-family frees are undefined
  * behavior. */
 typedef struct corvid_db    corvid_db;
+typedef struct corvid_coll  corvid_coll;
 typedef struct corvid_strs  corvid_strs;
 typedef struct corvid_value corvid_value;
+typedef struct corvid_pred  corvid_pred;
+typedef struct corvid_rows  corvid_rows;
 """
 
 [export]
@@ -50,4 +53,4 @@ typedef struct corvid_value corvid_value;
 # FFI-internal, and a zero-length-array struct would be a GNU extension,
 # not the spec's opaque forward declaration. FFI_VERSION is not a header
 # symbol (the ABI surface is the function corvid_ffi_version).
-exclude = ["corvid_db", "corvid_strs", "corvid_value", "FFI_VERSION"]
+exclude = ["corvid_db", "corvid_coll", "corvid_strs", "corvid_value", "corvid_pred", "corvid_rows", "FFI_VERSION"]

@@ -21,8 +21,11 @@
  * or corvid_close for the db) and cross-family frees are undefined
  * behavior. */
 typedef struct corvid_db    corvid_db;
+typedef struct corvid_coll  corvid_coll;
 typedef struct corvid_strs  corvid_strs;
 typedef struct corvid_value corvid_value;
+typedef struct corvid_pred  corvid_pred;
+typedef struct corvid_rows  corvid_rows;
 
 
 /**
@@ -152,6 +155,46 @@ typedef uint32_t corvid_err;
 #endif // __STDC_VERSION__ >= 202311L
 
 /**
+ * The comparison operator (FFI.md §1.4, frozen per §8): mirrors
+ * `corvid::CmpOp` (filter.rs).
+ */
+enum corvid_cmp
+#if __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Equal (numeric Int/Float interop, else structural).
+   */
+  CORVID_CMP_EQ = 0,
+  /**
+   * Not equal.
+   */
+  CORVID_CMP_NE = 1,
+  /**
+   * Less than (numbers/text only).
+   */
+  CORVID_CMP_LT = 2,
+  /**
+   * Less or equal.
+   */
+  CORVID_CMP_LE = 3,
+  /**
+   * Greater than.
+   */
+  CORVID_CMP_GT = 4,
+  /**
+   * Greater or equal.
+   */
+  CORVID_CMP_GE = 5,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum corvid_cmp corvid_cmp;
+#else
+typedef uint32_t corvid_cmp;
+#endif // __STDC_VERSION__ >= 202311L
+
+/**
  * The value discriminant (FFI.md §1.4, frozen per §8): tags 0..=8,
  * identical to the engine value module's private encoding tags. The
  * engine's constants are not `pub`, so the correspondence is pinned by
@@ -204,6 +247,101 @@ typedef enum corvid_value_type corvid_value_type;
 #else
 typedef uint32_t corvid_value_type;
 #endif // __STDC_VERSION__ >= 202311L
+
+/**
+ * One `(key, value)` pair for bulk inserts (spec §1.2, POD): the input
+ * shape of [`corvid_put_many`]. `key` is non-NULL (any length — the
+ * empty key is legal); `val` is non-NULL and CLONED by the call, so
+ * the caller keeps ownership of every value handle in the array.
+ */
+typedef struct corvid_kv {
+  /**
+   * The row's key, borrowed for the call.
+   */
+  const uint8_t *key;
+  /**
+   * Key bytes.
+   */
+  size_t key_len;
+  /**
+   * The document, borrowed-read and CLONED into the engine.
+   */
+  const corvid_value *val;
+} corvid_kv;
+
+/**
+ * `corvid_update`'s read-modify-write closure (spec §1.6).
+ *
+ * `current` is NULL when the key is absent (a missing document is not
+ * an error); it is BORROWED and valid only inside the callback.
+ * On success set `*out` to an OWNED `corvid_value*` (consumed by the
+ * call) or leave it NULL to delete the key. Return `CORVID_OK` to
+ * apply, any other value to abort (then `*out` must be NULL — nothing
+ * is consumed).
+ *
+ * **Reentrancy (spec §1.6):** the callback runs on the caller's
+ * thread between engine operations. It MUST NOT issue further writes
+ * to the same database, MUST NOT free or mutate the borrowed
+ * arguments, and SHOULD NOT make other corvid calls at all — the
+ * portable contract is "no reentrant corvid calls". Violating it
+ * (notably calling into the same db handle from inside the callback)
+ * is undefined behavior or a deadlock, not a checked error.
+ */
+typedef corvid_status (*corvid_update_fn)(void *ctx, const corvid_value *current, corvid_value **out);
+
+/**
+ * `corvid_scan`'s row sink (spec §1.6): `ctx` is passed through
+ * opaque; return 1 to continue, 0 to stop the scan — stopping is not
+ * an error (any other return value also stops, defensively: a
+ * misbehaving callback is not called again). `key` and `doc` are
+ * BORROWED and valid only inside the callback — freeing the doc or
+ * keeping the pointers past the return is UB; `corvid_value_clone` is
+ * the sanctioned escape.
+ *
+ * **Reentrancy (spec §1.6):** the callback runs on the caller's
+ * thread between engine operations, inside the scan's read
+ * transaction. It MUST NOT free or mutate the borrowed arguments, MUST
+ * NOT issue writes to the same database, and SHOULD NOT make other
+ * corvid calls at all — the portable contract is "no reentrant
+ * corvid calls". Violating it is UB or a deadlock, not a checked
+ * error.
+ */
+typedef int (*corvid_scan_fn)(void *ctx, const uint8_t *key, size_t key_len, const corvid_value *doc);
+
+/**
+ * Handle to a named collection (spec §4.2); the collection is created
+ * lazily on first write. Wraps `corvid::Db::collection` (infallible in
+ * Rust). `db` and `name` are non-NULL (`name` UTF-8, any length — the
+ * empty name is legal); NULL or misencoded input returns NULL with
+ * `CORVID_E_ARGUMENT` recorded. Reserved/invalid names are NOT checked
+ * here — they fail at write time with
+ * `CORVID_E_RESERVED_COLLECTION` / `CORVID_E_INVALID_NAME`, exactly as
+ * the engine does. The handle increments the db's derived-handle
+ * counter (spec §4.13) and holds an engine reference, so it keeps the
+ * database alive after `corvid_close` (spec §2).
+ */
+corvid_coll *corvid_collection(corvid_db *db, const char *name, size_t name_len);
+
+/**
+ * Free a collection handle (spec §4.2). No engine counterpart (Rust
+ * `Collection` is a copyable borrow); this releases the handle's engine
+ * reference and its derived-handle count (spec §4.13). `corvid_close`
+ * may have already run — the release is shaped to survive it (spec §2).
+ * `corvid_collection_free(NULL)` is a no-op (spec §7).
+ */
+void corvid_collection_free(corvid_coll *coll);
+
+/**
+ * The collection's name (spec §4.2): NUL-terminated, `*len_out` set to
+ * the byte length (`len_out` nullable). BORROWED from the handle: valid
+ * until `corvid_collection_free`, and stable across calls (the buffer
+ * never moves). A name that itself contains a NUL byte truncates only
+ * the C view — `*len_out` still carries the exact length. A NULL `coll`
+ * follows the non-status rule (§7): NULL return with
+ * `CORVID_E_ARGUMENT` recorded. No direct engine counterpart (reads the
+ * handle's stored name).
+ */
+const char *corvid_collection_name(corvid_coll *coll, size_t *len_out);
 
 /**
  * The ABI version (spec §4.1/§8): `1`. Bindings verify this before
@@ -270,6 +408,367 @@ void corvid_free(void *ptr);
  * collection may not appear. Returns NULL + error on failure.
  */
 corvid_strs *corvid_collections(corvid_db *db);
+
+/**
+ * Insert or overwrite the document at `key` (spec §4.8; counterpart:
+ * `Collection::insert`) — atomic with all index maintenance and
+ * unique checks. `doc` is borrowed-read (the engine encodes its own
+ * copy; the caller keeps the handle). Reserved/invalid collection
+ * names fail here with `CORVID_E_RESERVED_COLLECTION` /
+ * `CORVID_E_INVALID_NAME` (the write-time name gate).
+ */
+corvid_status corvid_insert(corvid_coll *c,
+                            const uint8_t *key,
+                            size_t key_len,
+                            const corvid_value *doc);
+
+/**
+ * Single-transaction bulk load (spec §4.8; counterpart:
+ * `Collection::insert_batch`): one commit instead of N; the whole
+ * batch rolls back on a schema/unique violation; duplicate keys inside
+ * one batch follow last-write-wins. `items` is an array of `count`
+ * [`corvid_kv`] PODs (borrowed for the call; every `val` CLONED) —
+ * NULL `items` is legal only with `count == 0` (an empty batch is a
+ * successful no-op).
+ */
+corvid_status corvid_put_many(corvid_coll *c, const struct corvid_kv *items, size_t count);
+
+/**
+ * Insert under a fresh, monotonically increasing zero-padded 20-digit
+ * key (spec §4.8; counterpart: `Collection::insert_auto ->
+ * Vec<u8>`). Returns the key bytes — **free with `corvid_free`** —
+ * with the length in `*key_len_out` (nullable, like §7's other
+ * len_outs: the buffer's hidden header is what `corvid_free` needs,
+ * so a NULL out is tolerable). NULL + error on failure; a failed
+ * insert does not burn an id (the engine reserves the counter inside
+ * the insert transaction, audit C9). `doc` as `corvid_insert`'s.
+ */
+uint8_t *corvid_insert_auto(corvid_coll *c, const corvid_value *doc, size_t *key_len_out);
+
+/**
+ * Read-modify-write `key` via callback (spec §4.8/§1.6; counterpart:
+ * `Collection::update(key, f)` with `F: FnOnce(Option<Value>) ->
+ * Option<Value>`). `fn` receives the current document (borrowed;
+ * NULL when absent — not an error) and produces the replacement
+ * (OWNED, consumed) or a deletion (`*out` left NULL). An aborting
+ * callback (any non-`CORVID_OK` return) fails this call with
+ * `CORVID_E_ARGUMENT` and a message noting the abort — nothing is
+ * written, and a non-NULL `*out` on the abort path is left untouched
+ * (the contract requires NULL there; a violating caller keeps
+ * ownership of whatever it stored).
+ *
+ * The engine method is get-then-write; this wrapper inlines that same
+ * shape (get, callback, insert-or-delete through the engine's own
+ * methods) because the engine closure type has no abort channel — the
+ * semantics are the engine's, with the abort leaving the store
+ * untouched. **Not linearizable** against concurrent writers (same as
+ * the engine's); use `corvid_compare_and_set` when that matters.
+ * **Reentrancy:** the callback MUST NOT call into the same database
+ * (writes especially) — see [`corvid_update_fn`]; that is UB or a
+ * deadlock, not a checked error.
+ */
+corvid_status corvid_update(corvid_coll *c,
+                            const uint8_t *key,
+                            size_t key_len,
+                            corvid_update_fn fn_,
+                            void *ctx);
+
+/**
+ * Merge `patch`'s top-level fields into the map at `key` (creating it
+ * if absent); a non-map on either side replaces the document with
+ * `patch` (spec §4.8; counterpart: `Collection::patch`). `patch` is
+ * borrowed-read as everywhere.
+ */
+corvid_status corvid_patch(corvid_coll *c,
+                           const uint8_t *key,
+                           size_t key_len,
+                           const corvid_value *patch);
+
+/**
+ * Atomic conditional write (spec §4.8; counterpart:
+ * `Collection::compare_and_set(key, Option<&Value>, Option<Value>) ->
+ * bool`). **Both value parameters are nullable, and nullability is
+ * semantic**: `expected == NULL` means "must be absent";
+ * `replacement == NULL` means "delete if it matches". `*applied_out`
+ * (nullable) is 1 when applied, 0 when the compare failed — which is
+ * `CORVID_OK`, NOT an error. Equality is the engine's semantic value
+ * equality (`schema::unique_value_eq`): `NaN == NaN` regardless of
+ * payload, `-0.0 == 0.0`, containers element-wise. The `replacement`
+ * is cloned for the engine (the caller keeps its handle); `expected`
+ * is borrowed-read.
+ */
+corvid_status corvid_compare_and_set(corvid_coll *c,
+                                     const uint8_t *key,
+                                     size_t key_len,
+                                     const corvid_value *expected,
+                                     const corvid_value *replacement,
+                                     int32_t *applied_out);
+
+/**
+ * Remove the document at `key` (spec §4.8; counterpart:
+ * `Collection::delete -> bool`): `*existed_out` (nullable) is 1 when a
+ * document was removed, 0 when the key held none. Deleting cascades
+ * the key's graph edges in the same transaction — including edges
+ * dangling on a key that never existed as a document (the engine's
+ * delete-of-absent still cleans edges).
+ */
+corvid_status corvid_delete(corvid_coll *c,
+                            const uint8_t *key,
+                            size_t key_len,
+                            int32_t *existed_out);
+
+/**
+ * Delete every document matching `pred` (spec §4.8; counterpart:
+ * `Collection::delete_where(Predicate) -> usize`) — **CONSUMES `pred`**
+ * (index-accelerated matching through the engine's query path). `pred`
+ * is required; it is consumed unconditionally, whatever the status
+ * (spec §8) — using or freeing it afterwards is UB. `*removed_out`
+ * (nullable) receives the number removed.
+ */
+corvid_status corvid_delete_where(corvid_coll *c, corvid_pred *pred, size_t *removed_out);
+
+/**
+ * Delete each of `keys` (spec §4.8; counterpart:
+ * `Collection::delete_batch(&[&[u8]]) -> usize`); `*removed_out`
+ * (nullable) counts how many existed. `keys`/`key_lens` are parallel
+ * borrowed arrays, non-NULL when `count > 0` (`count == 0` with NULL
+ * arrays is a successful no-op). Each delete cascades that key's graph
+ * edges, as `corvid_delete`'s.
+ */
+corvid_status corvid_delete_batch(corvid_coll *c,
+                                  const uint8_t *const *keys,
+                                  const size_t *key_lens,
+                                  size_t count,
+                                  size_t *removed_out);
+
+/**
+ * Insert `doc` at `key` with expiry `expires_at` (spec §4.8;
+ * counterpart: `Collection::insert_with_ttl`) — the row and its expiry
+ * commit atomically. `expires_at` is in the caller's epoch (the engine
+ * keeps no clock); the record behaves normally until purged.
+ */
+corvid_status corvid_insert_with_ttl(corvid_coll *c,
+                                     const uint8_t *key,
+                                     size_t key_len,
+                                     const corvid_value *doc,
+                                     int64_t expires_at);
+
+/**
+ * Set (or replace) `key`'s expiry without rewriting the document
+ * (spec §4.8; counterpart: `Collection::set_ttl`). Setting an expiry
+ * on an absent key records the expiry anyway (the engine's TTL index
+ * is key-addressed); the purge's compare-expiry re-verification keeps
+ * it harmless.
+ */
+corvid_status corvid_set_ttl(corvid_coll *c,
+                             const uint8_t *key,
+                             size_t key_len,
+                             int64_t expires_at);
+
+/**
+ * `key`'s expiry, if one is set (spec §4.8; counterpart:
+ * `Collection::ttl -> Option<i64>`). `*has_ttl` (nullable) is 1/0 —
+ * unset is NOT an error; `*expires_at_out` (nullable) carries the
+ * timestamp when set and 0 when not. A plain (non-TTL) write clears a
+ * previously set expiry — the engine clears it in the write
+ * transaction.
+ */
+corvid_status corvid_get_ttl(corvid_coll *c,
+                             const uint8_t *key,
+                             size_t key_len,
+                             int64_t *expires_at_out,
+                             int32_t *has_ttl);
+
+/**
+ * Delete every record whose expiry is `<= now` — **inclusive** (spec
+ * §4.8; counterpart: `Collection::purge_expired(now) -> usize`);
+ * `*purged_out` (nullable) receives the count. `now` is the caller's
+ * epoch. Records are removed through the normal delete path (indexes
+ * stay consistent); each candidate's expiry is re-verified inside the
+ * delete transaction, so a rewritten record is skipped, never purged.
+ */
+corvid_status corvid_purge_expired(corvid_coll *c, int64_t now, size_t *purged_out);
+
+/**
+ * True when the path resolves to a present value (spec §4.5;
+ * counterpart: `field(path).exists()` → `Predicate::Exists`). `path`
+ * is borrowed, non-NULL at any length, valid UTF-8; the empty path
+ * resolves nothing (a predicate that matches no document, not an
+ * error). NULL or misencoded `path` returns NULL +
+ * `CORVID_E_ARGUMENT`.
+ */
+corvid_pred *corvid_pred_exists(const char *path, size_t path_len);
+
+/**
+ * Compare the path's value against a constant (spec §4.5; counterpart:
+ * `field(path).eq/ne/lt/le/gt/ge(v)` → `Predicate::Compare`). `value`
+ * is borrowed-read and **CLONED** into the tree — the caller keeps its
+ * handle. Semantics (filter.rs): a missing path ⇒ false; unordered
+ * kinds under ordered ops ⇒ false; `Int`/`Float` compare numerically
+ * across kinds (exact to 2^53); NaN compares false against everything
+ * except `NE`. NULL `value`, or an `op` outside `CORVID_CMP_EQ..=GE`,
+ * returns NULL + `CORVID_E_ARGUMENT`.
+ */
+corvid_pred *corvid_pred_compare(const char *path,
+                                 size_t path_len,
+                                 corvid_cmp op,
+                                 const corvid_value *value);
+
+/**
+ * True when the value equals any element of `values` (spec §4.5;
+ * counterpart: `field(path).is_in([...])` → `Predicate::In`). Each
+ * element is borrowed-read and **CLONED**. `values` may be NULL only
+ * when `count == 0` — an empty membership matches nothing (not an
+ * error). A NULL element, or a NULL array with `count > 0`, returns
+ * NULL + `CORVID_E_ARGUMENT`.
+ */
+corvid_pred *corvid_pred_in(const char *path,
+                            size_t path_len,
+                            const corvid_value *const *values,
+                            size_t count);
+
+/**
+ * Inclusive `[low, high]` range (spec §4.5; counterpart:
+ * `field(path).between(lo, hi)` → `Predicate::Between`). Both bounds
+ * are required, borrowed-read, and **CLONED**. A NULL bound returns
+ * NULL + `CORVID_E_ARGUMENT`.
+ */
+corvid_pred *corvid_pred_between(const char *path,
+                                 size_t path_len,
+                                 const corvid_value *low,
+                                 const corvid_value *high);
+
+/**
+ * The text at `path` starts with `prefix` (spec §4.5; counterpart:
+ * `field(path).starts_with(p)` → `Predicate::StartsWith`). False on
+ * non-text values and missing paths. `prefix` is borrowed, non-NULL at
+ * any length, valid UTF-8; NULL or misencoded returns NULL +
+ * `CORVID_E_ARGUMENT`.
+ */
+corvid_pred *corvid_pred_starts_with(const char *path,
+                                     size_t path_len,
+                                     const char *prefix,
+                                     size_t prefix_len);
+
+/**
+ * The text at `path` contains `substr` (spec §4.5; counterpart:
+ * `field(path).contains(s)` → `Predicate::Contains`). False on
+ * non-text values and missing paths. `substr` is borrowed, non-NULL at
+ * any length, valid UTF-8; NULL or misencoded returns NULL +
+ * `CORVID_E_ARGUMENT`.
+ */
+corvid_pred *corvid_pred_contains(const char *path,
+                                  size_t path_len,
+                                  const char *substr,
+                                  size_t substr_len);
+
+/**
+ * The path holds a point (`[lat, lon]` array or `lat`/`lon` map)
+ * within `radius_km` of `(lat, lon)` — inclusive, haversine (spec
+ * §4.5; counterpart: `field(path).within_km(lat, lon, r)` →
+ * `Predicate::GeoWithin`). False on non-point values and missing
+ * paths. `path` as everywhere; the coordinates and radius cross by
+ * value (no validation — a negative radius simply matches nothing, as
+ * in the engine).
+ */
+corvid_pred *corvid_pred_geo_within(const char *path,
+                                    size_t path_len,
+                                    double lat,
+                                    double lon,
+                                    double radius_km);
+
+/**
+ * Logical conjunction — **CONSUMES `a` and `b`** (spec §4.5/§5 rule 4;
+ * counterpart: `Predicate::and` → `Predicate::And`). After the call the
+ * children belong to the tree: freeing them, passing them again, or
+ * otherwise using them is **undefined behavior** (a double free). A
+ * NULL child fails the combine (NULL + `CORVID_E_ARGUMENT`) after
+ * consuming the non-NULL sibling (spec §8's unconditional-consumption
+ * discipline); `a == b` (aliasing one handle into both arms) is
+ * rejected the same way, consuming the shared handle once.
+ */
+corvid_pred *corvid_pred_and(corvid_pred *a, corvid_pred *b);
+
+/**
+ * Logical disjunction — **CONSUMES `a` and `b`** (spec §4.5;
+ * counterpart: `Predicate::or` → `Predicate::Or`). The consumption,
+ * NULL-child, and aliasing contracts are `corvid_pred_and`'s.
+ */
+corvid_pred *corvid_pred_or(corvid_pred *a, corvid_pred *b);
+
+/**
+ * Logical negation — **CONSUMES `a`** (spec §4.5; counterpart:
+ * `std::ops::Not` → `Predicate::Not`). A NULL `a` fails (NULL +
+ * `CORVID_E_ARGUMENT`); after the call the child belongs to the tree
+ * (using or freeing it is UB).
+ */
+corvid_pred *corvid_pred_not(corvid_pred *a);
+
+/**
+ * Free a **never-consumed root** (spec §4.5; counterpart: Rust `Drop`
+ * of the tree). `corvid_pred_free(NULL)` is a no-op (§7). Predicates
+ * handed to `corvid_pred_and/or/not` or `corvid_delete_where` (and,
+ * from Task 5 on, `corvid_query_filter`) were consumed by that call —
+ * freeing them too is a double free, **undefined behavior**.
+ */
+void corvid_pred_free(corvid_pred *p);
+
+/**
+ * Fetch and decode the document at `key` (spec §4.9; counterpart:
+ * `Collection::get -> Option<Value>`): `*out` receives an OWNED value
+ * — free it with `corvid_value_free`. **Absence is a success**:
+ * `CORVID_OK` + `*out == NULL` when the key holds no document.
+ * `CORVID_ERR` on failure. `out` is required (spec §4.9: "out
+ * non-NULL" — the one read whose out-param is marked so); `key` as
+ * everywhere (non-NULL, any length).
+ */
+corvid_status corvid_get(corvid_coll *c, const uint8_t *key, size_t key_len, corvid_value **out);
+
+/**
+ * Stream every `(key, document)` in the collection to `fn`, in key
+ * order (spec §4.9; counterpart: `Collection::for_each_doc(FnMut(&[u8],
+ * Value) -> Result<bool>)` — the callback-shaped engine twin of the
+ * materializing `Collection::scan`). Constant memory regardless of
+ * collection size. The callback returns 1 to continue, 0 to stop
+ * (stopping is not an error — `CORVID_OK` either way); `key`/`doc`
+ * are BORROWED for the callback's duration only (see
+ * [`corvid_scan_fn`]'s reentrancy contract).
+ */
+corvid_status corvid_scan(corvid_coll *c, corvid_scan_fn fn_, void *ctx);
+
+/**
+ * Keyset pagination (spec §4.9; counterpart:
+ * `Collection::page(after: Option<&[u8]>, limit) -> Page { rows, next }`):
+ * up to `limit` documents in key order strictly after `after`, from
+ * one MVCC snapshot. `after == NULL || after_len == 0` starts at the
+ * beginning; `limit == 0` returns empty rows and no cursor.
+ *
+ * `*rows_out` (required) receives an OWNED rows cursor holding the
+ * page's materialized rows with score 0.0 — walk it with
+ * `corvid_rows_next` / free it with `corvid_rows_free` (Task 5's
+ * cursor family; the handle itself is produced here).
+ *
+ * `*next_after_out` (nullable, as is `next_after_len_out`) receives
+ * the resume cursor — an ABI-owned byte buffer, **free it with
+ * `corvid_free`** — or NULL with `*next_after_len_out == 0` at the end
+ * of the collection. The buffer is allocated only when
+ * `next_after_out` is non-NULL; a caller that ignores pagination may
+ * pass NULL for the pair.
+ */
+corvid_status corvid_page(corvid_coll *c,
+                          const uint8_t *after,
+                          size_t after_len,
+                          size_t limit,
+                          corvid_rows **rows_out,
+                          uint8_t **next_after_out,
+                          size_t *next_after_len_out);
+
+/**
+ * The document count (spec §4.9; counterpart: `Collection::len ->
+ * usize`) — O(1) maintained counter. `out` is nullable (§7's optional
+ * out-params: the call still succeeds and writes nothing).
+ */
+corvid_status corvid_len(corvid_coll *c, size_t *out);
 
 /**
  * Advance the cursor (spec §4.12): returns 1 and fills `*str_out` /
@@ -349,7 +848,9 @@ corvid_value *corvid_value_array_new(void);
  * `corvid_value_array_new` (or cloned from one) — any other value fails
  * with `CORVID_ERR` + `CORVID_E_ARGUMENT`. Pushing **invalidates every
  * child and `_ref` buffer previously borrowed from `arr`** (spec §5
- * rule 6: the Vec may reallocate) — using them after is UB.
+ * rule 6: the Vec may reallocate) — using them after is UB. On the
+ * self-insertion rejection path (`item == arr`) the shared handle has
+ * already been consumed by the call — free neither pointer afterwards.
  */
 corvid_status corvid_value_array_push(corvid_value *arr, corvid_value *item);
 
@@ -365,10 +866,16 @@ corvid_value *corvid_value_map_new(void);
  * unconditionally (spec §8 — a failed put has still dropped it; do not
  * free it afterwards). `key` is borrowed, non-NULL at any length (the
  * empty key is legal), and must be valid UTF-8 (spec §1.5 — map keys
- * are Rust `String`s). A duplicate key REPLACES the previous entry
- * (engine `BTreeMap::insert`, last write wins), **invalidating children
- * and `_ref` buffers borrowed from the replaced child** (spec §5 rule
- * 6). `map` must be an OWNED map value built by `corvid_value_map_new`
+ * are Rust `String`s). A put **invalidates every child and `_ref`
+ * buffer previously borrowed from `map`** (spec §5 rule 6), whatever
+ * the key: a duplicate key REPLACES the previous entry (engine
+ * `BTreeMap::insert`, last write wins — the replaced child is dropped),
+ * and a NEW key can split a B-tree node, relocating even untouched
+ * existing entries — the conservative rule, same as `array_push`'s.
+ * Using a previously borrowed child after any put is UB. On the
+ * self-insertion rejection path (`val == map`) the shared handle has
+ * already been consumed by the call — free neither pointer afterwards.
+ * `map` must be an OWNED map value built by `corvid_value_map_new`
  * (or cloned from one).
  */
 corvid_status corvid_value_map_put(corvid_value *map,

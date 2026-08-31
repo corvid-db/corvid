@@ -222,8 +222,10 @@ pub(crate) fn guard<T>(context: &str, f: impl FnOnce() -> corvid::Result<T>) -> 
 }
 
 /// Best-effort text out of a `catch_unwind` payload (`&'static str`,
-/// `String`, or opaque).
-fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> &str {
+/// `String`, or opaque). Shared by [`guard`] and the FFI callback
+/// invocations (a panicking C-land callback is caught the same
+/// defensive way, spec §3).
+pub(crate) fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> &str {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         s
     } else if let Some(s) = payload.downcast_ref::<String>() {

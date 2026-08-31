@@ -6,19 +6,22 @@
 //! implements that contract family by family; [`FFI_VERSION`] is 1 and
 //! bindings verify it via `corvid_ffi_version()` before anything else.
 //!
-//! Layout: one module per spec §4 family. Landed so far (the rest are
-//! stubs that name their landing task):
+//! Layout: one module per spec §4 family, declared in spec order (the
+//! header's emission order follows, so `corvid.h` reads like the spec's
+//! function reference). Landed so far (the rest are stubs that name
+//! their landing task):
 //!
 //! | module | spec §4 family | status |
 //! |---|---|---|
 //! | [`error`] | §1.3/§3 status + error codes, thread-local last error | landed |
 //! | [`handle`] | §1.1/§2/§4.13 opaque handles, derived-handle counter | landed |
 //! | [`lifecycle`] | §4.1 lifecycle & errors (8 fns) | landed |
-//! | [`strs`] | §4.12 string-cursor plumbing (`strs_next`/`strs_free`) | landed |
+//! | [`collection`] | §4.2 collection handles (3 fns) | landed |
 //! | [`value`] | §4.3/§4.4 value construction & reads (23 fns) | landed |
-//! | [`pred`] | §4.5 predicates | Task 4 |
-//! | [`mutation`] | §4.8 mutations | Task 4 |
-//! | [`read`] | §4.9 reads | Task 4 |
+//! | [`pred`] | §4.5 predicates (11 fns) | landed |
+//! | [`mutation`] | §4.8 mutations (13 fns) | landed |
+//! | [`read`] | §4.9 reads (4 fns) | landed |
+//! | [`strs`] | §4.12 string-cursor plumbing (`strs_next`/`strs_free`) | landed |
 //! | [`query`] | §4.6/§4.7 query builder, rows, aggregations | Task 5 |
 //! | [`index`] | §4.10 indexes & schema | Task 6 |
 //! | [`graph`] | §4.11 graph | Task 6 |
@@ -58,12 +61,16 @@
 /// Admin family (spec §4.13): `dump_to_path`, `load_from_path`,
 /// `load_from_path_with_renames`, `backup`, `compact`. Lands with Task 6.
 pub mod admin;
+/// Collection handles (spec §4.2): `collection`, `collection_free`,
+/// `collection_name` — the derived engine handle that keeps the `Db`
+/// alive past `corvid_close` and drives the derived-handle counter.
+pub mod collection;
 /// Status and error codes (spec §1.3), the engine-variant mapping, and the
 /// thread-local last-error slot (spec §3).
 pub mod error;
 /// Geo queries and the geohits cursor (spec §4.12). Lands with Task 6.
 pub mod geo;
-/// Graph family (spec §4.11). Lands with Task 4 (link/unlink) and Task 6.
+/// Graph family (spec §4.11). Lands with Task 6.
 pub mod graph;
 /// Opaque-handle infrastructure (spec §1.1/§2) and the FFI-owned
 /// derived-handle counter (spec §4.13/§6).
@@ -74,13 +81,18 @@ pub mod index;
 /// `close`, `last_error_code`, `last_error_message`, `free`,
 /// `collections`.
 pub mod lifecycle;
-/// Mutations (spec §4.8). Lands with Task 4.
+/// Mutations (spec §4.8): the 13 write functions — insert, put_many,
+/// insert_auto, update (C callback), patch, compare_and_set, delete,
+/// delete_where, delete_batch, and the TTL trio.
 pub mod mutation;
-/// Predicates (spec §4.5). Lands with Task 4.
+/// Predicates (spec §4.5): the 11 `corvid_pred_*` functions — ten
+/// constructors over dotted field paths (values CLONED into the tree)
+/// and `pred_free` for never-consumed roots.
 pub mod pred;
 /// Queries, rows cursor, aggregations (spec §4.6/§4.7). Task 5.
 pub mod query;
-/// Reads (spec §4.9). Lands with Task 4.
+/// Reads (spec §4.9): `get` (owned-out), `scan` (callback), `page`
+/// (keyset pagination + the `next_after` buffer), `len`.
 pub mod read;
 /// The string-cursor family plumbing (spec §4.12): `strs_next`,
 /// `strs_free` — shared by `corvid_collections` (landed) and the graph
