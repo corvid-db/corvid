@@ -78,6 +78,15 @@ so a highly selective filter may return fewer than `limit` rows (see the
   required?, unique?}` — that subsequent stores are validated against;
   `get_schema` returns the declared fields, or `{fields: null}` when none is
   declared.
+- **`corvid-ffi`** — the C ABI: a typed cdylib (`libcorvid.so` /
+  `libcorvid.dylib` / `corvid.dll`) plus the generated `corvid.h` — 122
+  symbols covering the engine surface, `FFI_VERSION = 1`. Documents are
+  built and read through value handles with no parsing or serialization
+  anywhere on the path (measured at parity with native Rust). Release
+  artifacts attach the library, header, and golden fixtures per platform
+  (Windows ships `corvid.dll` plus its MSVC import library
+  `corvid.dll.lib` — link the import lib); **[docs/FFI.md](docs/FFI.md)**
+  is the contract binding authors code against.
 
 A task-oriented walkthrough of every feature is in the **[user guide](docs/GUIDE.md)**.
 The **[website](https://i-rocky.github.io/corvid/)** hosts an overview and the

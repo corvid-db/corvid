@@ -18,7 +18,10 @@
 //!    abstracts gcc/clang/cl selection and flag dialects) against the
 //!    committed `corvid.h`, linking the cdylib BY PATH into a
 //!    scratch-directory executable — nothing is linked into the cdylib,
-//!    so the shipped artifact stays exactly the 122-symbol surface;
+//!    so the shipped artifact stays exactly the 122-symbol surface
+//!    (on MSVC the link names the emitted import library
+//!    `corvid.dll.lib` when present, the shape binding authors use;
+//!    at run time the child finds `corvid.dll` via `PATH`);
 //! 3. runs the executable via [`std::process::Command`] with the golden
 //!    directory's fixtures (sorted, so a new `golden/*.txt` joins the
 //!    suite automatically) and a fresh scratch workdir for its file
@@ -159,6 +162,25 @@ fn host_triple() -> String {
     }
 }
 
+/// What the LINK line names: on MSVC, the cdylib build also emits an
+/// import library next to `corvid.dll` (`corvid.dll.lib`) and linking
+/// against THAT is the documented path (link.exe reads a bare `.dll`'s
+/// exports in simple cases, but the import lib is the contract the
+/// release artifacts ship); elsewhere the cdylib file itself. The
+/// import-lib preference is Task 8's handling of the T7-noted
+/// Windows/MSVC risk — verified by the windows CI smoke leg.
+fn link_target(dylib: &Path) -> PathBuf {
+    if cfg!(target_os = "windows")
+        && let Some(imp) = dylib
+            .parent()
+            .map(|d| d.join("corvid.dll.lib"))
+            .filter(|p| p.exists())
+    {
+        return imp;
+    }
+    dylib.to_path_buf()
+}
+
 /// Compile + link the smoke executable into `workdir`; returns its path.
 fn build_smoke(workdir: &Path) -> PathBuf {
     let dylib = cdylib_artifact();
@@ -194,7 +216,7 @@ fn build_smoke(workdir: &Path) -> PathBuf {
     });
     let mut cmd = Command::new(compiler.path());
     cmd.arg(&smoke_c)
-        .arg(&dylib)
+        .arg(link_target(&dylib))
         .arg("-o")
         .arg(&exe)
         .arg("-I")
@@ -279,11 +301,15 @@ fn run_smoke_suite() {
     }
     // Help the loader find the cdylib when the platform needs it (the
     // baked rpath covers the common case; this is belt-and-braces for
-    // CI runners with stripped rpaths).
+    // CI runners with stripped rpaths). Windows resolves corvid.dll at
+    // load time through PATH (case-insensitive), so the artifact's
+    // directory joins it there too.
     let var = if cfg!(target_os = "macos") {
         Some("DYLD_LIBRARY_PATH")
     } else if cfg!(target_os = "linux") {
         Some("LD_LIBRARY_PATH")
+    } else if cfg!(target_os = "windows") {
+        Some("PATH")
     } else {
         None
     };

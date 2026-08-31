@@ -8,9 +8,41 @@ format and API may change without backward-compatibility guarantees.
 ### Design ledger
 
 - Closed the design ledger: every previously "future" item now carries an explicit dated disposition (shipped, deferred with a falsifiable trigger, declined, or never) — see DESIGN.md's decision log (2026-08-30 rows).
+- The C ABI surface is ruled and shipped: typed C calls end to end (no JSON/serialization on the runtime path), a 10-item v1 exclusion list with reopen triggers, idiomatic-OOP binding posture, sync-first, `FFI_VERSION = 1` stability policy — see docs/FFI.md and the 2026-08-31 decision-log rows.
 
 
 ### Added
+- The C ABI (`crates/corvid-ffi`): a 122-symbol typed cdylib —
+  `libcorvid.so` / `libcorvid.dylib` / `corvid.dll` — plus the
+  generated, committed, drift-gated `corvid.h`, covering the whole
+  engine surface (values, collections, predicates, the query builder
+  with rows cursors, aggregations, indexes/schema, graph, geo, admin).
+  docs/FFI.md is the locked contract (`FFI_VERSION = 1`; frozen
+  append-only enums; loud pre-1.0 break policy; post-1.0 soname
+  discipline). Documents are built and read through `corvid_value`
+  handles with borrowed zero-copy views — no parsing anywhere on the
+  path, measured: put/get/scan/hybrid-query through the ABI run
+  0.99–1.02× their native Rust twins (docs/BENCHES.md, corvid-ffi
+  Task 8). Guardrails shipped with it: spec-referential radar (the
+  generated header must equal Appendix A parsed from docs/FFI.md at
+  test time, and the C smoke suite must drive every symbol — 122/122),
+  golden fixtures (256 lines across 8 files, NaN/±inf/−0.0, cursors,
+  unique violations, geo boundaries, persistence-across-reopen), the
+  C smoke suite compiled and run as a cargo test (cc compiles
+  `c/smoke.c` against the freshly built library per OS/compiler —
+  gcc, clang, and MSVC cl via the `corvid.dll.lib` import library),
+  and a header drift gate. CI grows a 3-OS release-profile job
+  (ubuntu/macos/windows: build the cdylib artifact shape, run the
+  crate suite against it) and an ASan+UBSan+LSan Linux job (zero
+  leaks is the contract — every handle family's free path executes
+  inside the fixtures). Releases now attach a per-platform FFI archive
+  — the cdylib (Windows: plus `corvid.dll.lib`, the MSVC import
+  library), `corvid.h`, and the `golden/` fixtures — with sha256
+  entries in checksums.txt; note for binding authors writing C
+  directly: the header's value-type typedef/enum tag spell as
+  `corvid_value_type_t` (the bare name is the function; see FFI.md
+  §1.4's erratum), and on Windows link `corvid.dll.lib` (or the
+  DLL's exports) and place `corvid.dll` on the loader path.
 - Optional zstd compression of stored documents, behind a non-default
   `zstd` cargo feature: with the feature on, values in user collections
   whose encoding is at least 1 KiB are transparently compressed (zstd

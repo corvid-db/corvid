@@ -1,7 +1,11 @@
 name: Release
 
 # Cut a release by pushing a tag like `v0.1.0`. Builds the corvid-mcp binary
-# for Linux (x86_64 + arm64), macOS (Intel + Apple Silicon), and Windows.
+# for Linux (x86_64 + arm64), macOS (Intel + Apple Silicon), and Windows,
+# PLUS the C ABI artifact set per platform (the corvid-ffi cdylib —
+# libcorvid.so / libcorvid.dylib / corvid.dll (+ corvid.dll.lib, the MSVC
+# import library) — with the committed corvid.h and the golden/ fixture
+# directory binding authors can smoke their bindings against).
 # The GitHub release is created only AFTER every matrix build has succeeded
 # and the tag has been verified against the workspace version; the release
 # job then attaches the platform archives plus a checksums.txt of their
@@ -72,6 +76,60 @@ jobs:
           name: corvid-mcp-${{ matrix.target }}
           path: corvid-mcp-*
           if-no-files-found: error
+      # ---- The C ABI artifact set (Phase-0 Task 8) -------------------
+      # The cdylib is built for the SAME target the mcp binary just used
+      # (the taiki action's `rustup target add` above covers the
+      # toolchain side); the one leg the runner cannot link natively —
+      # aarch64-linux on an x86_64 host — goes through `cross`, the
+      # same tool the action itself installs for that leg.
+      - name: Install cross (the cross-compiled linux leg)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: taiki-e/install-action@cross
+      - name: Build the corvid-ffi cdylib
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            cross build -p corvid-ffi --release --target "${{ matrix.target }}"
+          else
+            cargo build -p corvid-ffi --release --target "${{ matrix.target }}"
+          fi
+      - name: Archive the FFI artifact set (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          T="${{ matrix.target }}"
+          DIR="corvid-ffi-${GITHUB_REF_NAME}-${T}"
+          mkdir -p "${DIR}/golden"
+          if [ -f "target/${T}/release/libcorvid.so" ]; then
+            cp "target/${T}/release/libcorvid.so" "${DIR}/"
+          else
+            cp "target/${T}/release/libcorvid.dylib" "${DIR}/"
+          fi
+          cp crates/corvid-ffi/corvid.h "${DIR}/"
+          cp crates/corvid-ffi/golden/*.txt "${DIR}/golden/"
+          tar -czf "${DIR}.tar.gz" "${DIR}"
+          ls -l "${DIR}.tar.gz"
+      # Windows ships the DLL plus its MSVC import library
+      # (corvid.dll.lib — the documented linking path for binding
+      # authors; see the Windows/MSVC note in the release notes).
+      - name: Archive the FFI artifact set (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $T = "${{ matrix.target }}"
+          $Dir = "corvid-ffi-${env:GITHUB_REF_NAME}-$T"
+          New-Item -ItemType Directory -Force "$Dir/golden" | Out-Null
+          Copy-Item "target/$T/release/corvid.dll" "$Dir/"
+          Copy-Item "target/$T/release/corvid.dll.lib" "$Dir/"
+          Copy-Item crates/corvid-ffi/corvid.h "$Dir/"
+          Copy-Item crates/corvid-ffi/golden/*.txt "$Dir/golden/"
+          Compress-Archive -Path "$Dir" -DestinationPath "$Dir.zip"
+          Get-Item "$Dir.zip"
+      - name: Upload FFI archive as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: corvid-ffi-${{ matrix.target }}
+          path: corvid-ffi-*
+          if-no-files-found: error
 
   release:
     needs: build
@@ -111,14 +169,14 @@ jobs:
         run: |
           cd dist
           ls -l
-          sha256sum corvid-mcp-* > checksums.txt
+          sha256sum corvid-mcp-* corvid-ffi-* > checksums.txt
           cat checksums.txt
       - name: "dry-run: publish skipped"
         if: inputs.dry_run == true
         run: >
-          echo "dry-run: publish skipped — matrix builds, version
-          verification, and sha256 checksums all ran; no GitHub release
-          created, no assets uploaded."
+          echo "dry-run: publish skipped — matrix builds (mcp binaries +
+          FFI cdylib/header/golden sets), version verification, and sha256
+          checksums all ran; no GitHub release created, no assets uploaded."
       - name: Create the release (idempotent) and attach assets
         if: inputs.dry_run != true
         env:
@@ -127,4 +185,4 @@ jobs:
           gh release view "$GITHUB_REF_NAME" \
             || gh release create "$GITHUB_REF_NAME" \
                  --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
-          gh release upload "$GITHUB_REF_NAME" dist/corvid-mcp-* dist/checksums.txt --clobber
+          gh release upload "$GITHUB_REF_NAME" dist/corvid-mcp-* dist/corvid-ffi-* dist/checksums.txt --clobber

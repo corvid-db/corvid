@@ -39,6 +39,11 @@ cargo bench -p corvid --bench engine -- quantized_scan
 cargo bench -p corvid --bench engine -- value_store_io
 # zstd-feature twin of the same group (ledger-closure Task 5):
 cargo bench -p corvid --features zstd --bench engine -- value_store_io
+# FFI crossing-cost comparison (corvid-ffi Task 8) — the cdylib the C
+# child links is NOT built by cargo bench; the build command is
+# load-bearing (a freshness tripwire fails the bench on a stale ABI):
+cargo build -p corvid-ffi --release
+cargo bench -p corvid-ffi --bench ffi
 ```
 
 The same literal commands live in the bench file's doc comments (one per
@@ -535,3 +540,56 @@ heuristic was considered and declined — it would mispredict on the mixed
 corpora where the feature matters. The existing default-config benches
 are untouched by the feature (OFF compiles to identity; verified by the
 default suite, 1000 green).
+
+## corvid-ffi Task 8 — the FFI crossing-cost table
+
+The typed C ABI (docs/FFI.md, 122 symbols) exists so bindings pay
+"zero parsing, bounded crossing cost". This bench turns that phrase
+into a measurement: the same four shapes through the ABI — a C
+consumer compiled at bench time from `c/bench.c` against the
+committed, drift-gated `corvid.h` (so a signature change is a compile
+error, not silent UB), linked against the release cdylib — and
+natively in-process in Rust, on identical deterministic corpora
+(2000 docs of `{i: int, txt: 4 tokens from a 50-word vocabulary,
+vec: [64 × f32]}`, index arithmetic, no `rand`).
+
+**Method** (medians of 5 rounds after a discarded warmup, both sides;
+two runs recorded, agreeing within ±2%): the C child does its own
+corpus setup then N iterations; the driver times the whole child and
+subtracts a zero-iteration baseline child (spawn + setup cancel), so
+there is no timing code in C and the file stays portable ISO C. The
+native twins time the loop only (setup outside the region). The `put`
+shape includes document CONSTRUCTION on both sides — a binding builds
+a value per call — so the row prices the honest end-to-end path; the
+C side constructs with `sprintf`/stack floats where Rust uses
+`format!`/`BTreeMap`, and the row shows that difference is noise next
+to the insert itself.
+
+| shape (iterations) | FFI (through the ABI) | native Rust | ratio |
+|---|---|---|---|
+| put — construct + insert (10k) | 20.8 µs/op | 20.9 µs/op | **1.00x** |
+| get — point-get + read 1 field (100k) | 1510 ns/op | 1508 ns/op | **1.00x** |
+| scan — full 2000-row pass (200) | 883 µs/pass | 896 µs/pass | **0.99x** |
+| hybrid — vector+text RRF query, k=10/source, drained (500) | 3.02 ms/query | 2.97 ms/query | **1.02x** |
+
+Confirmation run: 0.99x / 1.00x / 0.99x / 0.99x (put 20.3 vs 20.5 µs,
+get 1483 vs 1490 ns, scan 877 vs 886 µs, hybrid 3.00 vs 3.02 ms).
+
+**Reading:** the crossing cost is invisible at every shape — the ABI
+adds nothing measurable over the native path because each call is a
+plain C-ABI jump behind engine work that dominates (an insert's
+transaction, a scan's decode loop, a hybrid query's candidate
+fusion). There is no serialization anywhere on the path by
+construction (typed handles in, borrowed views out), so the plan's
+"bounded crossing cost" bound is, measured: ≤ ±2%, i.e. noise. The
+exclusion table's reopen trigger for direct `vector_search`/
+`text_search` entry points (docs/FFI.md §9 — "a workload proving
+per-call overhead of the builder matters") stays closed on this
+evidence: the builder path through the ABI is at parity with native,
+so per-call builder overhead cannot be a workload problem at this
+scale.
+
+**Provenance:** Apple M1 Max (MacBookPro18,2), Darwin arm64, rustc
+1.91.1, clang 17 (`cc`-selected), release cdylib + `-O2` C consumer;
+single-machine numbers, compare relatively — the claim this table
+backs is the RATIO column, not the absolute times.

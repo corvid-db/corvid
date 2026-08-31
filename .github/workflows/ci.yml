@@ -131,3 +131,63 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build engine for aarch64-ios
         run: cargo build -p corvid --target aarch64-apple-ios --release
+
+  # The C ABI's own gate (Phase-0 Task 8): build the cdylib consumers
+  # actually link (release profile, the artifact shape the release
+  # pipeline ships — libcorvid.so / libcorvid.dylib / corvid.dll) on
+  # each host OS, then run the crate's suite in the SAME profile so the
+  # C smoke suite compiles c/smoke.c against that fresh library with
+  # the host's native C compiler (gcc / clang / MSVC cl — the MSVC leg
+  # links the emitted import library corvid.dll.lib and resolves
+  # corvid.dll at load time via PATH; see src/smoke.rs). The ubuntu
+  # check job already runs the crate in debug; this matrix is the
+  # per-OS, per-compiler, release-profile half.
+  ffi-smoke:
+    name: ffi cdylib + C smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the release cdylib (the shipped artifact shape)
+        run: cargo build -p corvid-ffi --release
+      - name: Verify the FFI.md §8 artifact names
+        if: runner.os != 'Windows'
+        run: |
+          ls -l target/release/libcorvid.so target/release/libcorvid.dylib 2>/dev/null || true
+          test -f target/release/libcorvid.so || test -f target/release/libcorvid.dylib
+      - name: Verify the FFI.md §8 artifact names (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Get-Item target/release/corvid.dll, target/release/corvid.dll.lib
+        shell: pwsh
+      - name: Crate suite (smoke + radar) in release, against the fresh library
+        run: cargo test -p corvid-ffi --release
+
+  # The sanitizer half of the C-surface gate: the identical smoke suite
+  # under ASan + UBSan on the C side and `-Zsanitizer=address` on the
+  # Rust side, with the LeakSanitizer gate ON (Linux carries the leak
+  # half for the whole matrix — macOS arm64's runtime has no LSan, so
+  # its leg of ffi-smoke covers ASan+UBSan only; x86_64 macOS would
+  # leak-check too when run there). Zero leaks is the contract: every
+  # handle family's free path executes inside the golden fixtures
+  # (src/smoke.rs's leak-expectation notes).
+  ffi-sanitize:
+    name: ffi C smoke ASan + UBSan + LSan (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Sanitized smoke suite (leak gate on)
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          CORVID_SMOKE_ASAN: "1"
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+        run: cargo test -p corvid-ffi smoke_asan --lib -- --nocapture
