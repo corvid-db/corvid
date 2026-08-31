@@ -15,7 +15,7 @@
 //! | [`handle`] | §1.1/§2/§4.13 opaque handles, derived-handle counter | landed |
 //! | [`lifecycle`] | §4.1 lifecycle & errors (8 fns) | landed |
 //! | [`strs`] | §4.12 string-cursor plumbing (`strs_next`/`strs_free`) | landed |
-//! | [`value`] | §4.3/§4.4 value construction & reads | Task 3 |
+//! | [`value`] | §4.3/§4.4 value construction & reads (23 fns) | landed |
 //! | [`pred`] | §4.5 predicates | Task 4 |
 //! | [`mutation`] | §4.8 mutations | Task 4 |
 //! | [`read`] | §4.9 reads | Task 4 |
@@ -86,7 +86,10 @@ pub mod read;
 /// `strs_free` — shared by `corvid_collections` (landed) and the graph
 /// cursors (Task 6).
 pub mod strs;
-/// Value construction & reads (spec §4.3/§4.4). Lands with Task 3.
+/// Value construction & reads (spec §4.3/§4.4): the 23 value functions
+/// — constructors that CLONE their buffers, `_ref` zero-copy borrows,
+/// `array_get`/`map_get` borrowed children, and `corvid_value_free` for
+/// OWNED values only.
 pub mod value;
 
 /// The header drift gate (test-only): regenerates `corvid.h` from this
