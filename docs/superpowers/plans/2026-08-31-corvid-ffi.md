@@ -201,6 +201,17 @@ discipline (unexpected NULL → CORVID_E_ARGUMENT, never UB).
 
 ### Task 4: Predicates + mutations + reads + put_many
 
+Prepend (Task 3 review, binding): (a) fix the map_put invalidation
+doc-precision gap — the header/source wording implies only the replaced
+child dangles; BTreeMap node splits can relocate EXISTING entries on a
+new-key put, so the wording must match array_push's conservative rule
+("invalidates previously borrowed children of map") + header regen;
+(b) add the alias-path sentence to array_push/map_put docs (on the
+self-insertion rejection path the shared handle is consumed — free
+neither); (c) correct the T3 report's "plan allowed either" overstatement
+(registry was never a plan option; interior views satisfied the plan as
+written).
+
 The 12 predicate constructors (consumption semantics for and/or/not);
 the 13 mutations (incl. the update fn-ptr callback with its
 no-reentrancy contract documented, CAS nullability, delete_where
