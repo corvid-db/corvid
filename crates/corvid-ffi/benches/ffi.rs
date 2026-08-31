@@ -214,7 +214,9 @@ fn build_bench(workdir: &Path) -> PathBuf {
     } else {
         "corvid_ffi_bench"
     });
-    let mut cmd = Command::new(compiler.path());
+    // `to_command` (not `Command::new(path)`): on MSVC the tool carries
+    // the detected INCLUDE/LIB SDK environment (src/smoke.rs's rule).
+    let mut cmd = compiler.to_command();
     cmd.arg(manifest_dir().join("c").join("bench.c"))
         .arg(link_target(&dylib))
         .arg("-o")

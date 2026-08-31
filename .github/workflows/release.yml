@@ -86,6 +86,10 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         uses: taiki-e/install-action@cross
       - name: Build the corvid-ffi cdylib
+        # bash explicitly: the windows runner default is pwsh, and the
+        # cross/plain dispatch is a POSIX if (Git Bash ships with the
+        # runner; the MSVC toolchain env is inherited either way).
+        shell: bash
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             cross build -p corvid-ffi --release --target "${{ matrix.target }}"

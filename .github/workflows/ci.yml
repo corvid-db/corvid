@@ -184,10 +184,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Sanitized smoke suite (leak gate on)
         env:
           RUSTFLAGS: -Zsanitizer=address
           CORVID_SMOKE_ASAN: "1"
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
-        run: cargo test -p corvid-ffi smoke_asan --lib -- --nocapture
+        # --target (the host triple) keeps RUSTFLAGS on TARGET artifacts
+        # only: a host build would push the sanitizer flag into proc
+        # macros and fail with `can't find crate for thiserror_impl`.
+        # The smoke's artifact lookup knows the --target layout
+        # (target/<triple>/debug) and self-builds the instrumented
+        # cdylib if cargo test did not emit it (src/smoke.rs).
+        run: >
+          cargo test -p corvid-ffi --target x86_64-unknown-linux-gnu
+          smoke_asan --lib -- --nocapture

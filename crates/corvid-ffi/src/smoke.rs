@@ -13,7 +13,10 @@
 //! 1. locates the cdylib artifact `cargo test` just built/refreshed
 //!    (`target/<debug|release>/libcorvid.dylib` / `.so` / `corvid.dll`
 //!    — the profile from `cfg!(debug_assertions)`, the directory from
-//!    `CARGO_TARGET_DIR` or the workspace root);
+//!    `CARGO_TARGET_DIR` or the workspace root; if `cargo test` did
+//!    NOT build it — plain `cargo test` skips the artifact for a
+//!    cdylib-only crate, see [`cdylib_artifact`]'s self-heal note —
+//!    the test builds it itself with a nested `cargo build`);
 //! 2. compiles `c/smoke.c` with the **`cc` crate** (dev-dependency; it
 //!    abstracts gcc/clang/cl selection and flag dialects) against the
 //!    committed `corvid.h`, linking the cdylib BY PATH into a
@@ -86,16 +89,32 @@ fn asan_mode() -> bool {
     std::env::var_os("CORVID_SMOKE_ASAN").is_some()
 }
 
-/// The cdylib artifact `cargo test` built for THIS run: profile from the
-/// test binary's own `debug_assertions`, directory from
-/// `CARGO_TARGET_DIR` or the workspace default (`<ws>/target`).
+/// The cdylib artifact this run links: profile from the test binary's
+/// own `debug_assertions`, directory from `CARGO_TARGET_DIR` or the
+/// workspace default (`<ws>/target`). Two layouts are searched — the
+/// host layout (`<target>/<profile>`, what a plain `cargo build` /
+/// `cargo test` produces) and the explicit-target layout
+/// (`<target>/<triple>/<profile>`, what `cargo test --target T` and
+/// the sanitizer CI job produce).
+///
+/// **Self-heal (Task 8 discovery):** plain `cargo test` does NOT build
+/// the cdylib for this cdylib-only crate — nothing else in the test
+/// graph depends on the artifact, so cargo skips the normal lib build
+/// (T7's green runs had unknowingly linked a leftover artifact from
+/// manual builds; a clean-target CI run failed on exactly this). If
+/// the artifact is absent in both layouts, the test builds it itself
+/// — cargo releases the build lock before running tests, so a nested
+/// `cargo build` cannot deadlock — with `--target <host triple>` and
+/// the ambient `RUSTFLAGS`/`CARGO_TARGET_DIR` passed through, which
+/// keeps the sanitizer job's instrumented flags on the rebuilt dylib
+/// and the proc-macro/host split intact.
 fn cdylib_artifact() -> PathBuf {
     let profile = if cfg!(debug_assertions) {
         "debug"
     } else {
         "release"
     };
-    let mut dir = std::env::var_os("CARGO_TARGET_DIR")
+    let base = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             // <crate>/../.. is the workspace root; its target/ is the
@@ -103,18 +122,47 @@ fn cdylib_artifact() -> PathBuf {
             let default = manifest_dir().join("..").join("..").join("target");
             default.canonicalize().unwrap_or(default)
         });
-    dir.push(profile);
-    for name in ["libcorvid.dylib", "libcorvid.so", "corvid.dll"] {
-        let candidate = dir.join(name);
-        if candidate.exists() {
-            return candidate;
-        }
+    let layouts = [base.join(profile), base.join(host_triple()).join(profile)];
+    let find = |layouts: &[PathBuf]| -> Option<PathBuf> {
+        layouts.iter().find_map(|dir| {
+            ["libcorvid.dylib", "libcorvid.so", "corvid.dll"]
+                .iter()
+                .map(|name| dir.join(name))
+                .find(|p| p.exists())
+        })
+    };
+    if let Some(found) = find(&layouts) {
+        return found;
     }
-    panic!(
-        "the cdylib artifact is missing under {} — `cargo test` builds it \
-         alongside this test; did CARGO_TARGET_DIR change mid-run?",
-        dir.display()
+    let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    cmd.args([
+        "build",
+        "-p",
+        env!("CARGO_PKG_NAME"),
+        "--target",
+        &host_triple(),
+    ]);
+    if !cfg!(debug_assertions) {
+        cmd.arg("--release");
+    }
+    let out = cmd
+        .current_dir(manifest_dir())
+        .output()
+        .unwrap_or_else(|e| panic!("run a nested `cargo build` for the cdylib: {e}"));
+    assert!(
+        out.status.success(),
+        "building the cdylib artifact failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
     );
+    find(&layouts).unwrap_or_else(|| {
+        panic!(
+            "the cdylib artifact is still missing under {} (or its \
+             --target twin) after a nested `cargo build -p corvid-ffi` — \
+             did CARGO_TARGET_DIR change mid-run?",
+            base.display()
+        )
+    })
 }
 
 /// Count a fixture's executable lines: non-blank, not starting with '#'
@@ -214,7 +262,11 @@ fn build_smoke(workdir: &Path) -> PathBuf {
     } else {
         "corvid_smoke"
     });
-    let mut cmd = Command::new(compiler.path());
+    // `to_command` (not `Command::new(compiler.path())`): on MSVC the
+    // tool carries the detected INCLUDE/LIB environment of the
+    // installed SDK — without it cl cannot find even <math.h>
+    // (the Windows CI leg caught exactly that).
+    let mut cmd = compiler.to_command();
     cmd.arg(&smoke_c)
         .arg(link_target(&dylib))
         .arg("-o")

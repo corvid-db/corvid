@@ -27,12 +27,6 @@ crate-type = ["cdylib"]
 # on the lib target directly — verified non-vacuous (it fails on warnings):
 #   cargo rustdoc -p corvid-ffi --lib -- -D warnings
 doc = false
-# The lib is cdylib-only: there is nothing to link into a bench harness
-# from it (cargo would otherwise emit a spurious "benches src/lib.rs"
-# executable for the auto-bench target). The crate's one bench is the
-# explicit [[bench]] below, which — exactly like the smoke suite —
-# reaches the ABI through a C child instead of a Rust dependency.
-bench = false
 
 [dependencies]
 corvid.workspace = true

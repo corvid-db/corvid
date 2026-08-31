@@ -975,6 +975,12 @@ mod tests {
     }
 
     #[test]
+    // The buffer mutations below are the POINT (they prove the
+    // constructors cloned: the FFI must not observe them), and nothing
+    // in Rust ever reads them back — the read happens behind the ABI.
+    // A newer clippy flags exactly that shape (unused_assignments);
+    // the allow is the honest annotation, not a suppression of a bug.
+    #[allow(unused_assignments)]
     fn constructors_clone_their_buffers() {
         // Text: caller keeps its bytes and may reuse them immediately
         // (only the first 6 bytes cross: "corvid" out of the longer
