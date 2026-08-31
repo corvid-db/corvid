@@ -1,10 +1,10 @@
 //! Status and error codes (spec §1.3) and the thread-local last-error
 //! slot (spec §3).
 //!
-//! Every ABI function that can fail reports it through [`corvid_status`]
+//! Every ABI function that can fail reports it through `corvid_status`
 //! (`CORVID_OK`/`CORVID_ERR`) or a NULL where a handle/buffer was
 //! expected, and — as its first act on the failure path — records a code
-//! + message in thread-local storage via [`record`] or [`record_engine`].
+//! + message in thread-local storage via `record` or `record_engine`.
 //! Successful calls never clear the slot (spec §3: read the error
 //! immediately after the failure that interests you); the next failing
 //! call on the same thread overwrites both code and message.
@@ -13,6 +13,15 @@
 //! `corvid::Error` variants, pinned by the variant-inventory snapshot
 //! test below ([`tests`] / FFI.md §1.3); 19 (`CORVID_E_BUSY`) is the one
 //! FFI-only code (compaction exclusivity, spec §4.13). NEVER renumber.
+//!
+//! What the snapshot test can and cannot catch (a downstream crate
+//! cannot enumerate a foreign `#[non_exhaustive]` enum): removing or
+//! renaming an engine variant fails **compilation** (the named match
+//! arms here and in the test); a variant the test *constructs* outside
+//! the inventory fails the **wildcard arm** at runtime. Detecting an
+//! **addition** relies on a human extending `every_engine_variant` in
+//! step — the engine's `enum Error` carries a pointer comment making
+//! that duty explicit, and the review checklist checks it.
 //!
 //! [`tests`]: self
 
@@ -91,10 +100,14 @@ pub enum corvid_err {
 /// posture), so the trailing wildcard is required to compile — but it is
 /// unreachable while the variant-inventory snapshot test
 /// ([`tests::variant_inventory_matches_the_engine_and_the_mapping`]) is
-/// green: that test constructs one instance of every engine variant and
-/// fails on any variant outside the inventory. Removing or renaming an
-/// engine variant fails compilation here (the named arms break); adding
-/// one fails the snapshot test until this mapping is maintained.
+/// green: that test constructs one instance of every KNOWN engine
+/// variant, so it fails on any variant it constructs outside the
+/// inventory. Removing or renaming an engine variant fails compilation
+/// here (the named arms break). An ADDITION, however, is not detected
+/// until `every_engine_variant` is extended in the same change — a
+/// downstream crate cannot enumerate a foreign enum — so the engine's
+/// `enum Error` carries a pointer comment making that duty explicit;
+/// see the module docs for the full catch/cannot-catch breakdown.
 pub(crate) fn code_of(err: &corvid::Error) -> corvid_err {
     use corvid::Error;
     match err {
@@ -250,8 +263,14 @@ mod tests {
     /// Match every engine variant by name, with a wildcard arm asserting
     /// any unknown variant is present in the inventory — FFI.md §1.3's
     /// snapshot mechanism. Removing/renaming an engine variant breaks the
-    /// named arms at compile time; adding one trips the wildcard here
-    /// (and in [`code_of`]'s fallback) the moment the test constructs it.
+    /// named arms at compile time. A CONSTRUCTED variant outside the
+    /// inventory trips the wildcard here (and falls to [`code_of`]'s
+    /// defensive placeholder). An engine ADDITION is only covered once
+    /// `every_engine_variant` below is extended with it — that list is
+    /// hand-maintained (a downstream crate cannot enumerate a foreign
+    /// enum), which is exactly why the engine's `enum Error` carries the
+    /// same-change pointer comment; until then an added variant passes
+    /// this test vacuously. Review checks the list against the enum.
     fn assert_mapped(err: &corvid::Error) -> &'static str {
         use corvid::Error;
         let name = match err {
@@ -286,9 +305,13 @@ mod tests {
         name
     }
 
-    /// One constructible instance of every engine variant — the snapshot
-    /// input. The redb-passthrough six are built from redb's public error
-    /// enums (the engine wraps them via `#[from]`).
+    /// One constructible instance of every KNOWN engine variant — the
+    /// snapshot input, hand-maintained against the engine's `enum Error`
+    /// (the engine's enum doc points back at this list). The
+    /// redb-passthrough six are built from redb's public error enums (the
+    /// engine wraps them via `#[from]`). An engine variant added without
+    /// a row here is invisible to the snapshot test — extend this list,
+    /// `code_of`, and FFI.md §1.3 together.
     fn every_engine_variant() -> Vec<corvid::Error> {
         use corvid::Error;
         use redb::{
@@ -358,11 +381,14 @@ mod tests {
         ("Io", corvid_err::CORVID_E_IO),
     ];
 
-    /// The variant-inventory snapshot test (FFI.md §1.3): every engine
-    /// variant is constructed, asserted present in the inventory, and
-    /// asserted to carry exactly the spec's code. An engine change in any
-    /// direction (add/remove/rename) fails here until the mapping is
-    /// maintained.
+    /// The variant-inventory snapshot test (FFI.md §1.3): every KNOWN
+    /// engine variant is constructed, asserted present in the inventory,
+    /// and asserted to carry exactly the spec's code. Remove/rename of an
+    /// engine variant fails compilation elsewhere in this crate; a
+    /// variant constructed outside the inventory fails here (wildcard
+    /// arm); an engine ADDITION fails here only once
+    /// `every_engine_variant` is extended — the vacuous-pass gap the
+    /// engine's `enum Error` pointer comment closes procedurally.
     #[test]
     fn variant_inventory_matches_the_engine_and_the_mapping() {
         // (ii) first: the inventory equals the spec's mapping table, in

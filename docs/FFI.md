@@ -326,6 +326,11 @@ Open (creating if absent) a file-backed database. `path` non-NULL,
 filesystem path in platform encoding. Wraps `corvid::Db::open`.
 Returns the handle, or NULL + `CORVID_E_DATABASE` /
 `CORVID_E_INCOMPATIBLE_FORMAT` / `CORVID_E_IO`.
+*(Erratum, 2026-08-28, Task 2 implementation: "platform encoding" above
+is superseded by §1.5's universal UTF-8 rule — `corvid_open` enforces
+UTF-8 and answers non-UTF-8 bytes with `CORVID_E_ARGUMENT`, exactly as
+§9's non-UTF-8-path exclusion row records. Signature and error set are
+unchanged.)*
 
 ```c
 corvid_db* corvid_open_memory(void);

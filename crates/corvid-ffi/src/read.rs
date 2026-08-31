@@ -5,4 +5,4 @@
 //! `*out == NULL`), `scan` streams through a row callback, `page` is
 //! keyset pagination whose `next_after` resume cursor is an ABI-owned
 //! buffer freed with `corvid_free` (born in
-//! [`crate::lifecycle::buffer_new`]). Lands with Task 4.
+//! `crate::lifecycle::buffer_new`). Lands with Task 4.

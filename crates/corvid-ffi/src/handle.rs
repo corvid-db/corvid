@@ -2,8 +2,8 @@
 //! derived-handle counter (spec §4.13/§6).
 //!
 //! Every ABI handle is an opaque, single-pointer-sized, zero-sized
-//! `#[repr(C)]` marker type ([`corvid_db`], [`corvid_strs`], …). The real
-//! state lives in interior Rust structs ([`DbHandle`], [`StrsHandle`], …)
+//! `#[repr(C)]` marker type (`corvid_db`, `corvid_strs`, …). The real
+//! state lives in interior Rust structs (`DbHandle`, `StrsHandle`, …)
 //! that never cross the boundary by value: constructors hand out
 //! `Box::into_raw(body) as *mut Marker`, accessors borrow the body back,
 //! and each family's `_free` runs `Box::from_raw` on the original body
@@ -15,7 +15,7 @@
 //!
 //! `corvid_compact` needs exclusive engine access (`Db::compact` takes
 //! `&mut self`), so spec §4.13 checks quiescence with an FFI-owned
-//! [`AtomicUsize`] on the db: it counts live handles holding a **clone of
+//! `AtomicUsize` on the db: it counts live handles holding a **clone of
 //! the engine `Arc`** — initialized to 1 (the db handle itself) at open,
 //! incremented when a derived engine handle is created, decremented by
 //! that handle's `_free`; `corvid_compact` (Task 6) requires exactly 1
@@ -26,7 +26,7 @@
 //! **Wiring:** the increment is added by each family that creates
 //! engine-backed handles as those families land (collection handles with
 //! Task 4, query handles with Task 5) — none exist yet, so
-//! [`DbHandle::retain_derived`] currently has no production caller.
+//! `DbHandle::retain_derived` currently has no production caller.
 //! Cursors that own only materialized data and hold no engine reference
 //! (`rows`, `strs`, `geohits`, `groupiter`, `schemaiter` — the spec §2
 //! backing table) do **not** increment: they cannot keep the engine
@@ -40,14 +40,14 @@ use corvid::Db;
 
 /// The opaque `corvid_db*` handle type (spec §1.1). Zero-sized and never
 /// constructed — a pointer to it is a typed alias for the interior
-/// [`DbHandle`] box (see the module docs for the provenance contract).
+/// `DbHandle` box (see the module docs for the provenance contract).
 #[repr(C)]
 pub struct corvid_db {
     _unused: [u8; 0],
 }
 
 /// The opaque `corvid_strs*` handle type (spec §1.1). Backed by
-/// [`StrsHandle`].
+/// `StrsHandle`.
 #[repr(C)]
 pub struct corvid_strs {
     _unused: [u8; 0],

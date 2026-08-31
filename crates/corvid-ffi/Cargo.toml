@@ -22,8 +22,10 @@ description = "The typed C ABI (cdylib `corvid` + generated corvid.h) over the c
 name = "corvid"
 crate-type = ["cdylib"]
 # Two workspace libs cannot both rustdoc into target/doc/corvid; the engine
-# keeps the workspace doc slot. This crate's doc gate runs standalone:
-# RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p corvid-ffi
+# keeps the workspace doc slot. `cargo doc -p corvid-ffi` is VACUOUS under
+# doc = false (it emits nothing), so this crate's doc gate invokes rustdoc
+# on the lib target directly — verified non-vacuous (it fails on warnings):
+#   cargo rustdoc -p corvid-ffi --lib -- -D warnings
 doc = false
 
 [dependencies]

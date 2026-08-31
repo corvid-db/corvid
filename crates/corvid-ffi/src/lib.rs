@@ -38,11 +38,11 @@
 //! it immediately after the failure that interests you.
 //!
 //! Testing: everything is a unit test in `src/` (`#[cfg(test)] mod tests`
-//! per module, plus the header drift gate in [`header`]). An integration
-//! `tests/` directory is structurally impossible here: the lib target is
-//! named `corvid` (so the cdylib artifacts are `libcorvid.*`), which would
-//! make `corvid` resolve ambiguously against the engine dependency in an
-//! integration test's extern prelude.
+//! per module, plus the header drift gate in `src/header.rs`). An
+//! integration `tests/` directory is structurally impossible here: the lib
+//! target is named `corvid` (so the cdylib artifacts are `libcorvid.*`),
+//! which would make `corvid` resolve ambiguously against the engine
+//! dependency in an integration test's extern prelude.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 // The ABI shims are safe-marker `extern "C"` fns that dereference caller

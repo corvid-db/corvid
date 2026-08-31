@@ -200,7 +200,10 @@ const char *corvid_last_error_message(size_t *len_out);
  * The ONLY buffer deallocator in the ABI (spec §4.1/§5 rule 1): frees
  * any buffer the ABI returned by value — `corvid_insert_auto` keys,
  * `corvid_page`'s `next_after` cursor. Does NOT free handles (each has
- * its own `_free`) or values. `corvid_free(NULL)` is a no-op.
+ * its own `_free`) or values. The domain is exactly those ABI-returned
+ * buffers (spec §4.1): freeing a pointer the ABI did not return, or
+ * freeing one twice, is undefined behavior — the same class of misuse
+ * as C `free()`. `corvid_free(NULL)` is a no-op.
  */
 void corvid_free(void *ptr);
 

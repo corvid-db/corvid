@@ -10,6 +10,14 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// All errors the engine can produce.
+///
+/// FFI coupling note: the `corvid-ffi` ABI maps this enum 1:1 onto error
+/// codes 1..=18 (docs/FFI.md §1.3, frozen). Removing or renaming a variant
+/// breaks `corvid-ffi`'s compilation; **adding** one is invisible to its
+/// snapshot test (a downstream crate cannot enumerate a foreign
+/// `#[non_exhaustive]` enum) — a change here requires updating
+/// `corvid-ffi/src/error.rs`'s `every_engine_variant` + `code_of` + the
+/// FFI.md §1.3 table in the same PR.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
