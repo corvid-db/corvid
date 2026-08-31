@@ -240,6 +240,14 @@ walks incl. score presence/absence per source shape.
 
 ### Task 6: Indexes, schema, TTL-admin, graph, geo, admin
 
+Prepend (Task 5 review, binding): corvid_compact's gate must NOT treat
+counter==1 alone as engine-idle cross-thread — the counter is released at
+execute() entry while the Arc clone lives; back the gate with Arc
+exclusivity (Arc::try_unwrap or get_mut) AND the counter, per spec §4.13's
+intent. Also: metric_of's error message hardcodes corvid_query_vector —
+parameterize if reused; add the rows-survive-close pin (cosmetic gap,
+T4's page tests cover the identical shape).
+
 The 13 index/schema fns (all create variants incl. pq m/k + ondisk,
 set_schema from field_def array, schema iterator); graph 8; geo 3 +
 shared iterators; admin: dump_to_path/load_from_path/
