@@ -2125,6 +2125,24 @@ static void run_scenario(const char *path) {
     }
     if (starts_with_db(path)) open_memory();
 
+    /* `lines` is counted in an INDEPENDENT pre-scan (the same rule the
+     * Rust driver applies), so a dispatch loop that skips a counted
+     * line — a stray `continue`, a swallowed branch — diverges from
+     * `executed` and the check below reports it, instead of the two
+     * fields silently reading one counter. The scan is non-destructive
+     * (no NUL writes): the dispatch pass re-splits the same buffer. */
+    long lines = 0;
+    for (const char *q = buf; q && *q;) {
+        const char *nl = strchr(q, '\n');
+        const char *end = nl ? nl : q + strlen(q);
+        /* skip spaces and a trailing \r, then apply the same executable
+         * rule: blank or '#' lines are not executable. */
+        const char *first = q;
+        while (first < end && (*first == ' ' || *first == '\r')) first++;
+        if (first < end && *first != '#') lines++;
+        q = nl ? nl + 1 : NULL;
+    }
+
     long executed = 0;
     char *p = buf;
     while (p && *p) {
@@ -2170,7 +2188,9 @@ static void run_scenario(const char *path) {
     }
     free(buf);
     close_db();
-    printf("SMOKE %s lines=%ld executed=%ld\n", path, executed, executed);
+    if (executed != lines)
+        fail("dispatched %ld of %ld counted executable lines", executed, lines);
+    printf("SMOKE %s lines=%ld executed=%ld\n", path, lines, executed);
     fflush(stdout);
 }
 

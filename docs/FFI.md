@@ -181,17 +181,21 @@ typedef enum corvid_field_type {
 } corvid_field_type;          /* mirrors schema.rs FieldType::to_byte (0..8) */
 ```
 
-*(Erratum, 2026-08-28, Task 7 — discovered by compiling the C smoke
-suite: ISO C forbids one identifier from being both a typedef and a
-function in the same scope, and the appendix-locked FUNCTION
-`corvid_value_type` (§4.4) collides with §1.4's `corvid_value_type`
-TYPE spelling above — the pre-fix header did not compile as C at all.
-The generated `corvid.h` therefore spells the value-discriminant TYPE
-`corvid_value_type_t` (cbindgen `export.rename`; every use updates,
-including §4.4's signature rendering). The enum NAME, its members
-`CORVID_TYPE_NULL..=VECTOR`, and their frozen 0..=8 values are
-unchanged; the function name is unchanged; no other type collides.
-C sources should write `corvid_value_type_t` for the type.)*
+*(Erratum, 2026-08-28, Task 7; reworded in the Task 7 review round —
+discovered by compiling the C smoke suite: ISO C forbids one identifier
+from being both a typedef and a function in the same scope, and the
+appendix-locked FUNCTION `corvid_value_type` (§4.4) collides with
+§1.4's `corvid_value_type` TYPE spelling above — the pre-fix header did
+not compile as C at all. Precisely: the FUNCTION name
+`corvid_value_type` and all member values
+(`CORVID_TYPE_NULL..=VECTOR`, frozen 0..=8) are UNCHANGED; in the
+generated `corvid.h` the type's typedef AND its enum tag are both
+spelled `corvid_value_type_t` (cbindgen `export.rename`; §4.4's
+signature rendering follows). The only place the old spelling remains
+is §1.4's deliberately-frozen enum-value block above, kept verbatim as
+the historical record of the frozen values; C sources write
+`corvid_value_type_t` for the type. No other §1.4 type collides with a
+function name.)*
 
 ### 1.5 Strings, keys, and lengths
 
@@ -468,7 +472,7 @@ does not matter for equality or encoding.
 ### 4.4 Value reads (12)
 
 ```c
-corvid_value_type corvid_value_type(const corvid_value *v);
+corvid_value_type_t corvid_value_type(const corvid_value *v);
 ```
 The value's discriminant. Counterpart: the `Value` variant
 (`std::mem::discriminant`). A NULL `v` follows the non-status rule (§7):

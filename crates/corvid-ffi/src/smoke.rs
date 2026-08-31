@@ -56,7 +56,9 @@
 //! `-Zsanitizer=address` — mixing an instrumented executable with an
 //! uninstrumented dylib is unsupported); `CORVID_SMOKE_ASAN=1` then adds
 //! `-fsanitize=address,undefined` to BOTH the compile and the link of
-//! smoke.c and points the child's `ASAN_OPTIONS` at leak detection.
+//! smoke.c and points the child's `ASAN_OPTIONS` at leak detection —
+//! `detect_leaks=1` everywhere EXCEPT macOS arm64, where the runtime
+//! does not support LSan (x86_64 macOS and Linux both leak-check).
 //! `CORVID_SMOKE_CC`, `CORVID_SMOKE_CFLAGS`, and
 //! `CORVID_SMOKE_LDFLAGS` exist for the CI matrix's compiler/flag
 //! overrides; values are shell-split and passed through verbatim.
@@ -263,10 +265,11 @@ fn run_smoke_suite() {
     }
     if asan_mode() {
         let opts = std::env::var("ASAN_OPTIONS").unwrap_or_else(|_| {
-            if cfg!(target_os = "macos") {
-                // LSan is unsupported on macOS arm64 (ASan aborts if
-                // detect_leaks is forced there); the leak half of the
-                // variant runs in the Linux CI job (Task 8).
+            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                // LSan is unsupported on macOS arm64 (the runtime aborts
+                // if detect_leaks is forced there); x86_64 macOS and
+                // Linux both support it and get the leak gate. The arm64
+                // leak half runs in the Linux CI job (Task 8).
                 "halt_on_error=1".to_owned()
             } else {
                 "detect_leaks=1:halt_on_error=1".to_owned()
