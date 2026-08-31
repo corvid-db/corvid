@@ -1,11 +1,11 @@
-# Byte-compared and line-parsed artifacts must check out byte-identical
-# on every platform. Windows runners (and Windows contributors) default
-# to core.autocrlf=true, whose LF->CRLF checkout rewrite broke the
-# corvid-ffi header drift gate on the Windows CI leg (cbindgen renders
-# LF; the committed copy came back CRLF) and would corrupt the golden
-# fixtures' line protocol for smoke.c's tokenizer (a trailing CR rides
-# the last token of every line).
-crates/corvid-ffi/corvid.h text eol=lf
-crates/corvid-ffi/golden/** text eol=lf
-crates/corvid-ffi/c/** text eol=lf
-docs/FFI.md text eol=lf
+# LF everywhere, on every platform. Windows runners (and Windows
+# contributors) default to core.autocrlf=true, whose LF->CRLF checkout
+# rewrite breaks this repo in two measured ways (the Windows CI leg of
+# Phase-0 Task 8 caught both): the corvid-ffi header drift gate
+# byte-diffs the committed corvid.h against the cbindgen render (the
+# render is LF), and cbindgen itself reads the checked-out src/*.rs —
+# CRLF sources inject \r into every doc comment it embeds in the
+# generated header. The golden fixtures' line protocol (smoke.c's
+# tokenizer) is equally byte-sensitive. `text=auto` keeps binary
+# detection; `eol=lf` pins the checkout.
+* text=auto eol=lf

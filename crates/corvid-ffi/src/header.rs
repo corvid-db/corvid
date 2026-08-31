@@ -55,10 +55,36 @@ fn header_h_stays_generated_from_the_crate() {
             path.display()
         )
     });
-    assert_eq!(
-        committed, rendered,
-        "crates/corvid-ffi/corvid.h is out of sync with the crate sources \
-         — regenerate with CORVID_GEN_HEADER=1 cargo test -p corvid-ffi \
-         header_h_stays_generated"
-    );
+    if committed != rendered {
+        // Diagnose before panicking: lengths + the first differing byte
+        // window, so a Windows-checkout line-ending rewrite (the Task 8
+        // CI round) is identifiable from the log alone instead of a
+        // 90 KB undiffable assert dump.
+        let (cl, rl) = (committed.len(), rendered.len());
+        let idx = committed
+            .bytes()
+            .zip(rendered.bytes())
+            .position(|(a, b)| a != b)
+            .unwrap_or(cl.min(rl));
+        let window = |s: &str| -> String {
+            s[idx.saturating_sub(30)..(idx + 30).min(s.len())]
+                .chars()
+                .map(|c| {
+                    if c.is_control() {
+                        format!("\\x{:02x}", c as u32)
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect()
+        };
+        panic!(
+            "crates/corvid-ffi/corvid.h is out of sync with the crate sources \
+             — regenerate with CORVID_GEN_HEADER=1 cargo test -p corvid-ffi \
+             header_h_stays_generated. Lengths {cl} vs {rl}; first difference \
+             at byte {idx}: committed {:?} vs rendered {:?}",
+            window(&committed),
+            window(&rendered)
+        );
+    }
 }

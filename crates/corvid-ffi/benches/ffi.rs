@@ -85,21 +85,19 @@ fn manifest_dir() -> PathBuf {
 }
 
 /// The release cdylib the documented invocation just built. `cargo
-/// bench` does NOT produce it (the bench target does not depend on the
-/// lib — cdylib-only, and cargo builds no harness from it under
-/// `bench = false`), so the two-command invocation is load-bearing and
-/// a FRESHNESS tripwire backs it: the newest `src/**/*.rs` mtime must
-/// not be newer than the artifact's, so an edited-but-unbuilt crate
-/// fails loudly instead of silently benchmarking the stale ABI (this
-/// exact hazard: a T2-era 10-symbol dylib was found in target/release
-/// while developing this bench).
+/// bench` does NOT produce it (nothing in the bench graph depends on
+/// the cdylib-only lib target), so the two-command invocation is
+/// load-bearing and a FRESHNESS tripwire backs it: the newest
+/// `src/**/*.rs` mtime must not be newer than the artifact's, so an
+/// edited-but-unbuilt crate fails loudly instead of silently
+/// benchmarking the stale ABI (this exact hazard: a T2-era 10-symbol
+/// dylib was found in target/release while developing this bench).
 fn cdylib_artifact() -> PathBuf {
+    // NOT canonicalized: Windows canonicalize yields \\?\-verbatim
+    // paths MSVC link refuses (src/smoke.rs's note).
     let mut dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let default = manifest_dir().join("..").join("..").join("target");
-            default.canonicalize().unwrap_or(default)
-        });
+        .unwrap_or_else(|| manifest_dir().join("..").join("..").join("target"));
     dir.push("release");
     let artifact = ["libcorvid.dylib", "libcorvid.so", "corvid.dll"]
         .iter()

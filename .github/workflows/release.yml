@@ -96,12 +96,12 @@ jobs:
           else
             cargo build -p corvid-ffi --release --target "${{ matrix.target }}"
           fi
-      - name: Archive the FFI artifact set (unix)
+      - name: Stage the FFI artifact set (unix)
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
           T="${{ matrix.target }}"
-          DIR="corvid-ffi-${GITHUB_REF_NAME}-${T}"
+          DIR="ffi-stage/corvid-ffi-${GITHUB_REF_NAME}-${T}"
           mkdir -p "${DIR}/golden"
           if [ -f "target/${T}/release/libcorvid.so" ]; then
             cp "target/${T}/release/libcorvid.so" "${DIR}/"
@@ -110,29 +110,38 @@ jobs:
           fi
           cp crates/corvid-ffi/corvid.h "${DIR}/"
           cp crates/corvid-ffi/golden/*.txt "${DIR}/golden/"
-          tar -czf "${DIR}.tar.gz" "${DIR}"
-          ls -l "${DIR}.tar.gz"
+          # the staging tree lives under ffi-stage/ so the archive (and
+          # only the archive) lands at the workspace root
+          tar -czf "corvid-ffi-${GITHUB_REF_NAME}-${T}.tar.gz" -C ffi-stage "corvid-ffi-${GITHUB_REF_NAME}-${T}"
+          ls -l "corvid-ffi-${GITHUB_REF_NAME}-${T}.tar.gz"
       # Windows ships the DLL plus its MSVC import library
       # (corvid.dll.lib — the documented linking path for binding
       # authors; see the Windows/MSVC note in the release notes).
-      - name: Archive the FFI artifact set (Windows)
+      - name: Stage the FFI artifact set (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $T = "${{ matrix.target }}"
-          $Dir = "corvid-ffi-${env:GITHUB_REF_NAME}-$T"
+          $Name = "corvid-ffi-${env:GITHUB_REF_NAME}-$T"
+          $Dir = "ffi-stage/$Name"
           New-Item -ItemType Directory -Force "$Dir/golden" | Out-Null
           Copy-Item "target/$T/release/corvid.dll" "$Dir/"
           Copy-Item "target/$T/release/corvid.dll.lib" "$Dir/"
           Copy-Item crates/corvid-ffi/corvid.h "$Dir/"
           Copy-Item crates/corvid-ffi/golden/*.txt "$Dir/golden/"
-          Compress-Archive -Path "$Dir" -DestinationPath "$Dir.zip"
-          Get-Item "$Dir.zip"
+          Compress-Archive -Path "$Dir" -DestinationPath "$Name.zip"
+          Get-Item "$Name.zip"
+      # archive FILES only — a bare `corvid-ffi-*` glob also matches the
+      # staging directory, and the download would then merge the
+      # directory tree into dist/ alongside the archives (the first
+      # dry-run failed sha256sum on exactly that).
       - name: Upload FFI archive as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: corvid-ffi-${{ matrix.target }}
-          path: corvid-ffi-*
+          path: |
+            corvid-ffi-*.tar.gz
+            corvid-ffi-*.zip
           if-no-files-found: error
 
   release:
