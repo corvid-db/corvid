@@ -200,11 +200,58 @@ the multi-µs 8-thread fork/join handshake (measured wait ≈ 94 µs per
 dispatch); 7 spin-polling workers degraded the caller's own sequential
 phase. The redirected lever is per-eval SIMD kernels (AUDIT Open).
 
-## Current full suite (program exit, 2026-08-29) — the NEW baseline
+## Current full suite (ledger-closure exit, 2026-08-31) — the NEW baseline
+
+Full-suite run at the ledger-closure program exit (`2584dc6` family; all
+groups in one `cargo bench` invocation, same machine). Supersedes the
+2026-08-29 table below. Suite-context numbers — see "Regression check at
+exit" for the isolated-vs-suite frame. Means [95% CI]:
+
+| Bench | Mean | 95% CI |
+|---|---|---|
+| value_encode | 409.44 ns | [408.99, 411.51] |
+| value_decode | 872.73 ns | [872.36, 876.42] |
+| hnsw_build_2k_64d | 125.92 ms | [125.73, 126.11] |
+| hnsw_search_2k_64d | 19.04 µs | [18.97, 19.10] |
+| hnsw_build_pq_2k_64d | 365.69 ms | [363.03, 369.07] |
+| hnsw_search_pq_2k_64d | 37.79 µs | [36.85, 39.14] |
+| hnsw_build_none_10k_128d (from pq_train group) | see Task 13 section | — |
+| pq_train_2k_64d (parallel) | 64.93 ms | suite context |
+| pq_train_10k_128d (parallel) | 381.68 ms | suite context |
+| bm25_exact_2k | 8.033 ms | [7.968, 8.143] |
+| bm25_indexed_2k | 490.10 µs | [483.54, 498.24] |
+| dot_768d | 81.07 ns | [80.42, 81.68] |
+| l2_768d | 84.26 ns | [82.48, 84.98] |
+| cosine_768d | 224.29 ns | [220.86, 231.60] |
+| edge_link_10k | 392.98 ms | suite context |
+| edge_delete_sweep_100 | 49.70 ms | suite context |
+| delete_heavy/delete_half_2p5k | 230.39 ms | suite context |
+| delete_heavy/insert_unique_scalar_5k | 185.72 ms | suite context |
+| compound_prefix_scan/eq_leading_only_5k | 251.09 µs | suite context |
+| selective_window_verify/eq_50_of_5k | 236.20 µs | suite context |
+| selective_window_verify/eq_500_of_5k | 619.56 µs | suite context |
+| order_by_indexed_5k/asc_limit20 | 312.61 µs | suite context |
+| order_by_indexed_5k/desc_limit20 | 1.009 ms | suite context |
+| index_creation_ondisk/create_text_index_ondisk_5k | 230.22 ms | suite context |
+| index_creation_ondisk/create_vector_index_ondisk_2k_8d | 402.82 ms | suite context |
+
+Deltas vs the 2026-08-29 baseline worth naming: `bm25_exact_2k` +5.0%
+(the CJK-aware tokenize pass on the latin bench — the documented residual,
+"Ledger-closure Task 4 note"); the delete/edge family sits above its
+recorded isolated AFTERs (sweep 49.7 vs 40.5 ms isolated, delete_half
+230.4 vs 194.5 ms isolated) — the documented suite-vs-isolated context
+gap, unchanged code, isolated re-probes confirmed during the ledger-closure
+exit; `value_decode` +3.0% and the distance kernels +1-5% are ambient
+machine drift of the class documented in the regression-check section.
+Diagnostic groups (`bandwidth/`, `kernel_scaling/`, `kernel_stream/`,
+`declined_probes/`, `quantized_scan/`, `value_store_io/`) carry their own
+sections below and are unchanged within noise.
+
+## Prior full suite (program exit, 2026-08-29) — superseded baseline
 
 Full-suite run at program exit (all groups in one `cargo bench`
 invocation, same machine, working tree at the Task-14 carry-in commit).
-This is the baseline future work compares against. Means [95% CI]:
+Kept for delta-computation. Means [95% CI]:
 
 | Bench | Mean | 95% CI |
 |---|---|---|
