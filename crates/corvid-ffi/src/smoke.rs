@@ -118,9 +118,15 @@ fn cdylib_artifact() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             // <crate>/../.. is the workspace root; its target/ is the
-            // default shared directory.
-            let default = manifest_dir().join("..").join("..").join("target");
-            default.canonicalize().unwrap_or(default)
+            // default shared directory. NOT canonicalize(): on Windows
+            // that returns a \\?\-prefixed verbatim path MSVC link
+            // refuses (LNK1104, the Task 8 windows round) — the `..`
+            // segments are resolved by component popping instead, a
+            // clean absolute path with nothing for the toolchain to
+            // reinterpret.
+            let mut dir = manifest_dir();
+            assert!(dir.pop() && dir.pop(), "CARGO_MANIFEST_DIR is the crate");
+            dir.join("target")
         });
     let layouts = [base.join(profile), base.join(host_triple()).join(profile)];
     let find = |layouts: &[PathBuf]| -> Option<PathBuf> {
@@ -292,9 +298,16 @@ fn build_smoke(workdir: &Path) -> PathBuf {
     let out = cmd
         .output()
         .unwrap_or_else(|e| panic!("run the C compiler {:?}: {e}", compiler.path()));
+    // The argv dump makes linker-path failures diagnosable from CI logs
+    // alone (the Windows MSVC round produced a mangled-looking
+    // '\\corvid.dll.lib' in LNK1104 with no way to see what was passed).
+    let argv = std::iter::once(compiler.path().display().to_string())
+        .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
         out.status.success(),
-        "compiling c/smoke.c failed:\n{}{}",
+        "compiling c/smoke.c failed (argv: {argv}):\n{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
