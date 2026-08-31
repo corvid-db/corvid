@@ -34,6 +34,10 @@ corvid.workspace = true
 [dev-dependencies]
 cbindgen.workspace = true
 tempfile.workspace = true
+# Test-only: compiles c/smoke.c at TEST RUNTIME and links the just-built
+# cdylib by path (src/smoke.rs — the cc crate used as a library, not the
+# build-script usage; nothing is ever linked into the shipped cdylib).
+cc.workspace = true
 # Test-only: the variant-inventory snapshot test (src/error.rs) constructs
 # one instance of every engine error, and six of the eighteen variants wrap
 # redb's passthrough error types — redb's public error enums are the only

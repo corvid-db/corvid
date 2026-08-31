@@ -1,0 +1,56 @@
+# queries.txt — predicates × query shapes, hybrid RRF, order_by class
+# rule, aggregations (spec §4.5/§4.6/§4.7). Scores are RRF 1/(k+rank)
+# with k=60 — the fused hybrid pins 2/61 and 2/62.
+COLL	docs	t(docs)
+INSERT	s1,{kind=t(doc),tag=t(s),n=1,x=1.5,body=t(rust embedded database),v=vec(1,0)}	ok
+INSERT	s2,{kind=t(doc),tag=t(w),n=2,x=2.5,body=t(python web frameworks),v=vec(0,1)}	ok
+INSERT	s3,{kind=t(doc),tag=t(s),n=3,x=4.0,body=t(rust again database),v=vec(0.9,0.1)}	ok
+INSERT	m1,{kind=t(meta),n=0.5}	ok
+INSERT	m2,{kind=t(meta),n=6}	ok
+INSERT	nb,5	ok
+# predicates: numeric interop (int vs float), ranges, text, membership
+QF_COUNT	n,eq,1	1
+QF_COUNT	n,eq,0.5	1
+QF_EXISTS	kind	5
+QF_EXISTS	missing	0
+QF_BETWEEN	n,0.5,2	3
+QF_STARTS	body,t(rust)	2
+QF_CONTAINS	body,t(database)	2
+QF_AND	n,ge,1,n,le,3	3
+QF_OR	n,eq,1,n,eq,6	2
+QF_NOT	n,eq,1	5
+PRED_FREE	n,eq,1	ok
+Q_ABANDON		ok
+# hybrid: filter + vector + text sources, RRF + MMR + limit (§4.6) —
+# s1 is rank 1 of both sources (2/61), s3 rank 2 of both (2/62)
+HYBRID	v,vec(1,0),2,body,t(rust database),2,2	k(s1,s3)|~0.032787,~0.032258
+# the same with a tag filter: pre-ranking predicate over the filtered set
+HYBRID_F	v,vec(1,0),2,body,t(rust database),2,t(s),2	k(s1,s3)|~0.032787,~0.032258
+# a lone vector source scores 1/(60+rank) per row (§4.6)
+QVEC	v,vec(1,0),3	k(s1,s3,s2)|~0.016393,~0.016129,~0.015873
+# a BM25 text source's keys (order deterministic for the corpus)
+QTEXT	body,t(rust database),2	k(s1,s3)
+# approx execution answers identically for this corpus
+APPROX	v,vec(1,0),3	k(s1,s3,s2)
+# order_by class rule (§4.6/audit C4): numbers first in value order,
+# rows missing the field last, ties by key; descending reverses within
+# class only
+ORDER_BY	n,0,0,99	k(m1,s1,s2,s3,m2,nb)
+ORDER_BY	n,1,0,99	k(m2,s3,s2,s1,m1,nb)
+ORDER_BY	n,0,2,2	k(s2,s3)
+# select projects to the named top-level fields (§4.6)
+SELECT	(n,tag),k(s2)	{n=2,tag=t(w)}
+# aggregations (§4.7): exact values
+AGG_COUNT		6
+AGG_DISTINCT	n	5
+AGG_SUM	x	~8
+AGG_AVG	x	~2.666667
+AGG_AVG	missing	none
+AGG_MIN	x	1.5
+AGG_MAX	x	4.0
+AGG_MAX	n	6
+# group keys: text bare, int/float type-tagged (§4.7), ascending bytes
+AGG_GCOUNT	tag	g(s=2,w=1)
+AGG_GSUM	tag,x	g(s=~5.5,w=~2.5)
+AGG_GAVG	tag,x	g(s=~2.75,w=~2.5)
+AGG_GCOUNT	n	g(f:0.5=1,i:1=1,i:2=1,i:3=1,i:6=1)

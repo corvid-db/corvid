@@ -181,6 +181,18 @@ typedef enum corvid_field_type {
 } corvid_field_type;          /* mirrors schema.rs FieldType::to_byte (0..8) */
 ```
 
+*(Erratum, 2026-08-28, Task 7 — discovered by compiling the C smoke
+suite: ISO C forbids one identifier from being both a typedef and a
+function in the same scope, and the appendix-locked FUNCTION
+`corvid_value_type` (§4.4) collides with §1.4's `corvid_value_type`
+TYPE spelling above — the pre-fix header did not compile as C at all.
+The generated `corvid.h` therefore spells the value-discriminant TYPE
+`corvid_value_type_t` (cbindgen `export.rename`; every use updates,
+including §4.4's signature rendering). The enum NAME, its members
+`CORVID_TYPE_NULL..=VECTOR`, and their frozen 0..=8 values are
+unchanged; the function name is unchanged; no other type collides.
+C sources should write `corvid_value_type_t` for the type.)*
+
 ### 1.5 Strings, keys, and lengths
 
 - Strings and keys cross the ABI as **pointer + length** pairs and are
@@ -1129,8 +1141,10 @@ int corvid_strs_next(corvid_strs *s, const char **str_out, size_t *len_out);
 ```
 Next string: 1 fetched, 0 exhausted. BORROWED until the next call or
 `corvid_strs_free`. NULL-handle / NULL-out-param behavior follows the
-non-status rule (§7). No direct engine counterpart (cursor over
-`Vec<String>`).
+non-status rule (§7). No direct engine counterpart (cursor over the
+materialized byte-string list — §2's erratum applies here too: the
+backing is `Vec<Vec<u8>>`, not `Vec<String>`, so graph keys keep their
+arbitrary bytes; the cursor contract is unchanged).
 
 ```c
 void corvid_strs_free(corvid_strs *s);
@@ -1138,9 +1152,15 @@ void corvid_strs_free(corvid_strs *s);
 
 ### 4.13 Admin (5)
 
-Path-based administrative operations. All wrap `corvid::Db` methods;
-the FFI opens the files itself (`std::fs::File`) and hands them to the
-engine's generic `Read`/`Write` methods.
+Path-based administrative operations. All wrap `corvid::Db` methods.
+Dump and load open the files themselves (`std::fs::File`) and hand them
+to the engine's generic `Read`/`Write` methods; `corvid_backup` passes
+the PATH through to `Db::backup` directly — the engine opens the backup
+file itself, so the FFI never touches a file handle on that call.
+*(Erratum, 2026-08-28, Task 7 spec-text: this paragraph previously read
+"the FFI opens the files itself" for all of §4.13 — over-general; only
+the dump/load pair works through `File` objects. No signature or error
+set changes.)*
 
 ```c
 corvid_status corvid_dump_to_path(corvid_db *db, const char *path, size_t path_len);

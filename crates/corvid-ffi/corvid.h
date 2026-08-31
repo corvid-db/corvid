@@ -313,7 +313,7 @@ typedef uint32_t corvid_cmp;
  * engine's constants are not `pub`, so the correspondence is pinned by
  * the `type_tags_are_frozen...` test instead of a const reference.
  */
-enum corvid_value_type
+enum corvid_value_type_t
 #if __STDC_VERSION__ >= 202311L
   : uint32_t
 #endif // __STDC_VERSION__ >= 202311L
@@ -356,9 +356,9 @@ enum corvid_value_type
   CORVID_TYPE_VECTOR = 8,
 };
 #if __STDC_VERSION__ >= 202311L
-typedef enum corvid_value_type corvid_value_type;
+typedef enum corvid_value_type_t corvid_value_type_t;
 #else
-typedef uint32_t corvid_value_type;
+typedef uint32_t corvid_value_type_t;
 #endif // __STDC_VERSION__ >= 202311L
 
 /**
@@ -1739,7 +1739,7 @@ corvid_status corvid_value_map_put(corvid_value *map,
  * bits as a real Null value, which is the price of having no status
  * channel; distinguish by reading the recorded error.
  */
-corvid_value_type corvid_value_type(const corvid_value *v);
+corvid_value_type_t corvid_value_type(const corvid_value *v);
 
 /**
  * Typed read with an ok-flag (spec §4.4; counterpart:

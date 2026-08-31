@@ -390,6 +390,47 @@ mod tests {
         assert_eq!(corvid_close(db), CORVID_OK);
     }
 
+    /// Radius ties break by KEY (the Task 6 review prepend): two points
+    /// at the exact same haversine distance from the query center —
+    /// (0, 10) and (0, −10) mirror across the meridian, so the squared
+    /// sin/cos terms are bitwise equal — come back in key order, with
+    /// bitwise-equal distances. The nearest-`k` tie is pinned in
+    /// `nearest_is_exact_with_key_tiebreak`; this is the radius form.
+    #[test]
+    fn radius_ties_break_by_key() {
+        let (db, coll) = fresh();
+        let (field, field_len) = s("loc");
+        insert(coll, b"west", place(0.0, -10.0));
+        insert(coll, b"east", place(0.0, 10.0));
+        insert(coll, b"far", place(0.0, 90.0));
+
+        let hits = corvid_geo_within_radius(coll, field, field_len, 0.0, 0.0, 12000.0);
+        assert!(!hits.is_null());
+        let walked = walk(hits, true);
+        assert_eq!(
+            walked.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            vec![b"east".to_vec(), b"west".to_vec(), b"far".to_vec()],
+            "the equidistant pair in key order (east < west), then far"
+        );
+        assert_eq!(
+            walked[0].1, walked[1].1,
+            "the tie is exact: haversine is mirror-symmetric, bitwise"
+        );
+        assert_eq!(walked[0].1, corvid::haversine_km(0.0, 0.0, 0.0, 10.0));
+        corvid_geohits_free(hits);
+
+        // A radius that reaches ONLY the tied pair keeps the key order
+        // and the inclusive boundary.
+        let pair_km = corvid::haversine_km(0.0, 0.0, 0.0, 10.0);
+        let hits = corvid_geo_within_radius(coll, field, field_len, 0.0, 0.0, pair_km);
+        let keys: Vec<Vec<u8>> = walk(hits, true).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec![b"east".to_vec(), b"west".to_vec()]);
+        corvid_geohits_free(hits);
+
+        corvid_collection_free(coll);
+        assert_eq!(corvid_close(db), CORVID_OK);
+    }
+
     /// bbox: key order, the 0.0 distance sentinel, entry validation
     /// (lat/lon ranges, NaN, inverted latitude → `CORVID_E_ARGUMENT`),
     /// and the antimeridian wrap.

@@ -1,0 +1,39 @@
+# schema.txt — schema declaration/read-back over all 9 field types,
+# enforcement (unique/required/type), batch rollback, every index
+# create variant (spec §4.10).
+SET_SCHEMA	name#text#1#0,email#text#0#1	ok
+SCHEMA		name/text/1/0,email/text/0/1
+# all nine corvid_field_type discriminants round-trip (§1.4)
+SCHEMA9		0,1,2,3,4,5,6,7,8
+# the working schema (SCHEMA9 replaced it): conforming docs first
+SET_SCHEMA	name#text#1#0,email#text#0#1,f#vector#0#0	ok
+INSERT	u1,{name=t(rocky),email=t(a@x),f=vec(1,0,0,0)}	ok
+# violations: duplicate unique value, missing required, wrong type
+# (§4.10 — nothing is stored on failure)
+SCHEMA_ERR	u2,{name=t(zoe),email=t(a@x),f=vec(0,1,0,0)}	err:15
+SCHEMA_ERR	u3,{email=t(b@x),f=vec(0,0,1,0)}	err:15
+SCHEMA_ERR	u4,{name=5,email=t(c@x),f=vec(0,0,0,1)}	err:15
+LEN		1
+# put_many is atomic: a violating pair rolls the whole batch back
+PUTMANY_ROLLBACK	u5,{name=t(p),email=t(a@x),f=vec(1,1,0,0)},u6,{name=t(q),email=t(d@x),f=vec(0,1,1,0)}	err:15
+LEN		1
+# more training vectors, then every index create (§4.10)
+INSERT	w1,{name=t(a),email=t(w1@x),f=vec(0.9,0.1,0,0)}	ok
+INSERT	w2,{name=t(b),email=t(w2@x),f=vec(0.1,0.9,0,0)}	ok
+INSERT	w3,{name=t(c),email=t(w3@x),f=vec(0.5,0.5,0.5,0.5)}	ok
+INSERT	w4,{name=t(d),email=t(w4@x),f=vec(1,1,1,1)}	ok
+IDX_SCALAR	name	ok
+IDX_COMPOUND	name,email	ok
+IDX_TEXT	body	ok
+IDX_TEXT_DISK	body	ok
+IDX_GEO	loc	ok
+IDX_VEC	f,cosine	ok
+IDX_VEC_Q	f,dot,binary	ok
+IDX_VEC_DISK	f,l2	ok
+IDX_VEC_DISK_Q	f,cosine,scalar	ok
+IDX_PQ	f,cosine,2,2	ok
+IDX_PQ_DISK	f,l2,2,2	ok
+# PQ domain failures fold into EmptyIndexTraining (§4.10): dim%m!=0,
+# and no training vectors on a fresh field
+IDX_PQ_ERR	f,cosine,3,2	err:14
+IDX_PQ_ERR	missing,cosine,2,2	err:14

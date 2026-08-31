@@ -174,6 +174,7 @@ name = "corvid-ffi"
 version = "0.1.1"
 dependencies = [
  "cbindgen",
+ "cc",
  "corvid",
  "redb",
  "tempfile",

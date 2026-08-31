@@ -1,0 +1,28 @@
+# geo.txt — radius (nearest-first, ties by key, inclusive boundary),
+# bbox (key order, 0.0 sentinel, validated bounds), nearest-k (spec
+# §4.12). Distances are haversine kilometres, checked at ~1e-6.
+GINSERT	berlin,52.52,13.40	ok
+GINSERT_M	potsdam,52.40,13.06	ok
+GINSERT	hamburg,53.55,9.99	ok
+GINSERT	munchen,48.14,11.58	ok
+INSERT	nogeo,{x=1}	ok
+# radius: nearest first, both point encodings, invalid points skipped
+RADIUS	loc,52.52,13.40,600.0	k(berlin,potsdam,hamburg,munchen)|~0,~26.621424,~255.120591,~503.833264
+# radius ties break by key: (0,10) and (0,-10) are equidistant from
+# (0,0) — east < west in byte order, distances bitwise equal
+GINSERT	east,0,10	ok
+GINSERT	west,0,-10	ok
+RADIUS	loc,0,0,2000.0	k(east,west)|~1111.9508020802,~1111.9508020802
+# bbox: key order, the 0.0 sentinel (no center)
+BBOX	loc,47,5,55,15	k(berlin,hamburg,munchen,potsdam)|~0,~0,~0,~0
+BBOX	loc,53,9,54,10.5	k(hamburg)|~0
+BBOX_ERR	loc,91,0,90,0	err:12
+BBOX_ERR	loc,10,0,5,0	err:12
+# nearest-k: exact order, k=0 empty
+NEAREST	loc,52.52,13.40,2	k(berlin,potsdam)|~0,~26.621424
+NEAREST	loc,0,0,2	k(east,west)|~1111.9508020802,~1111.9508020802
+NEAREST	loc,0,0,0	k()
+# pred_geo_within drives the filter form (§4.5)
+QF_GEO	loc,0,0,1200.0	2
+IDX_GEO	loc	ok
+RADIUS	loc,0,0,1200.0	k(east,west)|~1111.9508020802,~1111.9508020802

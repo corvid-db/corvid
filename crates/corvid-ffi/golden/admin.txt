@@ -1,0 +1,33 @@
+# admin.txt — dump/load (incl. renames), backup, compact gate (spec
+# §4.13). File paths live under the harness's workdir; each scenario
+# starts on a fresh in-memory db and switches to file dbs via FILEDB*.
+FILEDB		ok
+COLL	docs	t(docs)
+INSERT	a,{n=1}	ok
+INSERT	b,{n=2}	ok
+LINK	a,rel,b	ok
+INSERT_TTL	t,{n=3},99	ok
+COLLECTIONS		k(docs)
+# dump + backup (a FRESH file): the same target twice fails
+DUMP		ok
+BACKUP		ok
+BACKUP_DUP		err:17
+# compact needs quiescence: the live collection handle answers BUSY,
+# freeing it opens the gate (§4.13)
+COMPACT_BUSY		err:19
+COMPACT		ok
+# loading the dump back merges into the same db: state unchanged
+LOAD		ok
+COLLECTIONS		k(docs)
+AGG_COUNT		3
+GETFIELD	a,n	1
+# a second file db: replay with a rename map (§4.13)
+FILEDB2		ok
+LOAD_RENAMES	docs,renamed	ok
+COLLECTIONS		k(renamed)
+COLL	renamed	t(renamed)
+AGG_COUNT		3
+GETFIELD	a,n	1
+# an invalid rename target is rejected before the stream is read
+FILEDB2		ok
+LOAD_RENAMES	docs,__bad	err:11

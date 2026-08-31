@@ -1215,6 +1215,73 @@ mod tests {
         assert_eq!(corvid_close(db), CORVID_OK);
     }
 
+    /// The full field-type mapping pin (the Task 6 review prepend): a
+    /// schema declared over ALL NINE `corvid_field_type` discriminants
+    /// reads back through `corvid_schema` + `corvid_schemaiter_next`
+    /// with every discriminant intact, in declaration order — the ABI
+    /// enum, the engine `FieldType`, and the cursor's POD round trip are
+    /// one bijection (the in-memory `field_type_of` loop in the
+    /// round-trip test above cannot see the engine crossing).
+    #[test]
+    fn set_schema_round_trips_all_nine_field_types() {
+        use corvid_field_type::CORVID_FIELD_ANY;
+        use corvid_field_type::CORVID_FIELD_ARRAY;
+        use corvid_field_type::CORVID_FIELD_BOOL;
+        use corvid_field_type::CORVID_FIELD_BYTES;
+        use corvid_field_type::CORVID_FIELD_FLOAT;
+        use corvid_field_type::CORVID_FIELD_INT;
+        use corvid_field_type::CORVID_FIELD_MAP;
+        use corvid_field_type::CORVID_FIELD_TEXT;
+        use corvid_field_type::CORVID_FIELD_VECTOR;
+
+        let (db, coll) = fresh();
+        let all = [
+            ("f_any", CORVID_FIELD_ANY, false, false),
+            ("f_bool", CORVID_FIELD_BOOL, true, false),
+            ("f_int", CORVID_FIELD_INT, false, false),
+            ("f_float", CORVID_FIELD_FLOAT, false, false),
+            ("f_text", CORVID_FIELD_TEXT, true, false),
+            ("f_bytes", CORVID_FIELD_BYTES, false, false),
+            ("f_vector", CORVID_FIELD_VECTOR, false, false),
+            ("f_array", CORVID_FIELD_ARRAY, false, false),
+            ("f_map", CORVID_FIELD_MAP, false, true),
+        ];
+        let defs: Vec<corvid_field_def> = all
+            .iter()
+            .map(|(name, ty, required, unique)| field_def(name, *ty, *required, *unique))
+            .collect();
+        assert_eq!(
+            corvid_set_schema(coll, defs.as_ptr(), defs.len()),
+            CORVID_OK
+        );
+
+        let mut it: *mut crate::handle::corvid_schemaiter = std::ptr::null_mut();
+        assert_eq!(corvid_schema(coll, &mut it), CORVID_OK);
+        assert!(!it.is_null());
+        let mut out = corvid_field_def {
+            name: std::ptr::null(),
+            name_len: 0,
+            r#type: CORVID_FIELD_ANY,
+            required: 0,
+            unique: 0,
+        };
+        for want in &all {
+            assert_eq!(corvid_schemaiter_next(it, &mut out), 1);
+            // SAFETY: out.name borrows the cursor's current field, read
+            // before the next next() invalidates it.
+            let name = unsafe { std::slice::from_raw_parts(out.name as *const u8, out.name_len) };
+            assert_eq!(name, want.0.as_bytes(), "declaration order preserved");
+            assert_eq!(out.r#type as u32, want.1 as u32, "discriminant survives");
+            assert_eq!(out.required, want.2 as c_int);
+            assert_eq!(out.unique, want.3 as c_int);
+        }
+        assert_eq!(corvid_schemaiter_next(it, &mut out), 0, "exactly nine");
+        corvid_schemaiter_free(it);
+
+        corvid_collection_free(coll);
+        assert_eq!(corvid_close(db), CORVID_OK);
+    }
+
     /// set_schema enforcement through the ABI: a unique field rejects a
     /// duplicate with `CORVID_E_SCHEMA_VIOLATION` (and nothing is
     /// stored); a required field rejects absence; the input discipline

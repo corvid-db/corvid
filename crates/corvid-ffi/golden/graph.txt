@@ -1,0 +1,24 @@
+# graph.txt — directed edges, weighted neighbors, BFS (spec §4.11).
+INSERT	ga,{n=1}	ok
+INSERT	gb,{n=2}	ok
+LINK	ga,rel,gb	ok
+LINK	ga,rel,gc	ok
+LINK	gb,rel,gd	ok
+LINK_W	ga,wrel,gb,2.5	ok
+LINK_W	ga,wrel,gd,0.75	ok
+NEIGHBORS	ga,rel	k(gb,gc)
+IN_NEIGHBORS	gb,rel	k(ga)
+NEIGHBORS_W	ga,wrel	g(gb=2.5,gd=0.75)
+TRAVERSE	ga,rel,1	k(gb,gc)
+TRAVERSE	ga,rel,2	k(gb,gc,gd)
+TRAVERSE	ga,rel,0	k()
+# cycles terminate (§4.11)
+LINK	gd,rel,ga	ok
+TRAVERSE	ga,rel,10	k(gb,gc,gd)
+UNLINK	ga,rel,gc	removed:1
+UNLINK	ga,rel,gc	removed:0
+NEIGHBORS	ga,rel	k(gb)
+# deleting a key cascades its graph edges in the same txn — even edges
+# dangling on a key that never existed as a document (§4.8)
+DELETE	gd	existed:0
+NEIGHBORS	gb,rel	k()

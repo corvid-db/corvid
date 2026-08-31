@@ -1,0 +1,86 @@
+# mutations.txt — writes, reads, CAS, TTL, pagination (spec §4.8/§4.9).
+COLL	docs	t(docs)
+INSERT	a,{n=1,tag=t(x)}	ok
+INSERT	b,{n=5,tag=t(x)}	ok
+LEN		2
+GET	a	{n=1,tag=t(x)}
+GETFIELD	a,n	1
+GETFIELD	b,tag	t(x)
+GET	zz	absent
+# put_many bulk (spec §4.8): one transaction
+PUTMANY	c,{n=9},d,{n=3}	ok
+LEN		4
+# insert_auto: 20-digit zero-padded keys, strictly monotonic ids
+INSERT_AUTO	{n=100}	ok
+INSERT_AUTO	{n=101}	ok
+# update (§1.6 callback): absent -> {n=1}, present -> n+1; abort writes nothing
+UPDATE	u	ok
+GETFIELD	u,n	1
+UPDATE	u	ok
+GETFIELD	u,n	2
+UPDATE_ABORT	v	err:12
+GET	v	absent
+# patch: merge into an absent key creates the doc
+PATCH	p,{n=1}	ok
+PATCH	p,{extra=2}	ok
+GETFIELD	p,extra	2
+# CAS matrix (§4.8): insert-on-absent, swap, mismatch, delete-on-match
+CAS	k,absent,{n=1}	applied:1
+CAS	k,{n=1},{n=2}	applied:1
+CAS	k,{n=1},{n=3}	applied:0
+GETFIELD	k,n	2
+CAS	k,{n=2},absent	applied:1
+GET	k	absent
+# CAS equality is the engine's semantic equality: NaN==NaN regardless of
+# payload, -0.0==0.0 (§4.8)
+INSERT	nf,{f=bits:0x7ff8000000000001}	ok
+CAS	nf,{f=bits:0x7ff8000000000002},{f=bits:0x7ff8000000000003}	applied:1
+GETFIELD	nf,f	bits:0x7ff8000000000003
+INSERT	z,{f=-0.0}	ok
+CAS	z,{f=0.0},{f=1.0}	applied:1
+GETFIELD	z,f	1.0
+# engine round-trip preserves i64 extremes and f64 specials bit-exactly
+INSERT	x,{i=-9223372036854775808,fp=inf,fn=-inf,z=-0.0,txt=t(héllo 🎉),bs=b(A1~B2)}	ok
+GETFIELD	x,i	-9223372036854775808
+GETFIELD	x,fp	inf
+GETFIELD	x,fn	-inf
+GETFIELD	x,z	-0.0
+GETFIELD	x,txt	t(héllo 🎉)
+GETFIELD	x,bs	b(A1~B2)
+# deletes: existed flag, pred-driven, batch; graph edges cascade
+DELETE	a	existed:1
+DELETE	a	existed:0
+DELETE_WHERE	n,gt,2	removed:5
+DELETE_IN	n,1,2	removed:2
+DELETE_BATCH	nf,zz,z	removed:2
+LEN		1
+# TTL (§4.8): read-back, replace, inclusive purge boundary, plain-write
+# clears expiry
+INSERT_TTL	t1,{n=1},100	ok
+GET_TTL	t1	ttl:100
+GET_TTL	x	nottl
+SET_TTL	t1,200	ok
+GET_TTL	t1	ttl:200
+PURGE	199	purged:0
+PURGE	200	purged:1
+GET_TTL	t1	nottl
+INSERT_TTL	t2,{n=2},50	ok
+INSERT	t2,{n=3}	ok
+GET_TTL	t2	nottl
+# scan streams in key order; early stop is not an error (§4.9)
+SCAN		2
+SCAN_STOP	2	2
+# keyset pagination (§4.9): resume cursors, end marker, limit 0
+PAGE	-,10	k(t2,x)|end
+PAGE	-,1	k(t2)|more
+PAGE	t2,1	k(x)|more
+PAGE	x,1	k()|end
+PAGE	-,0	k()|end
+# write-time name gate (§1.5/§4.2): reserved and invalid surface at
+# write time, never at handle creation
+COLL	__bad	t(__bad)
+INSERT_ERR	q,{n=1}	err:10
+COLL	a__b	t(a__b)
+INSERT_ERR	q,{n=1}	err:11
+COLL	docs	t(docs)
+LEN		2

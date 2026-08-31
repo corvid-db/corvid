@@ -1,0 +1,53 @@
+# values.txt — value construction & reads (spec §4.3/§4.4), no database.
+# OP<TAB>args<TAB>expected; stored literals compare bit-exactly.
+
+VERSION		1
+# discriminants of every kind
+VTYPE	null	null
+VTYPE	true	bool
+VTYPE	-9223372036854775808	int
+VTYPE	bits:0x7ff8000000000001	float
+VTYPE	t(héllo 🎉 — unicode)	text
+VTYPE	b(A1~B2!)	bytes
+VTYPE	vec(1,bits32:0x7fc00000)	vector
+VTYPE	[1,[2,3]]	array
+VTYPE	{a=1}	map
+# lengths (§4.4)
+VLEN	[1,2,3]	3
+VLEN	{a=1,b=2}	2
+VLEN	vec(1,2,3,4)	4
+VLEN	t(abc)	3
+VLEN	b(abcd)	4
+VLEN	null	0
+VLEN	7	0
+# typed reads with the ok-flag: i64 extremes, wrong-type failure
+VAS_INT	-9223372036854775808	ok:-9223372036854775808
+VAS_INT	9223372036854775807	ok:9223372036854775807
+VAS_INT	5.0	fail
+VAS_INT	t(x)	fail
+VAS_BOOL	true	ok:1
+VAS_BOOL	false	ok:0
+VAS_BOOL	2	fail
+# f64 specials bit-exact through as_float
+VAS_FLOAT	bits:0x7ff8000000000001	ok:bits:0x7ff8000000000001
+VAS_FLOAT	inf	ok:inf
+VAS_FLOAT	-inf	ok:-inf
+VAS_FLOAT	-0.0	ok:-0.0
+VAS_FLOAT	3.5	ok:3.5
+VAS_FLOAT	t(x)	fail
+# borrowed _ref views (§4.4): bytes (incl. empty) come back unchanged
+VTEXT_REF	t(héllo 🎉 — unicode)	t(héllo 🎉 — unicode)
+VTEXT_REF	t()	t()
+VBYTES_REF	b(A1~B2!)	b(A1~B2!)
+VVECTOR_REF	vec(1.5,-2.25,0,inf,-0.0,bits32:0x7fc00000)	vec(1.5,-2.25,0,inf,-0.0,bits32:0x7fc00000)
+# nested borrowed children: map/array paths, absence, clone escape
+VNEST	{a={b=[1,{c=t(x)}]}},a.b.1.c	t(x)
+VNEST	[10,[20,[30]]],1.1.0	30
+VNEST	{a=1},a.z	absent
+VCLONE	{a={b=[1,2]}},a.b	[1,2]
+# container mutation: push appends, put replaces/inserts
+VPUSH	[1,2],3	3
+VPUT	{a=1},b,2	2
+VPUT	{a=1},a,2	1
+# every _free(NULL) shape is a documented no-op (§7)
+NULLFREES		ok

@@ -41,11 +41,15 @@
 //! it immediately after the failure that interests you.
 //!
 //! Testing: everything is a unit test in `src/` (`#[cfg(test)] mod tests`
-//! per module, plus the header drift gate in `src/header.rs`). An
-//! integration `tests/` directory is structurally impossible here: the lib
-//! target is named `corvid` (so the cdylib artifacts are `libcorvid.*`),
-//! which would make `corvid` resolve ambiguously against the engine
-//! dependency in an integration test's extern prelude.
+//! per module, plus the header drift gate in `src/header.rs`, the
+//! C-surface radar in `src/radar.rs`, and the C smoke-suite driver in
+//! `src/smoke.rs` — which compiles `c/smoke.c` against the just-built
+//! cdylib at TEST time and runs it over the committed golden fixtures,
+//! so `cargo test --workspace` enforces the C surface end to end). An
+//! integration `tests/` directory is structurally impossible here: the
+//! lib target is named `corvid` (so the cdylib artifacts are
+//! `libcorvid.*`), which would make `corvid` resolve ambiguously against
+//! the engine dependency in an integration test's extern prelude.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 // The ABI shims are safe-marker `extern "C"` fns that dereference caller
@@ -123,6 +127,20 @@ pub mod value;
 /// spec, header, and radar cannot disagree silently (spec §8).
 #[cfg(test)]
 mod header;
+
+/// The C-surface radar (test-only, Task 7): no untested exports — the
+/// generated header's symbol set equals spec Appendix A (parsed from
+/// `docs/FFI.md` at test time), and the C smoke suite (`c/smoke.c`)
+/// calls every one of the 122 symbols.
+#[cfg(test)]
+mod radar;
+
+/// The C smoke suite driver (test-only, Task 7): compiles `c/smoke.c`
+/// against the just-built cdylib with the `cc` crate at TEST time, runs
+/// it over the committed golden fixtures (`golden/`), and asserts every
+/// fixture line executed — the golden-coverage half of the radar.
+#[cfg(test)]
+mod smoke;
 
 /// ABI version of the `corvid` cdylib (spec §0/§8). `1` — a breaking
 /// change bumps it (and the soname) loudly, per the pre-1.0 break policy.

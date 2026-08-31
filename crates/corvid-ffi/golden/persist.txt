@@ -1,0 +1,16 @@
+# persist.txt — on-disk indexes, schema, and documents survive a close
+# and reopen, and keep answering queries (spec §4.10 "persist across
+# reopen"; the Task 6 review prepend (f): reopen + query).
+FILEDB		ok
+INSERT	strong,{tag=t(s),kind=t(doc),body=t(rust embedded database),v=vec(1,0)}	ok
+INSERT	weak,{tag=t(w),kind=t(doc),body=t(python web frameworks),v=vec(0,1)}	ok
+IDX_TEXT_DISK	body	ok
+IDX_VEC_DISK	v,cosine	ok
+SET_SCHEMA	name#text#1#0	ok
+REOPEN		ok
+COLLECTIONS		k(docs)
+SCHEMA		name/text/1/0
+QTEXT	body,t(rust database),2	k(strong)
+QVEC	v,vec(1,0),2	k(strong,weak)|~0.016393,~0.016129
+GETFIELD	strong,body	t(rust embedded database)
+LEN		2

@@ -58,3 +58,14 @@ typedef struct corvid_schemaiter corvid_schemaiter;
 # not the spec's opaque forward declaration. FFI_VERSION is not a header
 # symbol (the ABI surface is the function corvid_ffi_version).
 exclude = ["corvid_db", "corvid_coll", "corvid_strs", "corvid_geohits", "corvid_value", "corvid_pred", "corvid_rows", "corvid_query", "corvid_groupiter", "corvid_schemaiter", "FFI_VERSION"]
+
+[export.rename]
+# ISO C forbids an identifier from being declared as both a typedef and a
+# function in the same scope — and the spec-LOCKED function name is
+# `corvid_value_type` (Appendix A), so the C TYPE spelling must give way:
+# the enum is emitted as `corvid_value_type_t` (the C-surface smoke suite,
+# Task 7, is what failed to compile the pre-fix header). The VALUES
+# (CORVID_TYPE_NULL..=VECTOR, 0..=8) are the frozen §1.4/§8 contract and
+# are unchanged. Spec erratum: docs/FFI.md §1.4's code block names the C
+# type `corvid_value_type`; the emitted header spells it `..._t`.
+"corvid_value_type" = "corvid_value_type_t"
