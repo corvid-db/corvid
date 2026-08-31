@@ -2108,7 +2108,13 @@ static void run_scenario(const char *path) {
      * file-db scenarios sharing one workdir never touch each other's
      * files. */
     {
+        /* Either separator: on Windows the driver passes backslash
+         * paths, and missing this made the whole absolute path the
+         * "stem" — workdir + "/D:\a\..." is not a legal path there
+         * (unix tolerated the prefix by accident). */
         const char *base = strrchr(path, '/');
+        const char *back = strrchr(path, '\\');
+        if (back && (!base || back > base)) base = back;
         base = base ? base + 1 : path;
         char stem[256];
         size_t sn = strlen(base);
