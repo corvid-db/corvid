@@ -8,13 +8,13 @@
 //!
 //! Layout: one module per spec §4 family, declared in spec order (the
 //! header's emission order follows, so `corvid.h` reads like the spec's
-//! function reference). Landed so far (the rest are stubs that name
-//! their landing task):
+//! function reference). Landed (the full 122-symbol surface — spec
+//! Appendix A):
 //!
 //! | module | spec §4 family | status |
 //! |---|---|---|
 //! | [`error`] | §1.3/§3 status + error codes, thread-local last error | landed |
-//! | [`handle`] | §1.1/§2/§4.13 opaque handles, derived-handle counter | landed |
+//! | [`handle`] | §1.1/§2/§4.13 opaque handles, derived-handle counter, compact gate | landed |
 //! | [`lifecycle`] | §4.1 lifecycle & errors (8 fns) | landed |
 //! | [`collection`] | §4.2 collection handles (3 fns) | landed |
 //! | [`value`] | §4.3/§4.4 value construction & reads (23 fns) | landed |
@@ -23,10 +23,10 @@
 //! | [`mutation`] | §4.8 mutations (13 fns) | landed |
 //! | [`read`] | §4.9 reads (4 fns) | landed |
 //! | [`strs`] | §4.12 string-cursor plumbing (`strs_next`/`strs_free`) | landed |
-//! | [`index`] | §4.10 indexes & schema | Task 6 |
-//! | [`graph`] | §4.11 graph | Task 6 |
-//! | [`geo`] | §4.12 geo queries & geohits cursor | Task 6 |
-//! | [`admin`] | §4.13 dump/load/backup/compact | Task 6 |
+//! | [`index`] | §4.10 indexes & schema (15 fns) | landed |
+//! | [`graph`] | §4.11 graph (7 fns) | landed |
+//! | [`geo`] | §4.12 geo queries & geohits cursor (5 fns) | landed |
+//! | [`admin`] | §4.13 dump/load/backup/compact (5 fns) | landed |
 //!
 //! Safety regime: the engine is `#![forbid(unsafe_code)]`; this crate IS
 //! the unsafe boundary. `#![deny(unsafe_op_in_unsafe_fn)]` is on at the
@@ -59,7 +59,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 /// Admin family (spec §4.13): `dump_to_path`, `load_from_path`,
-/// `load_from_path_with_renames`, `backup`, `compact`. Lands with Task 6.
+/// `load_from_path_with_renames`, `backup`, and the exclusivity-gated
+/// `compact` (the FFI-only `CORVID_E_BUSY` call site).
 pub mod admin;
 /// Collection handles (spec §4.2): `collection`, `collection_free`,
 /// `collection_name` — the derived engine handle that keeps the `Db`
@@ -68,14 +69,22 @@ pub mod collection;
 /// Status and error codes (spec §1.3), the engine-variant mapping, and the
 /// thread-local last-error slot (spec §3).
 pub mod error;
-/// Geo queries and the geohits cursor (spec §4.12). Lands with Task 6.
+/// Geo queries and the geohits cursor (spec §4.12):
+/// `geo_within_radius` / `geo_within_bbox` / `geo_nearest` plus
+/// `geohits_next` / `geohits_free` — the cursor shape shared with
+/// `corvid_neighbors_weighted`.
 pub mod geo;
-/// Graph family (spec §4.11). Lands with Task 6.
+/// Graph family (spec §4.11): the 7 edge/neighborhood functions —
+/// `link`, `link_weighted`, `unlink`, `neighbors`, `in_neighbors`,
+/// `neighbors_weighted` (the geohits reuse), `traverse`.
 pub mod graph;
 /// Opaque-handle infrastructure (spec §1.1/§2) and the FFI-owned
 /// derived-handle counter (spec §4.13/§6).
 pub mod handle;
-/// Indexes & schema (spec §4.10). Lands with Task 6.
+/// Indexes & schema (spec §4.10): the 11 `corvid_create_*_index`
+/// variants (scalar, compound, text x2, geo, and the six HNSW forms
+/// incl. quantized and product-quantized) plus `set_schema` /
+/// `schema` / `schemaiter_next` / `schemaiter_free`.
 pub mod index;
 /// Lifecycle & errors (spec §4.1): `ffi_version`, `open`, `open_memory`,
 /// `close`, `last_error_code`, `last_error_message`, `free`,
@@ -100,8 +109,8 @@ pub mod query;
 /// (keyset pagination + the `next_after` buffer), `len`.
 pub mod read;
 /// The string-cursor family plumbing (spec §4.12): `strs_next`,
-/// `strs_free` — shared by `corvid_collections` (landed) and the graph
-/// cursors (Task 6).
+/// `strs_free` — shared by `corvid_collections` and the graph-family
+/// cursors (`neighbors` / `in_neighbors` / `traverse`).
 pub mod strs;
 /// Value construction & reads (spec §4.3/§4.4): the 23 value functions
 /// — constructors that CLONE their buffers, `_ref` zero-copy borrows,

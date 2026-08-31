@@ -23,11 +23,13 @@
 typedef struct corvid_db        corvid_db;
 typedef struct corvid_coll      corvid_coll;
 typedef struct corvid_strs      corvid_strs;
+typedef struct corvid_geohits   corvid_geohits;
 typedef struct corvid_value     corvid_value;
 typedef struct corvid_pred      corvid_pred;
 typedef struct corvid_rows      corvid_rows;
 typedef struct corvid_query     corvid_query;
 typedef struct corvid_groupiter corvid_groupiter;
+typedef struct corvid_schemaiter corvid_schemaiter;
 
 
 /**
@@ -53,6 +55,115 @@ enum corvid_status
 typedef enum corvid_status corvid_status;
 #else
 typedef uint32_t corvid_status;
+#endif // __STDC_VERSION__ >= 202311L
+
+/**
+ * The distance metric (FFI.md §1.4, frozen per §8): mirrors
+ * `corvid::Metric` (distance.rs).
+ */
+enum corvid_metric
+#if __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Cosine distance `1 - cos_sim` in `[0,2]`; zero-norm = maximally
+   * distant.
+   */
+  CORVID_METRIC_COSINE = 0,
+  /**
+   * Negated dot product (larger dot sorts first).
+   */
+  CORVID_METRIC_DOT = 1,
+  /**
+   * Squared Euclidean (monotonic with L2).
+   */
+  CORVID_METRIC_L2 = 2,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum corvid_metric corvid_metric;
+#else
+typedef uint32_t corvid_metric;
+#endif // __STDC_VERSION__ >= 202311L
+
+/**
+ * The stored-vector quantization mode (FFI.md §1.4, frozen per §8):
+ * mirrors `corvid::Quantization` (quant.rs).
+ */
+enum corvid_quant
+#if __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Full `f32` precision (`dim * 4` bytes/vector).
+   */
+  CORVID_QUANT_NONE = 0,
+  /**
+   * One bit per dimension (sign), Hamming; ~32x smaller.
+   */
+  CORVID_QUANT_BINARY = 1,
+  /**
+   * 8-bit per-vector min+scale; ~4x smaller.
+   */
+  CORVID_QUANT_SCALAR = 2,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum corvid_quant corvid_quant;
+#else
+typedef uint32_t corvid_quant;
+#endif // __STDC_VERSION__ >= 202311L
+
+/**
+ * The declared type of a schema field (FFI.md §1.4, frozen per §8):
+ * mirrors `corvid::schema::FieldType` (schema.rs `to_byte`, 0..8).
+ */
+enum corvid_field_type
+#if __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * `FieldType::Any` — any value accepted.
+   */
+  CORVID_FIELD_ANY = 0,
+  /**
+   * `FieldType::Bool`.
+   */
+  CORVID_FIELD_BOOL = 1,
+  /**
+   * `FieldType::Int`.
+   */
+  CORVID_FIELD_INT = 2,
+  /**
+   * `FieldType::Float`.
+   */
+  CORVID_FIELD_FLOAT = 3,
+  /**
+   * `FieldType::Text`.
+   */
+  CORVID_FIELD_TEXT = 4,
+  /**
+   * `FieldType::Bytes`.
+   */
+  CORVID_FIELD_BYTES = 5,
+  /**
+   * `FieldType::Vector`.
+   */
+  CORVID_FIELD_VECTOR = 6,
+  /**
+   * `FieldType::Array`.
+   */
+  CORVID_FIELD_ARRAY = 7,
+  /**
+   * `FieldType::Map`.
+   */
+  CORVID_FIELD_MAP = 8,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum corvid_field_type corvid_field_type;
+#else
+typedef uint32_t corvid_field_type;
 #endif // __STDC_VERSION__ >= 202311L
 
 /**
@@ -197,35 +308,6 @@ typedef uint32_t corvid_cmp;
 #endif // __STDC_VERSION__ >= 202311L
 
 /**
- * The distance metric (FFI.md §1.4, frozen per §8): mirrors
- * `corvid::Metric` (distance.rs).
- */
-enum corvid_metric
-#if __STDC_VERSION__ >= 202311L
-  : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
- {
-  /**
-   * Cosine distance `1 - cos_sim` in `[0,2]`; zero-norm = maximally
-   * distant.
-   */
-  CORVID_METRIC_COSINE = 0,
-  /**
-   * Negated dot product (larger dot sorts first).
-   */
-  CORVID_METRIC_DOT = 1,
-  /**
-   * Squared Euclidean (monotonic with L2).
-   */
-  CORVID_METRIC_L2 = 2,
-};
-#if __STDC_VERSION__ >= 202311L
-typedef enum corvid_metric corvid_metric;
-#else
-typedef uint32_t corvid_metric;
-#endif // __STDC_VERSION__ >= 202311L
-
-/**
  * The value discriminant (FFI.md §1.4, frozen per §8): tags 0..=8,
  * identical to the engine value module's private encoding tags. The
  * engine's constants are not `pub`, so the correspondence is pinned by
@@ -278,6 +360,58 @@ typedef enum corvid_value_type corvid_value_type;
 #else
 typedef uint32_t corvid_value_type;
 #endif // __STDC_VERSION__ >= 202311L
+
+/**
+ * One geospatial / weighted hit (spec §1.2, POD): the output shape of
+ * [`corvid_geohits_next`]. `key` is BORROWED until the next
+ * `corvid_geohits_next` or `corvid_geohits_free` on that handle.
+ */
+typedef struct corvid_geohit {
+  /**
+   * The hit's key (a document key; arbitrary bytes, §1.5).
+   */
+  const uint8_t *key;
+  /**
+   * Key bytes.
+   */
+  size_t key_len;
+  /**
+   * Geo: kilometres from the query point (haversine). Bbox: the 0.0
+   * sentinel (no center). `neighbors_weighted`: the edge weight.
+   */
+  double distance_km;
+} corvid_geohit;
+
+/**
+ * One declared schema field (spec §1.2, POD): the input shape of
+ * [`corvid_set_schema`] and the output shape of
+ * [`corvid_schemaiter_next`]. As an INPUT, `name` is non-NULL borrowed
+ * UTF-8; as an OUTPUT it is BORROWED from the cursor — valid only
+ * until the next `corvid_schemaiter_next` or
+ * `corvid_schemaiter_free` on that handle.
+ */
+typedef struct corvid_field_def {
+  /**
+   * The field's name.
+   */
+  const char *name;
+  /**
+   * Name bytes.
+   */
+  size_t name_len;
+  /**
+   * The accepted value type (§1.4).
+   */
+  corvid_field_type type;
+  /**
+   * 0 or 1: the field must be present and non-null on every write.
+   */
+  int required;
+  /**
+   * 0 or 1: no two documents may share this field's value.
+   */
+  int unique;
+} corvid_field_def;
 
 /**
  * One `(key, value)` pair for bulk inserts (spec §1.2, POD): the input
@@ -340,6 +474,68 @@ typedef corvid_status (*corvid_update_fn)(void *ctx, const corvid_value *current
 typedef int (*corvid_scan_fn)(void *ctx, const uint8_t *key, size_t key_len, const corvid_value *doc);
 
 /**
+ * Write a logical, version-stamped dump of the whole database —
+ * documents, index/schema/TTL definitions, graph edges, auto-id
+ * counters — to `path`, from one read snapshot (spec §4.13;
+ * counterpart: `Db::dump<W: Write>`, migrate.rs; the FFI supplies the
+ * `File`).
+ */
+corvid_status corvid_dump_to_path(corvid_db *db, const char *path, size_t path_len);
+
+/**
+ * Replay a dump into this database (spec §4.13; counterpart:
+ * `Db::load<R: Read>` — equivalent to `load_with_renames` with an
+ * empty map; loading merges with pre-existing collections per the
+ * engine contract).
+ */
+corvid_status corvid_load_from_path(corvid_db *db, const char *path, size_t path_len);
+
+/**
+ * Replay a dump with a collection-RENAME map (spec §4.13; counterpart:
+ * `Db::load_with_renames(r, &BTreeMap<String, String>)` — the
+ * migration path for legacy `__`-containing names): every collection
+ * occurrence in the stream lands under the target name. Same engine
+ * contract, validated BEFORE the stream is read: an invalid target
+ * fails with `CORVID_E_INVALID_NAME`, two-sources-one-target (or a
+ * target colliding with another mapped/unmapped dump collection) fails
+ * with `CORVID_E_ARGUMENT`. The arrays may be NULL only at
+ * `count == 0` (the `pred_in` array rule); every pair is borrowed
+ * UTF-8.
+ */
+corvid_status corvid_load_from_path_with_renames(corvid_db *db,
+                                                 const char *path,
+                                                 size_t path_len,
+                                                 const char *const *old_names,
+                                                 const char *const *new_names,
+                                                 const size_t *old_lens,
+                                                 const size_t *new_lens,
+                                                 size_t count);
+
+/**
+ * Consistent point-in-time PHYSICAL backup to a FRESH file at `path`
+ * (spec §4.13; counterpart: `Db::backup`) — an existing target fails
+ * with `CORVID_E_BACKUP_TARGET_EXISTS`; safe while writers are active.
+ * Physical means feature-configuration-dependent — use dump/load to
+ * move between feature builds.
+ */
+corvid_status corvid_backup(corvid_db *db, const char *path, size_t path_len);
+
+/**
+ * Reclaim file space after heavy deletes — offline maintenance (spec
+ * §4.13; counterpart: `Db::compact(&mut self) -> Result<bool>`). The
+ * engine requires EXCLUSIVE access, so this call requires quiescence:
+ * every handle derived from this `db` must already be freed, checked by
+ * the derived-handle counter AND `Arc` exclusivity (spec §4.13's
+ * intent; the Task 5 review prepend — a query's `execute()` releases
+ * its count at entry while its `Arc` clone lives, so the counter alone
+ * is not engine-idle). Otherwise fails with the FFI-only
+ * `CORVID_E_BUSY`. `*moved_out` (nullable) reports whether any data
+ * moved. In-memory databases have no file to reclaim: the call
+ * succeeds and reports no movement.
+ */
+corvid_status corvid_compact(corvid_db *db, int *moved_out);
+
+/**
  * Handle to a named collection (spec §4.2); the collection is created
  * lazily on first write. Wraps `corvid::Db::collection` (infallible in
  * Rust). `db` and `name` are non-NULL (`name` UTF-8, any length — the
@@ -373,6 +569,327 @@ void corvid_collection_free(corvid_coll *coll);
  * handle's stored name).
  */
 const char *corvid_collection_name(corvid_coll *coll, size_t *len_out);
+
+/**
+ * Documents whose `field` point lies within `radius_km` (INCLUSIVE) of
+ * `(lat, lon)`, nearest first, ties by key (spec §4.12; counterpart:
+ * `Collection::geo_within_radius`). Documents lacking a valid point are
+ * skipped. Returns NULL + error on failure.
+ */
+corvid_geohits *corvid_geo_within_radius(corvid_coll *c,
+                                         const char *field,
+                                         size_t field_len,
+                                         double lat,
+                                         double lon,
+                                         double radius_km);
+
+/**
+ * Documents whose `field` point lies inside the box
+ * `[min_lat, max_lat] × [min_lon, max_lon]`, in KEY order (spec §4.12;
+ * counterpart: `Collection::geo_within_bbox`). Bounds are validated at
+ * entry — latitude `[-90, 90]`, longitude `[-180, 180]`, NaN rejected,
+ * inverted latitude rejected — with `CORVID_E_ARGUMENT`;
+ * `min_lon > max_lon` wraps the antimeridian (both ranges, exact,
+ * unaccelerated). The hits' `distance_km` is the 0.0 sentinel. Returns
+ * NULL + error on failure.
+ */
+corvid_geohits *corvid_geo_within_bbox(corvid_coll *c,
+                                       const char *field,
+                                       size_t field_len,
+                                       double min_lat,
+                                       double min_lon,
+                                       double max_lat,
+                                       double max_lon);
+
+/**
+ * The true `k` nearest documents by `field` point, nearest first (spec
+ * §4.12; counterpart: `Collection::geo_nearest` — expanding radius,
+ * exact): fewer than `k` only when fewer valid points exist; `k == 0`
+ * yields nothing. Returns NULL + error on failure.
+ */
+corvid_geohits *corvid_geo_nearest(corvid_coll *c,
+                                   const char *field,
+                                   size_t field_len,
+                                   double lat,
+                                   double lon,
+                                   size_t k);
+
+/**
+ * Advance the cursor (spec §4.12): returns 1 and fills `*out` (and
+ * `*doc_out` when that out-param is non-NULL — it is nullable, §7) for
+ * the next hit, 0 at exhaustion — out-params untouched at 0; never
+ * errors (the list is materialized). `out->key` and the document are
+ * BORROWED until the next `corvid_geohits_next` or
+ * `corvid_geohits_free` on this handle — using or freeing them after
+ * either is UB. **Cursors from `corvid_neighbors_weighted` set
+ * `*doc_out = NULL`** (the engine returns `(key, weight)` pairs with no
+ * document) and still return 1.
+ *
+ * NULL handle or NULL out-parameter follows the non-status rule (spec
+ * §7): defined inert value (0 = exhausted) AND `CORVID_E_ARGUMENT`
+ * recorded — never UB, and never a status return (there is none).
+ */
+int corvid_geohits_next(corvid_geohits *h, struct corvid_geohit *out, const corvid_value **doc_out);
+
+/**
+ * Free the cursor (spec §4.12). `corvid_geohits_free(NULL)` is a no-op
+ * (spec §7). Cross-family frees are UB (spec §2).
+ */
+void corvid_geohits_free(corvid_geohits *h);
+
+/**
+ * Add a directed edge `from --relation--> to` (spec §4.11; counterpart:
+ * `Collection::link`). Idempotent; the default weight is 1.0 — a plain
+ * link OVERWRITES a prior weighted edge's weight. Keys are borrowed
+ * bytes (any content, §1.5); `relation` is borrowed UTF-8.
+ */
+corvid_status corvid_link(corvid_coll *c,
+                          const uint8_t *from,
+                          size_t from_len,
+                          const char *relation,
+                          size_t rel_len,
+                          const uint8_t *to,
+                          size_t to_len);
+
+/**
+ * Add a directed edge carrying a `weight` (spec §4.11; counterpart:
+ * `Collection::link_weighted`) — readable back through
+ * [`corvid_neighbors_weighted`]. A later plain [`corvid_link`] of the
+ * same edge overwrites the weight with 1.0.
+ */
+corvid_status corvid_link_weighted(corvid_coll *c,
+                                   const uint8_t *from,
+                                   size_t from_len,
+                                   const char *relation,
+                                   size_t rel_len,
+                                   const uint8_t *to,
+                                   size_t to_len,
+                                   double weight);
+
+/**
+ * Remove the edge (and its reverse) atomically (spec §4.11;
+ * counterpart: `Collection::unlink -> bool`). `*removed_out` (nullable)
+ * reports whether the FORWARD edge existed — false is not an error.
+ */
+corvid_status corvid_unlink(corvid_coll *c,
+                            const uint8_t *from,
+                            size_t from_len,
+                            const char *relation,
+                            size_t rel_len,
+                            const uint8_t *to,
+                            size_t to_len,
+                            int *removed_out);
+
+/**
+ * The targets of every `from --relation--> ?` edge, in key order, as a
+ * strs cursor (spec §4.11; counterpart: `Collection::neighbors ->
+ * Vec<Vec<u8>>`). Returns NULL + error on failure.
+ */
+corvid_strs *corvid_neighbors(corvid_coll *c,
+                              const uint8_t *from,
+                              size_t from_len,
+                              const char *relation,
+                              size_t rel_len);
+
+/**
+ * The sources of every `? --relation--> to` edge, in key order, as a
+ * strs cursor (spec §4.11; counterpart: `Collection::in_neighbors ->
+ * Vec<Vec<u8>>`). Returns NULL + error on failure.
+ */
+corvid_strs *corvid_in_neighbors(corvid_coll *c,
+                                 const uint8_t *to,
+                                 size_t to_len,
+                                 const char *relation,
+                                 size_t rel_len);
+
+/**
+ * `(target, weight)` for every `from --relation--> ?` edge (spec
+ * §4.11; counterpart: `Collection::neighbors_weighted ->
+ * Vec<(Vec<u8>, f64)>`) — the `(key, double)` shape REUSES the geohits
+ * cursor: `distance_km` carries the edge weight (1.0 for unweighted
+ * edges) and `corvid_geohits_next` reports `doc_out = NULL` for these
+ * cursors (spec §4.12's documented shape). Results in key order. Returns
+ * NULL + error on failure.
+ */
+corvid_geohits *corvid_neighbors_weighted(corvid_coll *c,
+                                          const uint8_t *from,
+                                          size_t from_len,
+                                          const char *relation,
+                                          size_t rel_len);
+
+/**
+ * Breadth-first traversal following `relation` up to `hops` hops from
+ * `start` (spec §4.11; counterpart: `Collection::traverse`): the
+ * reachable nodes EXCLUDING `start`, each once, in BFS order; `hops ==
+ * 0` yields nothing; cycles terminate. One read snapshot covers the
+ * walk. Returns NULL + error on failure.
+ */
+corvid_strs *corvid_traverse(corvid_coll *c,
+                             const uint8_t *start,
+                             size_t start_len,
+                             const char *relation,
+                             size_t rel_len,
+                             size_t hops);
+
+/**
+ * Create (or replace) a scalar secondary index on `field` (spec §4.10;
+ * counterpart: `Collection::create_scalar_index`, scalar.rs) — equality
+ * and range filters on `field` then use it; on disk, persists.
+ */
+corvid_status corvid_create_scalar_index(corvid_coll *c, const char *field, size_t field_len);
+
+/**
+ * Create (or replace) a compound index over an ordered field list (spec
+ * §4.10; counterpart: `Collection::create_compound_index(&[&str])`,
+ * scalar.rs) — equality on a leading prefix plus an optional range on
+ * the next field use it. `fields` (and `field_lens`) may be NULL only
+ * when `count == 0` (the `pred_in` array rule); each name is borrowed
+ * UTF-8.
+ */
+corvid_status corvid_create_compound_index(corvid_coll *c,
+                                           const char *const *fields,
+                                           const size_t *field_lens,
+                                           size_t count);
+
+/**
+ * Create (or replace) an in-memory inverted text index on `field`
+ * (spec §4.10; counterpart: `Collection::create_text_index`, fts.rs).
+ */
+corvid_status corvid_create_text_index(corvid_coll *c, const char *field, size_t field_len);
+
+/**
+ * Create (or replace) an **on-disk** inverted text index on `field`
+ * (spec §4.10; counterpart: `Collection::create_text_index_ondisk`,
+ * fts.rs) — postings stored as redb entries; existing documents
+ * backfill synchronously.
+ */
+corvid_status corvid_create_text_index_ondisk(corvid_coll *c, const char *field, size_t field_len);
+
+/**
+ * Create (or replace) a spatial index on `field` (spec §4.10;
+ * counterpart: `Collection::create_geo_index`, geo_index.rs) — serves
+ * the radius/bbox windows of §4.12.
+ */
+corvid_status corvid_create_geo_index(corvid_coll *c, const char *field, size_t field_len);
+
+/**
+ * Create (or replace) a full-precision in-memory HNSW index on `field`
+ * (spec §4.10; counterpart: `Collection::create_vector_index`,
+ * index.rs).
+ */
+corvid_status corvid_create_vector_index(corvid_coll *c,
+                                         const char *field,
+                                         size_t field_len,
+                                         corvid_metric metric);
+
+/**
+ * Like [`corvid_create_vector_index`] but storing vectors quantized
+ * (spec §4.10; counterpart: `Collection::create_vector_index_quantized`)
+ * — binary ≈32x / scalar ≈4x smaller at some recall cost.
+ */
+corvid_status corvid_create_vector_index_quantized(corvid_coll *c,
+                                                   const char *field,
+                                                   size_t field_len,
+                                                   corvid_metric metric,
+                                                   corvid_quant quant);
+
+/**
+ * Create (or replace) an on-disk HNSW index on `field` (spec §4.10;
+ * counterpart: `Collection::create_vector_index_ondisk`) — the graph
+ * lives in the database file; existing documents backfill
+ * synchronously.
+ */
+corvid_status corvid_create_vector_index_ondisk(corvid_coll *c,
+                                                const char *field,
+                                                size_t field_len,
+                                                corvid_metric metric);
+
+/**
+ * Like [`corvid_create_vector_index_ondisk`] but storing each vector
+ * quantized (spec §4.10; counterpart:
+ * `Collection::create_vector_index_ondisk_quantized`).
+ */
+corvid_status corvid_create_vector_index_ondisk_quantized(corvid_coll *c,
+                                                          const char *field,
+                                                          size_t field_len,
+                                                          corvid_metric metric,
+                                                          corvid_quant quant);
+
+/**
+ * Create (or replace) an in-memory HNSW index storing
+ * **product-quantized** vectors (spec §4.10; counterpart:
+ * `Collection::create_vector_index_pq(field, metric, m, k)`, index.rs —
+ * arity verified): a codebook of `m` subspaces × `k` centroids trains
+ * deterministically from existing vectors; `dim % m == 0` required.
+ * Every `Pq::train` domain failure — `m == 0`, `k` outside `2..=256`,
+ * `dim % m != 0`, zero-dimensional or mixed-dimension training
+ * vectors, or no usable training vectors — surfaces as the engine's
+ * single `CORVID_E_EMPTY_INDEX_TRAINING`.
+ */
+corvid_status corvid_create_vector_index_pq(corvid_coll *c,
+                                            const char *field,
+                                            size_t field_len,
+                                            corvid_metric metric,
+                                            size_t m,
+                                            size_t k);
+
+/**
+ * Create (or replace) an on-disk HNSW index storing product-quantized
+ * vectors (spec §4.10; counterpart:
+ * `Collection::create_vector_index_ondisk_pq(field, metric, m, k)`,
+ * index.rs — same arity and the same `EmptyIndexTraining` domain
+ * contract as [`corvid_create_vector_index_pq`]).
+ */
+corvid_status corvid_create_vector_index_ondisk_pq(corvid_coll *c,
+                                                   const char *field,
+                                                   size_t field_len,
+                                                   corvid_metric metric,
+                                                   size_t m,
+                                                   size_t k);
+
+/**
+ * Declare (or replace) the collection's schema (spec §4.10;
+ * counterpart: `Collection::set_schema(&Schema)`, schema.rs): enforced
+ * on subsequent writes only — existing documents are not retroactively
+ * validated. The engine `Schema` is built with
+ * `Schema::new().field(Field::new(name, ty).required().unique())`;
+ * field names are validated UTF-8 and an out-of-domain field-type
+ * discriminant fails with `CORVID_E_ARGUMENT`. `fields` may be NULL
+ * only when `count == 0` (the `pred_in` array rule) — an empty array
+ * declares an empty schema, which accepts any map document and
+ * REPLACES any previously declared one.
+ */
+corvid_status corvid_set_schema(corvid_coll *c,
+                                const struct corvid_field_def *fields,
+                                size_t count);
+
+/**
+ * The declared schema as a field cursor (spec §4.10; counterpart:
+ * `Collection::schema() -> Option<Schema>`, infallible in Rust).
+ * Absence is a success: `CORVID_OK` + `*out == NULL` when no schema is
+ * declared; `CORVID_ERR` only on NULL arguments. `out` non-NULL.
+ */
+corvid_status corvid_schema(corvid_coll *c, corvid_schemaiter **out);
+
+/**
+ * Advance the schema cursor (spec §4.10): returns 1 and fills `*out`
+ * for the next field (declaration order), 0 at exhaustion — out-params
+ * untouched at 0; never errors (the list is materialized). `out->name`
+ * is BORROWED until the next `corvid_schemaiter_next` or
+ * `corvid_schemaiter_free` on this handle — using or freeing it after
+ * either is UB.
+ *
+ * NULL handle or NULL out-parameter follows the non-status rule (spec
+ * §7): defined inert value (0 = exhausted) AND `CORVID_E_ARGUMENT`
+ * recorded — never UB, and never a status return (there is none).
+ */
+int corvid_schemaiter_next(corvid_schemaiter *it, struct corvid_field_def *out);
+
+/**
+ * Free the cursor (spec §4.10). `corvid_schemaiter_free(NULL)` is a
+ * no-op (spec §7). Cross-family frees are UB (spec §2).
+ */
+void corvid_schemaiter_free(corvid_schemaiter *it);
 
 /**
  * The ABI version (spec §4.1/§8): `1`. Bindings verify this before

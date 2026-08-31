@@ -136,10 +136,9 @@ const BUFFER_HEADER: usize = core::mem::size_of::<usize>();
 
 /// Allocate an ABI-owned buffer holding `bytes` (spec §4.1: the buffer
 /// shape behind `corvid_insert_auto` keys and `corvid_page`'s
-/// `next_after`; those producers land with Task 4). Returns NULL only on
-/// allocation failure — callers translate that to their signature's
+/// `next_after` — both producers landed in Task 4). Returns NULL only
+/// on allocation failure — callers translate that to their signature's
 /// failure shape.
-#[allow(dead_code)] // first producer lands with Task 4 (insert_auto/page)
 pub(crate) fn buffer_new(bytes: &[u8]) -> *mut u8 {
     // A slice's length is bounded well below isize::MAX, so the layout
     // arithmetic cannot overflow.
@@ -213,7 +212,9 @@ pub extern "C" fn corvid_collections(db: *mut corvid_db) -> *mut corvid_strs {
         return std::ptr::null_mut();
     };
     match guard("corvid_collections", || handle.engine().collections()) {
-        Some(names) => into_strs(StrsHandle::new(names)),
+        Some(names) => into_strs(StrsHandle::new(
+            names.into_iter().map(String::into_bytes).collect(),
+        )),
         None => std::ptr::null_mut(),
     }
 }

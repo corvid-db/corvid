@@ -839,8 +839,8 @@ mod tests {
 
     /// Whole-batch rollback on a mid-batch violation, pinned through the
     /// ABI. The schema itself is declared through the ENGINE API in the
-    /// test setup (its ABI surface — `corvid_set_schema` — lands with
-    /// Task 6); the violation and the rollback are observed entirely
+    /// test setup (its ABI surface — `corvid_set_schema` —
+    /// landed with Task 6); the violation and the rollback are observed entirely
     /// through `corvid_put_many` / `corvid_len`.
     #[test]
     fn put_many_rolls_back_whole_batch_on_violation() {

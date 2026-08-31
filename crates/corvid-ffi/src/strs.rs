@@ -1,12 +1,14 @@
 //! The string-cursor family plumbing (spec §4.12): `corvid_strs_next` and
 //! `corvid_strs_free`.
 //!
-//! The cursor is the shared read shape for every ABI call that returns
-//! `Vec<String>` (spec §2: `corvid_collections` — landed — plus the graph
+//! The cursor is the shared read shape for every ABI call that returns a
+//! list of strings (spec §2: `corvid_collections`, plus the graph
 //! family's `corvid_neighbors` / `corvid_in_neighbors` /
-//! `corvid_traverse`, Task 6). Single-threaded use by contract; the
-//! strings are binary-safe `(pointer, length)` pairs, NOT NUL-terminated
-//! (spec §1.5), borrowed until the next call or `_free`.
+//! `corvid_traverse`). Single-threaded use by contract; the items are
+//! binary-safe `(pointer, length)` pairs, NOT NUL-terminated (spec
+//! §1.5) — collection names arrive as UTF-8 bytes, graph endpoints as
+//! arbitrary document-key bytes — borrowed until the next call or
+//! `_free`.
 
 use std::ffi::c_char;
 use std::ffi::c_int;
@@ -36,16 +38,16 @@ pub extern "C" fn corvid_strs_next(
         return 0;
     }
     // SAFETY: handle non-NULL (checked) with corvid_collections (and
-    // later graph) provenance, not yet freed; the §2 contract confines a
+    // graph) provenance, not yet freed; the §2 contract confines a
     // cursor to one thread, so the exclusive borrow is sound.
     let cursor = unsafe { borrow_strs_mut(s) }.expect("non-NULL checked above");
     match cursor.next() {
-        Some(text) => {
+        Some(bytes) => {
             // SAFETY: both out-params are non-NULL (checked); the pointer
             // + length pair is §1.5's binary-safe string shape.
             unsafe {
-                *str_out = text.as_ptr() as *const c_char;
-                *len_out = text.len();
+                *str_out = bytes.as_ptr() as *const c_char;
+                *len_out = bytes.len();
             }
             1
         }
@@ -70,7 +72,7 @@ mod tests {
 
     #[test]
     fn next_walks_every_string_then_sticks() {
-        let cursor = into_strs(StrsHandle::new(vec!["alpha".into(), "beta".into()]));
+        let cursor = into_strs(StrsHandle::new(vec![b"alpha".to_vec(), b"beta".to_vec()]));
         let mut str_ptr: *const c_char = std::ptr::null();
         let mut len = 0;
 
@@ -113,7 +115,7 @@ mod tests {
             crate::error::corvid_err::CORVID_E_ARGUMENT
         );
 
-        let cursor = into_strs(StrsHandle::new(vec!["x".into()]));
+        let cursor = into_strs(StrsHandle::new(vec![b"x".to_vec()]));
         assert_eq!(corvid_strs_next(cursor, std::ptr::null_mut(), &mut len), 0);
         assert_eq!(
             crate::error::last_code(),
@@ -133,7 +135,7 @@ mod tests {
     #[test]
     fn empty_strings_carry_a_non_null_pointer_with_len_zero() {
         // §1.5: empty is a non-NULL pointer with length 0.
-        let cursor = into_strs(StrsHandle::new(vec![String::new()]));
+        let cursor = into_strs(StrsHandle::new(vec![Vec::new()]));
         let mut str_ptr: *const c_char = std::ptr::null();
         let mut len = usize::MAX;
         assert_eq!(corvid_strs_next(cursor, &mut str_ptr, &mut len), 1);

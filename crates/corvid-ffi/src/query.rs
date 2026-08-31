@@ -81,21 +81,25 @@ pub enum corvid_metric {
 }
 
 /// Map an ABI metric onto the engine metric, or `None` (having recorded
-/// `CORVID_E_ARGUMENT`) when it is outside `COSINE..=L2` — the enum is
-/// frozen (§8), so an out-of-domain value is a caller bug, not a future
-/// opcode. Validating the raw discriminant (not the enum) keeps an
-/// out-of-domain integer from C a checked error instead of an
-/// unspecified-match footgun, exactly like `corvid_cmp` (pred.rs).
-fn metric_of(m: u32) -> Option<Metric> {
+/// `CORVID_E_ARGUMENT` under the calling function's name) when it is
+/// outside `COSINE..=L2` — the enum is frozen (§8), so an out-of-domain
+/// value is a caller bug, not a future opcode. Validating the raw
+/// discriminant (not the enum) keeps an out-of-domain integer from C a
+/// checked error instead of an unspecified-match footgun, exactly like
+/// `corvid_cmp` (pred.rs). Shared by `corvid_query_vector` and the six
+/// `corvid_create_vector_index*` creates (index.rs) — hence the
+/// parameterized context (the Task 5 review prepend: the rejection must
+/// name the function that rejected).
+pub(crate) fn metric_of(context: &str, m: u32) -> Option<Metric> {
     match m {
         0 => Some(Metric::Cosine),
         1 => Some(Metric::Dot),
         2 => Some(Metric::L2),
         _ => {
-            record_argument(
-                "corvid_query_vector: metric is outside \
-                 CORVID_METRIC_COSINE..=CORVID_METRIC_L2",
-            );
+            record_argument(&format!(
+                "{context}: metric is outside \
+                 CORVID_METRIC_COSINE..=CORVID_METRIC_L2"
+            ));
             None
         }
     }
@@ -199,7 +203,7 @@ pub extern "C" fn corvid_query_vector(
         );
         return corvid_status::CORVID_ERR;
     }
-    let Some(metric) = metric_of(metric as u32) else {
+    let Some(metric) = metric_of("corvid_query_vector", metric as u32) else {
         return corvid_status::CORVID_ERR;
     };
     // SAFETY: query is non-NULL (checked) and the caller guarantees it
@@ -1413,6 +1417,33 @@ mod tests {
         assert_eq!(corvid_close(db2), CORVID_OK);
     }
 
+    /// The rows cursor owns its materialized rows: a query run BEFORE
+    /// `corvid_close` still walks AFTER it (spec §2/§4.1: "freeing the db
+    /// while rows/iterators from it are live is fine (those own their
+    /// data)"). The page-family twin of this shape landed in Task 4
+    /// (read.rs); this is the query-family pin (the Task 5 review
+    /// prepend's cosmetic gap).
+    #[test]
+    fn rows_survive_close() {
+        let (db, coll) = fresh();
+        insert(coll, b"a", doc(&[("v", corvid_value_int(1))]));
+        insert(coll, b"b", doc(&[("v", corvid_value_int(2))]));
+
+        let rows = {
+            let q = query(coll);
+            corvid_query_run(q) // consumes q
+        };
+        assert!(!rows.is_null());
+        corvid_collection_free(coll);
+        assert_eq!(corvid_close(db), CORVID_OK);
+
+        let walked = walk(rows, |_, _| {});
+        assert_eq!(walked.len(), 2, "the materialized rows outlive the db");
+        assert_eq!(walked[0].0, b"a".to_vec());
+        assert_eq!(walked[1].0, b"b".to_vec());
+        finish(rows);
+    }
+
     // --- §4.6: filters AND; limit/offset; order_by; select ----------------------
 
     /// Multiple `corvid_query_filter` calls AND together; a NULL pred
@@ -1837,12 +1868,14 @@ mod tests {
 
         // The out-of-domain metric rejection, at the mapper level (an
         // invalid enum cannot be constructed in Rust without UB — the
-        // cmp_op precedent).
-        assert!(metric_of(3).is_none());
+        // cmp_op precedent). The context parameter names the rejecter.
+        assert!(metric_of("corvid_query_vector", 3).is_none());
         assert_eq!(last_code(), corvid_err::CORVID_E_ARGUMENT);
-        assert_eq!(metric_of(0), Some(Metric::Cosine));
-        assert_eq!(metric_of(1), Some(Metric::Dot));
-        assert_eq!(metric_of(2), Some(Metric::L2));
+        let (_, msg_len) = crate::error::last_message().expect("recorded above");
+        assert!(msg_len > 0);
+        assert_eq!(metric_of("corvid_query_vector", 0), Some(Metric::Cosine));
+        assert_eq!(metric_of("corvid_query_vector", 1), Some(Metric::Dot));
+        assert_eq!(metric_of("corvid_query_vector", 2), Some(Metric::L2));
 
         corvid_collection_free(coll);
         assert_eq!(corvid_close(db), CORVID_OK);

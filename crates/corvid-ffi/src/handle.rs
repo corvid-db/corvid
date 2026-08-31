@@ -26,8 +26,13 @@
 //! `AtomicUsize` on the db: it counts live handles holding a **clone of
 //! the engine `Arc`** — initialized to 1 (the db handle itself) at open,
 //! incremented when a derived engine handle is created, decremented by
-//! that handle's `_free`; `corvid_compact` (Task 6) requires exactly 1
-//! and otherwise fails with the FFI-only `CORVID_E_BUSY`. The count is
+//! that handle's `_free`; `corvid_compact` requires the count at exactly
+//! 1 **and** sole ownership of the engine `Arc`
+//! (`DbHandle::compact`), and otherwise fails with the FFI-only
+//! `CORVID_E_BUSY`. The count alone is NOT engine-idle:
+//! `QueryHandle::execute` releases its count at entry while its `Arc`
+//! clone lives through the engine call, so `Arc` exclusivity is the
+//! second half of the gate (the Task 5 review prepend). The count is
 //! deterministic because this layer is the only `Arc` cloner — bindings
 //! never see the `Arc`.
 //!
@@ -77,6 +82,13 @@ pub struct corvid_strs {
     _unused: [u8; 0],
 }
 
+/// The opaque `corvid_geohits*` handle type (spec §1.1). Backed by
+/// `GeoHitsHandle`.
+#[repr(C)]
+pub struct corvid_geohits {
+    _unused: [u8; 0],
+}
+
 /// The opaque `corvid_value*` handle type (spec §1.1). Backed by a bare
 /// boxed `corvid::Value` (`into_value`) — see the module docs for why
 /// this family skips a wrapper struct, and the value plumbing below for
@@ -115,6 +127,14 @@ pub struct corvid_query {
 /// engine reference.
 #[repr(C)]
 pub struct corvid_groupiter {
+    _unused: [u8; 0],
+}
+
+/// The opaque `corvid_schemaiter*` handle type (spec §1.1). Backed by
+/// `SchemaIterHandle` — the materialized field list plus a cursor, no
+/// engine reference.
+#[repr(C)]
+pub struct corvid_schemaiter {
     _unused: [u8; 0],
 }
 
@@ -166,11 +186,52 @@ impl DbHandle {
         self.derived.fetch_add(1, Ordering::Release);
     }
 
-    /// `corvid_compact`'s quiescence check: exactly the db handle itself
-    /// is live (spec §4.13). Task 6 wires this into `corvid_compact`.
-    #[allow(dead_code)] // wired by Task 6 (corvid_compact)
+    /// `corvid_compact`'s quiescence check, first half: exactly the db
+    /// handle itself is live (spec §4.13). (pub(crate): the collection
+    /// and query tests pin the counter arithmetic through it.)
     pub(crate) fn is_exclusive(&self) -> bool {
         self.derived.load(Ordering::Acquire) == 1
+    }
+
+    /// `corvid_compact`'s engine call (spec §4.13): the exclusive
+    /// `Db::compact(&mut self)` under a TWO-part gate —
+    ///
+    /// 1. the derived-handle counter at exactly 1 (only this handle
+    ///    holds a count), and
+    /// 2. sole ownership of the engine `Arc` (`Arc::get_mut` succeeds).
+    ///
+    /// Counter alone is NOT engine-idle: [`QueryHandle::execute`]
+    /// releases its count at entry while its `Arc` clone lives through
+    /// the engine call, so a query in flight on another thread can show
+    /// count 1 with a live clone — the `Arc` check catches it (the Task
+    /// 5 review prepend; `Arc::get_mut` over `try_unwrap` keeps the `Arc`
+    /// in place, no take-out-and-rewrap dance around the call). Either
+    /// half failing records the FFI-only `CORVID_E_BUSY` and answers
+    /// `None`; success runs the engine compact under the panic guard and
+    /// returns whether any data moved.
+    pub(crate) fn compact(&mut self) -> Option<bool> {
+        if !self.is_exclusive() {
+            crate::error::record(
+                crate::error::corvid_err::CORVID_E_BUSY,
+                "corvid_compact: derived handles are still open — free \
+                 every collection/query handle first (spec §4.13)",
+            );
+            return None;
+        }
+        // SAFETY-free Arc::get_mut: Some only when the strong (and weak)
+        // count is exactly 1 — this handle's own reference. The engine
+        // call takes &mut through it and the Arc stays put afterwards.
+        let Some(engine) = Arc::get_mut(&mut self.db) else {
+            crate::error::record(
+                crate::error::corvid_err::CORVID_E_BUSY,
+                "corvid_compact: an engine reference outlives its \
+                 derived-handle count (a query in flight releases its \
+                 count at execute() entry but holds its Arc clone through \
+                 the call) — retry at quiescence (spec §4.13)",
+            );
+            return None;
+        };
+        crate::error::guard("corvid_compact", || engine.compact())
     }
 }
 
@@ -496,27 +557,147 @@ impl RowsHandle {
     }
 }
 
-/// Interior state behind a `corvid_strs*`: the materialized string list
-/// and the read cursor (spec §2: "owned `Vec<String>` + cursor",
-/// single-threaded use).
+/// Interior state behind a `corvid_strs*`: the materialized byte-string
+/// list and the read cursor (spec §2, single-threaded use). The items are
+/// `Vec<u8>`, not `String`: the cursor is shared by `corvid_collections`
+/// (UTF-8 names) and the graph family, whose endpoints are document
+/// KEYS — arbitrary bytes under spec §1.5 — so the backing preserves
+/// bytes and the cursor hands out §1.5's binary-safe `(pointer, length)`
+/// pairs either way.
 pub(crate) struct StrsHandle {
-    items: Vec<String>,
+    items: Vec<Vec<u8>>,
     cursor: usize,
 }
 
 impl StrsHandle {
-    pub(crate) fn new(items: Vec<String>) -> Self {
+    pub(crate) fn new(items: Vec<Vec<u8>>) -> Self {
         Self { items, cursor: 0 }
     }
 
-    /// Borrow the string at the cursor and advance it; `None` at
+    /// Borrow the string bytes at the cursor and advance them; `None` at
     /// exhaustion (the cursor stays, so exhaustion is sticky).
-    pub(crate) fn next(&mut self) -> Option<&str> {
-        let item = self.items.get(self.cursor).map(String::as_str);
+    pub(crate) fn next(&mut self) -> Option<&[u8]> {
+        let item = self.items.get(self.cursor).map(Vec::as_slice);
         if item.is_some() {
             self.cursor += 1;
         }
         item
+    }
+}
+
+/// Interior state behind a `corvid_geohits*` (spec §2: "owned
+/// `Vec<corvid::GeoHit>` (or `(key, weight)` pairs) + cursor",
+/// single-threaded use). One entry shape serves both producers: the three
+/// geo queries carry the full document (borrowed out via `geohits_next`'s
+/// `doc_out`), `corvid_neighbors_weighted` carries only `(key, weight)`
+/// and reports `doc_out = NULL`. Holds no engine reference, so it does
+/// not touch the derived-handle counter (spec §4.13 — see the module
+/// docs).
+pub(crate) struct GeoHitsHandle {
+    hits: Vec<GeoEntry>,
+    cursor: usize,
+}
+
+/// One materialized geohits row.
+pub(crate) struct GeoEntry {
+    /// The hit's key (document key; arbitrary bytes, spec §1.5).
+    pub key: Vec<u8>,
+    /// The hit's `distance_km` — the haversine kilometres for the geo
+    /// queries, the 0.0 sentinel for `geo_within_bbox` (no center), the
+    /// edge weight for `neighbors_weighted`.
+    pub distance_km: f64,
+    /// The full document for the geo queries; `None` for
+    /// `neighbors_weighted` (the engine returns `(key, weight)` pairs
+    /// with no document — `doc_out` is NULL there, spec §4.12).
+    pub document: Option<corvid::Value>,
+}
+
+impl GeoHitsHandle {
+    /// From the three geo queries' `Vec<GeoHit>` (document present).
+    pub(crate) fn from_geo(hits: Vec<corvid::GeoHit>) -> Self {
+        Self {
+            hits: hits
+                .into_iter()
+                .map(|hit| GeoEntry {
+                    key: hit.key,
+                    distance_km: hit.distance_km,
+                    document: Some(hit.document),
+                })
+                .collect(),
+            cursor: 0,
+        }
+    }
+
+    /// From `geo_within_bbox`'s `(key, document)` pairs — the documented
+    /// 0.0 distance sentinel (the box query has no center; the engine
+    /// returns no distance).
+    pub(crate) fn from_bbox(hits: Vec<(Vec<u8>, corvid::Value)>) -> Self {
+        Self {
+            hits: hits
+                .into_iter()
+                .map(|(key, document)| GeoEntry {
+                    key,
+                    distance_km: 0.0,
+                    document: Some(document),
+                })
+                .collect(),
+            cursor: 0,
+        }
+    }
+
+    /// From `neighbors_weighted`'s `(key, weight)` pairs (no document —
+    /// `doc_out` reads NULL, spec §4.12).
+    pub(crate) fn from_weighted(pairs: Vec<(Vec<u8>, f64)>) -> Self {
+        Self {
+            hits: pairs
+                .into_iter()
+                .map(|(key, weight)| GeoEntry {
+                    key,
+                    distance_km: weight,
+                    document: None,
+                })
+                .collect(),
+            cursor: 0,
+        }
+    }
+
+    /// Borrow the hit at the cursor and advance it; `None` at exhaustion
+    /// (the cursor stays, so exhaustion is sticky).
+    pub(crate) fn next(&mut self) -> Option<(&[u8], f64, Option<&corvid::Value>)> {
+        let hit = self
+            .hits
+            .get(self.cursor)
+            .map(|e| (e.key.as_slice(), e.distance_km, e.document.as_ref()));
+        if hit.is_some() {
+            self.cursor += 1;
+        }
+        hit
+    }
+}
+
+/// Interior state behind a `corvid_schemaiter*` (spec §2: "owned
+/// `Vec<schema::Field>` + cursor", read-only, single-threaded use).
+/// `corvid_schema` materializes the declared fields in declaration
+/// order. Holds no engine reference, so it does not touch the
+/// derived-handle counter (spec §4.13 — see the module docs).
+pub(crate) struct SchemaIterHandle {
+    fields: Vec<corvid::schema::Field>,
+    cursor: usize,
+}
+
+impl SchemaIterHandle {
+    pub(crate) fn new(fields: Vec<corvid::schema::Field>) -> Self {
+        Self { fields, cursor: 0 }
+    }
+
+    /// Borrow the field at the cursor and advance it; `None` at
+    /// exhaustion (the cursor stays, so exhaustion is sticky).
+    pub(crate) fn next(&mut self) -> Option<&corvid::schema::Field> {
+        let field = self.fields.get(self.cursor);
+        if field.is_some() {
+            self.cursor += 1;
+        }
+        field
     }
 }
 
@@ -570,6 +751,25 @@ pub(crate) unsafe fn borrow_db<'a>(ptr: *mut corvid_db) -> Option<&'a DbHandle> 
     unsafe { (ptr as *mut DbHandle).as_ref() }
 }
 
+/// Exclusive borrow of a db body, or `None` on NULL — for
+/// `corvid_compact`, the one call that needs `&mut` (the engine's
+/// `Db::compact(&mut self)`).
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_db`] and not yet reclaimed.
+/// The borrow is EXCLUSIVE: sound only at the quiescent point spec §6
+/// demands of a compacting caller — no other thread may be inside any
+/// call on this same db handle (shared or reclaiming) while it is live.
+/// The §4.13 gate makes the engine-side half of that duty checkable; the
+/// handle-side half is the caller's documented quiescence, the same
+/// discipline as `corvid_close`'s single reclaim.
+pub(crate) unsafe fn borrow_db_mut<'a>(ptr: *mut corvid_db) -> Option<&'a mut DbHandle> {
+    // SAFETY: caller guarantees provenance and exclusivity (doc comment
+    // above); the box pointer round-trips through the marker.
+    unsafe { (ptr as *mut DbHandle).as_mut() }
+}
+
 /// Take a db body back for `corvid_close`, or `None` on NULL.
 ///
 /// # Safety
@@ -615,9 +815,89 @@ pub(crate) unsafe fn reclaim_strs(ptr: *mut corvid_strs) -> Option<Box<StrsHandl
     if ptr.is_null() {
         return None;
     }
-    // SAFETY: caller guarantees this is the single reclaim of a pointer
+    // SAFETY: caller guarantees the single reclaim of a pointer
     // produced by into_strs (doc comment above).
     Some(unsafe { Box::from_raw(ptr as *mut StrsHandle) })
+}
+
+// --- geohits handle plumbing --------------------------------------------------
+
+/// Box a geohits body and hand out its opaque ABI pointer (the three geo
+/// queries and `corvid_neighbors_weighted` produce these).
+pub(crate) fn into_geohits(body: GeoHitsHandle) -> *mut corvid_geohits {
+    Box::into_raw(Box::new(body)) as *mut corvid_geohits
+}
+
+/// Exclusive borrow of a geohits body, or `None` on NULL.
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_geohits`] and not yet
+/// reclaimed by [`reclaim_geohits`]; cursors are single-threaded by
+/// contract (spec §2/§6), so this is the only borrow.
+pub(crate) unsafe fn borrow_geohits_mut<'a>(
+    ptr: *mut corvid_geohits,
+) -> Option<&'a mut GeoHitsHandle> {
+    // SAFETY: caller guarantees provenance and exclusivity (doc comment
+    // above); the box pointer round-trips through the marker.
+    unsafe { (ptr as *mut GeoHitsHandle).as_mut() }
+}
+
+/// Take a geohits body back for `corvid_geohits_free`, or `None` on
+/// NULL.
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_geohits`], exactly once, and
+/// not yet reclaimed.
+pub(crate) unsafe fn reclaim_geohits(ptr: *mut corvid_geohits) -> Option<Box<GeoHitsHandle>> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees the single reclaim of a pointer
+    // produced by into_geohits (doc comment above).
+    Some(unsafe { Box::from_raw(ptr as *mut GeoHitsHandle) })
+}
+
+// --- schemaiter handle plumbing ------------------------------------------------
+
+/// Box a schemaiter body and hand out its opaque ABI pointer
+/// (`corvid_schema` produces these).
+pub(crate) fn into_schemaiter(body: SchemaIterHandle) -> *mut corvid_schemaiter {
+    Box::into_raw(Box::new(body)) as *mut corvid_schemaiter
+}
+
+/// Exclusive borrow of a schemaiter body, or `None` on NULL.
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_schemaiter`] and not yet
+/// reclaimed by [`reclaim_schemaiter`]; cursors are single-threaded by
+/// contract (spec §2/§6), so this is the only borrow.
+pub(crate) unsafe fn borrow_schemaiter_mut<'a>(
+    ptr: *mut corvid_schemaiter,
+) -> Option<&'a mut SchemaIterHandle> {
+    // SAFETY: caller guarantees provenance and exclusivity (doc comment
+    // above); the box pointer round-trips through the marker.
+    unsafe { (ptr as *mut SchemaIterHandle).as_mut() }
+}
+
+/// Take a schemaiter body back for `corvid_schemaiter_free`, or `None`
+/// on NULL.
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_schemaiter`], exactly once,
+/// and not yet reclaimed.
+pub(crate) unsafe fn reclaim_schemaiter(
+    ptr: *mut corvid_schemaiter,
+) -> Option<Box<SchemaIterHandle>> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees the single reclaim of a pointer
+    // produced by into_schemaiter (doc comment above).
+    Some(unsafe { Box::from_raw(ptr as *mut SchemaIterHandle) })
 }
 
 // --- coll handle plumbing ---------------------------------------------------
@@ -1001,14 +1281,104 @@ mod tests {
 
     #[test]
     fn strs_cursor_walks_and_sticks_at_exhaustion() {
-        let mut strs = StrsHandle::new(vec!["alpha".into(), "beta".into()]);
-        assert_eq!(strs.next(), Some("alpha"));
-        assert_eq!(strs.next(), Some("beta"));
+        let mut strs = StrsHandle::new(vec![b"alpha".to_vec(), b"beta".to_vec()]);
+        assert_eq!(strs.next(), Some(&b"alpha"[..]));
+        assert_eq!(strs.next(), Some(&b"beta"[..]));
         assert_eq!(strs.next(), None);
         assert_eq!(strs.next(), None, "exhaustion is sticky");
 
         let mut empty = StrsHandle::new(Vec::new());
         assert_eq!(empty.next(), None);
+    }
+
+    #[test]
+    fn geohits_cursor_serves_geo_bbox_and_weighted_shapes() {
+        use corvid::GeoHit;
+        // Geo shape: key + distance + full document.
+        let mut geo = GeoHitsHandle::from_geo(vec![GeoHit {
+            key: b"near".to_vec(),
+            distance_km: 12.5,
+            document: corvid::Value::Int(1),
+        }]);
+        let (key, distance, doc) = geo.next().expect("one hit");
+        assert_eq!(key, b"near");
+        assert_eq!(distance, 12.5);
+        assert_eq!(doc, Some(&corvid::Value::Int(1)));
+        assert!(geo.next().is_none(), "exhaustion is sticky");
+
+        // bbox shape: 0.0 sentinel distance, document present.
+        let mut bbox = GeoHitsHandle::from_bbox(vec![(b"in-box".to_vec(), corvid::Value::Null)]);
+        let (key, distance, doc) = bbox.next().expect("one hit");
+        assert_eq!((key, distance), (b"in-box".as_slice(), 0.0));
+        assert_eq!(doc, Some(&corvid::Value::Null));
+        assert!(bbox.next().is_none());
+
+        // Weighted shape: the weight rides distance_km, doc is None.
+        let mut weighted = GeoHitsHandle::from_weighted(vec![(b"to".to_vec(), 0.5)]);
+        let (key, distance, doc) = weighted.next().expect("one pair");
+        assert_eq!((key, distance), (b"to".as_slice(), 0.5));
+        assert_eq!(doc, None, "neighbors_weighted carries no document");
+        assert!(weighted.next().is_none());
+    }
+
+    #[test]
+    fn schemaiter_cursor_walks_fields_in_declaration_order() {
+        use corvid::schema::{Field, FieldType};
+        let fields = vec![
+            Field::new("name", FieldType::Text).required(),
+            Field::new("email", FieldType::Text).unique(),
+        ];
+        let mut it = SchemaIterHandle::new(fields);
+        let first = it.next().expect("field 1");
+        assert_eq!(
+            (first.name.as_str(), first.ty, first.required, first.unique),
+            ("name", FieldType::Text, true, false)
+        );
+        let second = it.next().expect("field 2");
+        assert_eq!(
+            (second.name.as_str(), second.required, second.unique),
+            ("email", false, true)
+        );
+        assert!(it.next().is_none());
+        assert!(it.next().is_none(), "exhaustion is sticky");
+    }
+
+    /// The compact gate's two halves (spec §4.13, the Task 5 review
+    /// prepend): a derived count > 1 fails BUSY even when the Arc is
+    /// otherwise exclusive, and a count of exactly 1 with a live clone
+    /// (the execute()-in-flight shape) fails BUSY too — only count 1 AND
+    /// sole Arc ownership lets the engine call through.
+    #[test]
+    fn compact_gate_requires_count_one_and_sole_arc_ownership() {
+        let mut db = DbHandle::new(corvid::Db::open_in_memory().unwrap());
+
+        // Count 1, Arc exclusive: the engine call runs (whether an
+        // in-memory db reports movement is redb's business — the gate's
+        // answer is that the call goes THROUGH).
+        assert!(db.compact().is_some(), "fresh in-memory db: the gate opens");
+
+        // Count 2 (a live derived handle): BUSY.
+        db.retain_derived();
+        assert!(db.compact().is_none());
+        assert_eq!(
+            crate::error::last_code(),
+            crate::error::corvid_err::CORVID_E_BUSY
+        );
+
+        // Count back to 1 but a clone lives (the execute()-in-flight
+        // shape): still BUSY — the counter alone is not engine-idle.
+        let engine = db.db();
+        db.derived.fetch_sub(1, Ordering::Release);
+        assert_eq!(db.derived.load(Ordering::Acquire), 1);
+        assert!(db.compact().is_none());
+        assert_eq!(
+            crate::error::last_code(),
+            crate::error::corvid_err::CORVID_E_BUSY
+        );
+
+        // Clone dropped: count 1 AND sole ownership — compacts again.
+        drop(engine);
+        assert!(db.compact().is_some(), "sole ownership: the gate opens");
     }
 
     #[test]

@@ -250,6 +250,12 @@ Lifecycle notes:
   reference — the `Db` (and its file locks) are released when the last
   derived handle is gone. `corvid_compact` requires exclusivity, checked
   by the FFI-owned derived-handle counter (§4.13).
+  *(Erratum, 2026-08-28, Task 6 implementation: the counter is necessary
+  but not sufficient — a query's `execute()` releases its count at entry
+  while its engine `Arc` clone lives through the engine call, so the gate
+  is the counter at exactly 1 AND sole `Arc` ownership (`Arc::get_mut`);
+  the `CORVID_E_BUSY` answer is unchanged. The spec text of §4.13 stands
+  as the intent; this note records the enforcement.)*
 - A `corvid_coll` keeps its `corvid_db` alive; freeing the db handle while
   collection handles live is fine (the collection keeps the engine open).
 - Collections are **created lazily on first write** (engine
@@ -259,6 +265,13 @@ Lifecycle notes:
 - **Cross-family frees are forbidden.** Each handle has exactly one
   destructor. Passing a handle to any function of another family is
   undefined behavior (the type system cannot stop it in C).
+  *(Erratum, 2026-08-28, Task 6 implementation: the `corvid_strs*` row
+  above reads "owned `Vec<String>` + cursor"; the implemented backing is
+  `Vec<Vec<u8>>` — graph endpoints are document keys, and §1.5 keys may
+  be any bytes, so the cursor preserves bytes and hands out the same
+  binary-safe `(pointer, length)` pairs either way (`corvid_collections`
+  stores its UTF-8 names as their bytes). The observable cursor contract
+  is unchanged.)*
 
 ## 3. Error handling model
 
