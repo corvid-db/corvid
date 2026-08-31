@@ -1,0 +1,56 @@
+//! The header drift gate (spec §8: "the generated `corvid.h` is
+//! committed and drift-gated"). Test-only.
+//!
+//! [`header_h_stays_generated_from_the_crate`] re-renders `corvid.h` from
+//! the crate sources with cbindgen (exact-pinned in `Cargo.toml`, so the
+//! output is byte-stable) and diffs it against the committed copy — the
+//! SYNTAX.md pattern, so the crate, the committed header, and the spec
+//! cannot disagree silently. With `CORVID_GEN_HEADER=1` in the
+//! environment it (re)writes the file instead — the command is in the
+//! header's own comment.
+
+use std::path::PathBuf;
+
+/// Render the canonical header text from this crate's sources.
+fn generate_header() -> String {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config = cbindgen::Config::from_file(manifest.join("cbindgen.toml")).expect(
+        "crates/corvid-ffi/cbindgen.toml parses (check key names against cbindgen::Config)",
+    );
+    let bindings = cbindgen::Builder::new()
+        .with_config(config)
+        .with_crate(&manifest)
+        .generate()
+        .expect("cbindgen parses the corvid-ffi sources");
+    let mut out = Vec::<u8>::new();
+    bindings.write(&mut out);
+    String::from_utf8(out).expect("cbindgen emits UTF-8 for this crate's docs")
+}
+
+/// docs/FFI.md §8's drift gate, in the SYNTAX.md pattern: regenerate and
+/// byte-diff on every run; `CORVID_GEN_HEADER=1` rewrites the committed
+/// copy (the failure message and the header comment both carry the
+/// command).
+#[test]
+fn header_h_stays_generated_from_the_crate() {
+    let rendered = generate_header();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corvid.h");
+    if std::env::var_os("CORVID_GEN_HEADER").is_some() {
+        std::fs::write(&path, &rendered)
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        return;
+    }
+    let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "read {}: {e} — generate it with CORVID_GEN_HEADER=1 cargo \
+             test -p corvid-ffi header_h_stays_generated",
+            path.display()
+        )
+    });
+    assert_eq!(
+        committed, rendered,
+        "crates/corvid-ffi/corvid.h is out of sync with the crate sources \
+         — regenerate with CORVID_GEN_HEADER=1 cargo test -p corvid-ffi \
+         header_h_stays_generated"
+    );
+}

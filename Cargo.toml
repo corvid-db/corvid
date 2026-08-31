@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/corvid", "crates/corvid-mcp", "crates/corvid-wasm"]
+members = [
+    "crates/corvid",
+    "crates/corvid-ffi",
+    "crates/corvid-mcp",
+    "crates/corvid-wasm",
+]
 
 [workspace.package]
 version = "0.1.1"
@@ -32,6 +37,11 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # reads only frames it wrote itself and trains no dictionaries.
 zstd = { version = "0.13", default-features = false }
 corvid = { path = "crates/corvid" }
+# Header generator for the C ABI crate (corvid-ffi): dev/test-only, exact-
+# pinned because its output formatting is byte-drift-gated against the
+# committed crates/corvid-ffi/corvid.h. Defaults trimmed to the library API
+# (no clap — the CLI front door stays out of the workspace graph).
+cbindgen = { version = "=0.29.4", default-features = false }
 
 # Size-optimized profile for the WASM bundle (keeps it under the 2 MB gzipped
 # budget). Used via `cargo build -p corvid-wasm --target wasm32-unknown-unknown

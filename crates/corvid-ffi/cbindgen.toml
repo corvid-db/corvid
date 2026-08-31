@@ -1,0 +1,52 @@
+# cbindgen configuration for crates/corvid-ffi/corvid.h — the committed C
+# header of the locked ABI (docs/FFI.md). Byte-drift-gated by the
+# `header_h_stays_generated_from_the_crate` unit test in src/header.rs;
+# regenerate with:
+#   CORVID_GEN_HEADER=1 cargo test -p corvid-ffi header_h_stays_generated
+
+language = "C"
+
+# C99: the fixed-width aliases (stdint.h) and size_t (stddef.h).
+no_includes = false
+
+include_guard = "CORVID_H"
+
+# The spec's signatures say `size_t` (docs/FFI.md §1.5); without this
+# cbindgen renders Rust `usize` as `uintptr_t`.
+usize_is_size_t = true
+
+# `typedef enum <tag> { ... } <tag>;` — the shape FFI.md §1.3/§1.4 show.
+style = "Both"
+
+# Declaration order within a family, families in module order: the
+# header's shape mirrors the crate's, which mirrors the spec's.
+sort_by = "None"
+
+documentation = true
+
+header = """
+/* corvid.h — the typed C ABI of the `corvid` cdylib.
+ *
+ * GENERATED FILE — do not edit by hand. Source of truth: crates/corvid-ffi
+ * (docs/FFI.md is the locked contract). Regenerate with:
+ *   CORVID_GEN_HEADER=1 cargo test -p corvid-ffi header_h_stays_generated
+ * Every ordinary `cargo test` run re-renders and byte-diffs this file, so
+ * the crate, the header, and the spec cannot drift apart silently.
+ */
+"""
+
+after_includes = """
+/* Opaque, single-pointer-sized handles (FFI.md §1.1). The definitions are
+ * private to the library; each handle has exactly one destructor (_free,
+ * or corvid_close for the db) and cross-family frees are undefined
+ * behavior. */
+typedef struct corvid_db   corvid_db;
+typedef struct corvid_strs corvid_strs;
+"""
+
+[export]
+# The handle markers stay forward-declared (above): their Rust bodies are
+# FFI-internal, and a zero-length-array struct would be a GNU extension,
+# not the spec's opaque forward declaration. FFI_VERSION is not a header
+# symbol (the ABI surface is the function corvid_ffi_version).
+exclude = ["corvid_db", "corvid_strs", "FFI_VERSION"]
