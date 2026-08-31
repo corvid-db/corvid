@@ -10,11 +10,13 @@ call.
 > line by line. It is not a product, has no roadmap, and comes with no support
 > promises.
 >
-> **What it isn't.** A toy. The code is solid and genuinely usable: ~1,000
-> tests, >90% line coverage, zero-warning clippy, criterion benchmarks on the
-> hot paths, and a correctness-first design (filters are true predicates,
-> indexes are never stale, writes are transactional). If a corner is rough,
-> it's a missing feature, not a broken one.
+> **What it isn't.** A toy. The code is solid and genuinely usable: 1,000+
+> tests across four feature configurations, >96% line coverage,
+> zero-warning clippy, criterion benchmarks on the hot paths (recorded
+> with before/after history in [docs/BENCHES.md](docs/BENCHES.md)), and a
+> correctness-first design (filters are true predicates, indexes are never
+> stale, writes are transactional). If a corner is rough, it's a missing
+> feature, not a broken one.
 >
 > Status: **v0.1**, pre-1.0. The API changes freely until 1.0 — no
 > backward-compatibility guarantees yet; a format change is migrated with
@@ -101,10 +103,10 @@ full **[API reference](https://i-rocky.github.io/corvid/api/corvid/)**.
 | k-nearest geo (`geo_nearest`) | ✅ |
 | Keyset (cursor) pagination (`page`) | ✅ |
 | Compound (multi-field) scalar index | ✅ |
-| Logical dump/load migration (`Db::dump`/`load`) | ✅ |
+| Logical dump/load migration (`Db::dump`/`load`, format v2; `load_with_renames` maps old `__`-containing names on load) | ✅ |
 | HNSW approximate index (`create_vector_index`) | ✅ in-memory, derived |
 | On-disk HNSW (`create_vector_index_ondisk`) | ✅ bounded memory, persists |
-| Vector quantization (binary ≈32×; scalar ≈4×, asymptotic — less at low dim where the 8-byte header dominates) | ✅ in-memory **and** on-disk |
+| Vector quantization (binary ≈32×; scalar ≈4×, asymptotic — less at low dim where the 8-byte header dominates; product quantization ≈16× via `create_vector_index_pq` in-memory and `create_vector_index_ondisk_pq` on disk) | ✅ in-memory **and** on-disk |
 | On-disk inverted text index (`create_text_index_ondisk`) | ✅ bounded memory, persists |
 | Scalar index (`create_scalar_index`): sub-linear eq/range filters | ✅ on disk, persists |
 | Directed property graph (`link`/`neighbors`/`traverse`) | ✅ |
