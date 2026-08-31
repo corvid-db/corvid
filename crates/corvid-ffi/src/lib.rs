@@ -6,10 +6,10 @@
 //! implements that contract family by family; [`FFI_VERSION`] is 1 and
 //! bindings verify it via `corvid_ffi_version()` before anything else.
 //!
-//! Layout: one module per spec §4 family, declared in spec order (the
-//! header's emission order follows, so `corvid.h` reads like the spec's
-//! function reference). Landed (the full 122-symbol surface — spec
-//! Appendix A):
+//! Layout: one module per spec §4 family (declared alphabetically; the
+//! header's emission order is cbindgen's own — the radar checks the
+//! symbol SET against spec Appendix A, not the order). Landed (the full
+//! 122-symbol surface — Appendix A):
 //!
 //! | module | spec §4 family | status |
 //! |---|---|---|

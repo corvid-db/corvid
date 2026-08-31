@@ -110,6 +110,7 @@ typedef enum corvid_err {
     CORVID_E_INVALID_DUMP        = 16, /* corvid::Error::InvalidDump — malformed / unknown-version dump stream */
     CORVID_E_BACKUP_TARGET_EXISTS= 17, /* corvid::Error::BackupTargetExists — backup path already exists */
     CORVID_E_IO                  = 18, /* corvid::Error::Io — I/O error (dump/load paths, files) */
+*(Enforcement: counter AND `Arc::get_mut` exclusivity jointly — see the §2 erratum; the counter alone is released at execute() entry while the Arc lives.)*
     CORVID_E_BUSY                = 19  /* FFI-ONLY: corvid_compact while derived handles are still
                                           open (engine Db::compact needs &mut self; see §4.13).
                                           No engine variant. */
