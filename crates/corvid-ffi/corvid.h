@@ -20,12 +20,14 @@
  * private to the library; each handle has exactly one destructor (_free,
  * or corvid_close for the db) and cross-family frees are undefined
  * behavior. */
-typedef struct corvid_db    corvid_db;
-typedef struct corvid_coll  corvid_coll;
-typedef struct corvid_strs  corvid_strs;
-typedef struct corvid_value corvid_value;
-typedef struct corvid_pred  corvid_pred;
-typedef struct corvid_rows  corvid_rows;
+typedef struct corvid_db        corvid_db;
+typedef struct corvid_coll      corvid_coll;
+typedef struct corvid_strs      corvid_strs;
+typedef struct corvid_value     corvid_value;
+typedef struct corvid_pred      corvid_pred;
+typedef struct corvid_rows      corvid_rows;
+typedef struct corvid_query     corvid_query;
+typedef struct corvid_groupiter corvid_groupiter;
 
 
 /**
@@ -192,6 +194,35 @@ enum corvid_cmp
 typedef enum corvid_cmp corvid_cmp;
 #else
 typedef uint32_t corvid_cmp;
+#endif // __STDC_VERSION__ >= 202311L
+
+/**
+ * The distance metric (FFI.md §1.4, frozen per §8): mirrors
+ * `corvid::Metric` (distance.rs).
+ */
+enum corvid_metric
+#if __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Cosine distance `1 - cos_sim` in `[0,2]`; zero-norm = maximally
+   * distant.
+   */
+  CORVID_METRIC_COSINE = 0,
+  /**
+   * Negated dot product (larger dot sorts first).
+   */
+  CORVID_METRIC_DOT = 1,
+  /**
+   * Squared Euclidean (monotonic with L2).
+   */
+  CORVID_METRIC_L2 = 2,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum corvid_metric corvid_metric;
+#else
+typedef uint32_t corvid_metric;
 #endif // __STDC_VERSION__ >= 202311L
 
 /**
@@ -461,8 +492,14 @@ uint8_t *corvid_insert_auto(corvid_coll *c, const corvid_value *doc, size_t *key
  * shape (get, callback, insert-or-delete through the engine's own
  * methods) because the engine closure type has no abort channel — the
  * semantics are the engine's, with the abort leaving the store
- * untouched. **Not linearizable** against concurrent writers (same as
- * the engine's); use `corvid_compare_and_set` when that matters.
+ * untouched. One divergence, an honest boundary: the engine's
+ * `update` runs `ensure_writable` (db.rs) BEFORE the closure, so on an
+ * unwritable collection name its closure never runs, while this
+ * wrapper reaches the check only at the write half — AFTER the
+ * callback (the get half is a legal read on any name; through today's
+ * ABI the final store state is identical, nothing written either
+ * way). **Not linearizable** against concurrent writers (same as the
+ * engine's); use `corvid_compare_and_set` when that matters.
  * **Reentrancy:** the callback MUST NOT call into the same database
  * (writes especially) — see [`corvid_update_fn`]; that is UB or a
  * deadlock, not a checked error.
@@ -712,6 +749,301 @@ corvid_pred *corvid_pred_not(corvid_pred *a);
  * freeing them too is a double free, **undefined behavior**.
  */
 void corvid_pred_free(corvid_pred *p);
+
+/**
+ * Begin a query over `coll` (spec §4.6; counterpart:
+ * `Collection::query() -> QueryBuilder`). Returns NULL only on NULL
+ * `coll` (with `CORVID_E_ARGUMENT` recorded). The handle holds an
+ * engine reference (it keeps the db alive after `corvid_close`,
+ * spec §2) and increments the db's derived-handle counter (spec
+ * §4.13) — released by `corvid_query_run`/any aggregate (which
+ * consume the handle) or by `corvid_query_free`, exactly one of the
+ * two.
+ */
+corvid_query *corvid_query_new(corvid_coll *coll);
+
+/**
+ * Add a filter — **CONSUMES `pred`** (spec §4.6; counterpart:
+ * `QueryBuilder::filter(predicate)`, by value). Multiple calls AND
+ * together. `pred` is consumed unconditionally when non-NULL (spec
+ * §8): a failed call (NULL `q`) has still taken it — free nothing
+ * afterwards. NULL `pred` fails with `CORVID_E_ARGUMENT` and consumes
+ * nothing.
+ */
+corvid_status corvid_query_filter(corvid_query *q, corvid_pred *pred);
+
+/**
+ * Add a vector-search source (spec §4.6; counterpart:
+ * `QueryBuilder::vector(field, query, k, metric)`). The query vector
+ * is CLONED — the caller keeps its buffer. `field` is borrowed UTF-8,
+ * non-NULL at any length; `query` is non-NULL at any `dim` (dim 0
+ * legal, spec §1.5); `k` is any `size_t` (the engine truncates each
+ * source's ranking to `k`). A `metric` outside
+ * `CORVID_METRIC_COSINE..=L2`, a NULL pointer, or invalid UTF-8 fails
+ * with `CORVID_E_ARGUMENT` and leaves the query untouched.
+ */
+corvid_status corvid_query_vector(corvid_query *q,
+                                  const char *field,
+                                  size_t field_len,
+                                  const float *query,
+                                  size_t dim,
+                                  size_t k,
+                                  corvid_metric metric);
+
+/**
+ * Add a BM25 text-search source (spec §4.6; counterpart:
+ * `QueryBuilder::text(field, query, k)`). `s` is CLONED into the
+ * source; both strings are borrowed UTF-8, non-NULL at any length.
+ */
+corvid_status corvid_query_text(corvid_query *q,
+                                const char *field,
+                                size_t field_len,
+                                const char *s,
+                                size_t s_len,
+                                size_t k);
+
+/**
+ * Set the Reciprocal Rank Fusion constant (spec §4.6; counterpart:
+ * `QueryBuilder::fuse_rrf(k)`; engine default `corvid::DEFAULT_RRF_K`
+ * = 60). **This setter always succeeds** — the engine validates at
+ * execution (audit C6): a non-finite or non-positive `k` fails
+ * `corvid_query_run`/aggregates with `CORVID_E_ARGUMENT`.
+ */
+corvid_status corvid_query_fuse_rrf(corvid_query *q, float k);
+
+/**
+ * Diversify results with Maximal Marginal Relevance (spec §4.6;
+ * counterpart: `QueryBuilder::rerank_mmr(lambda)`). **This setter
+ * always succeeds** — `lambda` outside `[0,1]` (NaN included) fails
+ * `corvid_query_run`/aggregates with `CORVID_E_ARGUMENT` at execution
+ * (audit C6). The rerank anchors on the first vector source; without
+ * one it is a no-op (engine documented).
+ */
+corvid_status corvid_query_rerank_mmr(corvid_query *q, float lambda);
+
+/**
+ * Allow approximate execution (spec §4.6; counterpart:
+ * `QueryBuilder::approx`): a filtered single-vector-source query may
+ * use its ANN index with over-fetch-then-filter. A knob, not data —
+ * it cannot fail beyond the NULL discipline.
+ */
+corvid_status corvid_query_approx(corvid_query *q);
+
+/**
+ * Cap the result at `n` rows (spec §4.6; counterpart:
+ * `QueryBuilder::limit`). `limit 0` yields an empty result (the
+ * engine truncates to zero), applied after `offset`.
+ */
+corvid_status corvid_query_limit(corvid_query *q, size_t n);
+
+/**
+ * Skip the first `n` rows (spec §4.6; counterpart:
+ * `QueryBuilder::offset`) — applied after ordering, before `limit`.
+ */
+corvid_status corvid_query_offset(corvid_query *q, size_t n);
+
+/**
+ * Order results by a scalar field instead of by rank (spec §4.6;
+ * counterpart: `QueryBuilder::order_by(field, descending)`).
+ * `descending` is any non-zero `int`. The engine's ordering contract
+ * (audit C4): comparable values (numbers numerically — numbers before
+ * texts across kinds — texts lexically) first in value order;
+ * incomparable values (bools, containers, NaN) after them; rows
+ * missing the field last; ties by key; `descending` reverses
+ * within-class order only.
+ */
+corvid_status corvid_query_order_by(corvid_query *q,
+                                    const char *field,
+                                    size_t field_len,
+                                    int descending);
+
+/**
+ * Project result documents to these top-level fields (spec §4.6;
+ * counterpart: `QueryBuilder::select(fields)`): missing fields are
+ * absent, non-map documents pass through unchanged, and ranking still
+ * sees the full document. `fields`/`field_lens` are parallel borrowed
+ * arrays, non-NULL when `count > 0` (`count == 0` — arrays may be
+ * NULL — is the engine-faithful empty projection: map documents
+ * project to an empty map, exactly `select(vec![])` in Rust). A NULL
+ * array (or array element) with `count > 0`, or a non-UTF-8 field,
+ * fails with `CORVID_E_ARGUMENT`.
+ */
+corvid_status corvid_query_select(corvid_query *q,
+                                  const char *const *fields,
+                                  const size_t *field_lens,
+                                  size_t count);
+
+/**
+ * Execute — **CONSUMES `q`** (spec §4.6; counterpart:
+ * `QueryBuilder::run(self)`). Returns a rows cursor even for an empty
+ * result; NULL + error on failure (distinguish failure by the NULL,
+ * never by an empty cursor). One MVCC snapshot covers the whole query;
+ * the ranking parameters are validated HERE (audit C6 — a bad
+ * `fuse_rrf`/`rerank_mmr` value fails with `CORVID_E_ARGUMENT` after
+ * having consumed the query, per spec §8). The handle's derived count
+ * is released by this consumption whichever way it goes.
+ */
+corvid_rows *corvid_query_run(corvid_query *q);
+
+/**
+ * Free a builder abandoned without executing (spec §4.6). **NOT** for
+ * use after `corvid_query_run`/aggregates — they consumed the handle,
+ * and this free would be the documented double-free UB (spec §8). No
+ * engine counterpart (Rust drops the builder). Releases the handle's
+ * derived count (spec §4.13). `corvid_query_free(NULL)` is a no-op
+ * (spec §7).
+ */
+void corvid_query_free(corvid_query *q);
+
+/**
+ * Advance the rows cursor (spec §4.6): returns 1 and fills the
+ * out-params for the next row, 0 at exhaustion — out-params untouched
+ * at 0; never errors (the result is materialized). The key and the
+ * document are **BORROWED from the cursor: valid only until the next
+ * `corvid_rows_next` or `corvid_rows_free` — using or freeing them
+ * after is UB** (the value family's borrowed-child rule, value.rs
+ * module docs; `corvid_value_clone` is the sanctioned escape).
+ * `score` is the fused RRF score (`f32`), `0.0` for pure filter/order
+ * queries and `corvid_page` rows. NULL handle or NULL out-parameter
+ * follows the non-status rule (spec §7): return 0 with
+ * `CORVID_E_ARGUMENT` recorded.
+ */
+int corvid_rows_next(corvid_rows *rows,
+                     const uint8_t **key_out,
+                     size_t *key_len_out,
+                     const corvid_value **doc_out,
+                     float *score_out);
+
+/**
+ * Free the rows cursor (spec §4.6; counterpart: dropping the
+ * `Vec<ResultRow>`). `corvid_rows_free(NULL)` is a no-op (spec §7);
+ * the last row's borrowed key/doc die with it.
+ */
+void corvid_rows_free(corvid_rows *rows);
+
+/**
+ * Count the matching documents (spec §4.7; counterpart:
+ * `QueryBuilder::count() -> usize`; O(1) when unfiltered via the
+ * engine's maintained counter). `out` is nullable (§7's optional
+ * out-params: the call still executes and writes nothing).
+ */
+corvid_status corvid_query_count(corvid_query *q, size_t *out);
+
+/**
+ * Distinct values at `field` (spec §4.7; counterpart:
+ * `QueryBuilder::count_distinct(field)`) — by the canonical group key
+ * (text bare; int/float/bool type-tagged so distinct kinds stay
+ * distinct; missing and container values ignored). `field` is
+ * borrowed UTF-8, non-NULL at any length; `out` is nullable (§7).
+ */
+corvid_status corvid_query_count_distinct(corvid_query *q,
+                                          const char *field,
+                                          size_t field_len,
+                                          size_t *out);
+
+/**
+ * Sum the numeric (`int`/`float`) values at `field` (spec §4.7;
+ * counterpart: `QueryBuilder::sum(field) -> f64`); missing or
+ * non-numeric values are skipped (an all-skipped field sums to `0.0`).
+ * `out` is nullable (§7).
+ */
+corvid_status corvid_query_sum(corvid_query *q, const char *field, size_t field_len, double *out);
+
+/**
+ * Mean of the numeric values at `field` (spec §4.7; counterpart:
+ * `QueryBuilder::avg(field) -> Option<f64>`). Absence is a success:
+ * when no numeric value exists, `*has_value = 0` and `*out` (if
+ * non-NULL) is set to `0.0` for a defined shape; otherwise
+ * `*has_value = 1` and `*out` carries the mean. Both out-params are
+ * nullable (§7).
+ */
+corvid_status corvid_query_avg(corvid_query *q,
+                               const char *field,
+                               size_t field_len,
+                               double *out,
+                               int *has_value);
+
+/**
+ * The minimum comparable (numeric or text) value at `field` (spec
+ * §4.7; counterpart: `QueryBuilder::min(field) -> Option<Value>`), as
+ * an OWNED value handle in `*out` — free it with
+ * `corvid_value_free`. Absence is a success: `CORVID_OK` + `*out ==
+ * NULL` when the filtered set holds no comparable value (the §3
+ * optional-value convention). `out` is REQUIRED (spec §4.7: "out
+ * non-NULL"); a NULL `field` is the usual `CORVID_E_ARGUMENT`.
+ */
+corvid_status corvid_query_min(corvid_query *q,
+                               const char *field,
+                               size_t field_len,
+                               corvid_value **out);
+
+/**
+ * The maximum comparable value at `field` — [`corvid_query_min`]'s
+ * twin (spec §4.7; counterpart: `QueryBuilder::max(field)`), same
+ * owned-out/absence-is-success/required-`out` contract.
+ */
+corvid_status corvid_query_max(corvid_query *q,
+                               const char *field,
+                               size_t field_len,
+                               corvid_value **out);
+
+/**
+ * Count matching documents grouped by the value at `field` (spec
+ * §4.7; counterpart: `QueryBuilder::group_count(field)`), as a
+ * `(group key, count)` cursor in ascending group-key (byte) order —
+ * the engine's `BTreeMap` iteration order. Group keys use the
+ * canonical tagged form (text bare; `i:`/`f:`/`b:` tags; `t:`
+ * escaping for ambiguous texts). NULL + error on failure (the query
+ * is consumed either way).
+ */
+corvid_groupiter *corvid_query_group_count(corvid_query *q, const char *field, size_t field_len);
+
+/**
+ * Sum `value_field` grouped by `group_field` (spec §4.7; counterpart:
+ * `QueryBuilder::group_sum`), as a `(group key, sum)` cursor in
+ * ascending group-key order; non-numeric or missing values are
+ * skipped per row (a group with none never materializes). NULL +
+ * error on failure (the query is consumed either way).
+ */
+corvid_groupiter *corvid_query_group_sum(corvid_query *q,
+                                         const char *group_field,
+                                         size_t group_field_len,
+                                         const char *value_field,
+                                         size_t value_field_len);
+
+/**
+ * Mean of `value_field` grouped by `group_field` (spec §4.7;
+ * counterpart: `QueryBuilder::group_avg`), as a `(group key, mean)`
+ * cursor in ascending group-key order. NULL + error on failure (the
+ * query is consumed either way).
+ */
+corvid_groupiter *corvid_query_group_avg(corvid_query *q,
+                                         const char *group_field,
+                                         size_t group_field_len,
+                                         const char *value_field,
+                                         size_t value_field_len);
+
+/**
+ * Advance the group cursor (spec §4.7): returns 1 and fills the
+ * out-params for the next `(key, value)` pair, 0 at exhaustion —
+ * out-params untouched at 0; never errors (the list is materialized).
+ * The key bytes are BORROWED until the next call or
+ * `corvid_groupiter_free` — the strs-cursor rule (strs.rs); using
+ * them after is UB. The value is a `double` (`group_sum`/`group_avg`
+ * means and sums; `group_count` counts, exact in a `double` to 2^53).
+ * NULL handle or NULL out-parameter follows the non-status rule
+ * (spec §7): return 0 with `CORVID_E_ARGUMENT` recorded.
+ */
+int corvid_groupiter_next(corvid_groupiter *it,
+                          const char **key_out,
+                          size_t *key_len_out,
+                          double *value_out);
+
+/**
+ * Free the group cursor (spec §4.7). `corvid_groupiter_free(NULL)` is
+ * a no-op (spec §7); the last key's borrowed bytes die with it.
+ */
+void corvid_groupiter_free(corvid_groupiter *it);
 
 /**
  * Fetch and decode the document at `key` (spec §4.9; counterpart:

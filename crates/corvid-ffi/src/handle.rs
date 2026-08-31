@@ -32,16 +32,18 @@
 //! never see the `Arc`.
 //!
 //! **Wiring:** the increment lives at each derived-handle constructor —
-//! collection handles (`corvid_collection`) are wired; query handles
-//! follow with Task 5. The decrement lives at each family's `_free`,
-//! which may run AFTER `corvid_close` has already dropped the
-//! `DbHandle` box (spec §2: a collection handle legitimately outlives
-//! its db handle) — the counter is therefore an `Arc<AtomicUsize>`
-//! shared with every derived handle, not a field the box owns alone.
-//! Cursors that own only materialized data and hold no engine reference
-//! (`rows`, `strs`, `geohits`, `groupiter`, `schemaiter` — the spec §2
-//! backing table) do **not** increment: they cannot keep the engine
-//! working and so cannot block exclusive compaction.
+//! collection handles (`corvid_collection`) and query handles
+//! (`corvid_query_new`) are wired. The decrement lives at each handle's
+//! single consumption point — a `_free`, or (for queries) the executing
+//! call that consumes the handle per spec §5 rule 5 — which may run
+//! AFTER `corvid_close` has already dropped the `DbHandle` box (spec
+//! §2: a derived handle legitimately outlives its db handle) — the
+//! counter is therefore an `Arc<AtomicUsize>` shared with every derived
+//! handle, not a field the box owns alone. Cursors that own only
+//! materialized data and hold no engine reference (`rows`, `strs`,
+//! `geohits`, `groupiter`, `schemaiter` — the spec §2 backing table) do
+//! **not** increment: they cannot keep the engine working and so cannot
+//! block exclusive compaction.
 
 use std::ffi::c_char;
 use std::sync::Arc;
@@ -49,6 +51,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use corvid::Db;
+use corvid::Metric;
 use corvid::ResultRow;
 use corvid::filter::Predicate;
 
@@ -99,6 +102,22 @@ pub struct corvid_rows {
     _unused: [u8; 0],
 }
 
+/// The opaque `corvid_query*` handle type (spec §1.1). Backed by
+/// `QueryHandle` — owned QueryBuilder state (an engine `Arc` + name +
+/// filters + sources + knobs, per the spec §2 backing table).
+#[repr(C)]
+pub struct corvid_query {
+    _unused: [u8; 0],
+}
+
+/// The opaque `corvid_groupiter*` handle type (spec §1.1). Backed by
+/// `GroupIterHandle` — the materialized group list plus a cursor, no
+/// engine reference.
+#[repr(C)]
+pub struct corvid_groupiter {
+    _unused: [u8; 0],
+}
+
 /// Interior state behind a `corvid_db*`: the engine handle (shared with
 /// derived handles as `Arc` clones) and the derived-handle counter.
 pub(crate) struct DbHandle {
@@ -142,7 +161,7 @@ impl DbHandle {
     }
 
     /// Count a newly created derived engine handle (module docs). Wired
-    /// at `corvid_collection`; the query family (Task 5) follows.
+    /// at `corvid_collection` and `corvid_query_new`.
     pub(crate) fn retain_derived(&self) {
         self.derived.fetch_add(1, Ordering::Release);
     }
@@ -214,6 +233,242 @@ impl CollHandle {
     pub(crate) fn release_derived(&self) {
         self.derived.fetch_sub(1, Ordering::Release);
     }
+
+    /// Birth a query handle over this collection (the `corvid_query_new`
+    /// body): increments the shared derived count BEFORE the handle
+    /// exists (the count and the handle are born together, spec §4.13 —
+    /// the same discipline as `corvid_collection`) and returns the
+    /// handle holding this coll's engine `Arc`, name, and counter
+    /// clone.
+    pub(crate) fn spawn_query(&self) -> QueryHandle {
+        self.derived.fetch_add(1, Ordering::Release);
+        QueryHandle::new(
+            self.db.clone(),
+            self.name.clone(),
+            Arc::clone(&self.derived),
+        )
+    }
+}
+
+/// One retrieval source accumulated on a query handle — the FFI-side
+/// mirror of the engine builder's private `Source` enum (builder.rs):
+/// the parts must be owned because a `corvid_query*` outlives the call
+/// that adds them, and the engine's variant is not `pub`.
+#[derive(Debug)]
+pub(crate) enum Source {
+    /// A vector-search source: `corvid_query_vector`.
+    Vector {
+        field: String,
+        query: Vec<f32>,
+        k: usize,
+        metric: Metric,
+    },
+    /// A BM25 text-search source: `corvid_query_text`.
+    Text {
+        field: String,
+        query: String,
+        k: usize,
+    },
+}
+
+/// Interior state behind a `corvid_query*` (spec §2: "owned
+/// QueryBuilder state (`Arc<Db>` + name + filters + sources + knobs)",
+/// single-threaded build).
+///
+/// **Why parts, not a live `QueryBuilder`:** the engine's
+/// `QueryBuilder<'c>` BORROWS a `Collection<'c>` (`{ db: &'c Db, name
+/// }`), and an opaque C handle cannot carry that borrow — giving the
+/// collection a sound `'static` lifetime would mean leaking or leaking-
+/// equivalent tricks (`Box::leak` of the engine) that defeat
+/// `corvid_close` and the counter lifecycle. The spec's own backing
+/// table rules the shape instead: the handle owns the PARTS (engine
+/// `Arc` + name + filters + sources + knobs) and
+/// [`QueryHandle::execute`] materializes a real engine
+/// `QueryBuilder` from them at execution time — every run/aggregate
+/// consumes the handle (spec §5 rule 5), so the chain is applied
+/// exactly once, by value, with no clone. The parts are applied in
+/// insertion order (filter calls AND; source order is RRF's
+/// source-chaining order; later knob calls overwrite earlier ones —
+/// `order_by`/`select` replace, `limit`/`offset`/`rrf` overwrite),
+/// matching the fluent builder a Rust caller would have chained.
+pub(crate) struct QueryHandle {
+    /// The engine reference that keeps the db working after
+    /// `corvid_close` (spec §2 — the same derived-handle shape
+    /// `CollHandle` uses).
+    db: Arc<Db>,
+    /// The collection name as stored on the coll handle.
+    name: String,
+    /// Filters, AND-combined in call order (`corvid_query_filter`).
+    filters: Vec<Predicate>,
+    /// Retrieval sources in call order.
+    sources: Vec<Source>,
+    /// The RRF constant (`corvid_query_fuse_rrf`; engine default
+    /// `corvid::DEFAULT_RRF_K` until overridden — validated at
+    /// execution, audit C6).
+    rrf_k: f32,
+    /// The MMR lambda (`corvid_query_rerank_mmr`; `None` until set).
+    mmr_lambda: Option<f32>,
+    /// The row cap (`corvid_query_limit`; `None` until set).
+    limit: Option<usize>,
+    /// The rows to skip after ordering (`corvid_query_offset`).
+    offset: usize,
+    /// The ordering field and direction (`corvid_query_order_by`).
+    order_by: Option<(String, bool)>,
+    /// The projection field list (`corvid_query_select`).
+    projection: Option<Vec<String>>,
+    /// The approximate-execution flag (`corvid_query_approx`).
+    approx: bool,
+    /// The db's derived-handle counter clone — released exactly once, by
+    /// this handle's single consumption point (`corvid_query_free`, or
+    /// the executing call that consumed the handle), whenever that runs.
+    derived: Arc<AtomicUsize>,
+}
+
+impl QueryHandle {
+    /// Wrap the builder state. The caller owns the matching
+    /// `retain_derived` on the db handle (spec §4.13 — the count and the
+    /// handle are born together in `corvid_query_new`).
+    pub(crate) fn new(db: Arc<Db>, name: String, derived: Arc<AtomicUsize>) -> Self {
+        Self {
+            db,
+            name,
+            filters: Vec::new(),
+            sources: Vec::new(),
+            rrf_k: corvid::DEFAULT_RRF_K,
+            mmr_lambda: None,
+            limit: None,
+            offset: 0,
+            order_by: None,
+            projection: None,
+            approx: false,
+            derived,
+        }
+    }
+
+    /// Add a filter (the `corvid_query_filter` body; the pred was
+    /// consumed by the caller's reclaim).
+    pub(crate) fn push_filter(&mut self, predicate: Predicate) {
+        self.filters.push(predicate);
+    }
+
+    /// Add a vector source (the `corvid_query_vector` body).
+    pub(crate) fn push_vector(&mut self, field: String, query: Vec<f32>, k: usize, metric: Metric) {
+        self.sources.push(Source::Vector {
+            field,
+            query,
+            k,
+            metric,
+        });
+    }
+
+    /// Add a text source (the `corvid_query_text` body).
+    pub(crate) fn push_text(&mut self, field: String, query: String, k: usize) {
+        self.sources.push(Source::Text { field, query, k });
+    }
+
+    /// Set the RRF constant (`corvid_query_fuse_rrf`).
+    pub(crate) fn set_rrf_k(&mut self, k: f32) {
+        self.rrf_k = k;
+    }
+
+    /// Set the MMR lambda (`corvid_query_rerank_mmr`).
+    pub(crate) fn set_mmr_lambda(&mut self, lambda: f32) {
+        self.mmr_lambda = Some(lambda);
+    }
+
+    /// Set the limit (`corvid_query_limit`).
+    pub(crate) fn set_limit(&mut self, n: usize) {
+        self.limit = Some(n);
+    }
+
+    /// Set the offset (`corvid_query_offset`).
+    pub(crate) fn set_offset(&mut self, n: usize) {
+        self.offset = n;
+    }
+
+    /// Set (replace) the ordering (`corvid_query_order_by`).
+    pub(crate) fn set_order_by(&mut self, field: String, descending: bool) {
+        self.order_by = Some((field, descending));
+    }
+
+    /// Set (replace) the projection (`corvid_query_select`).
+    pub(crate) fn set_projection(&mut self, fields: Vec<String>) {
+        self.projection = Some(fields);
+    }
+
+    /// Allow approximate execution (`corvid_query_approx`).
+    pub(crate) fn set_approx(&mut self) {
+        self.approx = true;
+    }
+
+    /// CONSUME the handle: release the derived-handle count (spec
+    /// §4.13 — execution consumes the handle unconditionally, spec §8,
+    /// so the release happens before the engine call, on every path),
+    /// materialize the engine `QueryBuilder` from the parts (see the
+    /// struct docs), and run `f` on it under the panic guard.
+    pub(crate) fn execute<T>(
+        self,
+        context: &str,
+        f: impl FnOnce(corvid::QueryBuilder<'_>) -> corvid::Result<T>,
+    ) -> Option<T> {
+        self.derived.fetch_sub(1, Ordering::Release);
+        let Self {
+            db,
+            name,
+            filters,
+            sources,
+            rrf_k,
+            mmr_lambda,
+            limit,
+            offset,
+            order_by,
+            projection,
+            approx,
+            derived: _,
+        } = self;
+        // The builder borrows the engine Arc and the name — both locals
+        // of this scope, outliving `f`'s call; no lifetime escapes.
+        let mut builder = db.collection(&name).query();
+        for predicate in filters {
+            builder = builder.filter(predicate);
+        }
+        for source in sources {
+            builder = match source {
+                Source::Vector {
+                    field,
+                    query,
+                    k,
+                    metric,
+                } => builder.vector(field, query, k, metric),
+                Source::Text { field, query, k } => builder.text(field, query, k),
+            };
+        }
+        builder = builder.fuse_rrf(rrf_k);
+        if let Some(lambda) = mmr_lambda {
+            builder = builder.rerank_mmr(lambda);
+        }
+        if approx {
+            builder = builder.approx();
+        }
+        builder = builder.offset(offset);
+        if let Some(n) = limit {
+            builder = builder.limit(n);
+        }
+        if let Some((field, descending)) = order_by {
+            builder = builder.order_by(field, descending);
+        }
+        if let Some(fields) = projection {
+            builder = builder.select(fields);
+        }
+        crate::error::guard(context, || f(builder))
+    }
+
+    /// The release half of the derived-handle count (spec §4.13), for
+    /// `corvid_query_free`'s abandoned-builder path — the executing calls
+    /// release inside [`Self::execute`] instead.
+    pub(crate) fn release_derived(&self) {
+        self.derived.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// Interior state behind a `corvid_rows*` (spec §2: "materialized
@@ -232,8 +487,6 @@ impl RowsHandle {
 
     /// Borrow the row at the cursor and advance it; `None` at exhaustion
     /// (the cursor stays, so exhaustion is sticky).
-    #[allow(dead_code)] // wired by Task 5 (corvid_rows_next); Task 4's
-    // corvid_page produces the handles and its tests walk them in-crate.
     pub(crate) fn next(&mut self) -> Option<&ResultRow> {
         let row = self.rows.get(self.cursor);
         if row.is_some() {
@@ -264,6 +517,34 @@ impl StrsHandle {
             self.cursor += 1;
         }
         item
+    }
+}
+
+/// Interior state behind a `corvid_groupiter*` (spec §2: "owned group
+/// list (sorted by group key) + cursor", read-only, single-threaded use).
+/// The list is the engine aggregate's `BTreeMap` iteration order —
+/// ascending group-key bytes — with `usize` counts widened to `f64`
+/// (exact to 2^53, the spec §4.7 note). Holds no engine reference, so it
+/// does not touch the derived-handle counter (spec §4.13 — see the
+/// module docs).
+pub(crate) struct GroupIterHandle {
+    groups: Vec<(String, f64)>,
+    cursor: usize,
+}
+
+impl GroupIterHandle {
+    pub(crate) fn new(groups: Vec<(String, f64)>) -> Self {
+        Self { groups, cursor: 0 }
+    }
+
+    /// Borrow the `(key, value)` pair at the cursor and advance it;
+    /// `None` at exhaustion (the cursor stays, so exhaustion is sticky).
+    pub(crate) fn next(&mut self) -> Option<(&str, f64)> {
+        let pair = self.groups.get(self.cursor).map(|(k, v)| (k.as_str(), *v));
+        if pair.is_some() {
+            self.cursor += 1;
+        }
+        pair
     }
 }
 
@@ -414,8 +695,8 @@ pub(crate) unsafe fn reclaim_pred(ptr: *mut corvid_pred) -> Option<Box<Predicate
 
 // --- rows handle plumbing ---------------------------------------------------
 
-/// Box a rows body and hand out its opaque ABI pointer (spec §4.9's
-/// `corvid_page` produces these; Task 5's `corvid_query_run` follows).
+/// Box a rows body and hand out its opaque ABI pointer (spec §4.6's
+/// `corvid_query_run` and §4.9's `corvid_page` produce these).
 pub(crate) fn into_rows(body: RowsHandle) -> *mut corvid_rows {
     Box::into_raw(Box::new(body)) as *mut corvid_rows
 }
@@ -427,8 +708,6 @@ pub(crate) fn into_rows(body: RowsHandle) -> *mut corvid_rows {
 /// `ptr` is NULL or was produced by [`into_rows`] and not yet reclaimed
 /// by [`reclaim_rows`]; cursors are single-threaded by contract (spec
 /// §2/§6), so this is the only borrow.
-#[allow(dead_code)] // wired by Task 5 (corvid_rows_next); Task 4's page
-// tests walk the handle in-crate to verify rows before the cursor lands.
 pub(crate) unsafe fn borrow_rows_mut<'a>(ptr: *mut corvid_rows) -> Option<&'a mut RowsHandle> {
     // SAFETY: caller guarantees provenance and exclusivity (doc comment
     // above); the box pointer round-trips through the marker.
@@ -441,15 +720,91 @@ pub(crate) unsafe fn borrow_rows_mut<'a>(ptr: *mut corvid_rows) -> Option<&'a mu
 ///
 /// `ptr` is NULL or was produced by [`into_rows`], exactly once, and
 /// not yet reclaimed.
-#[allow(dead_code)] // wired by Task 5 (corvid_rows_free); Task 4's page
-// tests reclaim in-crate so the handles do not leak before then.
 pub(crate) unsafe fn reclaim_rows(ptr: *mut corvid_rows) -> Option<Box<RowsHandle>> {
     if ptr.is_null() {
         return None;
     }
-    // SAFETY: caller guarantees this is the single reclaim of a pointer
+    // SAFETY: caller guarantees the single reclaim of a pointer
     // produced by into_rows (doc comment above).
     Some(unsafe { Box::from_raw(ptr as *mut RowsHandle) })
+}
+
+// --- query handle plumbing ---------------------------------------------------
+
+/// Box a query body and hand out its opaque ABI pointer. The caller has
+/// already run `DbHandle::retain_derived` (the count and the handle are
+/// born together — spec §4.13).
+pub(crate) fn into_query(body: QueryHandle) -> *mut corvid_query {
+    Box::into_raw(Box::new(body)) as *mut corvid_query
+}
+
+/// Exclusive borrow of a query body, or `None` on NULL.
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_query`] and not yet consumed
+/// by [`reclaim_query`]; the query family is single-threaded by contract
+/// (spec §2/§6 — build AND execution), so this is the only borrow.
+pub(crate) unsafe fn borrow_query_mut<'a>(ptr: *mut corvid_query) -> Option<&'a mut QueryHandle> {
+    // SAFETY: caller guarantees provenance and exclusivity (doc comment
+    // above); the box pointer round-trips through the zero-sized marker.
+    unsafe { (ptr as *mut QueryHandle).as_mut() }
+}
+
+/// Take a query body back — the consumption that `corvid_query_free` and
+/// every executing call (`corvid_query_run`, the aggregates) perform
+/// exactly once, or `None` on NULL.
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_query`], exactly once, and
+/// not yet consumed. Consuming an already-consumed query (a double free
+/// — run/free twice, or free after run) is UB — spec §4.6/§8.
+pub(crate) unsafe fn reclaim_query(ptr: *mut corvid_query) -> Option<Box<QueryHandle>> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees the single reclaim of an into_query
+    // product (doc comment above).
+    Some(unsafe { Box::from_raw(ptr as *mut QueryHandle) })
+}
+
+// --- groupiter handle plumbing ------------------------------------------------
+
+/// Box a groupiter body and hand out its opaque ABI pointer (the
+/// `corvid_query_group_*` constructors produce these).
+pub(crate) fn into_groupiter(body: GroupIterHandle) -> *mut corvid_groupiter {
+    Box::into_raw(Box::new(body)) as *mut corvid_groupiter
+}
+
+/// Exclusive borrow of a groupiter body, or `None` on NULL.
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_groupiter`] and not yet
+/// reclaimed by [`reclaim_groupiter`]; cursors are single-threaded by
+/// contract (spec §2/§6), so this is the only borrow.
+pub(crate) unsafe fn borrow_groupiter_mut<'a>(
+    ptr: *mut corvid_groupiter,
+) -> Option<&'a mut GroupIterHandle> {
+    // SAFETY: caller guarantees provenance and exclusivity (doc comment
+    // above); the box pointer round-trips through the marker.
+    unsafe { (ptr as *mut GroupIterHandle).as_mut() }
+}
+
+/// Take a groupiter body back, or `None` on NULL.
+///
+/// # Safety
+///
+/// `ptr` is NULL or was produced by [`into_groupiter`], exactly once,
+/// and not yet reclaimed.
+pub(crate) unsafe fn reclaim_groupiter(ptr: *mut corvid_groupiter) -> Option<Box<GroupIterHandle>> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees the single reclaim of a pointer
+    // produced by into_groupiter (doc comment above).
+    Some(unsafe { Box::from_raw(ptr as *mut GroupIterHandle) })
 }
 
 // --- value handle plumbing --------------------------------------------------
@@ -536,8 +891,8 @@ mod tests {
 
     /// The counter's lifecycle: 1 at open, +1 per derived handle, back to
     /// 1 at release; `is_exclusive` is the compaction gate (spec §4.13).
-    /// The production retain call site is `corvid_collection`
-    /// (collection.rs); the query family (Task 5) follows; this pins the
+    /// The production retain call sites are `corvid_collection`
+    /// (collection.rs) and `corvid_query_new` (query.rs); this pins the
     /// arithmetic.
     #[test]
     fn derived_counter_gates_exclusive_compaction() {
@@ -654,6 +1009,58 @@ mod tests {
 
         let mut empty = StrsHandle::new(Vec::new());
         assert_eq!(empty.next(), None);
+    }
+
+    #[test]
+    fn groupiter_cursor_walks_pairs_and_sticks_at_exhaustion() {
+        let mut groups = GroupIterHandle::new(vec![("1".into(), 1.0), ("b:true".into(), 2.0)]);
+        assert_eq!(groups.next(), Some(("1", 1.0)));
+        assert_eq!(groups.next(), Some(("b:true", 2.0)));
+        assert_eq!(groups.next(), None);
+        assert_eq!(groups.next(), None, "exhaustion is sticky");
+
+        let mut empty = GroupIterHandle::new(Vec::new());
+        assert_eq!(empty.next(), None);
+    }
+
+    /// The query handle's derived count is released exactly once on the
+    /// EXECUTION path (even a failing execution — spec §8's unconditional
+    /// consumption), and once on the free path: both halves of the
+    /// wiring, at the interior-state level.
+    #[test]
+    fn query_execute_and_free_each_release_the_derived_count_once() {
+        let engine = Arc::new(corvid::Db::open_in_memory().unwrap());
+        let counter = Arc::new(AtomicUsize::new(1));
+        // The born-together retain `corvid_query_new` performs via
+        // `CollHandle::spawn_query` (spec §4.13) — replicated per handle.
+        let retain = || counter.fetch_add(1, Ordering::Release);
+
+        // The free path: release_derived is free's single decrement.
+        retain();
+        let query = QueryHandle::new(Arc::clone(&engine), "docs".into(), Arc::clone(&counter));
+        query.release_derived();
+        assert_eq!(counter.load(Ordering::Acquire), 1, "free path: back to 1");
+
+        // The execution path: execute consumes (and releases) even when
+        // the engine call FAILS — a bad rrf_k makes run reject.
+        retain();
+        let mut query = QueryHandle::new(Arc::clone(&engine), "docs".into(), Arc::clone(&counter));
+        query.set_rrf_k(0.0);
+        let failed: Option<Vec<corvid::ResultRow>> = query.execute("test", |b| b.run());
+        assert!(failed.is_none(), "rrf_k 0.0 fails at execution (audit C6)");
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            1,
+            "execute path: back to 1"
+        );
+
+        // And a SUCCEEDING execution releases too, handing back the
+        // engine's rows.
+        retain();
+        let query = QueryHandle::new(Arc::clone(&engine), "docs".into(), Arc::clone(&counter));
+        let rows: Option<Vec<corvid::ResultRow>> = query.execute("test", |b| b.run());
+        assert_eq!(rows.expect("empty collection queries fine").len(), 0);
+        assert_eq!(counter.load(Ordering::Acquire), 1);
     }
 
     #[test]

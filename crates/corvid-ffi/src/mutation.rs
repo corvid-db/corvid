@@ -206,8 +206,14 @@ pub extern "C" fn corvid_insert_auto(
 /// shape (get, callback, insert-or-delete through the engine's own
 /// methods) because the engine closure type has no abort channel — the
 /// semantics are the engine's, with the abort leaving the store
-/// untouched. **Not linearizable** against concurrent writers (same as
-/// the engine's); use `corvid_compare_and_set` when that matters.
+/// untouched. One divergence, an honest boundary: the engine's
+/// `update` runs `ensure_writable` (db.rs) BEFORE the closure, so on an
+/// unwritable collection name its closure never runs, while this
+/// wrapper reaches the check only at the write half — AFTER the
+/// callback (the get half is a legal read on any name; through today's
+/// ABI the final store state is identical, nothing written either
+/// way). **Not linearizable** against concurrent writers (same as the
+/// engine's); use `corvid_compare_and_set` when that matters.
 /// **Reentrancy:** the callback MUST NOT call into the same database
 /// (writes especially) — see [`corvid_update_fn`]; that is UB or a
 /// deadlock, not a checked error.
@@ -644,6 +650,7 @@ mod tests {
     use crate::lifecycle::corvid_open_memory;
     use crate::read::corvid_get;
     use crate::read::corvid_len;
+    use crate::value::corvid_value_float;
     use crate::value::corvid_value_free;
     use crate::value::corvid_value_int;
     use crate::value::corvid_value_map_new;
@@ -1316,7 +1323,7 @@ mod tests {
         // Semantic equality (schema::unique_value_eq): NaN == NaN
         // regardless of payload; -0.0 == 0.0.
         let nan_a = corvid_value_map_new();
-        let x_a = crate::value::corvid_value_float(f64::NAN);
+        let x_a = corvid_value_float(f64::NAN);
         assert_eq!(
             corvid_value_map_put(nan_a, b"x".as_ptr() as *const std::ffi::c_char, 1, x_a),
             CORVID_OK
@@ -1325,7 +1332,7 @@ mod tests {
         corvid_value_free(nan_a);
         let nan_b = corvid_value_map_new();
         // A DIFFERENT NaN payload (0x7FF8... vs the quiet bit set).
-        let x_b = crate::value::corvid_value_float(f64::from_bits(0x7FF8_0000_0000_0001));
+        let x_b = corvid_value_float(f64::from_bits(0x7FF8_0000_0000_0001));
         assert_eq!(
             corvid_value_map_put(nan_b, b"x".as_ptr() as *const std::ffi::c_char, 1, x_b),
             CORVID_OK
@@ -1339,6 +1346,90 @@ mod tests {
         assert_eq!(get_int(coll, b"nan"), Some(0));
         corvid_value_free(nan_b);
         corvid_value_free(zero);
+
+        // The -0.0 == 0.0 half of the same rule (the T4 report claimed
+        // it without asserting it — the Task 5 prepend's pin): a stored
+        // +0.0 matches an expected -0.0, bitwise-distinct floats that
+        // IEEE (and the engine's semantic equality) call equal.
+        let stored = corvid_value_map_new();
+        let x_plus = corvid_value_float(0.0);
+        assert_eq!(
+            corvid_value_map_put(stored, b"x".as_ptr() as *const std::ffi::c_char, 1, x_plus),
+            CORVID_OK
+        );
+        assert_eq!(corvid_insert(coll, b"negz".as_ptr(), 4, stored), CORVID_OK);
+        corvid_value_free(stored);
+        let expected = corvid_value_map_new();
+        let x_minus = corvid_value_float(-0.0);
+        assert_eq!(
+            corvid_value_map_put(
+                expected,
+                b"x".as_ptr() as *const std::ffi::c_char,
+                1,
+                x_minus
+            ),
+            CORVID_OK
+        );
+        let replacement = corvid_value_map_new();
+        let x_one = corvid_value_float(1.0);
+        assert_eq!(
+            corvid_value_map_put(
+                replacement,
+                b"x".as_ptr() as *const std::ffi::c_char,
+                1,
+                x_one
+            ),
+            CORVID_OK
+        );
+        assert_eq!(
+            corvid_compare_and_set(
+                coll,
+                b"negz".as_ptr(),
+                4,
+                expected,
+                replacement,
+                &mut applied
+            ),
+            CORVID_OK
+        );
+        assert_eq!(applied, 1, "-0.0 == 0.0 under semantic equality");
+        // And the reflected order: stored -0.0 matches expected +0.0.
+        let stored2 = corvid_value_map_new();
+        let x_minus2 = corvid_value_float(-0.0);
+        assert_eq!(
+            corvid_value_map_put(
+                stored2,
+                b"x".as_ptr() as *const std::ffi::c_char,
+                1,
+                x_minus2
+            ),
+            CORVID_OK
+        );
+        assert_eq!(
+            corvid_insert(coll, b"negz2".as_ptr(), 5, stored2),
+            CORVID_OK
+        );
+        corvid_value_free(stored2);
+        let expected2 = corvid_value_map_new();
+        let x_plus2 = corvid_value_float(0.0);
+        assert_eq!(
+            corvid_value_map_put(
+                expected2,
+                b"x".as_ptr() as *const std::ffi::c_char,
+                1,
+                x_plus2
+            ),
+            CORVID_OK
+        );
+        let two = corvid_value_int(2);
+        assert_eq!(
+            corvid_compare_and_set(coll, b"negz2".as_ptr(), 5, expected2, two, &mut applied),
+            CORVID_OK
+        );
+        assert_eq!(applied, 1);
+        assert_eq!(get_int(coll, b"negz2"), Some(2));
+        corvid_value_free(expected2);
+        corvid_value_free(two);
 
         // applied_out is nullable (§7's optional out-params).
         let one = corvid_value_int(0);

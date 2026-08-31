@@ -19,10 +19,10 @@
 //! | [`collection`] | §4.2 collection handles (3 fns) | landed |
 //! | [`value`] | §4.3/§4.4 value construction & reads (23 fns) | landed |
 //! | [`pred`] | §4.5 predicates (11 fns) | landed |
+//! | [`query`] | §4.6/§4.7 query builder, rows cursor, aggregations (26 fns) | landed |
 //! | [`mutation`] | §4.8 mutations (13 fns) | landed |
 //! | [`read`] | §4.9 reads (4 fns) | landed |
 //! | [`strs`] | §4.12 string-cursor plumbing (`strs_next`/`strs_free`) | landed |
-//! | [`query`] | §4.6/§4.7 query builder, rows, aggregations | Task 5 |
 //! | [`index`] | §4.10 indexes & schema | Task 6 |
 //! | [`graph`] | §4.11 graph | Task 6 |
 //! | [`geo`] | §4.12 geo queries & geohits cursor | Task 6 |
@@ -89,7 +89,12 @@ pub mod mutation;
 /// constructors over dotted field paths (values CLONED into the tree)
 /// and `pred_free` for never-consumed roots.
 pub mod pred;
-/// Queries, rows cursor, aggregations (spec §4.6/§4.7). Task 5.
+/// Queries, rows cursor, aggregations (spec §4.6/§4.7): the 15
+/// query-family functions — the builder setters (filter consuming a
+/// predicate, vector/text sources, RRF/MMR knobs, limit/offset/
+/// order_by/select), `run` CONSUMING the query into a rows cursor,
+/// `rows_next`'s borrowed key/doc walk — plus the 11 aggregations
+/// (all consuming; the `groupiter` cursor).
 pub mod query;
 /// Reads (spec §4.9): `get` (owned-out), `scan` (callback), `page`
 /// (keyset pagination + the `next_after` buffer), `len`.
