@@ -223,6 +223,14 @@ put_many atomicity.
 
 ### Task 5: Query builder + rows cursor + aggregations
 
+Prepend (Task 4 review nits, binding): (a) add the missing CAS -0.0==0.0
+pin through the ABI (the report claimed it; only NaN-payload equality is
+asserted); (b) fix the report's two inaccuracies (lib.rs is alphabetical,
+header is not §4 order — harmless, Task 7 checks the set; drop the claim)
+and the stale task-3-report sentence; (c) add the one-sentence
+ensure_writable-timing caveat to corvid_update's equivalence docs
+(unreachable through today's ABI; honest boundary).
+
 The 16 query fns (build a real QueryBuilder under the handle; run
 CONSUMES as documented) + rows_next cursor (borrowed doc contract);
 the 10 aggregation fns (consume semantics; groupiter cursors). Tests:
