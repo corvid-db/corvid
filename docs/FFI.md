@@ -86,8 +86,8 @@ typedef enum corvid_status {
 
 /* Detailed codes returned by corvid_last_error_code(). Value 0 means
    "no error recorded on this thread". Codes 1..18 map 1:1 onto the
-   engine's corvid::Error variants (exhaustiveness-tested in the crate);
-   code 19 is FFI-only. NEVER renumber. */
+   engine's corvid::Error variants (pinned by the variant-inventory
+   snapshot test, §1.3); code 19 is FFI-only. NEVER renumber. */
 typedef enum corvid_err {
     CORVID_E_OK                  = 0,  /* no error */
     CORVID_E_DATABASE            = 1,  /* corvid::Error::Database — opening/creating the file failed */
@@ -110,16 +110,25 @@ typedef enum corvid_err {
     CORVID_E_INVALID_DUMP        = 16, /* corvid::Error::InvalidDump — malformed / unknown-version dump stream */
     CORVID_E_BACKUP_TARGET_EXISTS= 17, /* corvid::Error::BackupTargetExists — backup path already exists */
     CORVID_E_IO                  = 18, /* corvid::Error::Io — I/O error (dump/load paths, files) */
-    CORVID_E_BUSY                = 19  /* FFI-ONLY: corvid_compact with collection handles still open
-                                          (engine Db::compact needs &mut self; see §4.13). No engine variant. */
+    CORVID_E_BUSY                = 19  /* FFI-ONLY: corvid_compact while derived handles are still
+                                          open (engine Db::compact needs &mut self; see §4.13).
+                                          No engine variant. */
 } corvid_err;
 ```
 
 The engine's `corvid::Error` (crates/corvid/src/error.rs) currently has
-exactly 18 variants; the mapping above is exhaustive and pinned by a
-compile-time exhaustiveness test in `corvid-ffi` (adding an engine variant
-without a code fails the FFI build). `CORVID_E_BUSY` is the one code with
-no engine source.
+exactly 18 variants and is `#[non_exhaustive]` (the correct
+published-crate posture — kept), so a downstream compile-time exhaustive
+`match` is impossible by design. The mapping is instead pinned by a
+**variant-inventory snapshot test** in `corvid-ffi`: a `const` array of
+the 18 variant names, and a test that (i) matches every engine variant
+with a wildcard arm asserting the variant is present in the inventory,
+and (ii) asserts the inventory equals the mapping table above. Adding,
+removing, or renaming an engine variant fails the FFI test suite until
+the mapping is maintained — the same enforcement a plain exhaustive
+match would give, without requiring the engine to drop
+`#[non_exhaustive]`. `CORVID_E_BUSY` is the one code with no engine
+source.
 
 ### 1.4 Domain enums (explicit values — frozen)
 
@@ -239,8 +248,8 @@ Lifecycle notes:
 - `corvid_db` holds the only strong reference after open; every
   `corvid_coll` clones the `Arc`. `corvid_close` drops the handle's
   reference — the `Db` (and its file locks) are released when the last
-  derived handle is gone. `corvid_compact` requires the `Arc` to be unique
-  (§4.13).
+  derived handle is gone. `corvid_compact` requires exclusivity, checked
+  by the FFI-owned derived-handle counter (§4.13).
 - A `corvid_coll` keeps its `corvid_db` alive; freeing the db handle while
   collection handles live is fine (the collection keeps the engine open).
 - Collections are **created lazily on first write** (engine
@@ -432,16 +441,18 @@ does not matter for equality or encoding.
 corvid_value_type corvid_value_type(const corvid_value *v);
 ```
 The value's discriminant. Counterpart: the `Value` variant
-(`std::mem::discriminant`).
+(`std::mem::discriminant`). A NULL `v` follows the non-status rule (§7):
+returns `CORVID_TYPE_NULL` (0) and records `CORVID_E_ARGUMENT`.
 
 ```c
 int      corvid_value_as_bool(const corvid_value *v, int *ok);
 int64_t  corvid_value_as_int(const corvid_value *v, int *ok);
 double   corvid_value_as_float(const corvid_value *v, int *ok);
 ```
-Typed read with an ok-flag (type mismatch sets `*ok = 0` and returns 0 —
+Typed read with an ok-flag. A wrong type sets `*ok = 0` and returns 0 —
 **not an error**, mirroring `Value::as_bool/as_int/as_float` returning
-`Option`). `v` non-NULL.
+`Option`. A NULL `v` or NULL `ok` follows the non-status rule (§7):
+`*ok = 0`, return 0, `CORVID_E_ARGUMENT` recorded.
 
 ```c
 const char*   corvid_value_text_ref(const corvid_value *v, size_t *len_out);
@@ -449,9 +460,10 @@ const uint8_t* corvid_value_bytes_ref(const corvid_value *v, size_t *len_out);
 const float*  corvid_value_vector_ref(const corvid_value *v, size_t *dim_out);
 ```
 Zero-copy BORROWED views (counterparts: `Value::as_text` / `as_bytes` /
-`as_vector`). NULL when the value is of a different type — not an error.
-The buffer is valid until the parent value is freed or mutated; **freeing
-or writing through these pointers is UB.**
+`as_vector`). NULL when the value is of a different type — not an error;
+NULL with `CORVID_E_ARGUMENT` recorded when `v` or `len_out` is NULL
+(§7). The buffer is valid until the parent value is freed or mutated;
+**freeing or writing through these pointers is UB.**
 
 ```c
 const corvid_value* corvid_value_array_get(const corvid_value *arr, size_t index);
@@ -466,8 +478,10 @@ error. Child lifetime rides the parent (§5 rule 6): **calling
 size_t corvid_value_len(const corvid_value *v);
 ```
 Array items / map entries / vector dimensions / text bytes / bytes bytes;
-0 for null/bool/int/float. No single engine method — the collection
-lengths (`Vec::len`, `BTreeMap::len`, `String::len`) it reports.
+0 for null/bool/int/float. A NULL `v` returns 0 with
+`CORVID_E_ARGUMENT` recorded (§7). No single engine method — the
+collection lengths (`Vec::len`, `BTreeMap::len`, `String::len`) it
+reports.
 
 ```c
 corvid_value* corvid_value_clone(const corvid_value *v);
@@ -654,11 +668,12 @@ int corvid_rows_next(corvid_rows *rows,
 ```
 Advance: returns 1 and fills the out-params for the next row, 0 at
 exhaustion (out-params untouched at 0; never errors — the result is
-materialized). All out-params are required non-NULL. The key and the
-document are **BORROWED from the cursor: valid only until the next
-`corvid_rows_next` or `corvid_rows_free` — using or freeing them after is
-UB.** `score` is the fused RRF score (`f32`), `0.0` for pure
-filter/order queries and for `corvid_page` rows. No direct engine
+materialized). NULL-handle / NULL-out-param behavior follows the
+non-status rule (§7): return 0 with `CORVID_E_ARGUMENT` recorded. The
+key and the document are **BORROWED from the cursor: valid only until
+the next `corvid_rows_next` or `corvid_rows_free` — using or freeing
+them after is UB.** `score` is the fused RRF score (`f32`), `0.0` for
+pure filter/order queries and for `corvid_page` rows. No direct engine
 counterpart — the cursor walks the `Vec<ResultRow>` that
 `QueryBuilder::run` returned.
 
@@ -734,7 +749,8 @@ int corvid_groupiter_next(corvid_groupiter *it,
                           double *value_out);
 ```
 Next `(key, value)`: 1 fetched, 0 exhausted. The key is BORROWED until
-the next call or `corvid_groupiter_free`. The value is a `double` for
+the next call or `corvid_groupiter_free`. NULL-handle / NULL-out-param
+behavior follows the non-status rule (§7). The value is a `double` for
 `group_sum`/`group_avg`; `group_count` yields a count that is exact in a
 `double` up to 2^53 (beyond any realistic group cardinality — noted, not
 an engine limit). No direct engine counterpart (cursor over the
@@ -942,8 +958,12 @@ HNSW variants, 1:1 with the engine (index.rs): in-memory full precision
 (`create_vector_index_ondisk_quantized`), in-memory product-quantized
 (`create_vector_index_pq` — **arity verified: `(field, metric, m, k)`**,
 `m` subspaces × `k` centroids, `dim % m == 0`), on-disk product-quantized
-(`create_vector_index_ondisk_pq`, same arity). PQ creates require
-existing training vectors, else `CORVID_E_EMPTY_INDEX_TRAINING`.
+(`create_vector_index_ondisk_pq`, same arity). PQ creates fail with
+`CORVID_E_EMPTY_INDEX_TRAINING` when there are no usable training
+vectors, and — because `Pq::train`'s domain checks fold into the same
+error at index.rs — also for `m == 0`, `k` outside `2..=256`,
+`dim % m != 0`, zero-dimensional or mixed-dimension training vectors
+(pq.rs `train_inner`).
 
 ```c
 corvid_status corvid_set_schema(corvid_coll *c, const corvid_field_def *fields, size_t count);
@@ -967,7 +987,8 @@ int corvid_schemaiter_next(corvid_schemaiter *it, corvid_field_def *out);
 ```
 Next field: 1 fetched, 0 exhausted. Fields arrive in declaration order;
 `out->name` is BORROWED until the next call or
-`corvid_schemaiter_free`. No direct engine counterpart (cursor over
+`corvid_schemaiter_free`. NULL-handle / NULL-out-param behavior follows
+the non-status rule (§7). No direct engine counterpart (cursor over
 `Schema::fields()`).
 
 ```c
@@ -1074,8 +1095,12 @@ int corvid_geohits_next(corvid_geohits *h, corvid_geohit *out,
 ```
 Next hit: 1 fetched, 0 exhausted. `out->key` is BORROWED until the next
 call or `corvid_geohits_free`; `*doc_out` (nullable pointer) is the
-likewise-borrowed full document for this hit. No direct engine
-counterpart (cursor over the `Vec<GeoHit>`).
+likewise-borrowed full document for this hit. **Cursors from
+`corvid_neighbors_weighted` set `*doc_out = NULL`** — the engine returns
+`(key, weight)` pairs with no document — and `corvid_geohits_next`
+still returns 1 for them. NULL-handle / NULL-out-param behavior follows
+the non-status rule (§7). No direct engine counterpart (cursor over the
+`Vec<GeoHit>`).
 
 ```c
 void corvid_geohits_free(corvid_geohits *h);
@@ -1085,7 +1110,8 @@ void corvid_geohits_free(corvid_geohits *h);
 int corvid_strs_next(corvid_strs *s, const char **str_out, size_t *len_out);
 ```
 Next string: 1 fetched, 0 exhausted. BORROWED until the next call or
-`corvid_strs_free`. No direct engine counterpart (cursor over
+`corvid_strs_free`. NULL-handle / NULL-out-param behavior follows the
+non-status rule (§7). No direct engine counterpart (cursor over
 `Vec<String>`).
 
 ```c
@@ -1141,11 +1167,16 @@ corvid_status corvid_compact(corvid_db *db, int *moved_out);
 Reclaim file space after heavy deletes (offline maintenance).
 `*moved_out` (nullable) reports whether any data moved. Counterpart:
 `Db::compact(&mut self) -> Result<bool>` — **the engine requires
-exclusive access**, so this call requires that no `corvid_coll` handle
-(or query) derived from this `db` is still alive; otherwise it fails
-with the FFI-only `CORVID_E_BUSY` (free your collection handles first;
-the handle's `Arc` reference count is the check). This is the one
-FFI-only error code.
+exclusive access**, so this call requires quiescence: every handle
+derived from this `db` (collections, queries, and anything else holding
+an engine reference) must already be freed. Exclusivity is checked with
+an **FFI-owned derived-handle counter** — an `AtomicUsize` incremented
+when a handle is created from the db and decremented when that handle is
+freed; `corvid_compact` requires the count to be exactly 1 (the db
+handle itself) and otherwise fails with the FFI-only `CORVID_E_BUSY`.
+The counter is deterministic because the FFI layer is the only `Arc`
+cloner — bindings never see the `Arc`. This is the one FFI-only error
+code.
 
 ## 5. Ownership & transfer rules
 
@@ -1198,6 +1229,12 @@ outputs: O=owned-by-caller, B=borrowed):
   its own last failure; no locking is needed or provided.
 - Freeing a handle while another thread is calling into it is UB. Free
   after joining/quiescing.
+- **Quiescence consequence of `corvid_compact`:** compact needs exclusive
+  engine access, checked by the FFI-owned derived-handle counter (§4.13).
+  Concurrent use of other handles is unaffected until the compact call —
+  but a binding that wants to compact must reach a quiescent point (all
+  collection/query handles freed) first; threads still holding handles
+  keep `CORVID_E_BUSY` as the deterministic answer, never a hang or UB.
 
 ## 7. NULL discipline
 
@@ -1205,6 +1242,16 @@ outputs: O=owned-by-caller, B=borrowed):
   signature). An unexpected NULL — including a NULL handle, a NULL
   out-param marked required, or a NULL data pointer with nonzero length —
   returns `CORVID_ERR` with `CORVID_E_ARGUMENT`. **Never UB.**
+- **Non-status functions** (functions that do not return
+  `corvid_status`: `corvid_value_type`, `corvid_value_as_bool/as_int/
+  as_float`, `corvid_value_len`, the `_ref` trio, and all five `_next`
+  cursors) follow the same discipline without a status channel: a NULL
+  handle or a NULL required out-parameter yields a **defined inert
+  value** — `0` / `*ok = 0` / `NULL` pointer / `0` (= exhausted) for
+  `_next` — AND records `CORVID_E_ARGUMENT` in the thread-local
+  last-error. Never UB, and never a status return (these functions have
+  none). The per-signature notes in §4.4, §4.6, and §4.12 defer to this
+  rule.
 - Nullable-by-contract pointers carry semantics: `corvid_compare_and_set`'s
   `expected`/`replacement` (absent / delete), `corvid_page`'s `after`
   (start), `corvid_update`'s `current`/`*out` (absent / delete), optional
@@ -1245,7 +1292,8 @@ Stability:
   `corvid_cmp`, `corvid_metric`, `corvid_quant`, `corvid_value_type`,
   `corvid_field_type` are never renumbered and never reordered; new
   values may only be appended (a new engine `Error` variant appends code
-  20+, never fills a gap).
+  20+, never fills a gap — and the variant-inventory snapshot test of
+  §1.3 fails until it is mapped).
 - **Pre-1.0 break policy:** while the engine is pre-1.0, breaking ABI
   changes are allowed but must be loud — bump `FFI_VERSION`, change the
   SONAME-less artifact names, and record the break in CHANGELOG and
@@ -1277,6 +1325,7 @@ notes), so binding authors know what is missing on purpose:
 | `Db::bulk` (begin_bulk relaxed durability) | `corvid_put_many` covers the bulk fast path | a dump-ingest bench showing per-commit fsync cost matters |
 | `Collection::page_where` (spec note) | filtered keyset pagination composes from `query().filter()` + `offset/limit`; cursor semantics across a moving filter set are subtle | a binding needing constant-memory filtered pagination |
 | `Store`-level byte API (spec note) | the ABI is typed-document only by ruling 1 | none foreseen |
+| Non-UTF-8 filesystem paths (spec note) | the engine's `Db::open` accepts any `AsRef<Path>` (including non-UTF-8 OS paths); the ABI takes `(const char*, len)` and requires UTF-8 (§1.5) — a deliberate narrowing so one encoding rule covers every string | a binding on a platform where UTF-8 paths are insufficient (then: a wide-char or OS-native path entry point, additive) |
 
 ## Appendix A — exported symbols (122, pinned)
 
