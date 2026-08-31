@@ -258,6 +258,17 @@ dump→load→query equivalence through the ABI.
 
 ### Task 7: C-surface radar + golden vectors + C smoke suite
 
+Prepend (Task 6 review, binding): (a) fix FFI.md §4.12's stale
+"Vec<String>" sentence (the §2 erratum changed the backing to bytes —
+amend the strs_next note); (b) the radar's appendix source must be
+docs/FFI.md ITSELF parsed at test time (not a transcribed const — closes
+the last drift link); (c) close the field-type mapping pin: set_schema
+over all 9 corvid_field_type values read back through the schema
+iterator; (d) pin geo radius ties-by-key; (e) spec-text: §4.13's
+"opens the files itself" over-generalizes backup (engine takes the path
+directly) — correct the sentence; (f) fold index persistence-across-
+reopen into the golden suite (reopen + query).
+
 The radar: parse corvid.h, extract exported symbols, assert the C
 smoke suite drives every one (no untested exports — 122/122). The
 golden fixture generator + committed fixtures (§6 format; cover
