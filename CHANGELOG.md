@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/). Until 1.0 the on-disk
 format and API may change without backward-compatibility guarantees.
 
+## [0.3.0] - 2026-09-01
+### Added
+
+- The C ABI's first additive expansion inside `FFI_VERSION = 1`
+  (docs/FFI.md §4.4/§4.6 errata): `corvid_value_map_keys` — a map's
+  keys as the §4.12 strs cursor in ascending key-BYTE order (a non-map
+  answers an EMPTY cursor, inert, the `as_*` wrong-type convention;
+  NULL records `CORVID_E_ARGUMENT` and returns NULL) — retiring the
+  candidate-key oracle corvid-go's bootstrap needed at every map
+  decode; and `corvid_phrase_search` — the DIRECT positional text
+  search (`Collection::phrase_search`: consecutive in-order analyzed
+  tokens, stop words collapsing out of adjacency, most relevant first,
+  ties by key) over a collection handle, returning the §4.6 rows
+  cursor whose `score` is the hit's BM25 phrase sum (`TextHit::score`,
+  not the builder's fused RRF); `k == 0` answers an empty cursor
+  (inert, per the engine and the `geo_nearest`/`page` convention).
+  Appendix A grows 122 → 124; no signature, enum value, or behavior
+  changes; the soname/`FFI_VERSION` stay at 1. §9's direct-search
+  exclusion row is amended (the phrase half was never coverable by the
+  bag-of-words `.text` source). The golden fixtures gain executable
+  lines (`values.txt`, `mutations.txt`, `queries.txt` — a fixture-set
+  change; binding repos that vendor `golden/` byte-identical re-vendor
+  at their next engine-pin bump).
+
 ## [Unreleased]
 ### Design ledger
 
