@@ -85,11 +85,17 @@ so a highly selective filter may return fewer than `limit` rows (see the
   anywhere on the path (measured at parity with native Rust). Release
   artifacts attach the library, header, and golden fixtures per platform
   (Windows ships `corvid.dll` plus its MSVC import library
-  `corvid.dll.lib` — link the import lib); **[docs/FFI.md](docs/FFI.md)**
-  is the contract binding authors code against.
+  `corvid.dll.lib` — link the import lib); the FFI spec lives in
+  **[docs/FFI.md](docs/FFI.md)** (source) and as the site's
+  **[C ABI section](https://corvid-db.github.io/docs/ffi/)** — the canonical
+  rendered form binding authors code against.
 
-A task-oriented walkthrough of every feature is in the **[user guide](docs/GUIDE.md)**.
-The **[website](https://corvid-db.github.io/corvid/)** hosts an overview and the
+The canonical documentation lives at
+**[corvid-db.github.io/docs](https://corvid-db.github.io/docs/)** — a
+task-oriented tutorial, the corvid-language reference, index/full-text/geo/
+vector guides, administration, performance, the C ABI, and the bindings
+ecosystem, with versioned release snapshots. The
+**[website](https://corvid-db.github.io/corvid/)** hosts an overview and the
 full **[API reference](https://corvid-db.github.io/corvid/api/corvid/)**.
 
 ## Capabilities (v0.1)
