@@ -21,7 +21,7 @@
 //!    abstracts gcc/clang/cl selection and flag dialects) against the
 //!    committed `corvid.h`, linking the cdylib BY PATH into a
 //!    scratch-directory executable — nothing is linked into the cdylib,
-//!    so the shipped artifact stays exactly the 122-symbol surface
+//!    so the shipped artifact stays exactly the 124-symbol surface
 //!    (on MSVC the link names the emitted import library
 //!    `corvid.dll.lib` when present, the shape binding authors use;
 //!    at run time the child finds `corvid.dll` via `PATH`);

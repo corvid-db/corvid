@@ -1,6 +1,6 @@
 //! corvid-ffi — the typed C ABI over the corvid engine.
 //!
-//! The contract is `docs/FFI.md` (LOCKED, Phase-0 Task 1): 122 `corvid_`
+//! The contract is `docs/FFI.md` (LOCKED, Phase-0 Task 1): 124 `corvid_`
 //! prefixed `extern "C"` symbols across 13 families, opaque handles, the
 //! 19-code error enum, and the ownership rules of its §4/§5. This crate
 //! implements that contract family by family; [`FFI_VERSION`] is 1 and
@@ -9,7 +9,7 @@
 //! Layout: one module per spec §4 family (declared alphabetically; the
 //! header's emission order is cbindgen's own — the radar checks the
 //! symbol SET against spec Appendix A, not the order). Landed (the full
-//! 122-symbol surface — Appendix A):
+//! 124-symbol surface — Appendix A):
 //!
 //! | module | spec §4 family | status |
 //! |---|---|---|
@@ -17,9 +17,9 @@
 //! | [`handle`] | §1.1/§2/§4.13 opaque handles, derived-handle counter, compact gate | landed |
 //! | [`lifecycle`] | §4.1 lifecycle & errors (8 fns) | landed |
 //! | [`collection`] | §4.2 collection handles (3 fns) | landed |
-//! | [`value`] | §4.3/§4.4 value construction & reads (23 fns) | landed |
+//! | [`value`] | §4.3/§4.4 value construction & reads (24 fns) | landed |
 //! | [`pred`] | §4.5 predicates (11 fns) | landed |
-//! | [`query`] | §4.6/§4.7 query builder, rows cursor, aggregations (26 fns) | landed |
+//! | [`query`] | §4.6/§4.7 query builder, rows cursor, direct phrase search, aggregations (27 fns) | landed |
 //! | [`mutation`] | §4.8 mutations (13 fns) | landed |
 //! | [`read`] | §4.9 reads (4 fns) | landed |
 //! | [`strs`] | §4.12 string-cursor plumbing (`strs_next`/`strs_free`) | landed |
@@ -102,12 +102,13 @@ pub mod mutation;
 /// constructors over dotted field paths (values CLONED into the tree)
 /// and `pred_free` for never-consumed roots.
 pub mod pred;
-/// Queries, rows cursor, aggregations (spec §4.6/§4.7): the 15
+/// Queries, rows cursor, aggregations (spec §4.6/§4.7): the 16
 /// query-family functions — the builder setters (filter consuming a
 /// predicate, vector/text sources, RRF/MMR knobs, limit/offset/
 /// order_by/select), `run` CONSUMING the query into a rows cursor,
-/// `rows_next`'s borrowed key/doc walk — plus the 11 aggregations
-/// (all consuming; the `groupiter` cursor).
+/// `rows_next`'s borrowed key/doc walk, and the one DIRECT retrieval
+/// call `corvid_phrase_search` (the §4.6 2026-09-01 erratum) — plus
+/// the 11 aggregations (all consuming; the `groupiter` cursor).
 pub mod query;
 /// Reads (spec §4.9): `get` (owned-out), `scan` (callback), `page`
 /// (keyset pagination + the `next_after` buffer), `len`.
@@ -116,10 +117,10 @@ pub mod read;
 /// `strs_free` — shared by `corvid_collections` and the graph-family
 /// cursors (`neighbors` / `in_neighbors` / `traverse`).
 pub mod strs;
-/// Value construction & reads (spec §4.3/§4.4): the 23 value functions
+/// Value construction & reads (spec §4.3/§4.4): the 24 value functions
 /// — constructors that CLONE their buffers, `_ref` zero-copy borrows,
-/// `array_get`/`map_get` borrowed children, and `corvid_value_free` for
-/// OWNED values only.
+/// `array_get`/`map_get` borrowed children, `map_keys`' key cursor, and
+/// `corvid_value_free` for OWNED values only.
 pub mod value;
 
 /// The header drift gate (test-only): regenerates `corvid.h` from this
@@ -131,7 +132,7 @@ mod header;
 /// The C-surface radar (test-only, Task 7): no untested exports — the
 /// generated header's symbol set equals spec Appendix A (parsed from
 /// `docs/FFI.md` at test time), and the C smoke suite (`c/smoke.c`)
-/// calls every one of the 122 symbols.
+/// calls every one of the 124 symbols.
 #[cfg(test)]
 mod radar;
 

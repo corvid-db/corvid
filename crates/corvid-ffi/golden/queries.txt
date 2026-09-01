@@ -30,6 +30,16 @@ HYBRID_F	v,vec(1,0),2,body,t(rust database),2,t(s),2	k(s1,s3)|~0.032787,~0.03225
 QVEC	v,vec(1,0),3	k(s1,s3,s2)|~0.016393,~0.016129,~0.015873
 # a BM25 text source's keys (order deterministic for the corpus)
 QTEXT	body,t(rust database),2	k(s1,s3)
+# phrase search (§4.6's direct fn, 2026-09-01 erratum): order-sensitive
+# adjacency — the score column is the BM25 phrase sum (TextHit's scale,
+# not the builder's RRF); reversed word order matches nothing; k == 0
+# is the inert EMPTY cursor, never an error
+PHRASE	body,t(embedded database),10	k(s1)|~1.450833
+PHRASE	body,t(database embedded),10	k()
+PHRASE	body,t(database),10	k(s1,s3)|~0.470004,~0.470004
+PHRASE	body,t(database),1	k(s1)|~0.470004
+PHRASE	body,t(quick brown),10	k()
+PHRASE_K0	body,t(database),0	k()
 # approx execution answers identically for this corpus
 APPROX	v,vec(1,0),3	k(s1,s3,s2)
 # order_by class rule (§4.6/audit C4): numbers first in value order,

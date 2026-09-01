@@ -4,11 +4,12 @@
 //! The cursor is the shared read shape for every ABI call that returns a
 //! list of strings (spec §2: `corvid_collections`, plus the graph
 //! family's `corvid_neighbors` / `corvid_in_neighbors` /
-//! `corvid_traverse`). Single-threaded use by contract; the items are
+//! `corvid_traverse`, and §4.4's `corvid_value_map_keys`). Single-threaded
+//! use by contract; the items are
 //! binary-safe `(pointer, length)` pairs, NOT NUL-terminated (spec
-//! §1.5) — collection names arrive as UTF-8 bytes, graph endpoints as
-//! arbitrary document-key bytes — borrowed until the next call or
-//! `_free`.
+//! §1.5) — collection names and map keys arrive as UTF-8 bytes, graph
+//! endpoints as arbitrary document-key bytes — borrowed until the next
+//! call or `_free`.
 
 use std::ffi::c_char;
 use std::ffi::c_int;

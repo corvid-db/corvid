@@ -543,7 +543,7 @@ default suite, 1000 green).
 
 ## corvid-ffi Task 8 — the FFI crossing-cost table
 
-The typed C ABI (docs/FFI.md, 122 symbols) exists so bindings pay
+The typed C ABI (docs/FFI.md, 124 symbols) exists so bindings pay
 "zero parsing, bounded crossing cost". This bench turns that phrase
 into a measurement: the same four shapes through the ABI — a C
 consumer compiled at bench time from `c/bench.c` against the

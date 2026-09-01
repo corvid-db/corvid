@@ -5,7 +5,7 @@ corvid-ffi plan, 2026-08-31) · Artifact: the `corvid` cdylib + generated
 `corvid.h`.
 
 This document is **the contract**: `crates/corvid-ffi` implements it
-(Phase-0 Tasks 2–8), the C-surface radar asserts it (122/122 symbols), and
+(Phase-0 Tasks 2–8), the C-surface radar asserts it (124/124 symbols), and
 every binding repo (C, Node, JS, Go, JVM, Dart, PHP, Python) codes against
 it. Every signature below was written against the real engine sources —
 each function cites the Rust item it wraps. Where a C function has **no
@@ -254,8 +254,8 @@ matters.
 | `corvid_value*` | `corvid::Value` | builder handles are **single-threaded**; borrowed children ride the parent's lifetime | any `corvid_value_*` constructor, `corvid_get`, `corvid_query_min/max`, `corvid_value_clone` | `corvid_value_free` (owned values only) |
 | `corvid_pred*` | `corvid::filter::Predicate` tree | **single-threaded** construction | the 10 `corvid_pred_*` constructors | `corvid_pred_free` (never-consumed roots only); consumed by `and/or/not/filter/delete_where` |
 | `corvid_query*` | owned QueryBuilder state (`Arc<Db>` + name + filters + sources + knobs) | **single-threaded** build | `corvid_query_new` | `corvid_query_run` and every aggregate (CONSUME); `corvid_query_free` for abandoned builders |
-| `corvid_rows*` | materialized `Vec<corvid::ResultRow>` + cursor | read-only cursor; **single-threaded** use | `corvid_query_run`, `corvid_page` | `corvid_rows_free` |
-| `corvid_strs*` | owned `Vec<String>` + cursor | read-only cursor; **single-threaded** | `corvid_collections`, `corvid_neighbors`, `corvid_in_neighbors`, `corvid_traverse` | `corvid_strs_free` |
+| `corvid_rows*` | materialized `Vec<corvid::ResultRow>` + cursor | read-only cursor; **single-threaded** use | `corvid_query_run`, `corvid_page`, `corvid_phrase_search` | `corvid_rows_free` |
+| `corvid_strs*` | owned `Vec<String>` + cursor | read-only cursor; **single-threaded** | `corvid_collections`, `corvid_neighbors`, `corvid_in_neighbors`, `corvid_traverse`, `corvid_value_map_keys` | `corvid_strs_free` |
 | `corvid_geohits*` | owned `Vec<corvid::GeoHit>` (or `(key, weight)` pairs) + cursor | read-only cursor; **single-threaded** | the 3 `corvid_geo_*` fns, `corvid_neighbors_weighted` | `corvid_geohits_free` |
 | `corvid_groupiter*` | owned group list (sorted by group key) + cursor | read-only cursor; **single-threaded** | `corvid_query_group_count/sum/avg` (consume the query) | `corvid_groupiter_free` |
 | `corvid_schemaiter*` | owned `Vec<schema::Field>` + cursor | read-only cursor; **single-threaded** | `corvid_schema` | `corvid_schemaiter_free` |
@@ -325,7 +325,7 @@ Lifecycle notes:
   any residual panic and convert it to `CORVID_ERR` + message (defensive
   only — not part of the contract).
 
-## 4. Function reference — all 122 symbols
+## 4. Function reference — all 124 symbols
 
 Conventions used in every signature below (not repeated per function):
 
@@ -470,7 +470,7 @@ the replaced child is dropped). Same invalidation rule as `array_push`.
 Map iteration order in the engine is sorted by key — construction order
 does not matter for equality or encoding.
 
-### 4.4 Value reads (12)
+### 4.4 Value reads (13)
 
 ```c
 corvid_value_type_t corvid_value_type(const corvid_value *v);
@@ -508,6 +508,39 @@ BORROWED children (counterparts: `Vec` indexing and `Value::get`).
 NULL when out of range / absent / parent is not that container — not an
 error. Child lifetime rides the parent (§5 rule 6): **calling
 `corvid_value_free` on a borrowed child is UB** (bold per plan §4.6).
+
+```c
+corvid_strs* corvid_value_map_keys(const corvid_value *v);
+```
+The map's keys as the §4.12 string cursor (`corvid_strs_next` /
+`corvid_strs_free` drive it), in ascending key-BYTE order — the engine
+`BTreeMap` iteration order §4.3's "sorted by key" note cites. No single
+engine method — `BTreeMap::keys`. The handle is OWNED by the caller;
+each key is UTF-8 (map keys are Rust `String`s, §1.5) handed out as a
+§1.5 binary-safe `(pointer, length)` pair borrowed until the cursor's
+next `next` or its free. A non-map `v` yields an EMPTY cursor — inert,
+not an error, nothing recorded (the `as_*` wrong-type convention;
+distinguish with `corvid_value_type` first). A NULL `v` follows §7's
+handle-returning failure shape: NULL + `CORVID_E_ARGUMENT` recorded
+(the `corvid_value_clone` rule).
+*(Erratum, 2026-09-01, additive within `FFI_VERSION = 1`:
+`corvid_value_map_keys` joins §4.4 — the corvid-go bootstrap (its
+task-go1 report, last concern) found that bindings could read a map's
+values by known key but could not ENUMERATE keys, forcing a
+candidate-key oracle (writes + schemas + harness expectation keys) at
+every map decode. The symbol is additive per §8's append-only
+stability rule: no signature, enum value, or existing behavior
+changes, and the soname/`FFI_VERSION` stay at 1. The strs handle is
+reused — §2's byte-keyed erratum already covers it (map keys arrive as
+their UTF-8 bytes, exactly how `corvid_collections` stores names) — so
+the set changes are §2's created-by list, this section's count
+(12 → 13), and Appendix A (122 → 124 together with §4.6's same-day
+`corvid_phrase_search` erratum — both additions ship in engine
+v0.3.0). The golden fixtures gained executable lines with this
+addition (`values.txt`, `mutations.txt`): a fixture-set change —
+binding repos that vendor `golden/` byte-identical re-vendor on their
+next engine-pin bump, where their independent pre-scan counts absorb
+the new lines.)*
 
 ```c
 size_t corvid_value_len(const corvid_value *v);
@@ -610,13 +643,16 @@ Frees a **never-consumed root** only. Predicates handed to
 `corvid_delete_where` are consumed by that call and MUST NOT be freed
 (double free = UB). Counterpart: Rust `Drop` of the tree.
 
-### 4.6 Query builder & rows (15)
+### 4.6 Query builder, rows & direct phrase search (16)
 
 A query is built on a `corvid_query*` (single-threaded) and executed by
 `corvid_query_run` or any aggregate, **either of which consumes it**
 (mirroring the engine's `QueryBuilder` taking `self`). Counterpart for
 the whole family: `corvid::Collection::query()` →
-`corvid::QueryBuilder` (builder.rs) and its fluent methods.
+`corvid::QueryBuilder` (builder.rs) and its fluent methods. The section
+also carries the one DIRECT retrieval call of the ABI,
+`corvid_phrase_search` — the positional-semantics half of text search,
+which the builder's bag-of-words `.text` source cannot express.
 
 ```c
 corvid_query* corvid_query_new(corvid_coll *coll);
@@ -707,8 +743,10 @@ materialized). NULL-handle / NULL-out-param behavior follows the
 non-status rule (§7): return 0 with `CORVID_E_ARGUMENT` recorded. The
 key and the document are **BORROWED from the cursor: valid only until
 the next `corvid_rows_next` or `corvid_rows_free` — using or freeing
-them after is UB.** `score` is the fused RRF score (`f32`), `0.0` for
-pure filter/order queries and for `corvid_page` rows. No direct engine
+them after is UB.** `score` is the producing call's ranking (`f32`):
+the fused RRF score for `corvid_query_run` (`0.0` for pure
+filter/order queries), the BM25 phrase score for
+`corvid_phrase_search`, `0.0` for `corvid_page` rows. No direct engine
 counterpart — the cursor walks the `Vec<ResultRow>` that
 `QueryBuilder::run` returned.
 
@@ -716,6 +754,54 @@ counterpart — the cursor walks the `Vec<ResultRow>` that
 void corvid_rows_free(corvid_rows *rows);
 ```
 Counterpart: dropping the `Vec<ResultRow>`.
+
+```c
+corvid_rows* corvid_phrase_search(corvid_coll *c, const char *field, size_t field_len,
+                                  const char *phrase, size_t phrase_len, size_t k);
+```
+DIRECT positional text search — no query handle, one call (counterpart:
+`Collection::phrase_search(field, phrase, k) -> Vec<TextHit>`, the
+engine query.rs). Documents whose `field` TEXT contains `phrase` as a
+consecutive, IN-ORDER run of analyzed tokens, most relevant first, ties
+by key; up to `k` rows. The engine's analysis applies to the phrase
+too, and stop words collapse out of adjacency on both sides —
+`"embedded the database"` matches text containing `"embedded
+database"` (no position gap for a removed stop word). Documents
+lacking `field`, or holding a non-text value there, are not part of
+the corpus. `k == 0` yields an empty cursor (inert, per the engine and
+the `corvid_geo_nearest`/`corvid_page` convention — NOT an error); any
+larger `k` is accepted and simply caps the result. A phrase whose
+tokens analyze away entirely (empty or all stop words) matches
+nothing. Returns an OWNED rows cursor — the same §4.6 cursor
+`corvid_query_run` produces — whose `score` field carries the hit's
+BM25 relevance: the sum over the phrase's analyzed terms (higher is
+more relevant, the `TextHit::score` scale — NOT the builder's fused
+RRF score; the two producers of `corvid_rows*` keep their own score
+scales). One MVCC snapshot covers the search. `field` and `phrase` are
+borrowed UTF-8 (§1.5); NULL `c`/`field`/`phrase`, or invalid UTF-8 in
+either, follows §7's handle-returning failure shape: NULL +
+`CORVID_E_ARGUMENT` recorded. Using a REGISTERED text index
+(`corvid_create_text_index`/`_ondisk` on `field`) when one exists is
+the engine's business — indexed and scanned paths answer identically
+(audit B7); the ABI adds no index knob.
+*(Erratum, 2026-09-01, additive within `FFI_VERSION = 1`:
+`corvid_phrase_search` joins §4.6 — the binding examples round (all
+four bootstrapped repos) logged that positional phrase semantics were
+beyond the ABI v0.2.x surface: the builder's `.text` source is
+bag-of-words BM25 and composes no adjacency, so the engine's
+`phrase_search` — a direct `Collection` method, not a builder chain —
+had no ABI path (§9's exclusion row said the builder "covers them";
+for the phrase half that was wrong, and the row is amended). The
+symbol is additive per §8's append-only stability rule: no signature,
+enum value, or existing behavior changes, and the soname/`FFI_VERSION`
+stay at 1. The rows handle is reused — §2's created-by list, this
+section's count (15 → 16), and Appendix A (122 → 124 together with
+§4.4's same-day `corvid_value_map_keys` erratum; both ship in engine
+v0.3.0) are the set changes. The golden fixtures gained executable
+lines with this addition (`queries.txt`): a fixture-set change —
+binding repos that vendor `golden/` byte-identical re-vendor on their
+next engine-pin bump, where their independent pre-scan counts absorb
+the new lines.)*
 
 ### 4.7 Aggregations (11)
 
@@ -1243,9 +1329,9 @@ outputs: O=owned-by-caller, B=borrowed):
 | Lifecycle & errors | path B | db handle O; error message B (thread-local); strs handle O |
 | Collection | name B | coll handle O; name B (until free) |
 | Value construction | text/bytes/vector C; `array_push`/`map_put` item K | value O |
-| Value reads | parent B | `_ref` buffers B; children B; `as_*` by value; `clone` O |
+| Value reads | parent B | `_ref` buffers B; children B; `as_*` by value; `clone` O; `map_keys` strs O |
 | Predicates | path/value C; combinators' children K | pred O |
-| Query builder | filter pred K; vector/text/select/fields B | query O; `run` → rows O (query K) |
+| Query builder | filter pred K; vector/text/select/fields B; `phrase_search` field/phrase B | query O; `run` → rows O (query K); `phrase_search` → rows O |
 | Aggregations | query K; field names B | scalars by value; min/max O; groupiter O |
 | Mutations | keys/docs B (docs C into the engine); update callback's `*out` K; CAS/pred per rule 4 | auto-key buffer O (corvid_free); counters by value |
 | Reads | key/after B | `get` value O; scan rows B (callback-scoped); page rows O + next_after O (corvid_free) |
@@ -1361,7 +1447,7 @@ notes), so binding authors know what is missing on purpose:
 | Exclusion | Why | Reopen trigger |
 |---|---|---|
 | Events / subscriptions (`reactive.rs`, `Subscribe`) | reentrancy across languages | demonstrated v2 need (a binding shipping a portable event loop story) |
-| Direct `vector_search` / `text_search` / `phrase_search` fns | the query builder covers them (`.vector`/`.text` sources) | a workload proving per-call overhead of the builder matters (FFI bench) |
+| Direct `vector_search` / `text_search` fns | the query builder covers them (`.vector`/`.text` sources) — note `phrase_search` HAS a direct fn since the 2026-09-01 additive erratum (§4.6): positional phrase semantics do not compose out of the bag-of-words `.text` source, so the direct `Collection` call is the only faithful shape | a workload proving per-call overhead of the builder matters (FFI bench) |
 | Sketches (`BloomFilter`, `CuckooFilter`, `HyperLogLog`, `LshIndex`, `MinHash`, `TDigest`) | not core to the typed-document story | binding-user demand |
 | Semantic cache (`SemanticCache`) | young API | engine-side stabilization |
 | `PlanCache` / `explain` / `plan_shape` | advisory/diagnostic, no runtime contract | a binding asks for query introspection |
@@ -1370,12 +1456,13 @@ notes), so binding authors know what is missing on purpose:
 | `Store`-level byte API (spec note) | the ABI is typed-document only by ruling 1 | none foreseen |
 | Non-UTF-8 filesystem paths (spec note) | the engine's `Db::open` accepts any `AsRef<Path>` (including non-UTF-8 OS paths); the ABI takes `(const char*, len)` and requires UTF-8 (§1.5) — a deliberate narrowing so one encoding rule covers every string | a binding on a platform where UTF-8 paths are insufficient (then: a wide-char or OS-native path entry point, additive) |
 
-## Appendix A — exported symbols (122, pinned)
+## Appendix A — exported symbols (124, pinned)
 
 The C-surface radar (Task 7) asserts the header exposes exactly these
-122 symbols and the smoke suite drives every one. Grouped as in §4; the
-count per family: 8 + 3 + 11 + 12 + 11 + 15 + 11 + 13 + 4 + 15 + 7 + 7 +
-5 = **122**.
+124 symbols and the smoke suite drives every one. Grouped as in §4; the
+count per family: 8 + 3 + 11 + 13 + 11 + 16 + 11 + 13 + 4 + 15 + 7 + 7 +
+5 = **124** *(122 before the 2026-09-01 additive `corvid_value_map_keys`
++ `corvid_phrase_search`, §4.4/§4.6 errata; both ship in engine v0.3.0)*.
 
 ```
 corvid_ffi_version
@@ -1409,6 +1496,7 @@ corvid_value_bytes_ref
 corvid_value_vector_ref
 corvid_value_array_get
 corvid_value_map_get
+corvid_value_map_keys
 corvid_value_len
 corvid_value_clone
 corvid_value_free
@@ -1438,6 +1526,7 @@ corvid_query_run
 corvid_query_free
 corvid_rows_next
 corvid_rows_free
+corvid_phrase_search
 corvid_query_count
 corvid_query_count_distinct
 corvid_query_sum

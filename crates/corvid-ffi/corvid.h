@@ -1439,6 +1439,37 @@ int corvid_rows_next(corvid_rows *rows,
 void corvid_rows_free(corvid_rows *rows);
 
 /**
+ * DIRECT positional text search (spec §4.6's 2026-09-01 additive
+ * erratum; counterpart: `Collection::phrase_search(field, phrase, k)
+ * -> Vec<TextHit>`, the engine query.rs) — no query handle, one call
+ * over the coll. Documents whose `field` TEXT contains `phrase` as a
+ * consecutive, IN-ORDER run of analyzed tokens, most relevant first,
+ * ties by key, up to `k` rows; the engine's analysis applies to the
+ * phrase too, and stop words collapse out of adjacency on both sides
+ * (`"embedded the database"` matches `"embedded database"`). Documents
+ * lacking the field or holding a non-text value there are not part of
+ * the corpus. `k == 0` yields an EMPTY cursor — inert, per the engine
+ * and the `corvid_geo_nearest`/`corvid_page` convention (NOT an
+ * error); a phrase whose tokens analyze away entirely matches
+ * nothing. Returns an OWNED rows cursor (the §4.6 shape
+ * `corvid_query_run` produces) whose `score` field carries the hit's
+ * BM25 relevance — the sum over the phrase's analyzed terms
+ * (`TextHit::score`, higher is more relevant; NOT the builder's fused
+ * RRF score — the two rows producers keep their own score scales).
+ * One MVCC snapshot covers the search. `field` and `phrase` are
+ * borrowed UTF-8 (§1.5); NULL `c`/`field`/`phrase`, or invalid UTF-8
+ * in either, follows §7's handle-returning failure shape: NULL +
+ * `CORVID_E_ARGUMENT` recorded. The handle holds only materialized
+ * rows — no engine reference, no derived-handle count (spec §2/§4.13).
+ */
+corvid_rows *corvid_phrase_search(corvid_coll *c,
+                                  const char *field,
+                                  size_t field_len,
+                                  const char *phrase,
+                                  size_t phrase_len,
+                                  size_t k);
+
+/**
  * Count the matching documents (spec §4.7; counterpart:
  * `QueryBuilder::count() -> usize`; O(1) when unfiltered via the
  * engine's maintained counter). `out` is nullable (§7's optional
@@ -1818,6 +1849,24 @@ const corvid_value *corvid_value_array_get(const corvid_value *arr, size_t index
  * `corvid_value_free` on it is UB**.
  */
 const corvid_value *corvid_value_map_get(const corvid_value *map, const char *key, size_t key_len);
+
+/**
+ * The map's keys as an OWNED string cursor (spec §4.4; counterpart:
+ * `BTreeMap::keys` — no single engine method). The cursor is the §4.12
+ * strs handle (`corvid_strs_next` / `corvid_strs_free` drive it),
+ * carrying the keys in ascending key-BYTE order — the engine `BTreeMap`
+ * iteration order §4.3's "sorted by key" note cites, whatever the
+ * construction order was. Key bytes are UTF-8 (map keys are Rust
+ * `String`s, spec §1.5) handed out as §1.5 binary-safe
+ * `(pointer, length)` pairs, borrowed until the cursor's next `next` or
+ * its free. A non-map `v` answers an EMPTY cursor — inert, not an
+ * error, nothing recorded (the `as_*` wrong-type convention; callers
+ * distinguish with `corvid_value_type` first). A NULL `v` follows §7's
+ * handle-returning failure shape: NULL + `CORVID_E_ARGUMENT` recorded
+ * (the `corvid_value_clone` rule). The value itself is only read —
+ * borrowed (a `map_get` child works), never consumed or mutated.
+ */
+corvid_strs *corvid_value_map_keys(const corvid_value *v);
 
 /**
  * The value's length (spec §4.4): array items / map entries / vector

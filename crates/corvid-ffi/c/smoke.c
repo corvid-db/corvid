@@ -514,8 +514,9 @@ static int values_equal(const corvid_value *got, const corvid_value *want) {
 }
 
 /* Map comparison key-by-key: re-walk the expected literal's k=v pairs
- * (maps in this ABI have no key iterator; the fixture's expectation is
- * the key source — fine for equality since lengths are checked first). */
+ * (the fixture's expectation stays the key source here — equality only
+ * needs the known keys; the VMAP_KEYS/GET_KEYS OPs exercise the real
+ * key iterator, corvid_value_map_keys, on their own lines). */
 static int maps_equal(const corvid_value *g, const corvid_value *w,
                       Span want_tok) {
     if (corvid_value_len(g) != corvid_value_len(w)) return 0;
@@ -1062,6 +1063,38 @@ static void run_line(Span op, Span args, Span expected) {
         corvid_value_free(map);
         return;
     }
+    if (span_is(op, "VMAP_KEYS") || span_is(op, "GET_KEYS")) {
+        /* VMAP_KEYS enumerates a literal's keys (pure form, values.txt);
+         * GET_KEYS fetches an inserted document by key first, proving the
+         * decode-from-storage half bindings need. Both drive the §4.12
+         * strs cursor over corvid_value_map_keys' ascending byte order. */
+        corvid_value *v = NULL;
+        if (op.p[0] == 'G') {
+            expect_ok(corvid_get(docs(), (const uint8_t *)a[0].p, a[0].n, &v));
+            CHECK(v != NULL, "GET_KEYS on an absent document");
+        } else {
+            v = lit(a[0]);
+        }
+        corvid_strs *s = corvid_value_map_keys(v);
+        CHECK(s != NULL, "corvid_value_map_keys failed");
+        RowWalk w;
+        w.n = 0;
+        for (;;) {
+            const char *item = NULL;
+            size_t ilen = 0;
+            if (corvid_strs_next(s, &item, &ilen) != 1) break;
+            CHECK(w.n < MAX_ROWS, "map_keys overflow");
+            CHECK(ilen < sizeof w.key_buf[0], "map key too long");
+            memcpy(w.key_buf[w.n], item, ilen);
+            w.key_buf[w.n][ilen] = 0;
+            w.keys[w.n] = (Span){w.key_buf[w.n], ilen};
+            w.n++;
+        }
+        corvid_strs_free(s);
+        corvid_value_free(v);
+        check_keys(&w, expected);
+        return;
+    }
     if (span_is(op, "NULLFREES")) {
         corvid_value_free(NULL);
         corvid_pred_free(NULL);
@@ -1415,6 +1448,30 @@ static void run_line(Span op, Span args, Span expected) {
         walk_rows(rows, &w);
         corvid_rows_free(rows);
         check_keys(&w, expected);
+        return;
+    }
+    if (span_is(op, "PHRASE") || span_is(op, "PHRASE_K0")) {
+        /* The direct positional search (spec §4.6's erratum): args are
+         * field, t(phrase), k — expected is k(keys) plus an optional
+         * |~score suffix (the BM25 phrase sum, the rows cursor's other
+         * score scale). PHRASE_K0 is the inert k==0 shape: an EMPTY
+         * cursor, never NULL (the nothing-recorded half of k == 0's
+         * inertness is pinned by the query.rs unit test on a fresh
+         * thread — the smoke thread's last-error slot may hold an
+         * earlier line's intentional failure, by §3's contract that
+         * successful calls never clear it). */
+        Span body = text_body(a[1]);
+        corvid_rows *rows = corvid_phrase_search(
+            docs(), a[0].p, a[0].n, body.p, body.n, (size_t)parse_i64(a[2]));
+        CHECK(rows != NULL, "corvid_phrase_search failed");
+        RowWalk w;
+        walk_rows(rows, &w);
+        corvid_rows_free(rows);
+        check_keys(&w, key_part(expected));
+        check_scores(&w, suffix_part(expected));
+        if (op.n > 6) { /* PHRASE_K0: the empty-cursor half */
+            CHECK(w.n == 0, "k == 0 must answer an empty cursor");
+        }
         return;
     }
     if (span_is(op, "HYBRID") || span_is(op, "HYBRID_F")) {

@@ -45,6 +45,14 @@ VNEST	{a={b=[1,{c=t(x)}]}},a.b.1.c	t(x)
 VNEST	[10,[20,[30]]],1.1.0	30
 VNEST	{a=1},a.z	absent
 VCLONE	{a={b=[1,2]}},a.b	[1,2]
+# map key enumeration (§4.4): ascending key-BYTE order (the engine's
+# BTreeMap iteration order) whatever the construction order; unicode
+# and symbol keys verbatim; the empty map, non-maps, and scalars answer
+# an EMPTY cursor — inert, not an error
+VMAP_KEYS	{z=1,键=2,A1~B2=3}	k(A1~B2,z,键)
+VMAP_KEYS	{}	k()
+VMAP_KEYS	[1,2]	k()
+VMAP_KEYS	7	k()
 # container mutation: push appends, put replaces/inserts
 VPUSH	[1,2],3	3
 VPUT	{a=1},b,2	2

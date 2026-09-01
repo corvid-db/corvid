@@ -1,6 +1,6 @@
-//! Query builder, rows cursor, aggregations (spec §4.6/§4.7) — the 26
-//! functions of the ABI's retrieval families: 15 query/rows (§4.6) and
-//! 11 aggregations (§4.7).
+//! Query builder, rows cursor, aggregations (spec §4.6/§4.7) — the 27
+//! functions of the ABI's retrieval families: 16 query/rows/direct
+//! phrase search (§4.6) and 11 aggregations (§4.7).
 //!
 //! A `corvid_query*` holds owned QueryBuilder state (spec §2's backing
 //! table: engine `Arc` + name + filters + sources + knobs) — see the
@@ -29,21 +29,37 @@
 //! # The rows cursor (spec §4.6)
 //!
 //! `corvid_query_run` materializes the engine's `Vec<ResultRow>` into a
-//! `corvid_rows*` — the same handle `corvid_page` produces (score 0.0
-//! there), one walker for both. `corvid_rows_next` hands out each
-//! row's key and document as **BORROWED views into the cursor** — the
-//! same interior-pointer shape as the value family's borrowed children
-//! (value.rs module docs): valid only until the next
-//! `corvid_rows_next` or `corvid_rows_free`; using or freeing them
-//! after either is UB. `score` is the fused RRF score by value, `0.0`
-//! for pure filter/order queries and page rows.
+//! `corvid_rows*` — the same handle `corvid_page` (score 0.0) and
+//! `corvid_phrase_search` (BM25 phrase scores) produce, one walker for
+//! all three. `corvid_rows_next` hands out each row's key and document
+//! as **BORROWED views into the cursor** — the same interior-pointer
+//! shape as the value family's borrowed children (value.rs module
+//! docs): valid only until the next `corvid_rows_next` or
+//! `corvid_rows_free`; using or freeing them after either is UB.
+//! `score` is the producing call's ranking by value: the fused RRF
+//! score for `run` (`0.0` for pure filter/order queries), the BM25
+//! phrase score for `phrase_search`, `0.0` for page rows.
+//!
+//! # The direct phrase search (spec §4.6's 2026-09-01 erratum)
+//!
+//! `corvid_phrase_search` is the section's one DIRECT retrieval call:
+//! no query handle, one call over a coll — the engine's
+//! `Collection::phrase_search` is itself a direct method (not a
+//! builder chain), and positional adjacency does not compose out of
+//! the builder's bag-of-words `.text` source, so the direct shape is
+//! the faithful one. It reuses the rows cursor unchanged: the handle
+//! is materialized `Vec<ResultRow>` holding no engine reference (spec
+//! §2's backing table), so it takes NO derived-handle count — the
+//! same materialized-cursor rule as page rows.
 
 use std::ffi::c_char;
 use std::ffi::c_int;
 
 use corvid::Metric;
+use corvid::ResultRow;
 
 use crate::error::corvid_status;
+use crate::error::guard;
 use crate::error::record_argument;
 use crate::handle::GroupIterHandle;
 use crate::handle::RowsHandle;
@@ -468,6 +484,70 @@ pub extern "C" fn corvid_rows_free(rows: *mut corvid_rows) {
     // corvid_query_run / corvid_page product, reclaimed exactly once
     // here.
     drop(unsafe { reclaim_rows(rows) });
+}
+
+/// DIRECT positional text search (spec §4.6's 2026-09-01 additive
+/// erratum; counterpart: `Collection::phrase_search(field, phrase, k)
+/// -> Vec<TextHit>`, the engine query.rs) — no query handle, one call
+/// over the coll. Documents whose `field` TEXT contains `phrase` as a
+/// consecutive, IN-ORDER run of analyzed tokens, most relevant first,
+/// ties by key, up to `k` rows; the engine's analysis applies to the
+/// phrase too, and stop words collapse out of adjacency on both sides
+/// (`"embedded the database"` matches `"embedded database"`). Documents
+/// lacking the field or holding a non-text value there are not part of
+/// the corpus. `k == 0` yields an EMPTY cursor — inert, per the engine
+/// and the `corvid_geo_nearest`/`corvid_page` convention (NOT an
+/// error); a phrase whose tokens analyze away entirely matches
+/// nothing. Returns an OWNED rows cursor (the §4.6 shape
+/// `corvid_query_run` produces) whose `score` field carries the hit's
+/// BM25 relevance — the sum over the phrase's analyzed terms
+/// (`TextHit::score`, higher is more relevant; NOT the builder's fused
+/// RRF score — the two rows producers keep their own score scales).
+/// One MVCC snapshot covers the search. `field` and `phrase` are
+/// borrowed UTF-8 (§1.5); NULL `c`/`field`/`phrase`, or invalid UTF-8
+/// in either, follows §7's handle-returning failure shape: NULL +
+/// `CORVID_E_ARGUMENT` recorded. The handle holds only materialized
+/// rows — no engine reference, no derived-handle count (spec §2/§4.13).
+#[unsafe(no_mangle)]
+pub extern "C" fn corvid_phrase_search(
+    c: *mut corvid_coll,
+    field: *const c_char,
+    field_len: usize,
+    phrase: *const c_char,
+    phrase_len: usize,
+    k: usize,
+) -> *mut corvid_rows {
+    // SAFETY: NULL maps to None (spec §7); a non-NULL handle has
+    // corvid_collection provenance and the coll family is thread-safe
+    // (spec §2), so a shared borrow is fine.
+    let Some(coll) = (unsafe { borrow_coll(c) }) else {
+        record_argument("corvid_phrase_search: c is NULL");
+        return std::ptr::null_mut();
+    };
+    let (Some(field), Some(phrase)) = (
+        borrowed_utf8("corvid_phrase_search", "field", field, field_len),
+        borrowed_utf8("corvid_phrase_search", "phrase", phrase, phrase_len),
+    ) else {
+        return std::ptr::null_mut();
+    };
+    // TextHit → ResultRow is a field-for-field map (key, score,
+    // document): the f32 BM25 score crosses bit-exact, and the rows
+    // cursor answers with its producing call's ranking scale.
+    let hits = guard("corvid_phrase_search", || {
+        coll.collection().phrase_search(field, phrase, k)
+    });
+    let Some(hits) = hits else {
+        return std::ptr::null_mut();
+    };
+    let rows = hits
+        .into_iter()
+        .map(|hit| ResultRow {
+            key: hit.key,
+            score: hit.score,
+            document: hit.document,
+        })
+        .collect();
+    into_rows(RowsHandle::new(rows))
 }
 
 // --- §4.7 aggregations -------------------------------------------------------
@@ -1167,6 +1247,230 @@ mod tests {
         assert_eq!(walked[0].1, 1.0f32 / 61.0);
         assert_eq!(walked[1].1, 1.0f32 / 62.0);
         finish(rows);
+
+        corvid_collection_free(coll);
+        assert_eq!(corvid_close(db), CORVID_OK);
+    }
+
+    // --- §4.6: the direct phrase search (2026-09-01 erratum) ------------------
+
+    /// The phrase corpus: `a` holds the phrase adjacently, `b` holds it
+    /// reversed, `c` holds both terms non-adjacently, `d` lacks the
+    /// field, `e`'s field is not text (both outside the corpus).
+    fn phrase_corpus(coll: Coll) {
+        insert(
+            coll,
+            b"a",
+            doc(&[("body", text_value("the quick brown fox"))]),
+        );
+        insert(
+            coll,
+            b"b",
+            doc(&[("body", text_value("a brown quick dog"))]),
+        );
+        insert(coll, b"c", doc(&[("body", text_value("quick very brown"))]));
+        insert(coll, b"d", doc(&[("n", corvid_value_int(1))]));
+        insert(coll, b"e", doc(&[("body", corvid_value_int(2))]));
+    }
+
+    /// The engine-call twin: the same search through
+    /// `Collection::phrase_search`, for exact key/score parity.
+    fn engine_phrase(
+        db: *mut crate::handle::corvid_db,
+        phrase: &str,
+        k: usize,
+    ) -> Vec<(Vec<u8>, f32)> {
+        // SAFETY: db is a live corvid_open_memory product in these
+        // tests (never closed at the call site).
+        let engine = unsafe { crate::handle::borrow_db(db) }
+            .expect("non-NULL")
+            .engine();
+        engine
+            .collection("docs")
+            .phrase_search("body", phrase, k)
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.key, hit.score))
+            .collect()
+    }
+
+    /// Order-sensitive adjacency, exact engine score parity, the
+    /// stop-word collapse, and the inert k bounds (spec §4.6's erratum):
+    /// k == 0 answers an EMPTY cursor — never NULL, never an error —
+    /// and larger k just caps.
+    #[test]
+    fn phrase_search_is_order_sensitive_and_matches_the_engine() {
+        let (db, coll) = fresh();
+        phrase_corpus(coll);
+        let (field, field_len) = s("body");
+
+        // Adjacent in order: only `a`.
+        let (phrase, phrase_len) = s("quick brown");
+        let rows = corvid_phrase_search(coll, field, field_len, phrase, phrase_len, 10);
+        assert!(!rows.is_null(), "a match is a live cursor, never NULL");
+        let walked = walk(rows, |_, _| {});
+        assert_eq!(walked, engine_phrase(db, "quick brown", 10));
+        assert_eq!(
+            walked.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            vec![b"a".to_vec()]
+        );
+        assert!(
+            walked[0].1 > 0.0,
+            "the score is the BM25 phrase sum (TextHit::score), positive"
+        );
+        finish(rows);
+
+        // Reversed: a different, non-empty answer — the ORDER half of
+        // the order-sensitivity contract, not an empty-vs-match trick.
+        let (phrase, phrase_len) = s("brown quick");
+        let rows = corvid_phrase_search(coll, field, field_len, phrase, phrase_len, 10);
+        let walked = walk(rows, |_, _| {});
+        assert_eq!(walked, engine_phrase(db, "brown quick", 10));
+        assert_eq!(walked[0].0, b"b".to_vec());
+        finish(rows);
+
+        // A phrase only `c` holds ("quick very brown") — the third
+        // corpus document joins an answer set, still engine-exact.
+        let (phrase, phrase_len) = s("quick very");
+        let rows = corvid_phrase_search(coll, field, field_len, phrase, phrase_len, 10);
+        let walked = walk(rows, |_, _| {});
+        assert_eq!(walked, engine_phrase(db, "quick very", 10));
+        assert_eq!(walked[0].0, b"c".to_vec());
+        finish(rows);
+
+        // Stop words collapse out of adjacency on BOTH sides: "quick
+        // the brown" matches the text holding "quick brown".
+        let (phrase, phrase_len) = s("quick the brown");
+        let rows = corvid_phrase_search(coll, field, field_len, phrase, phrase_len, 10);
+        let walked = walk(rows, |_, _| {});
+        assert_eq!(walked, engine_phrase(db, "quick the brown", 10));
+        assert_eq!(walked[0].0, b"a".to_vec());
+        finish(rows);
+
+        // A phrase that analyzes away entirely matches nothing.
+        let (phrase, phrase_len) = s("the of a");
+        let rows = corvid_phrase_search(coll, field, field_len, phrase, phrase_len, 10);
+        assert_exhausted(rows);
+        finish(rows);
+
+        // k == 0: the inert empty cursor (the geo_nearest/page
+        // convention), NOT an error — and nothing recorded (every call
+        // so far in this test succeeded, so the thread-local is clear).
+        let (phrase, phrase_len) = s("quick brown");
+        let rows = corvid_phrase_search(coll, field, field_len, phrase, phrase_len, 0);
+        assert!(!rows.is_null(), "k == 0 is an EMPTY cursor, not a failure");
+        assert_exhausted(rows);
+        finish(rows);
+        assert_eq!(last_code(), corvid_err::CORVID_E_OK, "nothing failed");
+
+        // k caps: the top hit only.
+        let rows = corvid_phrase_search(coll, field, field_len, phrase, phrase_len, 1);
+        let walked = walk(rows, |_, _| {});
+        assert_eq!(walked, engine_phrase(db, "quick brown", 1));
+        assert_eq!(walked.len(), 1);
+        finish(rows);
+
+        corvid_collection_free(coll);
+        assert_eq!(corvid_close(db), CORVID_OK);
+    }
+
+    /// The phrase rows carry the hit's document (borrowed, the rows
+    /// cursor's rule) and the handle takes NO derived count: with the
+    /// coll freed, a live phrase cursor does not block exclusive
+    /// compaction — the materialized-cursor rule of §2/§4.13.
+    #[test]
+    fn phrase_search_rows_hold_docs_but_no_derived_count() {
+        let (db, coll) = fresh();
+        phrase_corpus(coll);
+        let (field, field_len) = s("body");
+        let (phrase, phrase_len) = s("quick brown");
+
+        let rows = corvid_phrase_search(coll, field, field_len, phrase, phrase_len, 10);
+        assert!(!rows.is_null());
+        let walked = walk(rows, |key, doc| {
+            assert_eq!(key, b"a");
+            // The hit's document reads through the value ABI inside the
+            // walk (borrowed only until the next next).
+            let field =
+                crate::value::corvid_value_map_get(doc, b"body".as_ptr() as *const c_char, 4);
+            assert!(!field.is_null());
+            let mut len = 0usize;
+            let text = crate::value::corvid_value_text_ref(field, &mut len);
+            assert!(!text.is_null());
+            // SAFETY: text borrows the row's document, valid until the
+            // next corvid_rows_next (which this walk makes only after
+            // the assert below).
+            let got = unsafe { std::slice::from_raw_parts(text as *const u8, len) };
+            assert_eq!(got, b"the quick brown fox");
+        });
+        assert_eq!(walked.len(), 1);
+
+        // The no-counter pin: free the coll (its count release) and the
+        // db reports exclusive WITH the rows cursor still live.
+        assert!(!exclusive(db), "the coll handle still holds its count");
+        corvid_collection_free(coll);
+        assert!(exclusive(db), "a phrase cursor holds no engine reference");
+        finish(rows);
+        assert_eq!(corvid_close(db), CORVID_OK);
+    }
+
+    /// §7's handle-returning failure shape for the direct search: NULL
+    /// coll/field/phrase and invalid UTF-8 answer NULL with
+    /// `CORVID_E_ARGUMENT` recorded.
+    #[test]
+    fn phrase_search_null_and_misencoded_inputs_record_argument() {
+        let (db, coll) = fresh();
+        let (field, field_len) = s("body");
+        let (phrase, phrase_len) = s("quick brown");
+
+        assert!(
+            corvid_phrase_search(
+                std::ptr::null_mut(),
+                field,
+                field_len,
+                phrase,
+                phrase_len,
+                1
+            )
+            .is_null()
+        );
+        assert_eq!(last_code(), corvid_err::CORVID_E_ARGUMENT);
+        assert!(
+            corvid_phrase_search(coll, std::ptr::null(), field_len, phrase, phrase_len, 1)
+                .is_null()
+        );
+        assert_eq!(last_code(), corvid_err::CORVID_E_ARGUMENT);
+        assert!(
+            corvid_phrase_search(coll, field, field_len, std::ptr::null(), phrase_len, 1).is_null()
+        );
+        assert_eq!(last_code(), corvid_err::CORVID_E_ARGUMENT);
+
+        // Invalid UTF-8 in either string (§1.5/§7): checked, not UB.
+        let bad = [0xffu8, 0xfe];
+        assert!(
+            corvid_phrase_search(
+                coll,
+                bad.as_ptr() as *const c_char,
+                bad.len(),
+                phrase,
+                phrase_len,
+                1
+            )
+            .is_null()
+        );
+        assert_eq!(last_code(), corvid_err::CORVID_E_ARGUMENT);
+        assert!(
+            corvid_phrase_search(
+                coll,
+                field,
+                field_len,
+                bad.as_ptr() as *const c_char,
+                bad.len(),
+                1
+            )
+            .is_null()
+        );
+        assert_eq!(last_code(), corvid_err::CORVID_E_ARGUMENT);
 
         corvid_collection_free(coll);
         assert_eq!(corvid_close(db), CORVID_OK);

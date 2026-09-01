@@ -11,7 +11,7 @@
 //!    byte drift gate (`crate::header`), the chain crate → header →
 //!    spec has no silent-drift link left.
 //! 2. **spec ↔ smoke (coverage)** — every Appendix A symbol is CALLED by
-//!    the C smoke suite (`c/smoke.c`): no untested exports, 122/122.
+//!    the C smoke suite (`c/smoke.c`): no untested exports, 124/124.
 //! 3. **smoke ↔ spec (phantom calls)** — every `corvid_*` call in
 //!    `smoke.c` names a real Appendix A symbol (a typo'd call would fail
 //!    at link time anyway; this fails at test time with a symbol name).
@@ -177,8 +177,10 @@ fn header_exports_exactly_the_spec_appendix() {
 
     assert_eq!(
         appendix.len(),
-        122,
-        "Appendix A is the locked 122-symbol contract (spec §4); parsed {}",
+        124,
+        "Appendix A is the locked 124-symbol contract (spec §4; 122 before \
+         the 2026-09-01 additive corvid_value_map_keys + \
+         corvid_phrase_search); parsed {}",
         appendix.len()
     );
     let missing: Vec<String> = appendix.difference(&header_set).cloned().collect();

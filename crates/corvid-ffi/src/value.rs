@@ -1,5 +1,5 @@
-//! Value construction & reads (spec §4.3/§4.4) — the 23 value functions
-//! over the ABI's document noun: 11 constructors (§4.3) and 12 readers
+//! Value construction & reads (spec §4.3/§4.4) — the 24 value functions
+//! over the ABI's document noun: 11 constructors (§4.3) and 13 readers
 //! (§4.4).
 //!
 //! # Handle shapes: owned boxes and borrowed views
@@ -66,9 +66,12 @@ use corvid::Value;
 
 use crate::error::corvid_status;
 use crate::error::record_argument;
+use crate::handle::StrsHandle;
 use crate::handle::borrow_value;
 use crate::handle::borrow_value_mut;
+use crate::handle::corvid_strs;
 use crate::handle::corvid_value;
+use crate::handle::into_strs;
 use crate::handle::into_value;
 use crate::handle::reclaim_value;
 
@@ -654,6 +657,38 @@ pub extern "C" fn corvid_value_map_get(
     value.get(key).map_or(std::ptr::null(), |child| {
         child as *const Value as *const corvid_value
     })
+}
+
+/// The map's keys as an OWNED string cursor (spec §4.4; counterpart:
+/// `BTreeMap::keys` — no single engine method). The cursor is the §4.12
+/// strs handle (`corvid_strs_next` / `corvid_strs_free` drive it),
+/// carrying the keys in ascending key-BYTE order — the engine `BTreeMap`
+/// iteration order §4.3's "sorted by key" note cites, whatever the
+/// construction order was. Key bytes are UTF-8 (map keys are Rust
+/// `String`s, spec §1.5) handed out as §1.5 binary-safe
+/// `(pointer, length)` pairs, borrowed until the cursor's next `next` or
+/// its free. A non-map `v` answers an EMPTY cursor — inert, not an
+/// error, nothing recorded (the `as_*` wrong-type convention; callers
+/// distinguish with `corvid_value_type` first). A NULL `v` follows §7's
+/// handle-returning failure shape: NULL + `CORVID_E_ARGUMENT` recorded
+/// (the `corvid_value_clone` rule). The value itself is only read —
+/// borrowed (a `map_get` child works), never consumed or mutated.
+#[unsafe(no_mangle)]
+pub extern "C" fn corvid_value_map_keys(v: *const corvid_value) -> *mut corvid_strs {
+    // SAFETY: NULL maps to the failure arm (§7); otherwise v is an owned
+    // handle or a live borrowed child (the §4.4 contract) on this thread.
+    let Some(value) = (unsafe { borrow_value(v) }) else {
+        record_argument("corvid_value_map_keys: v is NULL (§7 inert rule)");
+        return std::ptr::null_mut();
+    };
+    match value {
+        Value::Map(entries) => into_strs(StrsHandle::new(
+            entries.keys().map(|key| key.as_bytes().to_vec()).collect(),
+        )),
+        // Wrong container kind: an inert EMPTY cursor, not an error
+        // (spec §4.4 — the as_* wrong-type convention).
+        _ => into_strs(StrsHandle::new(Vec::new())),
+    }
 }
 
 /// The value's length (spec §4.4): array items / map entries / vector
@@ -1295,6 +1330,10 @@ mod tests {
         assert!(corvid_value_array_get(t, 0).is_null());
         assert!(corvid_value_map_get(v, b"k".as_ptr() as *const c_char, 1).is_null());
 
+        // map_keys on the wrong kind: an EMPTY cursor, no record (§4.4).
+        assert!(drain_strs(corvid_value_map_keys(t)).is_empty());
+        assert!(drain_strs(corvid_value_map_keys(v)).is_empty());
+
         // Scalars and containers read inertly too.
         let n = corvid_value_int(3);
         assert_eq!(corvid_value_as_bool(n, &mut ok), 0);
@@ -1317,6 +1356,60 @@ mod tests {
         corvid_value_free(v);
         corvid_value_free(n);
         corvid_value_free(arr);
+    }
+
+    /// Walk a strs cursor to exhaustion and free it, returning its bytes
+    /// (the §4.12 shape — the reader the map_keys tests drive).
+    fn drain_strs(cursor: *mut crate::handle::corvid_strs) -> Vec<Vec<u8>> {
+        assert!(!cursor.is_null(), "a live map/value never yields NULL here");
+        let mut out = Vec::new();
+        loop {
+            let mut item: *const c_char = std::ptr::null();
+            let mut len = 0;
+            if crate::strs::corvid_strs_next(cursor, &mut item, &mut len) != 1 {
+                break;
+            }
+            // SAFETY: item borrows the cursor's current string, valid
+            // until the next call (made only after the copy below).
+            out.push(unsafe { std::slice::from_raw_parts(item as *const u8, len) }.to_vec());
+        }
+        crate::strs::corvid_strs_free(cursor);
+        out
+    }
+
+    #[test]
+    fn map_keys_enumerate_sorted_and_answer_empty_elsewhere() {
+        // Ascending key-BYTE order regardless of construction order;
+        // unicode, empty, and interior-NUL keys keep their bytes (§1.5 —
+        // the cursor is the byte-keyed strs handle of §2's erratum, fed
+        // UTF-8 map keys as their bytes).
+        let m = corvid_value_map_new();
+        put(m, "z", corvid_value_int(1));
+        put(m, "键", corvid_value_int(2));
+        put(m, "a", corvid_value_int(3));
+        put(m, "", corvid_value_int(4)); // the empty key is legal
+        put(m, "a\0b", corvid_value_int(5));
+        let want: Vec<&[u8]> = vec![b"", b"a", b"a\0b", b"z", "键".as_bytes()];
+        assert_eq!(drain_strs(corvid_value_map_keys(m)), want);
+        corvid_value_free(m);
+
+        // Empty map: an empty cursor (exhausted at the first next).
+        let empty = corvid_value_map_new();
+        assert!(drain_strs(corvid_value_map_keys(empty)).is_empty());
+        corvid_value_free(empty);
+
+        // A borrowed child is a fine source: the read never consumes or
+        // mutates the parent (§4.4's const shape).
+        let parent = map(&[("inner", map(&[("k", Value::Int(1)), ("j", Value::Int(2))]))]);
+        let h = build(&parent);
+        let child = corvid_value_map_get(h, b"inner".as_ptr() as *const c_char, 5);
+        assert!(!child.is_null());
+        assert_eq!(
+            drain_strs(corvid_value_map_keys(child)),
+            vec![b"j".to_vec(), b"k".to_vec()],
+            "the nested map's keys, sorted"
+        );
+        corvid_value_free(h);
     }
 
     #[test]
@@ -1379,6 +1472,11 @@ mod tests {
 
         // clone(NULL): NULL + recorded.
         assert!(corvid_value_clone(std::ptr::null()).is_null());
+        assert_eq!(last_code(), corvid_err::CORVID_E_ARGUMENT);
+
+        // map_keys(NULL): NULL + recorded (the same handle-returning
+        // failure shape).
+        assert!(corvid_value_map_keys(std::ptr::null()).is_null());
         assert_eq!(last_code(), corvid_err::CORVID_E_ARGUMENT);
 
         // free(NULL): a no-op, nothing recorded (nothing fails).

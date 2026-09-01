@@ -47,6 +47,9 @@ GETFIELD	x,fn	-inf
 GETFIELD	x,z	-0.0
 GETFIELD	x,txt	t(héllo 🎉)
 GETFIELD	x,bs	b(A1~B2)
+# key enumeration over a DECODED document (§4.4's map_keys): the
+# storage round-trip keeps every key; ascending byte order
+GET_KEYS	x	k(bs,fn,fp,i,txt,z)
 # deletes: existed flag, pred-driven, batch; graph edges cascade
 DELETE	a	existed:1
 DELETE	a	existed:0
