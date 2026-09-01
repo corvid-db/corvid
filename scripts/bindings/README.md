@@ -9,6 +9,36 @@ red means don't merge, and the failing job is the evidence.
 The tool lives in the engine repo (it orchestrates the siblings but belongs to
 the coordinator). It operates on the repos registered in `registry.tsv`.
 
+## Toolchain policy (2026-09, correcting the stale-defaults mistake)
+
+**New bindings with zero users pin MODERN minimums, and CI tests latest +
+previous — there is no compat base to protect.** Defaulting a fresh binding
+to an older floor "to be safe" is the mistake this section exists to prevent:
+every floor we ship becomes a compat promise, and nothing has users yet.
+
+- **Language floors: latest-minus-one, not oldest-supported.** The `go.mod`
+  `go` directive and `engines`/`requires-python` floors track the newest
+  toolchain line a mainstream distro or LTS ships (e.g. Go 1.26 with the
+  1.27 toolchain auto-forwarding, Node ≥ 20, Python ≥ 3.11) — not the
+  oldest line that happens to compile.
+- **CI matrices test latest + previous** for every language: e.g. Go
+  `['1.27.x', '1.26.x']`, Node `[24, 22, 20]`, Python `[3.14, 3.13, 3.12,
+  3.11]` (intermediate Python lines may ride a single leg if wall-time
+  demands — keep latest + floor on the wide platform matrix).
+- **No EOL lines anywhere** (CI, engines fields, docs): Node 18, Python
+  ≤ 3.10, Go ≤ 1.24 must not appear as supported or tested.
+- **Build/tool floors follow the same rule**: e.g. corvid-c's
+  `cmake_minimum_required(3.28)` = Ubuntu 24.04 LTS system CMake, the
+  oldest any supported platform ships.
+- **CI actions and lint tooling stay current-major** (currently the
+  `actions/checkout@v7` era, `setup-*@v7`, `golangci-lint-action@v9` with
+  golangci-lint v2); bump them in the same sweep as language floors.
+- The engine's own MSRV is set deliberately by the workspace and is
+  **out of scope** here; bindings inherit it via the engine dependency.
+
+When a language line goes EOL, the floor moves up and the matrix drops the
+oldest line — in the binding repos, one PR per repo, golden CI as the gate.
+
 ## The workflow
 
 ```
