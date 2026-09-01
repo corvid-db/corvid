@@ -61,8 +61,26 @@ repo<TAB>pin-file-globs<TAB>base-branch
 - **base-branch** — the branch `bump/vX.Y.Z` is cut from and the PR base.
 
 Current rows: `corvid-db/corvid-c` (`fetch.sh`, `fetch.ps1`, optional
-`.engine-pin`, `README.md`, `docs/PLAN.md`) and `corvid-db/corvid-node`
-(`Cargo.toml`, `Cargo.lock`, `README.md`, `docs/PLAN.md`).
+`.engine-pin`, `README.md`, `docs/PLAN.md`), `corvid-db/corvid-node`
+(`Cargo.toml`, `Cargo.lock`, `README.md`, `docs/PLAN.md`),
+`corvid-db/corvid-python` (same shape as corvid-node), and
+`corvid-db/corvid-go` (same shape as corvid-c).
+
+## The binding-surface manifest: `surface.sh` / `surface.tsv`
+
+`surface.sh` parses the radar-enforced MANIFEST in
+`crates/corvid/tests/surface/mod.rs` (the same source `docs/SYNTAX.md`
+regenerates from) and emits `surface.tsv`: one `item<TAB>class<TAB>exposure`
+line per public construct, exposure starting `UNMAPPED`. The file is
+committed and drift-gated in engine CI (`crates/corvid/tests/surface_tsv.rs`
+re-derives it and fails on any difference).
+
+Every binding repo fetches `surface.tsv` from the raw URL at its pinned
+engine tag and resolves every line in its own `docs/SURFACE.tsv`
+(binding-api + proving test, or `N/A` + reason). This is the
+"how do we know a binding isn't missing engine surface?" gate — each
+binding's `surface-gate` CI job enforces it, so a tag that changes the
+engine surface lands in the binding gates the moment the pin is bumped.
 
 **A new binding registers itself by adding ONE line to `registry.tsv`** and
 being pushable by whoever runs the tool. Nothing else to wire up.

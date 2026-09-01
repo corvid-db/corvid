@@ -16,3 +16,5 @@
 # A new binding registers itself by adding ONE line here (see README.md).
 corvid-db/corvid-c	fetch.sh fetch.ps1 .engine-pin README.md docs/PLAN.md	master
 corvid-db/corvid-node	Cargo.toml Cargo.lock README.md docs/PLAN.md	master
+corvid-db/corvid-python	Cargo.toml Cargo.lock README.md docs/PLAN.md	master
+corvid-db/corvid-go	fetch.sh fetch.ps1 README.md docs/PLAN.md	master

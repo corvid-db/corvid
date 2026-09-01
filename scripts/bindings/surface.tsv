@@ -1,0 +1,327 @@
+corvid::Value	WHERE	UNMAPPED
+corvid::Value::Null	WHERE	UNMAPPED
+corvid::Value::Bool	WHERE	UNMAPPED
+corvid::Value::Int	WHERE	UNMAPPED
+corvid::Value::Float	WHERE	UNMAPPED
+corvid::Value::Text	WHERE	UNMAPPED
+corvid::Value::Bytes	WHERE	UNMAPPED
+corvid::Value::Array	WHERE	UNMAPPED
+corvid::Value::Map	WHERE	UNMAPPED
+corvid::Value::Vector	WHERE	UNMAPPED
+corvid::value::MAX_NESTING	Lifecycle	UNMAPPED
+corvid::Value::encode	Lifecycle	UNMAPPED
+corvid::Value::decode	Lifecycle	UNMAPPED
+corvid::Value::get	WHERE	UNMAPPED
+corvid::Value::get_path	WHERE	UNMAPPED
+corvid::Value::as_bool	WHERE	UNMAPPED
+corvid::Value::as_int	WHERE	UNMAPPED
+corvid::Value::as_float	WHERE	UNMAPPED
+corvid::Value::as_text	WHERE	UNMAPPED
+corvid::Value::as_bytes	WHERE	UNMAPPED
+corvid::Value::as_vector	WHERE	UNMAPPED
+corvid::CmpOp	WHERE	UNMAPPED
+corvid::CmpOp::Eq	WHERE	UNMAPPED
+corvid::CmpOp::Ne	WHERE	UNMAPPED
+corvid::CmpOp::Lt	WHERE	UNMAPPED
+corvid::CmpOp::Le	WHERE	UNMAPPED
+corvid::CmpOp::Gt	WHERE	UNMAPPED
+corvid::CmpOp::Ge	WHERE	UNMAPPED
+corvid::Predicate	WHERE	UNMAPPED
+corvid::Predicate::Compare	WHERE	UNMAPPED
+corvid::Predicate::Exists	WHERE	UNMAPPED
+corvid::Predicate::In	WHERE	UNMAPPED
+corvid::Predicate::Between	WHERE	UNMAPPED
+corvid::Predicate::StartsWith	WHERE	UNMAPPED
+corvid::Predicate::Contains	WHERE	UNMAPPED
+corvid::Predicate::GeoWithin	Geo	UNMAPPED
+corvid::Predicate::And	WHERE	UNMAPPED
+corvid::Predicate::Or	WHERE	UNMAPPED
+corvid::Predicate::Not	WHERE	UNMAPPED
+corvid::Predicate::and	WHERE	UNMAPPED
+corvid::Predicate::or	WHERE	UNMAPPED
+corvid::Predicate::eval	WHERE	UNMAPPED
+corvid::field	WHERE	UNMAPPED
+corvid::filter::FieldRef	WHERE	UNMAPPED
+corvid::filter::FieldRef::eq	WHERE	UNMAPPED
+corvid::filter::FieldRef::ne	WHERE	UNMAPPED
+corvid::filter::FieldRef::lt	WHERE	UNMAPPED
+corvid::filter::FieldRef::le	WHERE	UNMAPPED
+corvid::filter::FieldRef::gt	WHERE	UNMAPPED
+corvid::filter::FieldRef::ge	WHERE	UNMAPPED
+corvid::filter::FieldRef::exists	WHERE	UNMAPPED
+corvid::filter::FieldRef::is_in	WHERE	UNMAPPED
+corvid::filter::FieldRef::between	WHERE	UNMAPPED
+corvid::filter::FieldRef::starts_with	WHERE	UNMAPPED
+corvid::filter::FieldRef::contains	WHERE	UNMAPPED
+corvid::filter::FieldRef::within_km	Geo	UNMAPPED
+corvid::Metric	Vector search	UNMAPPED
+corvid::Metric::Cosine	Vector search	UNMAPPED
+corvid::Metric::Dot	Vector search	UNMAPPED
+corvid::Metric::L2	Vector search	UNMAPPED
+corvid::Metric::distance	Vector search	UNMAPPED
+corvid::distance::dot	Vector search	UNMAPPED
+corvid::distance::l2_squared	Vector search	UNMAPPED
+corvid::distance::cosine_distance	Vector search	UNMAPPED
+corvid::Quantization	Vector search	UNMAPPED
+corvid::Quantization::None	Vector search	UNMAPPED
+corvid::Quantization::Binary	Vector search	UNMAPPED
+corvid::Quantization::Scalar	Vector search	UNMAPPED
+corvid::Result	Lifecycle	UNMAPPED
+corvid::Error	Lifecycle	UNMAPPED
+corvid::Error::Database	Lifecycle	UNMAPPED
+corvid::Error::Transaction	Lifecycle	UNMAPPED
+corvid::Error::Table	Lifecycle	UNMAPPED
+corvid::Error::Storage	Lifecycle	UNMAPPED
+corvid::Error::Commit	Lifecycle	UNMAPPED
+corvid::Error::SetDurability	Lifecycle	UNMAPPED
+corvid::Error::Compaction	Lifecycle	UNMAPPED
+corvid::Error::Decode	Lifecycle	UNMAPPED
+corvid::Error::CorruptIndex	Schema (ALTER)	UNMAPPED
+corvid::Error::ReservedCollection	Schema (ALTER)	UNMAPPED
+corvid::Error::InvalidName	Schema (ALTER)	UNMAPPED
+corvid::Error::InvalidArgument	Hybrid	UNMAPPED
+corvid::Error::IncompatibleFormat	Lifecycle	UNMAPPED
+corvid::Error::EmptyIndexTraining	Schema (ALTER)	UNMAPPED
+corvid::Error::SchemaViolation	Schema (ALTER)	UNMAPPED
+corvid::Error::InvalidDump	Lifecycle	UNMAPPED
+corvid::Error::BackupTargetExists	Lifecycle	UNMAPPED
+corvid::Error::Io	Lifecycle	UNMAPPED
+corvid::ResultRow	SELECT shaping	UNMAPPED
+corvid::PlanShape	Lifecycle	UNMAPPED
+corvid::PlanShape::AnnIndex	Lifecycle	UNMAPPED
+corvid::PlanShape::TextIndex	Lifecycle	UNMAPPED
+corvid::PlanShape::IndexedWindow	Lifecycle	UNMAPPED
+corvid::PlanShape::SortIndex	Lifecycle	UNMAPPED
+corvid::PlanShape::StreamingTopK	Lifecycle	UNMAPPED
+corvid::PlanShape::Scan	Lifecycle	UNMAPPED
+corvid::QueryBuilder	SELECT shaping	UNMAPPED
+corvid::Collection::query	SELECT shaping	UNMAPPED
+corvid::QueryBuilder::filter	WHERE	UNMAPPED
+corvid::QueryBuilder::vector	Vector search	UNMAPPED
+corvid::QueryBuilder::text	Text search	UNMAPPED
+corvid::QueryBuilder::fuse_rrf	Hybrid	UNMAPPED
+corvid::QueryBuilder::rerank_mmr	Hybrid	UNMAPPED
+corvid::QueryBuilder::limit	SELECT shaping	UNMAPPED
+corvid::QueryBuilder::offset	SELECT shaping	UNMAPPED
+corvid::QueryBuilder::order_by	SELECT shaping	UNMAPPED
+corvid::QueryBuilder::approx	Vector search	UNMAPPED
+corvid::QueryBuilder::select	SELECT shaping	UNMAPPED
+corvid::QueryBuilder::count	Aggregations	UNMAPPED
+corvid::QueryBuilder::group_count	Aggregations	UNMAPPED
+corvid::QueryBuilder::sum	Aggregations	UNMAPPED
+corvid::QueryBuilder::avg	Aggregations	UNMAPPED
+corvid::QueryBuilder::min	Aggregations	UNMAPPED
+corvid::QueryBuilder::max	Aggregations	UNMAPPED
+corvid::QueryBuilder::count_distinct	Aggregations	UNMAPPED
+corvid::QueryBuilder::group_sum	Aggregations	UNMAPPED
+corvid::QueryBuilder::group_avg	Aggregations	UNMAPPED
+corvid::QueryBuilder::plan	Lifecycle	UNMAPPED
+corvid::QueryBuilder::plan_shape	Lifecycle	UNMAPPED
+corvid::QueryBuilder::explain	Lifecycle	UNMAPPED
+corvid::QueryBuilder::run	SELECT shaping	UNMAPPED
+corvid::Db	Lifecycle	UNMAPPED
+corvid::Db::open	Lifecycle	UNMAPPED
+corvid::Db::open_in_memory	Lifecycle	UNMAPPED
+corvid::Db::collection	Lifecycle	UNMAPPED
+corvid::Db::backup	Lifecycle	UNMAPPED
+corvid::Db::bulk	Lifecycle	UNMAPPED
+corvid::Db::compact	Lifecycle	UNMAPPED
+corvid::Db::collections	Lifecycle	UNMAPPED
+corvid::Collection	Mutations	UNMAPPED
+corvid::Collection::insert	Mutations	UNMAPPED
+corvid::Collection::update	Mutations	UNMAPPED
+corvid::Collection::patch	Mutations	UNMAPPED
+corvid::Collection::compare_and_set	Mutations	UNMAPPED
+corvid::Collection::for_each_doc	SELECT shaping	UNMAPPED
+corvid::Collection::len	SELECT shaping	UNMAPPED
+corvid::Collection::is_empty	SELECT shaping	UNMAPPED
+corvid::Collection::insert_batch	Mutations	UNMAPPED
+corvid::Collection::insert_auto	Mutations	UNMAPPED
+corvid::Collection::get	SELECT shaping	UNMAPPED
+corvid::Collection::delete	Mutations	UNMAPPED
+corvid::Collection::delete_where	Mutations	UNMAPPED
+corvid::Collection::delete_batch	Mutations	UNMAPPED
+corvid::Collection::scan	SELECT shaping	UNMAPPED
+corvid::Collection::page	SELECT shaping	UNMAPPED
+corvid::Collection::page_where	SELECT shaping	UNMAPPED
+corvid::db::Page	SELECT shaping	UNMAPPED
+corvid::Store	Lifecycle	UNMAPPED
+corvid::Store::open	Lifecycle	UNMAPPED
+corvid::Store::open_in_memory	Lifecycle	UNMAPPED
+corvid::Store::set_relaxed_durability	Lifecycle	UNMAPPED
+corvid::Store::begin_bulk	Lifecycle	UNMAPPED
+corvid::Store::flush	Lifecycle	UNMAPPED
+corvid::Store::compact	Lifecycle	UNMAPPED
+corvid::Store::next_auto_id	Lifecycle	UNMAPPED
+corvid::Store::backup	Lifecycle	UNMAPPED
+corvid::Store::transaction	Lifecycle	UNMAPPED
+corvid::Store::read	Lifecycle	UNMAPPED
+corvid::Store::put	Lifecycle	UNMAPPED
+corvid::Store::get	Lifecycle	UNMAPPED
+corvid::Store::delete	Lifecycle	UNMAPPED
+corvid::Store::scan	Lifecycle	UNMAPPED
+corvid::Store::collections	Lifecycle	UNMAPPED
+corvid::Store::scan_from	Lifecycle	UNMAPPED
+corvid::Store::count	Lifecycle	UNMAPPED
+corvid::Store::for_each	Lifecycle	UNMAPPED
+corvid::Store::scan_prefix	Lifecycle	UNMAPPED
+corvid::store::BulkScope	Lifecycle	UNMAPPED
+corvid::store::WriteBatch	Lifecycle	UNMAPPED
+corvid::store::WriteBatch::put	Lifecycle	UNMAPPED
+corvid::store::WriteBatch::get	Lifecycle	UNMAPPED
+corvid::store::WriteBatch::delete	Lifecycle	UNMAPPED
+corvid::store::WriteBatch::scan	Lifecycle	UNMAPPED
+corvid::store::WriteBatch::scan_from	Lifecycle	UNMAPPED
+corvid::store::WriteBatch::next_auto_id	Lifecycle	UNMAPPED
+corvid::store::ReadBatch	Lifecycle	UNMAPPED
+corvid::store::ReadBatch::collections	Lifecycle	UNMAPPED
+corvid::store::ReadBatch::auto_ids	Lifecycle	UNMAPPED
+corvid::store::ReadBatch::get	Lifecycle	UNMAPPED
+corvid::store::ReadBatch::scan	Lifecycle	UNMAPPED
+corvid::store::ReadBatch::scan_from	Lifecycle	UNMAPPED
+corvid::store::ReadBatch::scan_prefix	Lifecycle	UNMAPPED
+corvid::store::ReadBatch::for_each	Lifecycle	UNMAPPED
+corvid::Hit	Vector search	UNMAPPED
+corvid::TextHit	Text search	UNMAPPED
+corvid::Collection::text_search	Text search	UNMAPPED
+corvid::Collection::phrase_search	Text search	UNMAPPED
+corvid::Collection::vector_search	Vector search	UNMAPPED
+corvid::text::Bm25Params	Text search	UNMAPPED
+corvid::text::Bm25Params::new	Text search	UNMAPPED
+corvid::text::Bm25Params::validate	Text search	UNMAPPED
+corvid::text::tokenize	Text search	UNMAPPED
+corvid::text::s_stem	Text search	UNMAPPED
+corvid::text::Analyzer	Text search	UNMAPPED
+corvid::text::Analyzer::raw	Text search	UNMAPPED
+corvid::text::Analyzer::analyze	Text search	UNMAPPED
+corvid::text::analyze	Text search	UNMAPPED
+corvid::text::idf	Text search	UNMAPPED
+corvid::text::term_score	Text search	UNMAPPED
+corvid::DEFAULT_RRF_K	Hybrid	UNMAPPED
+corvid::reciprocal_rank_fusion	Hybrid	UNMAPPED
+corvid::mmr	Hybrid	UNMAPPED
+corvid::haversine_km	Geo	UNMAPPED
+corvid::GeoHit	Geo	UNMAPPED
+corvid::Collection::geo_within_radius	Geo	UNMAPPED
+corvid::Collection::geo_nearest	Geo	UNMAPPED
+corvid::Collection::geo_within_bbox	Geo	UNMAPPED
+corvid::Collection::create_geo_index	Schema (ALTER)	UNMAPPED
+corvid::Collection::link	Graph	UNMAPPED
+corvid::Collection::link_weighted	Graph	UNMAPPED
+corvid::Collection::neighbors_weighted	Graph	UNMAPPED
+corvid::Collection::unlink	Graph	UNMAPPED
+corvid::Collection::neighbors	Graph	UNMAPPED
+corvid::Collection::in_neighbors	Graph	UNMAPPED
+corvid::Collection::traverse	Graph	UNMAPPED
+corvid::JoinRow	Joins	UNMAPPED
+corvid::Collection::join	Joins	UNMAPPED
+corvid::hnsw::DEFAULT_M	Vector search	UNMAPPED
+corvid::hnsw::DEFAULT_EF_CONSTRUCTION	Vector search	UNMAPPED
+corvid::Hnsw	Vector search	UNMAPPED
+corvid::Hnsw::new	Vector search	UNMAPPED
+corvid::Hnsw::with_params	Vector search	UNMAPPED
+corvid::Hnsw::with_quant	Vector search	UNMAPPED
+corvid::Hnsw::with_pq	Vector search	UNMAPPED
+corvid::Hnsw::len	Vector search	UNMAPPED
+corvid::Hnsw::is_empty	Vector search	UNMAPPED
+corvid::Hnsw::insert	Vector search	UNMAPPED
+corvid::Hnsw::search	Vector search	UNMAPPED
+corvid::Collection::create_vector_index	Schema (ALTER)	UNMAPPED
+corvid::Collection::create_vector_index_quantized	Schema (ALTER)	UNMAPPED
+corvid::Collection::create_vector_index_ondisk	Schema (ALTER)	UNMAPPED
+corvid::Collection::create_vector_index_ondisk_quantized	Schema (ALTER)	UNMAPPED
+corvid::Collection::create_vector_index_ondisk_pq	Schema (ALTER)	UNMAPPED
+corvid::Collection::create_vector_index_pq	Schema (ALTER)	UNMAPPED
+corvid::Collection::create_text_index	Schema (ALTER)	UNMAPPED
+corvid::Collection::create_text_index_ondisk	Schema (ALTER)	UNMAPPED
+corvid::Collection::create_scalar_index	Schema (ALTER)	UNMAPPED
+corvid::Collection::create_compound_index	Schema (ALTER)	UNMAPPED
+corvid::schema::FieldType	Schema (ALTER)	UNMAPPED
+corvid::schema::FieldType::Any	Schema (ALTER)	UNMAPPED
+corvid::schema::FieldType::Bool	Schema (ALTER)	UNMAPPED
+corvid::schema::FieldType::Int	Schema (ALTER)	UNMAPPED
+corvid::schema::FieldType::Float	Schema (ALTER)	UNMAPPED
+corvid::schema::FieldType::Text	Schema (ALTER)	UNMAPPED
+corvid::schema::FieldType::Bytes	Schema (ALTER)	UNMAPPED
+corvid::schema::FieldType::Vector	Schema (ALTER)	UNMAPPED
+corvid::schema::FieldType::Array	Schema (ALTER)	UNMAPPED
+corvid::schema::FieldType::Map	Schema (ALTER)	UNMAPPED
+corvid::schema::Field	Schema (ALTER)	UNMAPPED
+corvid::schema::Field::new	Schema (ALTER)	UNMAPPED
+corvid::schema::Field::required	Schema (ALTER)	UNMAPPED
+corvid::schema::Field::unique	Schema (ALTER)	UNMAPPED
+corvid::schema::Schema	Schema (ALTER)	UNMAPPED
+corvid::schema::Schema::new	Schema (ALTER)	UNMAPPED
+corvid::schema::Schema::field	Schema (ALTER)	UNMAPPED
+corvid::schema::Schema::fields	Schema (ALTER)	UNMAPPED
+corvid::Collection::set_schema	Schema (ALTER)	UNMAPPED
+corvid::Collection::schema	Schema (ALTER)	UNMAPPED
+corvid::ChangeKind	Lifecycle	UNMAPPED
+corvid::ChangeKind::Insert	Lifecycle	UNMAPPED
+corvid::ChangeKind::Delete	Lifecycle	UNMAPPED
+corvid::ChangeEvent	Lifecycle	UNMAPPED
+corvid::SubscriptionId	Lifecycle	UNMAPPED
+corvid::Db::subscribe	Lifecycle	UNMAPPED
+corvid::Db::unsubscribe	Lifecycle	UNMAPPED
+corvid::SemanticCache	Lifecycle	UNMAPPED
+corvid::Collection::semantic_cache	Lifecycle	UNMAPPED
+corvid::SemanticCache::put	Lifecycle	UNMAPPED
+corvid::SemanticCache::get	Lifecycle	UNMAPPED
+corvid::HyperLogLog	Lifecycle	UNMAPPED
+corvid::HyperLogLog::new	Lifecycle	UNMAPPED
+corvid::HyperLogLog::with_precision	Lifecycle	UNMAPPED
+corvid::HyperLogLog::add_bytes	Lifecycle	UNMAPPED
+corvid::HyperLogLog::add_hash	Lifecycle	UNMAPPED
+corvid::HyperLogLog::estimate	Lifecycle	UNMAPPED
+corvid::BloomFilter	Lifecycle	UNMAPPED
+corvid::BloomFilter::new	Lifecycle	UNMAPPED
+corvid::BloomFilter::add_bytes	Lifecycle	UNMAPPED
+corvid::BloomFilter::contains_bytes	Lifecycle	UNMAPPED
+corvid::CuckooFilter	Lifecycle	UNMAPPED
+corvid::CuckooFilter::new	Lifecycle	UNMAPPED
+corvid::CuckooFilter::add_bytes	Lifecycle	UNMAPPED
+corvid::CuckooFilter::contains_bytes	Lifecycle	UNMAPPED
+corvid::CuckooFilter::delete_bytes	Lifecycle	UNMAPPED
+corvid::TDigest	Lifecycle	UNMAPPED
+corvid::TDigest::new	Lifecycle	UNMAPPED
+corvid::TDigest::add	Lifecycle	UNMAPPED
+corvid::TDigest::merge	Lifecycle	UNMAPPED
+corvid::TDigest::quantile	Lifecycle	UNMAPPED
+corvid::TDigest::cdf	Lifecycle	UNMAPPED
+corvid::MinHash	Lifecycle	UNMAPPED
+corvid::MinHash::new	Lifecycle	UNMAPPED
+corvid::MinHash::signature	Lifecycle	UNMAPPED
+corvid::MinHash::jaccard_estimate	Lifecycle	UNMAPPED
+corvid::LshIndex	Lifecycle	UNMAPPED
+corvid::LshIndex::new	Lifecycle	UNMAPPED
+corvid::LshIndex::insert	Lifecycle	UNMAPPED
+corvid::LshIndex::candidates	Lifecycle	UNMAPPED
+corvid::Collection::approx_distinct	Aggregations	UNMAPPED
+corvid::Collection::insert_with_ttl	TTL	UNMAPPED
+corvid::Collection::set_ttl	TTL	UNMAPPED
+corvid::Collection::ttl	TTL	UNMAPPED
+corvid::Collection::purge_expired	TTL	UNMAPPED
+corvid::Db::dump	Lifecycle	UNMAPPED
+corvid::Db::load	Lifecycle	UNMAPPED
+corvid::Db::load_with_renames	Lifecycle	UNMAPPED
+corvid::pq::Pq	Vector search	UNMAPPED
+corvid::pq::Pq::code_len	Vector search	UNMAPPED
+corvid::pq::Pq::dim	Vector search	UNMAPPED
+corvid::pq::Pq::params	Vector search	UNMAPPED
+corvid::pq::Pq::train	Vector search	UNMAPPED
+corvid::pq::Pq::encode	Vector search	UNMAPPED
+corvid::pq::Pq::decode	Vector search	UNMAPPED
+corvid::pq::Pq::distance	Vector search	UNMAPPED
+corvid::pq::Pq::l2_table	Vector search	UNMAPPED
+corvid::pq::Pq::adc_l2	Vector search	UNMAPPED
+corvid::pq::Pq::to_bytes	Vector search	UNMAPPED
+corvid::pq::Pq::from_bytes	Vector search	UNMAPPED
+corvid::QueryPlan	Lifecycle	UNMAPPED
+corvid::QueryPlan::key	Lifecycle	UNMAPPED
+corvid::PlanCache	Lifecycle	UNMAPPED
+corvid::PlanCache::new	Lifecycle	UNMAPPED
+corvid::PlanCache::get	Lifecycle	UNMAPPED
+corvid::PlanCache::insert	Lifecycle	UNMAPPED
+corvid::PlanCache::get_or_insert_with	Lifecycle	UNMAPPED
+corvid::PlanCache::len	Lifecycle	UNMAPPED
+corvid::PlanCache::is_empty	Lifecycle	UNMAPPED
