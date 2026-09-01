@@ -91,10 +91,27 @@ jobs:
         # runner; the MSVC toolchain env is inherited either way).
         shell: bash
         run: |
+          # Distributable-library hygiene (found by corvid-c, the external
+          # consumer): the dylib must carry @rpath/libcorvid.dylib as its
+          # install name (the raw cdylib embeds the build machine's absolute
+          # output path) and the .so a SONAME, or no external loader can
+          # use the published artifact.
+          case "${{ matrix.target }}" in
+            *-apple-darwin)
+              export RUSTFLAGS="-C link-arg=-Wl,-install_name,@rpath/libcorvid.dylib" ;;
+            *-unknown-linux-*)
+              export RUSTFLAGS="-C link-arg=-Wl,-soname,libcorvid.so" ;;
+          esac
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             cross build -p corvid-ffi --release --target "${{ matrix.target }}"
           else
             cargo build -p corvid-ffi --release --target "${{ matrix.target }}"
+          fi
+          # Verify before staging: install name / SONAME must be relocatable.
+          if [ -f "target/${{ matrix.target }}/release/libcorvid.dylib" ]; then
+            otool -D "target/${{ matrix.target }}/release/libcorvid.dylib" | tail -1 | grep -q '@rpath/libcorvid.dylib'
+          elif [ -f "target/${{ matrix.target }}/release/libcorvid.so" ]; then
+            objdump -p "target/${{ matrix.target }}/release/libcorvid.so" | grep -q 'SONAME.*libcorvid.so'
           fi
       - name: Stage the FFI artifact set (unix)
         if: runner.os != 'Windows'
