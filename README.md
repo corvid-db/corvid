@@ -57,7 +57,7 @@ let rows = docs
 
 The filter runs *before* ranking, so it is a true predicate — the top-k is
 computed among matching documents, never a post-hoc trim. Opting into
-[`.approx()`](https://i-rocky.github.io/corvid/api/corvid/struct.QueryBuilder.html#method.approx)
+[`.approx()`](https://corvid-db.github.io/corvid/api/corvid/struct.QueryBuilder.html#method.approx)
 trades this: the index's top-k is fetched first and the filter applied after,
 so a highly selective filter may return fewer than `limit` rows (see the
 `.approx()` docs).
@@ -89,8 +89,8 @@ so a highly selective filter may return fewer than `limit` rows (see the
   is the contract binding authors code against.
 
 A task-oriented walkthrough of every feature is in the **[user guide](docs/GUIDE.md)**.
-The **[website](https://i-rocky.github.io/corvid/)** hosts an overview and the
-full **[API reference](https://i-rocky.github.io/corvid/api/corvid/)**.
+The **[website](https://corvid-db.github.io/corvid/)** hosts an overview and the
+full **[API reference](https://corvid-db.github.io/corvid/api/corvid/)**.
 
 ## Capabilities (v0.1)
 

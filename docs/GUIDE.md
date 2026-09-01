@@ -34,7 +34,7 @@ crate is synchronous and in-process. For the *why* behind the design, see
 
 ```toml
 [dependencies]
-corvid = { git = "https://github.com/i-rocky/corvid" }
+corvid = { git = "https://github.com/corvid-db/corvid" }
 ```
 
 Requires stable Rust (2024 edition, MSRV 1.88). The engine has no required

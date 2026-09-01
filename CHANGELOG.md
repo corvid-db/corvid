@@ -613,5 +613,5 @@ format and API may change without backward-compatibility guarantees.
 - On-disk PQ distance: asymmetric-distance (ADC) fast path for the L2 metric,
   scoring codes against a per-query table built from the codebook.
 
-[0.1.1]: https://github.com/i-rocky/corvid/releases/tag/v0.1.1
-[0.1.0]: https://github.com/i-rocky/corvid/releases/tag/v0.1.0
+[0.1.1]: https://github.com/corvid-db/corvid/releases/tag/v0.1.1
+[0.1.0]: https://github.com/corvid-db/corvid/releases/tag/v0.1.0
