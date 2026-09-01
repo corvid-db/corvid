@@ -15,6 +15,10 @@ name: Release
 # manually from Actions with `dry_run` checked — every matrix build, the
 # tag/version verification, and the sha256 checksums all execute, but the
 # release/upload steps are skipped (an explicit echo marks the skip).
+#
+# Post-release checklist: fan the new pin out to every binding repo with
+# `scripts/bindings/bump.sh <TAG>` (PRs; merge each once its golden CI is
+# green via --merge-when-green — see scripts/bindings/README.md).
 on:
   push:
     tags:

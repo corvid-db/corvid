@@ -1,0 +1,18 @@
+# registry.tsv — the binding repos scripts/bindings/bump.sh fans engine-pin
+# bumps out to. One row per binding; TAB-separated, exactly three fields:
+#
+#   repo<TAB>pin-file-globs<TAB>base-branch
+#
+#   repo            GitHub ORG/NAME of the binding (ssh clone/push target).
+#   pin-file-globs  space-separated globs, relative to the binding repo root,
+#                   matching every file that pins or references the engine
+#                   tag. A tag inside a pin-shaped context (tag = "vX.Y.Z",
+#                   ?tag=vX.Y.Z, NAME..VERSION..=, PIN=) is a VOTE on what the
+#                   repo's pin is; all other occurrences are prose references
+#                   that get substituted along with it. Globs that match
+#                   nothing are reported (e.g. an optional .engine-pin).
+#   base-branch     branch the bump/vX.Y.Z branch is cut from and the PR base.
+#
+# A new binding registers itself by adding ONE line here (see README.md).
+corvid-db/corvid-c	fetch.sh fetch.ps1 .engine-pin README.md docs/PLAN.md	master
+corvid-db/corvid-node	Cargo.toml Cargo.lock README.md docs/PLAN.md	master
