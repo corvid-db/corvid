@@ -413,7 +413,7 @@ for i in "${!REPOS[@]}"; do
         echo "Automated engine-pin bump \`$old\` -> \`$NEW_TAG\`, opened by \`scripts/bindings/bump.sh\` in corvid-db/corvid."
         echo
         echo "The substitution is purely textual: every occurrence of \`$old\` in this repo's registered pin globs became \`$NEW_TAG\`:"
-        printf '%s\n' "$subs" | awk -F'\t' '{ printf -- "- `%s`: %s substitution(s)\n", $1, $2 }'
+        printf '%s\n' "$subs" | awk -F'\t' '{ printf "- `%s`: %s substitution(s)\n", $1, $2 }'
         echo
         echo "**The golden suite on this PR is the verdict for $NEW_TAG.** Green means the new pin is compatible with this binding — merge (squash). Red means do not merge; the failing job is the evidence."
         echo
