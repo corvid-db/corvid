@@ -22,3 +22,4 @@ corvid-db/corvid-js	Cargo.toml Cargo.lock README.md docs/PLAN.md	master
 corvid-db/corvid-cpp	fetch.sh fetch.ps1 .engine-pin README.md docs/PLAN.md	master
 corvid-db/corvid-zig	fetch.sh fetch.ps1 README.md docs/PLAN.md	master
 corvid-db/corvid-dart	fetch.sh fetch.ps1 README.md docs/PLAN.md	master
+corvid-db/corvid-php	fetch.sh fetch.ps1 .engine-pin README.md docs/PLAN.md	master
