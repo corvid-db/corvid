@@ -91,6 +91,12 @@ format and API may change without backward-compatibility guarantees.
   at their next engine-pin bump).
 
 ## [Unreleased]
+
+### Release engineering
+- v0.3.3: the tokenless publish pipeline — crates.io via OIDC trusted publishing
+  (rust-lang/crates-io-auth-action), the binding release cascade
+  (bump.sh --release-after-merge), and registry parity tooling. No functional
+  engine changes; artifacts and ABI identical to v0.3.2.
 ### Design ledger
 
 - Closed the design ledger: every previously "future" item now carries an explicit dated disposition (shipped, deferred with a falsifiable trigger, declined, or never) — see DESIGN.md's decision log (2026-08-30 rows).
