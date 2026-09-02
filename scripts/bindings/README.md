@@ -95,8 +95,9 @@ Current rows: `corvid-db/corvid-c` (`fetch.sh`, `fetch.ps1`, optional
 (`Cargo.toml`, `Cargo.lock`, `README.md`, `docs/PLAN.md`),
 `corvid-db/corvid-python` (same shape as corvid-node),
 `corvid-db/corvid-go` (same shape as corvid-c),
-`corvid-db/corvid-js` (same shape as corvid-node), and
-`corvid-db/corvid-cpp` (same shape as corvid-c).
+`corvid-db/corvid-js` (same shape as corvid-node),
+`corvid-db/corvid-cpp` (same shape as corvid-c), and
+`corvid-db/corvid-zig` (same shape as corvid-c).
 
 ## The binding-surface manifest: `surface.sh` / `surface.tsv`
 
