@@ -14,6 +14,13 @@
 # the design. --merge-when-green polls each PR's checks and squash-merges on
 # green; failures are reported with the failing job URL.
 #
+# The release cascade: after the engine tag exists and every bump PR has
+# merged, --release-after-merge tags each binding repo at the SAME vX.Y.Z
+# and pushes the tags — which fires the per-repo release workflows that
+# publish to the registries (npm / PyPI / pub.dev / crates.io-on-the-engine)
+# and pins the tag in the registry-less repos (c/go/cpp/zig/jvm; php's tag
+# itself is the Packagist release). One engine tag -> every registry.
+#
 # Modes:
 #   bump.sh --check                    read-only drift audit: current pin per
 #                                      registered repo vs the engine's latest tag
@@ -24,6 +31,19 @@
 #                                      engine remote)
 #   bump.sh --merge-when-green [TAG]   poll open bump PRs' checks until the
 #                                      golden CI completes; squash-merge on green
+#   bump.sh --release-after-merge NEW_TAG
+#                                      the cascade: after every bump PR merged,
+#                                      verify each base branch pins NEW_TAG (and
+#                                      the package version matches), tag vX.Y.Z,
+#                                      push, and print the fired workflow run
+#                                      URLs (or tag permalinks where no release
+#                                      workflow exists). NEVER runs implicitly —
+#                                      this exact flag is the only trigger.
+#   bump.sh --dry-run --release-after-merge NEW_TAG
+#                                      the cascade's dry form: every verification
+#                                      (open PRs, pins, package versions) runs and
+#                                      the table shows exactly which repos WOULD
+#                                      be tagged — but nothing is tagged/pushed
 #
 # Options:
 #   --repo ORG/NAME   operate on a subset of the registry (repeatable)
@@ -48,6 +68,7 @@ readonly PIN_CONTEXT_RE='(tag[[:space:]]*=[[:space:]]*"?|\?tag=|version[[:space:
 MODE_CHECK=0
 MODE_DRY=0
 MODE_MERGE=0
+MODE_RELEASE=0
 NEW_TAG=""
 REPO_FILTER=()
 POLL_TIMEOUT_MIN=60
@@ -132,6 +153,46 @@ substitute() {
     done
 }
 
+# read_package_version FILE -> the binding's OWN package version on stdout
+# (bare X.Y.Z, no v), format-detected from the file: package.json /
+# composer.json ("version": "x"), pubspec.yaml (version: x), anything TOMLish
+# (version = "x"). Empty output = not found.
+read_package_version() {
+    local f="$1" base
+    base="$(basename "$f")"
+    case "$base" in
+        package.json|composer.json)
+            sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1 ;;
+        pubspec.yaml)
+            sed -n 's/^version:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$f" | head -1 ;;
+        *)
+            sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1 ;;
+    esac
+}
+
+# set_package_version REPO_DIR FILE NEWVER -> rewrites the FIRST version
+# declaration in FILE to NEWVER (in every registered version file the
+# top-level package version is the first declaration; dependency tables
+# come later and are never touched). Format-aware per read_package_version.
+# NEWVER is always validated [0-9.]+ by the caller, so the perl snippets
+# are injection-safe.
+set_package_version() {
+    local repo_dir="$1" f="$2" newver="$3"
+    local file="$repo_dir/$f" base
+    [ -f "$file" ] || { log "  note: version file '$f' not found (absent or moved?)"; return 1; }
+    base="$(basename "$f")"
+    case "$base" in
+        package.json|composer.json)
+            # ${1} (not $1): the version digits would otherwise be read as
+            # $10, $11, ... — perl group interpolation swallows the digits.
+            perl -pi -e 'BEGIN{$d=0} if (!$d && s/("version"\s*:\s*")[^"]+/${1}'"$newver"'/) {$d=1}' "$file" ;;
+        pubspec.yaml)
+            perl -pi -e 'BEGIN{$d=0} if (!$d && s/^version:[[:space:]]*\S+/version: '"$newver"'/) {$d=1}' "$file" ;;
+        *)
+            perl -pi -e 'BEGIN{$d=0} if (!$d && s/^version[[:space:]]*=[[:space:]]*"[^"]+"/version = "'"$newver"'"/) {$d=1}' "$file" ;;
+    esac
+}
+
 # ---------------------------------------------------------------------------
 # CLI
 
@@ -140,6 +201,7 @@ while [ $# -gt 0 ]; do
         --check)             MODE_CHECK=1 ;;
         --dry-run)           MODE_DRY=1 ;;
         --merge-when-green)  MODE_MERGE=1 ;;
+        --release-after-merge) MODE_RELEASE=1 ;;
         --repo)
             shift
             [ $# -gt 0 ] || die "--repo needs an ORG/NAME argument"
@@ -164,10 +226,18 @@ done
 
 [ -f "$REGISTRY" ] || die "registry not found: $REGISTRY"
 
-n_modes=$(( MODE_CHECK + MODE_DRY + MODE_MERGE ))
-[ "$n_modes" -le 1 ] || die "--check, --dry-run and --merge-when-green are mutually exclusive"
-if [ "$n_modes" -eq 0 ]; then
-    [ -n "$NEW_TAG" ] || die "missing NEW_TAG (usage: bump.sh NEW_TAG | --check | --dry-run NEW_TAG | --merge-when-green [TAG])"
+# --check / --merge-when-green / --release-after-merge are mutually exclusive;
+# --dry-run stands alone (the bump dry-run) or rides with --release-after-merge
+# (the cascade dry form).
+n_modes=$(( MODE_CHECK + MODE_MERGE + MODE_RELEASE ))
+[ "$n_modes" -le 1 ] || die "--check, --merge-when-green and --release-after-merge are mutually exclusive"
+[ "$MODE_DRY" -eq 0 ] || [ "$n_modes" -eq 0 ] || [ "$MODE_RELEASE" -eq 1 ] \
+    || die "--dry-run combines only with --release-after-merge"
+if [ "$n_modes" -eq 0 ] && [ "$MODE_DRY" -eq 0 ]; then
+    [ -n "$NEW_TAG" ] || die "missing NEW_TAG (usage: bump.sh NEW_TAG | --check | --dry-run NEW_TAG | --merge-when-green [TAG] | --release-after-merge NEW_TAG)"
+fi
+if [ "$MODE_RELEASE" -eq 1 ]; then
+    [ -n "$NEW_TAG" ] || die "--release-after-merge needs a NEW_TAG (usage: bump.sh --release-after-merge vX.Y.Z)"
 fi
 if [ -n "$NEW_TAG" ]; then
     printf '%s' "$NEW_TAG" | grep -qE "$TAG_RE" \
@@ -187,30 +257,37 @@ command -v gh  >/dev/null 2>&1 || die "gh not found (authenticate with: gh auth 
 # ---------------------------------------------------------------------------
 # registry
 
-REPOS=() GLOBS=() BRANCHES=()
+REPOS=() GLOBS=() BRANCHES=() VERSIONS=()
 line_no=0
 while IFS= read -r raw; do
     line_no=$(( line_no + 1 ))
     case "$raw" in ''|'#'*) continue ;; esac
-    [ "$(printf '%s' "$raw" | tr -cd '\t' | wc -c | tr -d ' ')" -eq 2 ] \
-        || die "registry.tsv:$line_no: expected exactly 3 TAB-separated fields"
+    tabs="$(printf '%s' "$raw" | tr -cd '\t' | wc -c | tr -d ' ')"
+    [ "$tabs" -eq 2 ] || [ "$tabs" -eq 3 ] \
+        || die "registry.tsv:$line_no: expected 3 or 4 TAB-separated fields"
     repo="${raw%%$'\t'*}"
     rest="${raw#*$'\t'}"
     globs="${rest%%$'\t'*}"
-    branch="${rest#*$'\t'}"
+    rest="${rest#*$'\t'}"
+    if [ "$tabs" -eq 3 ]; then
+        branch="${rest%%$'\t'*}"
+        version_file="${rest#*$'\t'}"
+    else
+        branch="$rest"
+        version_file=""
+    fi
     case "$repo" in */*) ;; *) die "registry.tsv:$line_no: repo must be ORG/NAME, got '$repo'" ;; esac
     [ -n "$globs" ]  || die "registry.tsv:$line_no: empty pin-file-globs"
     [ -n "$branch" ] || die "registry.tsv:$line_no: empty base-branch"
+    keep=1
     if [ "${#REPO_FILTER[@]}" -gt 0 ]; then
         keep=0
         for f in "${REPO_FILTER[@]}"; do
             if [ "$f" = "$repo" ]; then keep=1; fi
         done
-        if [ "$keep" -eq 1 ]; then
-            REPOS+=("$repo"); GLOBS+=("$globs"); BRANCHES+=("$branch")
-        fi
-    else
-        REPOS+=("$repo"); GLOBS+=("$globs"); BRANCHES+=("$branch")
+    fi
+    if [ "$keep" -eq 1 ]; then
+        REPOS+=("$repo"); GLOBS+=("$globs"); BRANCHES+=("$branch"); VERSIONS+=("$version_file")
     fi
 done < "$REGISTRY"
 [ "${#REPOS[@]}" -gt 0 ] || die "no registered repos selected (registry: $REGISTRY, filter: ${REPO_FILTER[*]+"${REPO_FILTER[*]}"})"
@@ -267,6 +344,19 @@ if [ "$MODE_CHECK" -eq 1 ]; then
             [ -n "$extra" ] && detail="${detail:+$detail; }historical: $(printf '%s' "$extra" | sed 's/ $//')"
             printf '    %-32s %s\n' "$f" "${detail:--}"
         done
+        vfile="${VERSIONS[$i]}"
+        if [ -n "$vfile" ]; then
+            if [ -f "$WORK/$name/$vfile" ]; then
+                pkgver="$(read_package_version "$WORK/$name/$vfile")"
+                if [ "$pkgver" = "${latest#v}" ]; then
+                    printf '    %-32s %s\n' "$vfile" "package version ${pkgver:-?} (release parity with engine)"
+                else
+                    printf '    %-32s %s\n' "$vfile" "package version ${pkgver:-<unreadable>} — engine latest ${latest#v:-?} (parity lands with the next bump)"
+                fi
+            else
+                printf '    %-32s %s\n' "$vfile" "MISSING (registered version file not found)"
+            fi
+        fi
     done
     [ "$fail" -eq 0 ] || exit 1
     exit 0
@@ -363,6 +453,116 @@ if [ "$MODE_DRY" -eq 0 ] && [ "$tag_exists" -eq 0 ]; then
 fi
 [ "$tag_exists" -eq 1 ] || log "note: $NEW_TAG is not (yet) an engine tag — dry-run only"
 
+# ---------------------------------------------------------------------------
+# --release-after-merge: the cascade — tag every binding at NEW_TAG and let
+# the per-repo release workflows publish. Explicit opt-in only: this flag is
+# the ONLY path that creates these tags, and it refuses any repo whose bump
+# PR is still open, whose base branch does not pin NEW_TAG yet, or whose
+# registered package version does not match the tag (release parity).
+
+if [ "$MODE_RELEASE" -eq 1 ]; then
+    bare="${NEW_TAG#v}"
+    rel_repo=() rel_action=() rel_detail=() rel_url=()
+    rel_fail=0
+    for i in "${!REPOS[@]}"; do
+        repo="${REPOS[$i]}" branch="${BRANCHES[$i]}" vfile="${VERSIONS[$i]}"
+        name="${repo#*/}"
+        log "cloning $repo ($branch)..."
+        clone_repo "$repo" "$branch" "$WORK/$name" || {
+            rel_repo+=("$repo"); rel_action+=("CLONE-FAILED"); rel_detail+=("-"); rel_url+=("-"); rel_fail=1; continue; }
+
+        # 1. the bump PR for NEW_TAG must be merged (or closed) out of the way
+        open_url="$(gh pr list --repo "$repo" --head "bump/$NEW_TAG" --state open --json url --jq '.[0].url' 2>/dev/null || true)"
+        if [ -n "$open_url" ]; then
+            rel_repo+=("$repo"); rel_action+=("SKIPPED"); rel_detail+=("bump PR still open"); rel_url+=("$open_url"); rel_fail=1
+            log "$repo: bump/$NEW_TAG PR is still open — merge (or close) it first"; continue
+        fi
+
+        # 2. the merged base branch must pin NEW_TAG (the bump landed)
+        files=()
+        while IFS= read -r f; do files+=("$f"); done < <(expand_globs "$WORK/$name" "${GLOBS[$i]}" | awk '!seen[$0]++')
+        pin=""
+        [ "${#files[@]}" -gt 0 ] && pin="$(collect_votes "$WORK/$name" ${files[@]+"${files[@]}"} | cut -f2 | awk '!seen[$0]++')"
+        n_votes="$(printf '%s\n' "$pin" | grep -cxE "$TAG_TOKEN_RE" || true)"
+        if [ "$n_votes" -ne 1 ] || [ "$pin" != "$NEW_TAG" ]; then
+            rel_repo+=("$repo"); rel_action+=("SKIPPED"); rel_detail+=("pins '${pin:-nothing}', not $NEW_TAG"); rel_url+=("-"); rel_fail=1
+            log "$repo: base branch pins '${pin:-nothing}' — expected $NEW_TAG (bump PR merged?)"; continue
+        fi
+
+        # 3. registry-publishing bindings: package version must equal the tag
+        #    (release parity — the binding publishes at the engine's version)
+        if [ -n "$vfile" ]; then
+            if [ ! -f "$WORK/$name/$vfile" ]; then
+                rel_repo+=("$repo"); rel_action+=("SKIPPED"); rel_detail+=("version file '$vfile' missing"); rel_url+=("-"); rel_fail=1
+                log "$repo: registered version file '$vfile' not found"; continue
+            fi
+            pkgver="$(read_package_version "$WORK/$name/$vfile")"
+            if [ "$pkgver" != "$bare" ]; then
+                rel_repo+=("$repo"); rel_action+=("SKIPPED"); rel_detail+=("$vfile at ${pkgver:-<unreadable>}, tag wants $bare"); rel_url+=("-"); rel_fail=1
+                log "$repo: package version '${pkgver:-unset}' != $bare — land the version bump, then re-run"; continue
+            fi
+        fi
+
+        # dry-run of the cascade: every check above ran; tag NOTHING
+        if [ "$MODE_DRY" -eq 1 ]; then
+            rel_repo+=("$repo"); rel_action+=("WOULD-TAG"); rel_detail+=("$NEW_TAG (all checks passed)"); rel_url+=("-")
+            log "$repo: would tag $NEW_TAG and fire its release (dry-run — nothing tagged)"
+            continue
+        fi
+
+        # 4. tag HEAD at NEW_TAG (idempotent: an existing remote tag is kept)
+        have="$(git -C "$WORK/$name" ls-remote --tags --refs origin "refs/tags/$NEW_TAG" | wc -l | tr -d ' ')"
+        if [ "$have" -ge 1 ]; then
+            action="ALREADY-TAGGED"
+            log "$repo: $NEW_TAG already exists on the remote — keeping it"
+        else
+            git -C "$WORK/$name" tag "$NEW_TAG" || {
+                rel_repo+=("$repo"); rel_action+=("TAG-FAILED"); rel_detail+=("$NEW_TAG"); rel_url+=("-"); rel_fail=1; continue; }
+            if ! git -C "$WORK/$name" push --quiet origin "refs/tags/$NEW_TAG"; then
+                rel_repo+=("$repo"); rel_action+=("PUSH-FAILED"); rel_detail+=("tag $NEW_TAG"); rel_url+=("-"); rel_fail=1; continue
+            fi
+            action="TAGGED"
+        fi
+
+        # 5. surface the fired workflow run (repos with a release workflow)
+        #    or the tag permalink (pin-only repos; php: Packagist syncs)
+        url="-"; detail="$NEW_TAG"
+        if [ -f "$WORK/$name/.github/workflows/release.yml" ]; then
+            url=""
+            for _ in 1 2 3 4 5 6 7 8 9; do
+                url="$(gh run list --repo "$repo" --branch "$NEW_TAG" --event push --limit 1 --json url --jq '.[0].url' 2>/dev/null || true)"
+                [ -n "$url" ] && break
+                sleep 5
+            done
+            if [ -n "$url" ]; then
+                detail="$NEW_TAG (release workflow fired)"
+            else
+                url="-"; detail="$NEW_TAG (tag pushed; no run URL after 45s — watch Actions)"
+            fi
+        else
+            url="https://github.com/$repo/tree/$NEW_TAG"
+            if [ -f "$WORK/$name/composer.json" ]; then
+                detail="$NEW_TAG (Packagist auto-syncs from the tag)"
+            else
+                detail="$NEW_TAG (pin tag; no release workflow)"
+            fi
+        fi
+        rel_repo+=("$repo"); rel_action+=("$action"); rel_detail+=("$detail"); rel_url+=("$url")
+        log "$repo: $action — $detail $url"
+    done
+
+    echo
+    dry_suffix=""
+    [ "$MODE_DRY" -eq 1 ] && dry_suffix=" (dry-run — nothing tagged, nothing pushed)"
+    echo "=== --release-after-merge $NEW_TAG$dry_suffix — summary ==="
+    printf '%-24s %-14s %-44s %s\n' REPO ACTION DETAIL URL
+    for i in "${!rel_repo[@]}"; do
+        printf '%-24s %-14s %-44s %s\n' "${rel_repo[$i]}" "${rel_action[$i]}" "${rel_detail[$i]}" "${rel_url[$i]}"
+    done
+    [ "$rel_fail" -eq 0 ] || exit 1
+    exit 0
+fi
+
 declare -a out_repo=() out_old=() out_new=() out_url=() out_status=()
 fail=0
 for i in "${!REPOS[@]}"; do
@@ -399,6 +599,30 @@ for i in "${!REPOS[@]}"; do
 
     subs="$(substitute "$WORK/$name" "$old" "$NEW_TAG" ${files[@]+"${files[@]}"})"
     total="$(printf '%s\n' "$subs" | cut -f2 | awk '{s+=$1} END {print s+0}')"
+
+    # Release parity: repos with a registered version-file ALSO get their own
+    # package version set to the tag's bare version in the same PR, so the
+    # later --release-after-merge tag publishes at the engine's version.
+    pkg_old="" pkg_new="" version_note=""
+    if [ -n "${VERSIONS[$i]}" ]; then
+        if [ -f "$WORK/$name/${VERSIONS[$i]}" ]; then
+            pkg_old="$(read_package_version "$WORK/$name/${VERSIONS[$i]}")"
+            if [ -n "$pkg_old" ] && [ "$(ver_key "$pkg_old")" -gt "$(ver_key "$NEW_TAG")" ]; then
+                out_repo+=("$repo"); out_old+=("$old"); out_new+=("$NEW_TAG"); out_url+=(-)
+                out_status+=("REFUSED — package version $pkg_old would be a downgrade"); fail=1; continue
+            fi
+            if set_package_version "$WORK/$name" "${VERSIONS[$i]}" "${NEW_TAG#v}"; then
+                pkg_new="$(read_package_version "$WORK/$name/${VERSIONS[$i]}")"
+                if [ "$pkg_new" != "$pkg_old" ]; then
+                    version_note="y"
+                    log "$repo: package version $pkg_old -> $pkg_new (${VERSIONS[$i]})"
+                fi
+            fi
+        else
+            log "$repo: registered version file '${VERSIONS[$i]}' not found — pin bumped, version untouched"
+        fi
+    fi
+
     if git -C "$WORK/$name" diff --quiet; then
         out_repo+=("$repo"); out_old+=("$old"); out_new+=("$NEW_TAG"); out_url+=("-")
         out_status+=("NO-OP — substitution produced no diff"); fail=1; continue
@@ -409,7 +633,7 @@ for i in "${!REPOS[@]}"; do
         echo "=== $repo: $old -> $NEW_TAG ($total substitution(s)) — diff it would make ==="
         git -C "$WORK/$name" --no-pager diff
         out_repo+=("$repo"); out_old+=("$old"); out_new+=("$NEW_TAG"); out_url+=("(dry-run)")
-        out_status+=("$total substitution(s); would branch bump/$NEW_TAG and open a PR"); continue
+        out_status+=("$total substitution(s)${version_note:+ + ${VERSIONS[$i]} $pkg_old -> $pkg_new}; would branch bump/$NEW_TAG and open a PR"); continue
     fi
 
     body="$WORK/pr-body.md"
@@ -417,7 +641,10 @@ for i in "${!REPOS[@]}"; do
         echo "Automated engine-pin bump \`$old\` -> \`$NEW_TAG\`, opened by \`scripts/bindings/bump.sh\` in corvid-db/corvid."
         echo
         echo "The substitution is purely textual: every occurrence of \`$old\` in this repo's registered pin globs became \`$NEW_TAG\`:"
-        printf '%s\n' "$subs" | awk -F'\t' '{ printf "- `%s`: %s substitution(s)\n", $1, $2 }'
+        printf '%s\n' "$subs" | awk -F'\t' '{ printf "- \`%s\`: %s substitution(s)\n", $1, $2 }'
+        if [ "$version_note" = "y" ]; then
+            echo "- \`${VERSIONS[$i]}\`: package version \`$pkg_old\` -> \`$pkg_new\` (release parity — this binding publishes at the engine's version once tagged)"
+        fi
         echo
         echo "**The golden suite on this PR is the verdict for $NEW_TAG.** Green means the new pin is compatible with this binding — merge (squash). Red means do not merge; the failing job is the evidence."
         echo
@@ -426,9 +653,10 @@ for i in "${!REPOS[@]}"; do
 
     git -C "$WORK/$name" checkout -q -B "bump/$NEW_TAG"
     git -C "$WORK/$name" add -A
+    n_files="$(printf '%s\n' "$subs" | grep -c . || true)"
     if ! git -C "$WORK/$name" commit -q \
         -m "chore: bump engine pin $old -> $NEW_TAG" \
-        -m "Automated by scripts/bindings/bump.sh (corvid-db/corvid): $total textual substitution(s) across $(printf '%s\n' "$subs" | wc -l | tr -d ' ') file(s). The golden CI on this branch is the verdict for the new pin."; then
+        -m "Automated by scripts/bindings/bump.sh (corvid-db/corvid): $total textual substitution(s) across $n_files file(s)${version_note:+, package version $pkg_old -> $pkg_new for registry parity}. The golden CI on this branch is the verdict for the new pin."; then
         out_repo+=("$repo"); out_old+=("$old"); out_new+=("$NEW_TAG"); out_url+=(-)
         out_status+=("COMMIT-FAILED"); fail=1; continue
     fi

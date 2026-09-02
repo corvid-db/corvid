@@ -16,9 +16,16 @@ name: Release
 # tag/version verification, and the sha256 checksums all execute, but the
 # release/upload steps are skipped (an explicit echo marks the skip).
 #
+# After the GitHub release exists, the crates-io job publishes the engine
+# crate to crates.io (`cargo publish -p corvid-db`) — idempotently: a
+# crates.io API check skips the publish when the workspace version is
+# already registered, so a re-pushed tag never fails the job.
+#
 # Post-release checklist: fan the new pin out to every binding repo with
 # `scripts/bindings/bump.sh <TAG>` (PRs; merge each once its golden CI is
-# green via --merge-when-green — see scripts/bindings/README.md).
+# green via --merge-when-green), then cascade the release tags with
+# `scripts/bindings/bump.sh --release-after-merge <TAG>` — see
+# scripts/bindings/README.md.
 on:
   push:
     tags:
@@ -220,3 +227,51 @@ jobs:
             || gh release create "$GITHUB_REF_NAME" \
                  --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
           gh release upload "$GITHUB_REF_NAME" dist/corvid-mcp-* dist/corvid-ffi-* dist/checksums.txt --clobber
+
+  crates-io:
+    name: crates.io (corvid-db)
+    needs: release
+    # Tag pushes only (a dispatch run has no tag context), never on dry_run.
+    # Runs strictly after the GitHub release exists, so the crate lands only
+    # once the binary/FFI artifacts it documents are already published.
+    if: github.event_name == 'push' && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # NOTE — one-time secret (see scripts/bindings/README.md "USER
+    # INSTRUCTIONS"): create a publish-update-scoped token at
+    # https://crates.io/settings/tokens, then:
+    #   gh secret set CARGO_REGISTRY_TOKEN -R corvid-db/corvid
+    # cargo reads CARGO_REGISTRY_TOKEN from the environment for crates.io.
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Idempotence guard (skip if the version is already on crates.io)
+        id: guard
+        run: |
+          VERSION=$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version = /{gsub(/[";]/,"",$3); print $3; exit}' Cargo.toml)
+          if [ -z "$VERSION" ]; then
+            echo "::error::workspace version not found in Cargo.toml"
+            exit 1
+          fi
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+                      -A 'corvid-db/corvid release workflow (github.com/corvid-db/corvid)' \
+                      "https://crates.io/api/v1/crates/corvid-db/$VERSION")
+          echo "crates.io lookup: corvid-db $VERSION -> HTTP $CODE"
+          case "$CODE" in
+            200)
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::corvid-db $VERSION is already on crates.io — publish skipped (idempotent re-run)"
+              ;;
+            404)
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::unexpected crates.io API status $CODE (is the registry down?)"
+              exit 1
+              ;;
+          esac
+      - name: cargo publish -p corvid-db
+        if: steps.guard.outputs.skip != 'true'
+        run: cargo publish -p corvid-db

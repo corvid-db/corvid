@@ -1,7 +1,7 @@
 # registry.tsv — the binding repos scripts/bindings/bump.sh fans engine-pin
-# bumps out to. One row per binding; TAB-separated, exactly three fields:
+# bumps out to. One row per binding; TAB-separated, three or four fields:
 #
-#   repo<TAB>pin-file-globs<TAB>base-branch
+#   repo<TAB>pin-file-globs<TAB>base-branch[<TAB>version-file]
 #
 #   repo            GitHub ORG/NAME of the binding (ssh clone/push target).
 #   pin-file-globs  space-separated globs, relative to the binding repo root,
@@ -12,15 +12,25 @@
 #                   that get substituted along with it. Globs that match
 #                   nothing are reported (e.g. an optional .engine-pin).
 #   base-branch     branch the bump/vX.Y.Z branch is cut from and the PR base.
+#   version-file    OPTIONAL (4th field): the binding's OWN package-version
+#                   file (package.json / pyproject.toml / pubspec.yaml). When
+#                   present, the bump PR also sets its version to the tag's
+#                   bare X.Y.Z — release parity: the binding publishes at the
+#                   engine's version — and --release-after-merge refuses to
+#                   tag the repo unless the version matches. Registry-less
+#                   repos (c/go/cpp/zig/jvm/php) omit it: they are tagged for
+#                   pinning only (php's tag IS the Packagist release; its
+#                   composer.json carries no version field by Packagist
+#                   convention — Packagist derives it from the tag).
 #
 # A new binding registers itself by adding ONE line here (see README.md).
 corvid-db/corvid-c	fetch.sh fetch.ps1 .engine-pin README.md docs/PLAN.md	master
-corvid-db/corvid-node	Cargo.toml Cargo.lock README.md docs/PLAN.md	master
-corvid-db/corvid-python	Cargo.toml Cargo.lock README.md docs/PLAN.md	master
+corvid-db/corvid-node	Cargo.toml Cargo.lock README.md docs/PLAN.md	master	package.json
+corvid-db/corvid-python	Cargo.toml Cargo.lock README.md docs/PLAN.md	master	pyproject.toml
 corvid-db/corvid-go	fetch.sh fetch.ps1 README.md docs/PLAN.md	master
-corvid-db/corvid-js	Cargo.toml Cargo.lock README.md docs/PLAN.md	master
+corvid-db/corvid-js	Cargo.toml Cargo.lock README.md docs/PLAN.md	master	package.json
 corvid-db/corvid-cpp	fetch.sh fetch.ps1 .engine-pin README.md docs/PLAN.md	master
 corvid-db/corvid-zig	fetch.sh fetch.ps1 README.md docs/PLAN.md	master
-corvid-db/corvid-dart	fetch.sh fetch.ps1 README.md docs/PLAN.md	master
+corvid-db/corvid-dart	fetch.sh fetch.ps1 README.md docs/PLAN.md	master	pubspec.yaml
 corvid-db/corvid-php	fetch.sh fetch.ps1 .engine-pin README.md docs/PLAN.md	master
 corvid-db/corvid-jvm	fetch.sh fetch.ps1 README.md docs/PLAN.md	master
