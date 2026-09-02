@@ -1059,6 +1059,65 @@ fn queries_page_after_empty_bytes_skips_only_the_empty_key() {
 }
 
 #[test]
+fn queries_page_empty_key_cursor_chain_continues_never_restarts() {
+    // The 2026-09-02 acceptance-round seam, pinned at the engine: a page
+    // boundary landing exactly on the legal empty key b"". None starts
+    // AT b"" (it is the first key in key order); a full page ending on
+    // b"" hands back next = Some(b""); feeding that cursor back MUST
+    // continue strictly after b"" — excluding b"" exactly once — never
+    // restart the walk (the infinite-re-walk failure mode) and never
+    // re-emit b"".
+    let db = Db::open_in_memory().unwrap();
+    let c = seed(
+        &db,
+        "pge",
+        &[
+            (b"", map(&[("n", Value::Int(0))])),
+            (b"k1", map(&[("n", Value::Int(1))])),
+            (b"k2", map(&[("n", Value::Int(2))])),
+            (b"k3", map(&[("n", Value::Int(3))])),
+            (b"k4", map(&[("n", Value::Int(4))])),
+        ],
+    );
+
+    // First page: limit 1 lands the boundary exactly on the empty key —
+    // the page is [b""] and the cursor IS the zero-length key.
+    let p = c.page(None, 1).unwrap();
+    assert_eq!(
+        p.rows.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        vec![b"".to_vec()]
+    );
+    assert_eq!(p.next, Some(b"".to_vec()), "the empty key is a cursor");
+
+    // Feed next=b"" back: strictly-after continuation, pages of 2.
+    let mut seen: Vec<Vec<u8>> = p.rows.iter().map(|(k, _)| k.clone()).collect();
+    let mut after = p.next;
+    let mut guard = 0;
+    while let Some(cursor) = after {
+        guard += 1;
+        assert!(guard < 10, "the walk must terminate, not restart");
+        let p = c.page(Some(&cursor), 2).unwrap();
+        assert!(
+            !p.rows.iter().any(|(k, _)| k.is_empty()),
+            "after=b\"\" excludes the empty key — it was already emitted"
+        );
+        seen.extend(p.rows.iter().map(|(k, _)| k.clone()));
+        after = p.next;
+    }
+    assert_eq!(
+        seen,
+        vec![
+            b"".to_vec(),
+            b"k1".to_vec(),
+            b"k2".to_vec(),
+            b"k3".to_vec(),
+            b"k4".to_vec(),
+        ],
+        "every key exactly once: start includes b\"\", after=b\"\" resumes past it"
+    );
+}
+
+#[test]
 fn queries_page_where_predicate_and_full_walk() {
     let db = Db::open_in_memory().unwrap();
     let c = seed(
