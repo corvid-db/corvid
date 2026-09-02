@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/). Until 1.0 the on-disk
 format and API may change without backward-compatibility guarantees.
 
-## [Unreleased]
+## [0.3.2] - 2026-09-02
 ### Changed
 
 - The engine crate's PACKAGE name is now `corvid-db` (crates.io
