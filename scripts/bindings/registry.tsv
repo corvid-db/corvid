@@ -19,3 +19,4 @@ corvid-db/corvid-node	Cargo.toml Cargo.lock README.md docs/PLAN.md	master
 corvid-db/corvid-python	Cargo.toml Cargo.lock README.md docs/PLAN.md	master
 corvid-db/corvid-go	fetch.sh fetch.ps1 README.md docs/PLAN.md	master
 corvid-db/corvid-js	Cargo.toml Cargo.lock README.md docs/PLAN.md	master
+corvid-db/corvid-cpp	fetch.sh fetch.ps1 .engine-pin README.md docs/PLAN.md	master
