@@ -251,6 +251,30 @@ case "$POLL_TIMEOUT_MIN$POLL_INTERVAL" in
     *[!0-9]*) die "--timeout/--interval expect integers" ;;
 esac
 
+# Before opening bump PRs, wait for the engine release to finish
+# uploading: six bindings' CI fetches release artifacts (checksums.txt +
+# tarballs) at the pinned tag, and PRs opened the moment the tag exists
+# race the upload — v0.3.4's lesson: every artifact-fetch job 404'd
+# because the PRs' CI ran while release.yml was still building. Poll
+# the checksums URL; hard-fail rather than open PRs that cannot go
+# green. (Skipped in --dry-run, which pushes nothing.)
+RELEASE_WAIT_MIN="${RELEASE_WAIT_MIN:-20}"
+RELEASE_POLL_SEC="${RELEASE_POLL_SEC:-30}"
+
+wait_for_release_assets() { # $1 = tag
+    local url="https://github.com/corvid-db/corvid/releases/download/$1/checksums.txt"
+    local waited=0
+    log "waiting for engine release assets ($url)..."
+    while [ "$waited" -lt "$((RELEASE_WAIT_MIN * 60))" ]; do
+        if curl -fsIL -o /dev/null --max-time 30 "$url" 2>/dev/null; then
+            log "release assets are up (waited ${waited}s)"
+            return 0
+        fi
+        sleep "$RELEASE_POLL_SEC"; waited=$((waited + RELEASE_POLL_SEC))
+    done
+    die "engine release assets for $1 did not appear within ${RELEASE_WAIT_MIN}min — not opening PRs that would race the upload"
+}
+
 command -v git >/dev/null 2>&1 || die "git not found"
 command -v gh  >/dev/null 2>&1 || die "gh not found (authenticate with: gh auth login)"
 
@@ -565,6 +589,7 @@ fi
 
 declare -a out_repo=() out_old=() out_new=() out_url=() out_status=()
 fail=0
+[ "$MODE_DRY" -eq 1 ] || wait_for_release_assets "$NEW_TAG"
 for i in "${!REPOS[@]}"; do
     repo="${REPOS[$i]}" branch="${BRANCHES[$i]}"
     name="${repo#*/}"
