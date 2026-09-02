@@ -1021,16 +1021,29 @@ corvid_status corvid_page(corvid_coll *c, const uint8_t *after, size_t after_len
                           uint8_t **next_after_out, size_t *next_after_len_out);
 ```
 Keyset pagination: up to `limit` documents in key order strictly after
-`after` (`after == NULL || after_len == 0` starts at the beginning),
-from one MVCC snapshot. `*rows_out` is an owned rows cursor (score 0.0;
+`after`, from one MVCC snapshot. `after == NULL` is the ONLY start form —
+the very first key onward, the legal empty key `b""` included. A non-NULL
+`after` names the cursor bytes — all `after_len` of them, including ZERO:
+`after != NULL && after_len == 0` is the zero-length cursor, `b""` as an
+EXCLUSIVE continuation (strictly after `b""`, per §1.5's "empty is a
+non-NULL pointer with length 0" and §7's "empty is distinct from NULL";
+the 2026-09-02 resolution of this section's former "len 0 = start"
+wording — that fold made the ABI's own cursor inexpressible: a page
+boundary landing on `b""` hands back a zero-length `*next_after_out`,
+and feeding it back as a restart would loop the walk forever). Feeding
+`*next_after_out` back, whatever its length, always ADVANCES the walk.
+`*rows_out` is an owned rows cursor (score 0.0;
 `corvid_rows_next/free` drive it). `*next_after_out` is the resume
 cursor — **free it with `corvid_free`** — or NULL with
 `*next_after_len_out == 0` at the end of the collection. `limit == 0`
 returns empty rows and no cursor. Counterpart:
 `Collection::page(after: Option<&[u8]>, limit) -> Page { rows, next }`
 — the buffer's ownership (caller frees via `corvid_free`) is the ABI
-addition. (Filtered pagination `Collection::page_where` is not exposed in
-v1 — §9.)
+addition. (The empty-cursor edge is pinned by the in-crate FFI tests
+(read.rs), NOT by a golden fixture line: the fixture grammar's splitter
+drops empty tokens, so a zero-length cursor — and the empty key itself —
+cannot be written as a `PAGE`/`INSERT` line. Filtered pagination
+`Collection::page_where` is not exposed in v1 — §9.)
 
 ```c
 corvid_status corvid_len(corvid_coll *c, size_t *out);
@@ -1398,7 +1411,9 @@ outputs: O=owned-by-caller, B=borrowed):
   rule.
 - Nullable-by-contract pointers carry semantics: `corvid_compare_and_set`'s
   `expected`/`replacement` (absent / delete), `corvid_page`'s `after`
-  (start), `corvid_update`'s `current`/`*out` (absent / delete), optional
+  (NULL = start; non-NULL of any length — including 0, the zero-length
+  cursor `b""` — = the exclusive continuation, §4.9), `corvid_update`'s
+  `current`/`*out` (absent / delete), optional
   out-params (`existed_out`, `removed_out`, `moved_out`, `len_out`s,
   `doc_out`).
 - Empty (pointer, 0-length) is distinct from NULL and legal for keys,

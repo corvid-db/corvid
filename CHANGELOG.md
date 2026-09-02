@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/). Until 1.0 the on-disk
 format and API may change without backward-compatibility guarantees.
 
+## [Unreleased]
+### Fixed
+
+- `corvid_page`'s zero-length cursor is an EXCLUSIVE continuation, not a
+  start (docs/FFI.md §4.9 erratum, found by the corvid-zig acceptance
+  round): §4.9 said "`after == NULL || after_len == 0` starts at the
+  beginning", which contradicted §1.5/§7 ("empty is a non-NULL pointer
+  with length 0, distinct from NULL") and made the ABI's own cursor
+  inexpressible — the legal empty key `b""` sorts first, so a page
+  boundary landing on it returns a zero-length `*next_after_out`, and
+  feeding that back under the old fold RESTARTED the walk (an infinite
+  re-walk; the alternative — treating the empty cursor as end — silently
+  truncates). The engine's `page_inner` was already correct
+  (`after = Some(b"")` resumes strictly after `b""`; `after = None`
+  starts AT `b""`); only the FFI fold and the spec wording were wrong.
+  Now: `after == NULL` is the ONLY start form; a non-NULL `after` of any
+  length — including 0 — is the cursor (strictly after those bytes).
+  Behavior is bit-identical for every collection that does not contain
+  the empty key; signatures, symbols, enums, and `FFI_VERSION` (1) are
+  unchanged, so this rides the next release tag without a version bump.
+  Golden-fixture note: the fixture grammar's splitter drops empty
+  tokens, so the empty-cursor edge is pinned by the in-crate FFI tests
+  (crates/corvid-ffi/src/read.rs) and the engine conformance tests
+  (crates/corvid/tests/queries.rs), not by a `PAGE` fixture line
+  (documented in §4.9). Bindings re-vendor their golden sets at the next
+  pin bump: corvid-zig's zero-length-cursor test currently pins the old
+  restart shape and flips with this change.
+
 ## [0.3.1] - 2026-09-01
 ### Fixed
 
