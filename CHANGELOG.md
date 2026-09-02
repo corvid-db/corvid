@@ -1,8 +1,27 @@
 # Changelog
 
 All notable changes to this project are documented here. The format is loosely
-based on [Keep a Changelog](https://keepachangelog.com/). Until 1.0 the on-disk
-format and API may change without backward-compatibility guarantees.
+based on [Keep a Changelog](https://keepachangelog.com/). Until 1.0 the
+on-disk format and API may change without backward-compatibility guarantees.
+
+## [0.4.0] - 2026-09-02
+### Design ledger
+
+- The 2026-05-29 browser/OPFS deferral is **CLOSED — shipped** (decision
+  log, 2026-09-02). The product signal the 2026-08-30 row required
+  arrived (the corvid-js binding program building the browser runtime);
+  the mechanism is exactly the recorded insight — redb needs no mmap, so
+  a `StorageBackend` over one OPFS sync access handle suffices (the
+  v0.3.4 seam APIs are that door). corvid-js ships the rest: the Worker
+  runtime, the async `openOpfs`/`AsyncDb` surface, cross-tab
+  single-writer `Busy`, dump/load/backup forms, and Chromium CI running
+  all 8 golden fixture files (267/267) plus reload/cross-tab contracts
+  (contract: corvid-js `docs/OPFS-SPEC.md`). DESIGN.md's status lines,
+  the WASM-specifics section, and open question 2 are updated to the
+  shipped truth; SAHPool and the COOP/CEP synchronous API stay recorded
+  triggers, not scheduled work. No code changes in this release —
+  v0.3.4 carries the APIs; this tag closes the ledger and aligns the
+  release parity version for the corvid-js 0.4.0 publish.
 
 ## [0.3.4] - 2026-09-02
 ### Added
