@@ -278,8 +278,12 @@ fi
 if [ "$MODE_MERGE" -eq 1 ]; then
     pr_repos=() pr_urls=() pr_states=() pr_details=()
     for repo in "${REPOS[@]}"; do
-        list="$(gh pr list --repo "$repo" --state open --limit 100 \
-                     --json headRefName,url --jq '.[] | select(.headRefName | test("^bump/v[0-9]+\\\\.[0-9]+\\\\.[0-9]+$")) | .headRefName + "\t" + .url' 2>/dev/null || true)"
+    # NB: the regex's \. must be DOUBLE-backslashed here — jq unwraps
+    # \\ to \ in its string literals, so "\\\\." would arrive at the
+    # regex engine as a literal-backslash match and select nothing
+    # (the exact bug the first real --merge-when-green run hit).
+    list="$(gh pr list --repo "$repo" --state open --limit 100 \
+                 --json headRefName,url --jq '.[] | select(.headRefName | test("^bump/v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .headRefName + "\t" + .url' 2>/dev/null || true)"
         while IFS=$'\t' read -r head url; do
             [ -n "$head" ] || continue
             if [ -n "$NEW_TAG" ] && [ "$head" != "bump/$NEW_TAG" ]; then continue; fi
