@@ -198,6 +198,21 @@ the historical record of the frozen values; C sources write
 `corvid_value_type_t` for the type. No other §1.4 type collides with a
 function name.)*
 
+*(Erratum, 2026-09-01, engine v0.3.1 — the emitted `corvid.h`'s enum
+SYNTAX is portable C11/C++ as of v0.3.1: the generator's cbindgen
+render had been wrapping every §1.3/§1.4 enum in C23
+fixed-underlying-type guards (`enum <tag>` + `#if __STDC_VERSION__ >=
+202311L` + `: uint32_t`), whose pre-C23 fallback (`typedef uint32_t
+<tag>;` beside the enum tag) is ill-formed C++ — the tag and the
+typedef share a namespace there (found by corvid-cpp, which had to
+preprocessor-mask the guards in its ABI TUs). The header now emits the
+plain `typedef enum <tag> { ... } <tag>;` these sections have shown all
+along — valid C11, C23, and every C++ standard; §1.3/§1.4's
+frozen-value discipline is about VALUES (explicit, unchanged) not the
+C23 spelling, and the Rust-side `#[repr(u32)]` wire-type pin is
+untouched. Values, signatures, and the 124-symbol appendix are all
+unchanged.)*
+
 ### 1.5 Strings, keys, and lengths
 
 - Strings and keys cross the ABI as **pointer + length** pairs and are

@@ -37,11 +37,7 @@ typedef struct corvid_schemaiter corvid_schemaiter;
  * last error — a CORVID_ERR return is always paired with a freshly
  * recorded code and message.
  */
-enum corvid_status
-#if __STDC_VERSION__ >= 202311L
-  : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
- {
+typedef enum corvid_status {
   /**
    * Success.
    */
@@ -50,22 +46,13 @@ enum corvid_status
    * Failure; detail in `corvid_last_error_code`/`_message`.
    */
   CORVID_ERR = 1,
-};
-#if __STDC_VERSION__ >= 202311L
-typedef enum corvid_status corvid_status;
-#else
-typedef uint32_t corvid_status;
-#endif // __STDC_VERSION__ >= 202311L
+} corvid_status;
 
 /**
  * The distance metric (FFI.md §1.4, frozen per §8): mirrors
  * `corvid::Metric` (distance.rs).
  */
-enum corvid_metric
-#if __STDC_VERSION__ >= 202311L
-  : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
- {
+typedef enum corvid_metric {
   /**
    * Cosine distance `1 - cos_sim` in `[0,2]`; zero-norm = maximally
    * distant.
@@ -79,22 +66,13 @@ enum corvid_metric
    * Squared Euclidean (monotonic with L2).
    */
   CORVID_METRIC_L2 = 2,
-};
-#if __STDC_VERSION__ >= 202311L
-typedef enum corvid_metric corvid_metric;
-#else
-typedef uint32_t corvid_metric;
-#endif // __STDC_VERSION__ >= 202311L
+} corvid_metric;
 
 /**
  * The stored-vector quantization mode (FFI.md §1.4, frozen per §8):
  * mirrors `corvid::Quantization` (quant.rs).
  */
-enum corvid_quant
-#if __STDC_VERSION__ >= 202311L
-  : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
- {
+typedef enum corvid_quant {
   /**
    * Full `f32` precision (`dim * 4` bytes/vector).
    */
@@ -107,22 +85,13 @@ enum corvid_quant
    * 8-bit per-vector min+scale; ~4x smaller.
    */
   CORVID_QUANT_SCALAR = 2,
-};
-#if __STDC_VERSION__ >= 202311L
-typedef enum corvid_quant corvid_quant;
-#else
-typedef uint32_t corvid_quant;
-#endif // __STDC_VERSION__ >= 202311L
+} corvid_quant;
 
 /**
  * The declared type of a schema field (FFI.md §1.4, frozen per §8):
  * mirrors `corvid::schema::FieldType` (schema.rs `to_byte`, 0..8).
  */
-enum corvid_field_type
-#if __STDC_VERSION__ >= 202311L
-  : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
- {
+typedef enum corvid_field_type {
   /**
    * `FieldType::Any` — any value accepted.
    */
@@ -159,12 +128,7 @@ enum corvid_field_type
    * `FieldType::Map`.
    */
   CORVID_FIELD_MAP = 8,
-};
-#if __STDC_VERSION__ >= 202311L
-typedef enum corvid_field_type corvid_field_type;
-#else
-typedef uint32_t corvid_field_type;
-#endif // __STDC_VERSION__ >= 202311L
+} corvid_field_type;
 
 /**
  * Detailed codes returned by `corvid_last_error_code()` (FFI.md §1.3,
@@ -172,11 +136,7 @@ typedef uint32_t corvid_field_type;
  * 1–18 map 1:1 onto the engine's `corvid::Error` variants; 19 is
  * FFI-only.
  */
-enum corvid_err
-#if __STDC_VERSION__ >= 202311L
-  : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
- {
+typedef enum corvid_err {
   /**
    * No error recorded on this thread.
    */
@@ -260,22 +220,13 @@ enum corvid_err
    * (spec §4.13). No engine variant.
    */
   CORVID_E_BUSY = 19,
-};
-#if __STDC_VERSION__ >= 202311L
-typedef enum corvid_err corvid_err;
-#else
-typedef uint32_t corvid_err;
-#endif // __STDC_VERSION__ >= 202311L
+} corvid_err;
 
 /**
  * The comparison operator (FFI.md §1.4, frozen per §8): mirrors
  * `corvid::CmpOp` (filter.rs).
  */
-enum corvid_cmp
-#if __STDC_VERSION__ >= 202311L
-  : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
- {
+typedef enum corvid_cmp {
   /**
    * Equal (numeric Int/Float interop, else structural).
    */
@@ -300,12 +251,7 @@ enum corvid_cmp
    * Greater or equal.
    */
   CORVID_CMP_GE = 5,
-};
-#if __STDC_VERSION__ >= 202311L
-typedef enum corvid_cmp corvid_cmp;
-#else
-typedef uint32_t corvid_cmp;
-#endif // __STDC_VERSION__ >= 202311L
+} corvid_cmp;
 
 /**
  * The value discriminant (FFI.md §1.4, frozen per §8): tags 0..=8,
@@ -313,11 +259,7 @@ typedef uint32_t corvid_cmp;
  * engine's constants are not `pub`, so the correspondence is pinned by
  * the `type_tags_are_frozen...` test instead of a const reference.
  */
-enum corvid_value_type_t
-#if __STDC_VERSION__ >= 202311L
-  : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
- {
+typedef enum corvid_value_type_t {
   /**
    * `Value::Null` — absence of a value.
    */
@@ -354,12 +296,7 @@ enum corvid_value_type_t
    * `Value::Vector` — dense f32 embedding.
    */
   CORVID_TYPE_VECTOR = 8,
-};
-#if __STDC_VERSION__ >= 202311L
-typedef enum corvid_value_type_t corvid_value_type_t;
-#else
-typedef uint32_t corvid_value_type_t;
-#endif // __STDC_VERSION__ >= 202311L
+} corvid_value_type_t;
 
 /**
  * One geospatial / weighted hit (spec §1.2, POD): the output shape of

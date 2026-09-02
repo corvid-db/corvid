@@ -16,6 +16,13 @@ include_guard = "CORVID_H"
 usize_is_size_t = true
 
 # `typedef enum <tag> { ... } <tag>;` — the shape FFI.md §1.3/§1.4 show.
+# NOTE: cbindgen keys its C output off #[repr(prim)] and has no config
+# that suppresses its C23 fixed-underlying-type guards (`#if
+# __STDC_VERSION__ >= 202311L : uint32_t`) — cpp_compat only re-shapes
+# them, and their pre-C23 fallback (`typedef uint32_t <tag>;` beside the
+# enum tag) is ill-formed C++. src/header.rs's portable_enum_form
+# post-pass folds the guards into this plain shape — valid C11 AND C++;
+# the Rust-side #[repr(u32)] (the actual wire-type pin) is untouched.
 style = "Both"
 
 # Declaration order within a family, families in module order: the
