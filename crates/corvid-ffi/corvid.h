@@ -1557,8 +1557,14 @@ corvid_status corvid_scan(corvid_coll *c, corvid_scan_fn fn_, void *ctx);
  * Keyset pagination (spec §4.9; counterpart:
  * `Collection::page(after: Option<&[u8]>, limit) -> Page { rows, next }`):
  * up to `limit` documents in key order strictly after `after`, from
- * one MVCC snapshot. `after == NULL || after_len == 0` starts at the
- * beginning; `limit == 0` returns empty rows and no cursor.
+ * one MVCC snapshot. `after == NULL` is the ONLY start form (the very
+ * first key onward, the legal empty key `b""` included). A NON-NULL
+ * `after` names the cursor bytes — including ZERO of them: the
+ * zero-length cursor is `b""` as an exclusive continuation (strictly
+ * after `b""`, §1.5's empty-bytes shape; the 2026-09-02 resolution of
+ * the "len 0 = start" ambiguity — feeding `next_after` back, whatever
+ * its length, always advances the walk, never restarts it).
+ * `limit == 0` returns empty rows and no cursor.
  *
  * `*rows_out` (required) receives an OWNED rows cursor holding the
  * page's materialized rows with score 0.0 — walk it with

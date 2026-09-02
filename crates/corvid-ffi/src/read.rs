@@ -174,8 +174,14 @@ pub extern "C" fn corvid_scan(
 /// Keyset pagination (spec §4.9; counterpart:
 /// `Collection::page(after: Option<&[u8]>, limit) -> Page { rows, next }`):
 /// up to `limit` documents in key order strictly after `after`, from
-/// one MVCC snapshot. `after == NULL || after_len == 0` starts at the
-/// beginning; `limit == 0` returns empty rows and no cursor.
+/// one MVCC snapshot. `after == NULL` is the ONLY start form (the very
+/// first key onward, the legal empty key `b""` included). A NON-NULL
+/// `after` names the cursor bytes — including ZERO of them: the
+/// zero-length cursor is `b""` as an exclusive continuation (strictly
+/// after `b""`, §1.5's empty-bytes shape; the 2026-09-02 resolution of
+/// the "len 0 = start" ambiguity — feeding `next_after` back, whatever
+/// its length, always advances the walk, never restarts it).
+/// `limit == 0` returns empty rows and no cursor.
 ///
 /// `*rows_out` (required) receives an OWNED rows cursor holding the
 /// page's materialized rows with score 0.0 — walk it with
@@ -217,10 +223,13 @@ pub extern "C" fn corvid_page(
     let Some(coll) = borrow_coll_checked("corvid_page", c) else {
         return corvid_status::CORVID_ERR;
     };
-    // after is nullable-with-semantics (§7): NULL or length 0 starts at
-    // the beginning; a NULL pointer with nonzero length is the
-    // unexpected-NULL shape instead.
-    let after = if after.is_null() || after_len == 0 {
+    // after is nullable-with-semantics (§7): NULL is the ONLY start form.
+    // A NON-NULL pointer names the cursor bytes — all `after_len` of
+    // them, including ZERO: the legal empty key b"" as an exclusive
+    // continuation (§1.5's empty-bytes shape, the engine's
+    // `after = Some(b"")`), never a restart. A NULL pointer with
+    // nonzero length is the unexpected-NULL shape instead.
+    let after = if after.is_null() {
         if after_len > 0 {
             record_argument(
                 "corvid_page: after is NULL with after_len > 0 (§7's \
@@ -603,7 +612,10 @@ mod tests {
     #[test]
     fn page_pins_the_edge_shapes() {
         let (db, coll) = fresh();
-        seed(coll, &[b"a", b"b", b"c"]);
+        // The empty key sorts FIRST, so every edge below is discriminating:
+        // start (NULL) vs the zero-length cursor (non-NULL, len 0) differ
+        // exactly here.
+        seed(coll, &[b"", b"a", b"b", b"c"]);
 
         // limit 0: empty rows, no cursor.
         let mut rows: *mut corvid_rows = std::ptr::null_mut();
@@ -624,7 +636,9 @@ mod tests {
         assert!(walk_rows(rows).is_empty());
         assert!(next.is_null() && next_len == 0);
 
-        // after with length 0 (non-NULL): the beginning, like NULL.
+        // after with length 0 (non-NULL): the ZERO-LENGTH CURSOR b"" —
+        // the exclusive continuation past the empty key (never a
+        // restart; start is NULL only, the 2026-09-02 §4.9 resolution).
         assert_eq!(
             corvid_page(
                 coll,
@@ -732,6 +746,103 @@ mod tests {
                 &mut next_len
             ),
             CORVID_ERR
+        );
+
+        corvid_collection_free(coll);
+        assert_eq!(corvid_close(db), CORVID_OK);
+    }
+
+    /// The 2026-09-02 empty-cursor seam, pinned at the ABI: the legal
+    /// empty key b"" sorts first, so a page boundary can land on it and
+    /// `next_after` comes back as a NON-NULL buffer of ZERO bytes. Feeding
+    /// THAT buffer back (non-NULL pointer, length 0 — §1.5's empty-bytes
+    /// shape) must be the EXCLUSIVE continuation past b"" (the engine's
+    /// `after = Some(b"")`), never a restart — start is `after == NULL`
+    /// only.
+    #[test]
+    fn page_empty_key_cursor_continues_exclusively_never_restarts() {
+        let (db, coll) = fresh();
+        // The empty key first, then more keys than one minimal page.
+        seed(coll, &[b"", b"k1", b"k2", b"k3", b"k4"]);
+
+        // Page 1 (NULL after, limit 1): the boundary lands exactly on the
+        // empty key — rows [b""], cursor a zero-length buffer (not NULL,
+        // not end).
+        let mut rows: *mut corvid_rows = std::ptr::null_mut();
+        let mut next: *mut u8 = std::ptr::null_mut();
+        let mut next_len = usize::MAX;
+        assert_eq!(
+            corvid_page(
+                coll,
+                std::ptr::null(),
+                0,
+                1,
+                &mut rows,
+                &mut next,
+                &mut next_len
+            ),
+            CORVID_OK
+        );
+        let walked = walk_rows(rows);
+        assert_eq!(walked.len(), 1);
+        assert!(walked[0].0.is_empty(), "the empty key is the first row");
+        assert!(
+            !next.is_null() && next_len == 0,
+            "not-end: the cursor is the zero-length key itself, non-NULL"
+        );
+
+        // Continuation: feed the RETURNED buffer back — same pointer, same
+        // (zero) length. Strictly after b"": the rest of the collection,
+        // the empty key never re-emitted, the walk terminating on the
+        // short page.
+        let mut seen: Vec<Vec<u8>> = vec![b"".to_vec()];
+        let mut after: *mut u8 = next;
+        let mut after_len = next_len;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 10, "the walk must terminate, not restart");
+            let mut rows: *mut corvid_rows = std::ptr::null_mut();
+            let mut next: *mut u8 = std::ptr::null_mut();
+            let mut next_len = 0usize;
+            assert_eq!(
+                corvid_page(
+                    coll,
+                    after,
+                    after_len,
+                    2,
+                    &mut rows,
+                    &mut next,
+                    &mut next_len
+                ),
+                CORVID_OK
+            );
+            let walked = walk_rows(rows);
+            assert!(
+                !walked.iter().any(|(k, _, _)| k.is_empty()),
+                "after=b\"\" excludes the empty key — already emitted"
+            );
+            seen.extend(walked.into_iter().map(|(k, _, _)| k));
+            if next.is_null() {
+                assert_eq!(next_len, 0);
+                break;
+            }
+            corvid_free(after as *mut c_void); // the PREVIOUS page's cursor
+            after = next;
+            after_len = next_len;
+        }
+        corvid_free(after as *mut c_void);
+        assert_eq!(
+            seen,
+            vec![
+                b"".to_vec(),
+                b"k1".to_vec(),
+                b"k2".to_vec(),
+                b"k3".to_vec(),
+                b"k4".to_vec()
+            ],
+            "every key exactly once: NULL starts AT b\"\", the zero-length \
+             cursor resumes past it"
         );
 
         corvid_collection_free(coll);
