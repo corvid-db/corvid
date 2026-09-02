@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/). Until 1.0 the on-disk
 format and API may change without backward-compatibility guarantees.
 
+## [0.3.4] - 2026-09-02
+### Added
+
+- The backend storage seam (OPFS program T2a; the contract is
+  corvid-js `docs/OPFS-SPEC.md` §2): `Store::open_with_backend` and
+  `Db::open_with_backend` (the general form of the seam
+  `open_in_memory` uses — open the engine over any redb
+  `StorageBackend`), plus `Store::backup_with_backend` and
+  `Db::backup_with_backend` (the backend form of the physical-copy
+  backup; exists-check and partial-target cleanup belong to the
+  caller, who owns the backend). Purely additive; no behavior change
+  to any existing path (`open_in_memory` and the path-based `backup`
+  now delegate through the same internal tails, proven by their
+  unchanged tests). Pinned by `tests/backend.rs`: drop-and-reopen
+  roundtrip over a shared backend (the unit-level twin of the
+  `persist.txt` fixture), trait-dispatch/sync_data/close-exactly-once
+  counting, injected backend write failures surfacing as clean engine
+  errors at both open-time and mid-life, and both backup twins copying
+  into independent reopenable backends. The browser binding builds
+  OPFS persistence on this seam; the surface manifest gains the four
+  constructs (331 total).
+
 ## [0.3.2] - 2026-09-02
 ### Changed
 
@@ -104,24 +126,6 @@ format and API may change without backward-compatibility guarantees.
 
 
 ### Added
-- The backend storage seam (OPFS program T2a; the contract is
-  corvid-js `docs/OPFS-SPEC.md` §2): `Store::open_with_backend` and
-  `Db::open_with_backend` (the general form of the seam
-  `open_in_memory` uses — open the engine over any redb
-  `StorageBackend`), plus `Store::backup_with_backend` and
-  `Db::backup_with_backend` (the backend form of the physical-copy
-  backup; exists-check and partial-target cleanup belong to the
-  caller, who owns the backend). Purely additive; no behavior change
-  to any existing path (`open_in_memory` and the path-based `backup`
-  now delegate through the same internal tails, proven by their
-  unchanged tests). Pinned by `tests/backend.rs`: drop-and-reopen
-  roundtrip over a shared backend (the unit-level twin of the
-  `persist.txt` fixture), trait-dispatch/sync_data/close-exactly-once
-  counting, injected backend write failures surfacing as clean engine
-  errors at both open-time and mid-life, and both backup twins copying
-  into independent reopenable backends. The browser binding builds
-  OPFS persistence on this seam; the surface manifest gains the four
-  constructs (331 total).
 - The C ABI (`crates/corvid-ffi`): a 122-symbol typed cdylib —
   `libcorvid.so` / `libcorvid.dylib` / `corvid.dll` — plus the
   generated, committed, drift-gated `corvid.h`, covering the whole
