@@ -41,31 +41,31 @@ pub struct Db {
 impl Db {
     /// Open (creating if absent) a database backed by a file at `path`.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let db = Self {
-            store: Store::open(path)?,
-            indexes: Mutex::new(IndexState::default()),
-            fts: crate::fts::new_state(),
-            scalar: crate::scalar::new_state(),
-            geo: crate::geo_index::new_state(),
-            schemas: crate::schema::new_state(),
-            ttl: crate::ttl::new_state(),
-            subscribers: Mutex::new(Subscribers::default()),
-            index_resume: Mutex::new(()),
-        };
-        db.load_index_defs()?;
-        db.load_text_defs()?;
-        db.load_scalar_defs()?;
-        db.load_compound_defs()?;
-        db.load_geo_defs()?;
-        db.load_schemas()?;
-        db.load_ttl_collections()?;
-        Ok(db)
+        Self::from_store(Store::open(path)?)
     }
 
     /// Open a purely in-memory database.
     pub fn open_in_memory() -> Result<Self> {
+        Self::from_store(Store::open_in_memory()?)
+    }
+
+    /// Open (creating if absent) a database over a caller-supplied redb
+    /// storage backend — the general form of the seam `open_in_memory`
+    /// uses. The browser binding builds OPFS persistence on this (one
+    /// `FileSystemSyncAccessHandle` behind the trait); the backend must
+    /// be initially empty or contain a valid redb database, and
+    /// cleanup-on-failure is the caller's concern, not the engine's.
+    pub fn open_with_backend(backend: impl redb::StorageBackend) -> Result<Self> {
+        Self::from_store(Store::open_with_backend(backend)?)
+    }
+
+    /// Construct the handle over an opened store and rebuild the
+    /// derived-state registries (the shared tail of every open
+    /// constructor — the rebuild reads committed state, so it is
+    /// backend-independent).
+    fn from_store(store: Store) -> Result<Self> {
         let db = Self {
-            store: Store::open_in_memory()?,
+            store,
             indexes: Mutex::new(IndexState::default()),
             fts: crate::fts::new_state(),
             scalar: crate::scalar::new_state(),
@@ -104,6 +104,16 @@ impl Db {
     /// way).
     pub fn backup(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
         self.store.backup(path)
+    }
+
+    /// The backend form of [`Db::backup`]: copy the entire database into
+    /// a database created over `dst`. The path form's preconditions
+    /// (target must not exist; cleanup of a partial target on failure)
+    /// belong to the CALLER here — a backend has no path to stat or
+    /// remove. Same physical-copy semantics and feature-configuration
+    /// caveat as [`Db::backup`].
+    pub fn backup_with_backend(&self, dst: impl redb::StorageBackend) -> Result<()> {
+        self.store.backup_with_backend(dst)
     }
 
     /// Run `f` as a bulk load under relaxed (eventual) durability: write

@@ -255,7 +255,7 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::JoinRow` — `joins_smoke_left_outer_resolves_and_misses`, `joins_happy_path_join_row_shape_is_exact`, `joins_missing_fk_field_and_dangling_reference_retain_rows_with_none`, `joins_foreign_key_kinds_text_bytes_int_and_unusable_shapes`, `joins_self_join_references_within_one_collection`, `joins_empty_left_empty_right_and_unknown_right_collection`, `joins_rows_follow_left_collection_key_order`, `joins_non_map_left_documents_retained_with_none`
 - `corvid::Collection::join` — `joins_smoke_left_outer_resolves_and_misses`, `joins_happy_path_join_row_shape_is_exact`, `joins_dotted_foreign_key_path_resolves_nested_maps`, `joins_missing_fk_field_and_dangling_reference_retain_rows_with_none`, `joins_foreign_key_kinds_text_bytes_int_and_unusable_shapes`, `joins_self_join_references_within_one_collection`, `joins_empty_left_empty_right_and_unknown_right_collection`, `joins_rows_follow_left_collection_key_order`, `joins_track_right_and_left_side_mutations`, `joins_non_map_left_documents_retained_with_none`
 
-## Lifecycle — 123 construct(s)
+## Lifecycle — 127 construct(s)
 
 - `corvid::value::MAX_NESTING` — `lifecycle_value_decode_enforces_max_nesting_bound`
 - `corvid::Value::encode` — `lifecycle_dump_load_roundtrips_every_value_variant_bytes_exact`, `lifecycle_value_decode_enforces_max_nesting_bound`
@@ -287,20 +287,24 @@ paths; `mcp::tool::<name>` / `mcp::envelope::<kind>` are wire syntax.
 - `corvid::Db` *(shared across classes: Mutations, Lifecycle)* — `mutations_smoke_insert_roundtrips`, `lifecycle_db_open_real_file_persists_across_reopen_and_rejects_missing_parent`
 - `corvid::Db::open` — `lifecycle_db_open_real_file_persists_across_reopen_and_rejects_missing_parent`, `lifecycle_db_open_second_handle_to_same_file_hits_the_redb_exclusive_lock`
 - `corvid::Db::open_in_memory` *(shared across classes: Mutations, Lifecycle)* — `mutations_smoke_insert_roundtrips`, `lifecycle_db_open_in_memory_instances_are_isolated`
+- `corvid::Db::open_with_backend` — `backend_db_open_with_backend_roundtrips_across_drop_and_reopen`, `backend_failing_write_surfaces_clean_error_not_panic`
 - `corvid::Db::collection` — `mutations_smoke_insert_roundtrips`
 - `corvid::Db::backup` — `lifecycle_db_backup_restores_identical_state_and_pins_error_paths`
+- `corvid::Db::backup_with_backend` — `backend_backup_with_backend_copies_to_independent_reopenable_backend`
 - `corvid::Db::bulk` — `lifecycle_db_bulk_is_a_durability_scope_writes_before_err_persist`, `lifecycle_db_bulk_happy_path_applies_and_survives_reopen`
 - `corvid::Db::compact` — `lifecycle_db_compact_keeps_data_intact_and_tolerates_double_compact`
 - `corvid::Db::collections` — `lifecycle_db_collections_filters_graph_ttl_and_index_namespaces`
 - `corvid::Store` — `lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts`
 - `corvid::Store::open` — `lifecycle_store_begin_bulk_scopes_nest_and_flush_makes_writes_durable`, `lifecycle_store_backup_copies_to_an_independent_openable_file`
 - `corvid::Store::open_in_memory` — `lifecycle_store_transaction_commit_rollback_and_write_batch_surface`
+- `corvid::Store::open_with_backend` — `backend_seam_dispatches_syncs_and_closes_exactly_once`, `backend_failing_write_surfaces_clean_error_not_panic`
 - `corvid::Store::set_relaxed_durability` — `lifecycle_store_set_relaxed_durability_and_flush_keep_data_durable`
 - `corvid::Store::begin_bulk` — `lifecycle_store_begin_bulk_scopes_nest_and_flush_makes_writes_durable`
 - `corvid::Store::flush` — `lifecycle_store_begin_bulk_scopes_nest_and_flush_makes_writes_durable`, `lifecycle_store_set_relaxed_durability_and_flush_keep_data_durable`
 - `corvid::Store::compact` — `lifecycle_db_compact_keeps_data_intact_and_tolerates_double_compact`
 - `corvid::Store::next_auto_id` — `lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts`, `lifecycle_store_transaction_commit_rollback_and_write_batch_surface`
 - `corvid::Store::backup` — `lifecycle_store_backup_copies_to_an_independent_openable_file`
+- `corvid::Store::backup_with_backend` — `backend_backup_with_backend_copies_to_independent_reopenable_backend`
 - `corvid::Store::transaction` — `lifecycle_store_transaction_commit_rollback_and_write_batch_surface`
 - `corvid::Store::read` — `lifecycle_store_read_batch_is_one_snapshot_and_mirrors_standalone_ops`
 - `corvid::Store::put` — `lifecycle_store_kv_surface_roundtrips_and_unknown_collection_contracts`
@@ -439,8 +443,8 @@ the in-process duplex-I/O suite in `crates/corvid-mcp/tests/tools/`.
 - `mcp::tool::set_schema` — `set_schema_then_get_schema_roundtrips`, `set_schema_unique_enforced_on_stores`, `set_schema_required_and_type_violations`, `set_schema_param_and_name_errors`, `dump_load_preserves_schema_constraints`, `set_schema_flag_type_errors`, `set_schema_declared_empty_vs_undeclared_fields`
 - `mcp::tool::get_schema` — `set_schema_then_get_schema_roundtrips`, `set_schema_param_and_name_errors`, `dump_load_preserves_schema_constraints`, `set_schema_declared_empty_vs_undeclared_fields`
 
-327 engine construct(s) across 13 statement classes, 51 wire construct(s),
-305 distinct covering tests (existence and uniqueness enforced by the
+331 engine construct(s) across 13 statement classes, 51 wire construct(s),
+309 distinct covering tests (existence and uniqueness enforced by the
 radars; the 7 exempt row(s) above are the only uncovered ones, each
 with its justification).
 

@@ -1139,6 +1139,14 @@ static MANIFEST: &[Row] = &[
         ],
     ),
     row(
+        "corvid::Db::open_with_backend",
+        "Lifecycle",
+        &[
+            "backend_db_open_with_backend_roundtrips_across_drop_and_reopen",
+            "backend_failing_write_surfaces_clean_error_not_panic",
+        ],
+    ),
+    row(
         "corvid::Db::collection",
         "Lifecycle",
         &["mutations_smoke_insert_roundtrips"],
@@ -1147,6 +1155,11 @@ static MANIFEST: &[Row] = &[
         "corvid::Db::backup",
         "Lifecycle",
         &["lifecycle_db_backup_restores_identical_state_and_pins_error_paths"],
+    ),
+    row(
+        "corvid::Db::backup_with_backend",
+        "Lifecycle",
+        &["backend_backup_with_backend_copies_to_independent_reopenable_backend"],
     ),
     row(
         "corvid::Db::bulk",
@@ -1340,6 +1353,14 @@ static MANIFEST: &[Row] = &[
         &["lifecycle_store_transaction_commit_rollback_and_write_batch_surface"],
     ),
     row(
+        "corvid::Store::open_with_backend",
+        "Lifecycle",
+        &[
+            "backend_seam_dispatches_syncs_and_closes_exactly_once",
+            "backend_failing_write_surfaces_clean_error_not_panic",
+        ],
+    ),
+    row(
         "corvid::Store::set_relaxed_durability",
         "Lifecycle",
         &["lifecycle_store_set_relaxed_durability_and_flush_keep_data_durable"],
@@ -1374,6 +1395,11 @@ static MANIFEST: &[Row] = &[
         "corvid::Store::backup",
         "Lifecycle",
         &["lifecycle_store_backup_copies_to_an_independent_openable_file"],
+    ),
+    row(
+        "corvid::Store::backup_with_backend",
+        "Lifecycle",
+        &["backend_backup_with_backend_copies_to_independent_reopenable_backend"],
     ),
     row(
         "corvid::Store::transaction",

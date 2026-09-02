@@ -122,8 +122,10 @@ corvid::QueryBuilder::run	SELECT shaping	UNMAPPED
 corvid::Db	Lifecycle	UNMAPPED
 corvid::Db::open	Lifecycle	UNMAPPED
 corvid::Db::open_in_memory	Lifecycle	UNMAPPED
+corvid::Db::open_with_backend	Lifecycle	UNMAPPED
 corvid::Db::collection	Lifecycle	UNMAPPED
 corvid::Db::backup	Lifecycle	UNMAPPED
+corvid::Db::backup_with_backend	Lifecycle	UNMAPPED
 corvid::Db::bulk	Lifecycle	UNMAPPED
 corvid::Db::compact	Lifecycle	UNMAPPED
 corvid::Db::collections	Lifecycle	UNMAPPED
@@ -148,12 +150,14 @@ corvid::db::Page	SELECT shaping	UNMAPPED
 corvid::Store	Lifecycle	UNMAPPED
 corvid::Store::open	Lifecycle	UNMAPPED
 corvid::Store::open_in_memory	Lifecycle	UNMAPPED
+corvid::Store::open_with_backend	Lifecycle	UNMAPPED
 corvid::Store::set_relaxed_durability	Lifecycle	UNMAPPED
 corvid::Store::begin_bulk	Lifecycle	UNMAPPED
 corvid::Store::flush	Lifecycle	UNMAPPED
 corvid::Store::compact	Lifecycle	UNMAPPED
 corvid::Store::next_auto_id	Lifecycle	UNMAPPED
 corvid::Store::backup	Lifecycle	UNMAPPED
+corvid::Store::backup_with_backend	Lifecycle	UNMAPPED
 corvid::Store::transaction	Lifecycle	UNMAPPED
 corvid::Store::read	Lifecycle	UNMAPPED
 corvid::Store::put	Lifecycle	UNMAPPED

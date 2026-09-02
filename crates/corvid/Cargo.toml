@@ -65,6 +65,10 @@ zstd = ["dep:zstd"]
 tempfile.workspace = true
 proptest = "1"
 criterion = "0.5"
+# The backend-seam tests (tests/backend.rs, OPFS program T2a) implement
+# redb's StorageBackend themselves — the same workspace version the
+# engine links, so the trait is one crate instance.
+redb.workspace = true
 
 [[bench]]
 name = "engine"

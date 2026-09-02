@@ -101,8 +101,19 @@ impl Store {
 
     /// Open a purely in-memory store. Nothing is persisted.
     pub fn open_in_memory() -> Result<Self> {
+        Self::open_with_backend(redb::backends::InMemoryBackend::new())
+    }
+
+    /// Open (creating if absent) a store over a caller-supplied redb
+    /// storage backend — the seam `open_in_memory` uses, in its general
+    /// form. The backend must be initially empty or contain a valid
+    /// redb database (redb's own precondition for
+    /// `Builder::create_with_backend`); cleanup-on-failure is the
+    /// backend's concern, not the engine's — a backend has no path to
+    /// stat or remove.
+    pub fn open_with_backend(backend: impl redb::StorageBackend) -> Result<Self> {
         let store = Self {
-            db: Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?,
+            db: Database::builder().create_with_backend(backend)?,
             relaxed: std::sync::atomic::AtomicBool::new(false),
         };
         store.check_format_version()?;
@@ -257,7 +268,7 @@ impl Store {
         if path.exists() {
             return Err(crate::Error::BackupTargetExists(path.display().to_string()));
         }
-        let result = self.backup_tables(path);
+        let result = self.backup_into(Database::create(path)?);
         if result.is_err() {
             // Audit C8: no debris. Best-effort — the remove can itself fail
             // (nothing was created; the file is held elsewhere) — the
@@ -267,13 +278,24 @@ impl Store {
         result
     }
 
-    /// The table copy underlying [`Store::backup`]: snapshot the source,
-    /// create the destination, copy each table in one destination
-    /// transaction. Any error propagates to the caller, which then removes
-    /// the partial destination.
-    fn backup_tables(&self, path: &Path) -> Result<()> {
+    /// The backend form of [`Store::backup`]: copy all tables into a
+    /// database created over `dst`. The path form's preconditions
+    /// (target must not exist; cleanup of a partial target on failure)
+    /// belong to the CALLER here — a backend has no path to stat or
+    /// remove. Same physical-copy semantics and feature-configuration
+    /// caveat as [`Store::backup`].
+    pub fn backup_with_backend(&self, dst: impl redb::StorageBackend) -> Result<()> {
+        self.backup_into(Database::builder().create_with_backend(dst)?)
+    }
+
+    /// The table copy underlying [`Store::backup`] and
+    /// [`Store::backup_with_backend`]: snapshot the source, copy each
+    /// table into `dst` in one destination transaction. Any error
+    /// propagates to the caller — the path form then removes the
+    /// partial destination file; the backend form leaves cleanup to
+    /// its caller by contract.
+    fn backup_into(&self, dst: Database) -> Result<()> {
         let src = self.db.begin_read()?;
-        let dst = Database::create(path)?;
         let wtx = dst.begin_write()?;
 
         // Copy each table from the snapshot. A table absent in the source
