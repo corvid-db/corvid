@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/). Until 1.0 the on-disk
 format and API may change without backward-compatibility guarantees.
 
+## [0.3.1] - 2026-09-01
+### Fixed
+
+- `corvid.h`'s enum syntax is portable C11/C++ (docs/FFI.md §1.3/§1.4
+  erratum): the generated header had been wrapping every frozen enum in
+  C23 fixed-underlying-type guards (`enum <tag>` + `#if
+  __STDC_VERSION__ >= 202311L` + `: uint32_t`), whose pre-C23 fallback
+  (`typedef uint32_t <tag>;` beside the enum tag) is ill-formed C++ —
+  the tag and the typedef share a namespace there (found by corvid-cpp,
+  which had to preprocessor-mask the guards in its ABI TUs). The header
+  now emits the plain `typedef enum <tag> { ... } <tag>;` the spec has
+  shown all along — valid C11, C23, and every C++ standard; verified by
+  compiling a trivial TU both ways (`cc -x c -std=c11`, `c++ -x c++
+  -std=c++17`) against the published artifact's header. Values,
+  signatures, and the 124-symbol Appendix A are unchanged; the
+  Rust-side `#[repr(u32)]` wire-type pin is untouched; `FFI_VERSION`
+  and the soname stay at 1. Header-only change — no library code moved.
+
 ## [0.3.0] - 2026-09-01
 ### Added
 
