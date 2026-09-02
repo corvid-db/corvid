@@ -19,18 +19,50 @@ Run each step ONCE; after that the cascade (bottom of this file) is the whole
 publish pipeline. Nothing below is needed for CI to stay green — only for the
 registry-publishing steps of a release.
 
-1. **crates.io — the engine crate `corvid-db`** (token secret):
-   - create a token at <https://crates.io/settings/tokens>
-     (scope: *publish-update*), then:
-   - `gh secret set CARGO_REGISTRY_TOKEN -R corvid-db/corvid`
-     (paste the token at the prompt)
-2. **npm — corvid-js** (token secret):
-   - create an **Automation** token at
-     <https://www.npmjs.com/settings/&lt;user&gt;/tokens>, then:
-   - `gh secret set NPM_TOKEN -R corvid-db/corvid-js`
-   - (corvid-node's `NPM_TOKEN` is ALREADY set — 0.3.2 was published with it;
-     no action needed there.)
-3. **PyPI — corvid-python** (trusted publishing, NO token):
+1. **crates.io — the engine crate `corvid-db`** (trusted publishing, NO token):
+   - sign in at <https://crates.io>, open the crate's page
+     (<https://crates.io/crates/corvid-db>), click **Settings**, and under
+     **Trusted publishing** click **Add** / select **GitHub**, with exactly:
+     - Repository owner: `corvid-db`
+     - Repository name: `corvid`
+     - Workflow filename: `release.yml`
+     - Environment name: *(leave unset)*
+   - then remove the legacy secret:
+     `gh secret delete CARGO_REGISTRY_TOKEN -R corvid-db/corvid`
+2. **npm — corvid-js** (trusted publishing, NO token):
+   - sign in at <https://www.npmjs.com>, open the package's settings page
+     (<https://www.npmjs.com/package/corvid-js/access> — Packages →
+     corvid-js → Settings), and under **Trusted publishing → Select your
+     publisher** click **GitHub**, with exactly:
+     - Organization or user: `corvid-db`
+     - Repository: `corvid-js`
+     - Workflow filename: `release.yml`
+     - Environment name: *(leave blank)*
+     - Allowed actions: **npm publish** (configs created before 2026-05-20
+       were auto-set to publish-only — verify it shows publish)
+   - then remove the legacy secret:
+     `gh secret delete NPM_TOKEN -R corvid-db/corvid-js`
+3. **npm — corvid-node and its 5 platform packages** (trusted publishing,
+   NO token): npm links trusted publishers **per package** (one each — no
+   scope/pattern linking), so SIX packages each get the same one-time
+   linkage. For each of `corvid-node`, `corvid-node-darwin-arm64`,
+   `corvid-node-darwin-x64`, `corvid-node-linux-arm64-gnu`,
+   `corvid-node-linux-x64-gnu`, `corvid-node-win32-x64-msvc`:
+   - open <https://www.npmjs.com/package/&lt;name&gt;/access> (Packages →
+     &lt;name&gt; → Settings), and under **Trusted publishing → Select your
+     publisher** click **GitHub**, with exactly:
+     - Organization or user: `corvid-db`
+     - Repository: `corvid-node`
+     - Workflow filename: `release.yml`
+     - Environment name: *(leave blank)*
+     - Allowed actions: **npm publish**
+   - a NEW platform package added later (e.g. a musl or windows-arm64 leg)
+     cannot be pre-linked — npm has no pending-publisher mechanism yet — so
+     publish its first version once manually (`npm login` +
+     `npm publish` of the staged package), then link it exactly as above;
+   - then remove the legacy secret:
+     `gh secret delete NPM_TOKEN -R corvid-db/corvid-node`
+4. **PyPI — corvid-python** (trusted publishing, NO token):
    - sign in at <https://pypi.org>, then **Account settings → Publishing →
      Add a new pending publisher**, with exactly:
      - PyPI project name: `corvid-python`
@@ -38,7 +70,7 @@ registry-publishing steps of a release.
      - Repository: `corvid-python`
      - Workflow name: `release.yml`
      - Environment name: *(leave blank)*
-4. **pub.dev — corvid_dart** (trusted publishing, NO token):
+5. **pub.dev — corvid_dart** (trusted publishing, NO token):
    - pub.dev automates only EXISTING packages, so publish the first version
      manually once: remove `publish_to: none` from `pubspec.yaml`, commit,
      `dart pub publish` (browser login);
@@ -48,7 +80,7 @@ registry-publishing steps of a release.
      - Tag pattern: `v{{version}}`
      - Workflow: `release.yml`
      - Environment: *(leave unset)*
-5. **Packagist — corvid-php**: already linked (its GitHub integration syncs
+6. **Packagist — corvid-php**: already linked (its GitHub integration syncs
    each pushed tag; nothing to build, nothing to configure).
 
 ## The release cascade (one engine tag → every registry)
@@ -60,7 +92,7 @@ engine tag vX.Y.Z pushed
 engine .github/workflows/release.yml
         platform binaries + FFI artifacts on the GitHub release,
         then `cargo publish -p corvid-db` to crates.io
-        (CARGO_REGISTRY_TOKEN; idempotence guard via the crates.io API)
+        (OIDC trusted publishing; idempotence guard via the crates.io API)
         │
         ▼
 scripts/bindings/bump.sh --check            # (optional) drift audit first
@@ -76,8 +108,8 @@ scripts/bindings/bump.sh --release-after-merge vX.Y.Z
                                             # pushes, prints run URLs
 registries live:
   corvid-db (crates.io)   published by the engine release workflow above
-  corvid-node  → npm      release.yml (5-target napi matrix; NPM_TOKEN)
-  corvid-js    → npm      release.yml (wasm-pack build; NPM_TOKEN; npm view verify)
+  corvid-node  → npm      release.yml (5-target napi matrix; OIDC trusted publishing)
+  corvid-js    → npm      release.yml (wasm-pack build; OIDC trusted publishing; npm view verify)
   corvid-python→ PyPI     release.yml (maturin wheels+sdist; trusted publishing)
   corvid_dart  → pub.dev  release.yml (dart pub publish; OIDC trusted publishing)
   corvid-php   → Packagist (the tag itself; auto-synced, nothing builds)

@@ -17,7 +17,9 @@ name: Release
 # release/upload steps are skipped (an explicit echo marks the skip).
 #
 # After the GitHub release exists, the crates-io job publishes the engine
-# crate to crates.io (`cargo publish -p corvid-db`) — idempotently: a
+# crate to crates.io (`cargo publish -p corvid-db`, via crates.io trusted
+# publishing — the job's OIDC token is exchanged for a short-lived registry
+# token; no stored secret) — idempotently: a
 # crates.io API check skips the publish when the workspace version is
 # already registered, so a re-pushed tag never fails the job.
 #
@@ -237,13 +239,16 @@ jobs:
     if: github.event_name == 'push' && inputs.dry_run != true
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # NOTE — one-time secret (see scripts/bindings/README.md "USER
-    # INSTRUCTIONS"): create a publish-update-scoped token at
-    # https://crates.io/settings/tokens, then:
-    #   gh secret set CARGO_REGISTRY_TOKEN -R corvid-db/corvid
-    # cargo reads CARGO_REGISTRY_TOKEN from the environment for crates.io.
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    # Trusted publishing (https://crates.io/docs/trusted-publishing): the
+    # job's GitHub OIDC token is exchanged for a short-lived registry token
+    # by rust-lang/crates-io-auth-action, and cargo consumes that token via
+    # the CARGO_REGISTRY_TOKEN env var (the name cargo reads — the VALUE is
+    # now the minted token, not a stored secret). One-time linkage:
+    # the crate's Settings → Trusted publishing on crates.io (see
+    # scripts/bindings/README.md "USER INSTRUCTIONS").
+    permissions:
+      id-token: write # mint the OIDC token for the registry exchange
+      contents: read # checkout
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -272,6 +277,16 @@ jobs:
               exit 1
               ;;
           esac
+      - name: Exchange the OIDC token for a short-lived crates.io token
+        # rust-lang/crates-io-auth-action@v1, per the crates.io trusted
+        # publishing docs — skipped together with the publish when the guard
+        # already found the version registered.
+        id: auth
+        if: steps.guard.outputs.skip != 'true'
+        uses: rust-lang/crates-io-auth-action@v1
       - name: cargo publish -p corvid-db
         if: steps.guard.outputs.skip != 'true'
         run: cargo publish -p corvid-db
+        env:
+          # the SHORT-LIVED token minted by the auth step above (not a secret)
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
