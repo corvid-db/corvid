@@ -144,7 +144,7 @@ being pushable by whoever runs the tool. Nothing else to wire up.
   `version = "X.Y.Z"` line and the `#rev` hash are not (no `v`, and a rev
   cannot be computed textually). Cargo re-resolves the lock on the first build
   — the golden CI builds without `--locked`, so this is fine — and a
-  maintainer's first local `cargo update -p corvid` refreshes the committed
+  maintainer's first local `cargo update -p corvid-db` refreshes the committed
   lock.
 - **Pin globs that match nothing are reported, not fatal** (an optional
   `.engine-pin` may legitimately be absent); a typo'd glob is visible in every

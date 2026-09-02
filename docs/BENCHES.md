@@ -9,7 +9,7 @@ without a before/after table whose provenance is stated here.
 
 **Machine:** Apple M1 Max (MacBookPro18,2), Darwin arm64, 32 GiB,
 macOS 26.5.2. **Toolchain:** rustc 1.91.1 (ed61e7d7e 2025-11-07);
-MSRV 1.88. **Method:** `cargo bench -p corvid --bench engine`
+MSRV 1.88. **Method:** `cargo bench -p corvid-db --bench engine`
 (criterion, bench profile, in-memory `Db`, deterministic corpora —
 seeded xorshift/index math, no `rand`). Numbers are criterion **means
 with 95% CI** unless a table says median. Single-machine numbers:
@@ -18,27 +18,27 @@ compare relatively, not absolutely.
 ## Invocation (audit C10 convention — literal commands)
 
 ```text
-cargo bench -p corvid --bench engine                 # full suite
-cargo bench -p corvid --bench engine -- codec        # value_encode/_decode
-cargo bench -p corvid --bench engine -- hnsw         # build/search, None + PQ
-cargo bench -p corvid --bench engine -- pq_train     # parallel k-means training
-cargo bench -p corvid --bench engine -- text         # bm25 exact vs indexed
-cargo bench -p corvid --bench engine -- distance     # dot/l2/cosine 768d
-cargo bench -p corvid --bench engine -- index_creation_ondisk
-cargo bench -p corvid --bench engine -- edge_churn
-cargo bench -p corvid --bench engine -- compound_prefix_scan
-cargo bench -p corvid --bench engine -- delete_heavy
-cargo bench -p corvid --bench engine -- selective_window_verify
-cargo bench -p corvid --bench engine -- order_by_indexed_5k
-cargo bench -p corvid --bench engine -- neighbors_hub_10k
-cargo bench -p corvid --bench engine -- kernel_scaling
-cargo bench -p corvid --bench engine -- declined_probes
-cargo bench -p corvid --bench engine -- bandwidth
-cargo bench -p corvid --bench engine -- kernel_stream
-cargo bench -p corvid --bench engine -- quantized_scan
-cargo bench -p corvid --bench engine -- value_store_io
+cargo bench -p corvid-db --bench engine                 # full suite
+cargo bench -p corvid-db --bench engine -- codec        # value_encode/_decode
+cargo bench -p corvid-db --bench engine -- hnsw         # build/search, None + PQ
+cargo bench -p corvid-db --bench engine -- pq_train     # parallel k-means training
+cargo bench -p corvid-db --bench engine -- text         # bm25 exact vs indexed
+cargo bench -p corvid-db --bench engine -- distance     # dot/l2/cosine 768d
+cargo bench -p corvid-db --bench engine -- index_creation_ondisk
+cargo bench -p corvid-db --bench engine -- edge_churn
+cargo bench -p corvid-db --bench engine -- compound_prefix_scan
+cargo bench -p corvid-db --bench engine -- delete_heavy
+cargo bench -p corvid-db --bench engine -- selective_window_verify
+cargo bench -p corvid-db --bench engine -- order_by_indexed_5k
+cargo bench -p corvid-db --bench engine -- neighbors_hub_10k
+cargo bench -p corvid-db --bench engine -- kernel_scaling
+cargo bench -p corvid-db --bench engine -- declined_probes
+cargo bench -p corvid-db --bench engine -- bandwidth
+cargo bench -p corvid-db --bench engine -- kernel_stream
+cargo bench -p corvid-db --bench engine -- quantized_scan
+cargo bench -p corvid-db --bench engine -- value_store_io
 # zstd-feature twin of the same group (ledger-closure Task 5):
-cargo bench -p corvid --features zstd --bench engine -- value_store_io
+cargo bench -p corvid-db --features zstd --bench engine -- value_store_io
 # FFI crossing-cost comparison (corvid-ffi Task 8) — the cdylib the C
 # child links is NOT built by cargo bench; the build command is
 # load-bearing (a freshness tripwire fails the bench on a stale ABI):
@@ -338,7 +338,7 @@ AFTER on the implementation, same session/machine. Corpus: 2_001 docs,
 10k edge writes — 4 hubs × ~938 distinct fan-in edges + ~938 weighted
 fan-out edges (~313 per (hub, relation) per direction), plus 2_500
 uniform degree-~1 edges (the contrast case). Means [95% CI];
-`cargo bench -p corvid --bench engine -- neighbors_hub_10k`:
+`cargo bench -p corvid-db --bench engine -- neighbors_hub_10k`:
 
 | Bench | BEFORE (mean) | AFTER (mean) | Δ |
 |---|---|---|---|

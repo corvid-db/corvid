@@ -4,7 +4,7 @@
 manifests (crates/corvid/tests/surface/mod.rs and
 crates/corvid-mcp/tests/surface/mod.rs), which the radar tests keep
 honest against the sources. Regenerate with:
-CORVID_GEN_SYNTAX=1 cargo test -p corvid --test surface syntax_md
+CORVID_GEN_SYNTAX=1 cargo test -p corvid-db --test surface syntax_md
 Every ordinary `cargo test` run re-renders and diffs this file, so the
 committed copy cannot drift from the manifests. -->
 

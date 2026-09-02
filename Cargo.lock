@@ -157,7 +157,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "corvid"
+name = "corvid-db"
 version = "0.3.1"
 dependencies = [
  "criterion",
@@ -175,7 +175,7 @@ version = "0.3.1"
 dependencies = [
  "cbindgen",
  "cc",
- "corvid",
+ "corvid-db",
  "redb",
  "tempfile",
 ]
@@ -184,7 +184,7 @@ dependencies = [
 name = "corvid-mcp"
 version = "0.3.1"
 dependencies = [
- "corvid",
+ "corvid-db",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -194,7 +194,7 @@ dependencies = [
 name = "corvid-wasm"
 version = "0.3.1"
 dependencies = [
- "corvid",
+ "corvid-db",
 ]
 
 [[package]]

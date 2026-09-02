@@ -1,5 +1,10 @@
 [package]
-name = "corvid"
+# The crates.io name: bare `corvid` is taken by an unrelated crate, so the
+# package publishes as `corvid-db` (org-aligned with github.com/corvid-db).
+# The LIB target below keeps the ident `corvid`, so every `use corvid::…`
+# in this workspace, the bindings, and downstream code is unchanged — only
+# the dependency KEY in consumers' Cargo.toml says `corvid-db`.
+name = "corvid-db"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +14,13 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Embedded multi-modal data store with a fluent builder API"
+documentation = "https://corvid-db.github.io/docs/"
 readme = "../../README.md"
+
+[lib]
+# Preserves the pre-publish crate ident: package `corvid-db`, but the
+# compiled library is still `corvid` (libcorvid.rlib, `use corvid::…`).
+name = "corvid"
 
 [dependencies]
 redb.workspace = true

@@ -14,7 +14,7 @@ rust-version = "1.88"
 license = "MIT"
 authors = ["Rocky <smrockypk@gmail.com>"]
 repository = "https://github.com/corvid-db/corvid"
-keywords = ["database", "embedded", "vector", "search", "ai"]
+keywords = ["database", "embedded", "vector", "search", "hnsw"]
 categories = ["database-implementations"]
 
 [workspace.dependencies]
@@ -31,12 +31,15 @@ serde_json = "1"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # OPTIONAL value compression (ledger-closure Task 5): never in the default
 # build, the WASM budget, or the zero-dependency posture — pulled in only by
-# `-p corvid --features zstd` (see crates/corvid/Cargo.toml `[features]` and
-# `src/compression.rs`). Defaults trimmed to the one-shot bulk codec: the
+# `-p corvid-db --features zstd` (see crates/corvid/Cargo.toml `[features]`
+# and `src/compression.rs`). Defaults trimmed to the one-shot bulk codec: the
 # `legacy` (old-format frames) and `zdict_builder` features stay out — corvid
 # reads only frames it wrote itself and trains no dictionaries.
 zstd = { version = "0.13", default-features = false }
-corvid = { path = "crates/corvid" }
+# The engine crate: package `corvid-db` (crates.io), lib ident `corvid`
+# (see crates/corvid/Cargo.toml). Workspace members depend on it under the
+# package name; the code still says `use corvid::…`.
+corvid-db = { path = "crates/corvid" }
 # Header generator for the C ABI crate (corvid-ffi): dev/test-only, exact-
 # pinned because its output formatting is byte-drift-gated against the
 # committed crates/corvid-ffi/corvid.h. Defaults trimmed to the library API

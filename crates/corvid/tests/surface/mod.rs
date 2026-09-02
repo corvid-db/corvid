@@ -3998,7 +3998,7 @@ fn render_syntax_md() -> String {
          manifests (crates/corvid/tests/surface/mod.rs and\n\
          crates/corvid-mcp/tests/surface/mod.rs), which the radar tests keep\n\
          honest against the sources. Regenerate with:\n\
-         CORVID_GEN_SYNTAX=1 cargo test -p corvid --test surface syntax_md\n\
+         CORVID_GEN_SYNTAX=1 cargo test -p corvid-db --test surface syntax_md\n\
          Every ordinary `cargo test` run re-renders and diffs this file, so the\n\
          committed copy cannot drift from the manifests. -->\n\n\
          This is the complete writable surface of `corvid` and `corvid-mcp`: every\n\
@@ -4112,13 +4112,13 @@ fn syntax_md_stays_generated_from_the_manifests() {
     let committed = fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "read {}: {e} — generate it with CORVID_GEN_SYNTAX=1 cargo test \
-             -p corvid --test surface syntax_md",
+             -p corvid-db --test surface syntax_md",
             path.display()
         )
     });
     assert_eq!(
         committed, rendered,
         "docs/SYNTAX.md is out of sync with the surface manifests — regenerate \
-         with CORVID_GEN_SYNTAX=1 cargo test -p corvid --test surface syntax_md"
+         with CORVID_GEN_SYNTAX=1 cargo test -p corvid-db --test surface syntax_md"
     );
 }

@@ -5,6 +5,9 @@ API instead of SQL. One in-process dependency that does vector search,
 full-text search, metadata filtering, and rank fusion — composed into a single
 call.
 
+On crates.io as `corvid-db` once published — pending first publish; until then
+consume it as the git dependency (`corvid = { git = "https://github.com/corvid-db/corvid" }`).
+
 > **What this is.** A personal experiment, and an honest one: corvid was
 > *entirely vibe coded* — built by directing an AI coding agent, not hand-written
 > line by line. It is not a product, has no roadmap, and comes with no support

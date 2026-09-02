@@ -24,7 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build API docs
-        run: cargo doc --no-deps -p corvid -p corvid-mcp
+        run: cargo doc --no-deps -p corvid-db -p corvid-mcp
       - name: Assemble site
         run: |
           mkdir -p _site

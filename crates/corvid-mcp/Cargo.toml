@@ -9,9 +9,13 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Sidecar MCP server exposing a corvid store to agentic tools"
+# Binaries ship on engine releases, not crates.io; the engine crate
+# (package `corvid-db`) is the only published member for now.
+publish = false
 
 [dependencies]
-corvid.workspace = true
+# Package `corvid-db`, lib ident `corvid` — `use corvid::…` unchanged.
+corvid-db.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 

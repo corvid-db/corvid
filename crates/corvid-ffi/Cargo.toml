@@ -7,6 +7,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "The typed C ABI (cdylib `corvid` + generated corvid.h) over the corvid engine — docs/FFI.md is the locked contract"
+# cdylib artifacts ship on engine releases, not crates.io; the engine
+# crate (package `corvid-db`) is the only published member for now.
+publish = false
 
 [lib]
 # The cdylib artifact must be `libcorvid.so` / `libcorvid.dylib` /
@@ -29,7 +32,8 @@ crate-type = ["cdylib"]
 doc = false
 
 [dependencies]
-corvid.workspace = true
+# Package `corvid-db`, lib ident `corvid` — `use corvid::…` unchanged.
+corvid-db.workspace = true
 
 [dev-dependencies]
 cbindgen.workspace = true

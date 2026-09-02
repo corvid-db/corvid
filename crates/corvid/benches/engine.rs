@@ -115,7 +115,7 @@ fn bench_hnsw(c: &mut Criterion) {
 /// reproducible):
 ///
 /// ```text
-/// cargo bench -p corvid --bench engine -- pq_train
+/// cargo bench -p corvid-db --bench engine -- pq_train
 /// ```
 fn bench_pq_train(c: &mut Criterion) {
     let mut g = c.benchmark_group("pq_train");
@@ -201,11 +201,11 @@ fn bench_distance(c: &mut Criterion) {
 // Literal invocations (audit C10):
 //
 // ```text
-// cargo bench -p corvid --bench engine -- kernel_scaling
-// cargo bench -p corvid --bench engine -- declined_probes
-// cargo bench -p corvid --bench engine -- bandwidth
-// cargo bench -p corvid --bench engine -- kernel_stream
-// cargo bench -p corvid --bench engine -- quantized_scan
+// cargo bench -p corvid-db --bench engine -- kernel_scaling
+// cargo bench -p corvid-db --bench engine -- declined_probes
+// cargo bench -p corvid-db --bench engine -- bandwidth
+// cargo bench -p corvid-db --bench engine -- kernel_stream
+// cargo bench -p corvid-db --bench engine -- quantized_scan
 // ```
 
 /// BENCH-LOCAL declined-shape probe: 16 accumulator lanes instead of the
@@ -453,7 +453,7 @@ fn bench_quantized_scan(c: &mut Criterion) {
 /// reproducible):
 ///
 /// ```text
-/// cargo bench -p corvid --bench engine -- index_creation_ondisk
+/// cargo bench -p corvid-db --bench engine -- index_creation_ondisk
 /// ```
 fn bench_creation_ondisk(c: &mut Criterion) {
     const N_TEXT: usize = 5_000; // 3 backfill pages (PAGE = 2048)
@@ -528,7 +528,7 @@ fn bench_creation_ondisk(c: &mut Criterion) {
 /// reproducible):
 ///
 /// ```text
-/// cargo bench -p corvid --bench engine -- edge_churn
+/// cargo bench -p corvid-db --bench engine -- edge_churn
 /// ```
 fn bench_edge_churn(c: &mut Criterion) {
     const DOCS: usize = 1_000;
@@ -625,7 +625,7 @@ fn bench_edge_churn(c: &mut Criterion) {
 /// reproducible):
 ///
 /// ```text
-/// cargo bench -p corvid --bench engine -- compound_prefix_scan
+/// cargo bench -p corvid-db --bench engine -- compound_prefix_scan
 /// ```
 fn bench_compound_prefix_scan(c: &mut Criterion) {
     const DOCS: usize = 5_000;
@@ -678,7 +678,7 @@ fn bench_compound_prefix_scan(c: &mut Criterion) {
 /// reproducible):
 ///
 /// ```text
-/// cargo bench -p corvid --bench engine -- delete_heavy
+/// cargo bench -p corvid-db --bench engine -- delete_heavy
 /// ```
 fn bench_delete_heavy(c: &mut Criterion) {
     const DOCS: usize = 5_000;
@@ -767,7 +767,7 @@ fn bench_delete_heavy(c: &mut Criterion) {
 /// reproducible):
 ///
 /// ```text
-/// cargo bench -p corvid --bench engine -- selective_window_verify
+/// cargo bench -p corvid-db --bench engine -- selective_window_verify
 /// ```
 fn bench_selective_window_verify(c: &mut Criterion) {
     const DOCS: usize = 5_000;
@@ -835,7 +835,7 @@ fn bench_selective_window_verify(c: &mut Criterion) {
 /// reproducible):
 ///
 /// ```text
-/// cargo bench -p corvid --bench engine -- order_by_indexed_5k
+/// cargo bench -p corvid-db --bench engine -- order_by_indexed_5k
 /// ```
 fn bench_order_by_indexed(c: &mut Criterion) {
     const DOCS: usize = 5_000;
@@ -906,7 +906,7 @@ fn bench_order_by_indexed(c: &mut Criterion) {
 /// reproducible):
 ///
 /// ```text
-/// cargo bench -p corvid --bench engine -- neighbors_hub_10k
+/// cargo bench -p corvid-db --bench engine -- neighbors_hub_10k
 /// ```
 fn bench_neighbors_hub(c: &mut Criterion) {
     const NON_HUBS: usize = 1_997; // docs 4..=2000
@@ -988,8 +988,8 @@ fn bench_neighbors_hub(c: &mut Criterion) {
 /// pair is the control: incompressible values are stored raw under the
 /// feature too, so its two configs must agree within noise.
 ///
-/// `cargo bench -p corvid --bench engine -- value_store_io`
-/// (zstd run: `cargo bench -p corvid --features zstd --bench engine -- value_store_io`)
+/// `cargo bench -p corvid-db --bench engine -- value_store_io`
+/// (zstd run: `cargo bench -p corvid-db --features zstd --bench engine -- value_store_io`)
 fn bench_value_store_io(c: &mut Criterion) {
     let base =
         "the quick brown fox jumps over the lazy dog; pack my box with five dozen liquor jugs. ";

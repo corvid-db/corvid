@@ -30,29 +30,29 @@ jobs:
         run: cargo clippy --all-targets --workspace -- -D warnings
       - name: Zero-dep posture (Task 11 + Task 5)
         run: |
-          cargo build -p corvid --no-default-features
-          if cargo tree -p corvid --edges normal | grep -qE '(^|[^a-z-])tracing v'; then
+          cargo build -p corvid-db --no-default-features
+          if cargo tree -p corvid-db --edges normal | grep -qE '(^|[^a-z-])tracing v'; then
             echo "::error::tracing must not be in the default dependency graph (feature leak)"
             exit 1
           fi
-          if cargo tree -p corvid --edges normal | grep -qE '(^|[^a-z-])zstd v'; then
+          if cargo tree -p corvid-db --edges normal | grep -qE '(^|[^a-z-])zstd v'; then
             echo "::error::zstd must not be in the default dependency graph (feature leak)"
             exit 1
           fi
       - name: Feature-gated tracing (clippy + doc + test with the feature on)
         run: |
-          cargo clippy -p corvid --features tracing --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc -p corvid --features tracing --no-deps
-          cargo test -p corvid --features tracing
+          cargo clippy -p corvid-db --features tracing --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc -p corvid-db --features tracing --no-deps
+          cargo test -p corvid-db --features tracing
       - name: Feature-gated zstd (clippy + doc + test with the feature on)
         run: |
-          cargo clippy -p corvid --features zstd --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc -p corvid --features zstd --no-deps
-          cargo test -p corvid --features zstd
+          cargo clippy -p corvid-db --features zstd --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc -p corvid-db --features zstd --no-deps
+          cargo test -p corvid-db --features zstd
       - name: Feature composition (tracing + zstd together)
         run: |
-          cargo clippy -p corvid --features tracing,zstd --all-targets -- -D warnings
-          cargo test -p corvid --features tracing,zstd
+          cargo clippy -p corvid-db --features tracing,zstd --all-targets -- -D warnings
+          cargo test -p corvid-db --features tracing,zstd
       - name: Docs
         run: cargo doc --no-deps --workspace
         env:
@@ -117,7 +117,7 @@ jobs:
           targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
       - name: Build engine for aarch64-android
-        run: cargo build -p corvid --target aarch64-linux-android --release
+        run: cargo build -p corvid-db --target aarch64-linux-android --release
 
   mobile-ios:
     name: mobile cross-compile (iOS)
@@ -130,7 +130,7 @@ jobs:
           targets: aarch64-apple-ios
       - uses: Swatinem/rust-cache@v2
       - name: Build engine for aarch64-ios
-        run: cargo build -p corvid --target aarch64-apple-ios --release
+        run: cargo build -p corvid-db --target aarch64-apple-ios --release
 
   # The C ABI's own gate (Phase-0 Task 8): build the cdylib consumers
   # actually link (release profile, the artifact shape the release

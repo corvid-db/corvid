@@ -5,6 +5,22 @@ based on [Keep a Changelog](https://keepachangelog.com/). Until 1.0 the on-disk
 format and API may change without backward-compatibility guarantees.
 
 ## [Unreleased]
+### Changed
+
+- The engine crate's PACKAGE name is now `corvid-db` (crates.io
+  publication prep): bare `corvid` is taken on crates.io by an unrelated
+  crate, so the package publishes under the org-aligned `corvid-db`.
+  The compiled ident is unchanged — `[lib] name = "corvid"` — so every
+  `use corvid::…` in the workspace, the bindings, and downstream code
+  keeps compiling as-is; only dependency KEYS change
+  (`corvid = { path/git = … }` → `corvid-db = { … }`). Engine
+  publication metadata added (description, keywords, categories,
+  license, readme, repository, documentation); `corvid-mcp`,
+  `corvid-ffi`, and `corvid-wasm` carry `publish = false` — they ship
+  on engine releases, not crates.io. Verified by
+  `cargo publish --dry-run -p corvid-db`; the first publish is pending
+  a registry token. (CI/doc commands now say `-p corvid-db`.)
+
 ### Fixed
 
 - `corvid_page`'s zero-length cursor is an EXCLUSIVE continuation, not a

@@ -7,9 +7,13 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "WASM bundle-size harness for the corvid engine (links the engine into a cdylib)."
+# A size-budget harness for CI, not a consumable artifact; the engine
+# crate (package `corvid-db`) is the only published member for now.
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-corvid.workspace = true
+# Package `corvid-db`, lib ident `corvid` — `use corvid::…` unchanged.
+corvid-db.workspace = true
