@@ -5,8 +5,9 @@ API instead of SQL. One in-process dependency that does vector search,
 full-text search, metadata filtering, and rank fusion — composed into a single
 call.
 
-On crates.io as `corvid-db` once published — pending first publish; until then
-consume it as the git dependency (`corvid = { git = "https://github.com/corvid-db/corvid" }`).
+On crates.io as **[`corvid-db`](https://crates.io/crates/corvid-db)** (the
+lib ident is `corvid`: `corvid-db = "0.4"`); or consume the git dependency
+pinned to a release tag.
 
 > **What this is.** A personal experiment, and an honest one: corvid was
 > *entirely vibe coded* — built by directing an AI coding agent, not hand-written
@@ -21,7 +22,7 @@ consume it as the git dependency (`corvid = { git = "https://github.com/corvid-d
 > stale, writes are transactional). If a corner is rough, it's a missing
 > feature, not a broken one.
 >
-> Status: **v0.1**, pre-1.0. The API changes freely until 1.0 — no
+> Status: **v0.4.0**, pre-1.0. The API changes freely until 1.0 — no
 > backward-compatibility guarantees yet; a format change is migrated with
 > `dump`/`load`, never silently. Built for the author's own use first; shared in
 > the open under MIT. Use it, fork it, learn from it.
@@ -65,33 +66,17 @@ trades this: the index's top-k is fetched first and the filter applied after,
 so a highly selective filter may return fewer than `limit` rows (see the
 `.approx()` docs).
 
-## What's here
+## The workspace
 
-- **`corvid`** — the embedded engine (this is a library; strictly in-process,
-  no networking).
-- **`corvid-mcp`** — a sidecar that exposes a corvid store to agentic coding
-  tools over MCP (JSON-RPC on stdio). Run `corvid-mcp [PATH]` and point an MCP
-  client at it; tools: `store`, `patch`, `compare_and_set`, `get`, `delete`,
-  `delete_where`, `page`, `search`, `phrase_search`, `count`, `geo`, `join`,
-  `link`, `unlink`, `neighbors`, `in_neighbors`, `traverse`, `create_index`,
-  `create_text_index`, `create_scalar_index`, `create_compound_index`,
-  `create_geo_index`, `backup`, `dump`, `load`, `list_collections`,
-  `insert_auto`, `set_schema`, `get_schema`. `set_schema` declares (or
-  replaces) a collection's schema — a fields array of `{name, type,
-  required?, unique?}` — that subsequent stores are validated against;
-  `get_schema` returns the declared fields, or `{fields: null}` when none is
-  declared.
-- **`corvid-ffi`** — the C ABI: a typed cdylib (`libcorvid.so` /
-  `libcorvid.dylib` / `corvid.dll`) plus the generated `corvid.h` — 124
-  symbols covering the engine surface, `FFI_VERSION = 1`. Documents are
-  built and read through value handles with no parsing or serialization
-  anywhere on the path (measured at parity with native Rust). Release
-  artifacts attach the library, header, and golden fixtures per platform
-  (Windows ships `corvid.dll` plus its MSVC import library
-  `corvid.dll.lib` — link the import lib); the FFI spec lives in
-  **[docs/FFI.md](docs/FFI.md)** (source) and as the site's
-  **[C ABI section](https://corvid-db.github.io/docs/ffi/)** — the canonical
-  rendered form binding authors code against.
+Three crates ship from this repo. **corvid** is the engine (strictly
+in-process, no networking). **corvid-ffi** is the typed C ABI — a cdylib plus
+the generated `corvid.h`, 124 symbols, `FFI_VERSION = 1`, documents crossing
+as value handles with no parsing or serialization anywhere on the path; its
+contract is **[docs/FFI.md](docs/FFI.md)** (rendered as the site's
+**[C ABI section](https://corvid-db.github.io/docs/ffi/)**), and every language
+binding in the [org](https://github.com/corvid-db) is built on it.
+**corvid-mcp** is a sidecar exposing a corvid store to agentic coding tools
+over MCP on stdio (`corvid-mcp [PATH]`).
 
 The canonical documentation lives at
 **[corvid-db.github.io/docs](https://corvid-db.github.io/docs/)** — a
@@ -101,7 +86,7 @@ ecosystem, with versioned release snapshots. The
 **[website](https://corvid-db.github.io/corvid/)** hosts an overview and the
 full **[API reference](https://corvid-db.github.io/corvid/api/corvid/)**.
 
-## Capabilities (v0.1)
+## Capabilities
 
 | Area | Status |
 |---|---|
@@ -140,7 +125,8 @@ full **[API reference](https://corvid-db.github.io/corvid/api/corvid/)**.
 | Optional zstd compression of stored documents (`zstd` cargo feature, OFF by default; ~12× smaller text docs, transparent reads, default build unchanged) | ✅ opt-in feature |
 | Optional structured instrumentation (`tracing` cargo feature, OFF by default) | ✅ opt-in feature |
 | MCP sidecar over stdio | ✅ |
-| WASM build (engine, ≈0.2 MB gzipped; CI prints the measured size and enforces a 2 MB budget) | ✅ in-memory; OPFS persistence ⏳ |
+| Custom storage backends (`Store/Db::open_with_backend`, redb `StorageBackend`) | ✅ additive seam |
+| WASM build (engine ≈0.2 MB gzipped, CI-enforced 2 MB budget) + browser persistence via [corvid-js](https://github.com/corvid-db/corvid-js) (OPFS, Worker, async API) | ✅ |
 | Mobile cross-compile (aarch64 iOS/Android) | ✅ engine builds |
 
 Image search is vector search over image embeddings: embed in your app (CLIP
