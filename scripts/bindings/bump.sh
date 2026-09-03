@@ -153,6 +153,28 @@ substitute() {
     done
 }
 
+# Bare-version install coordinates: substitute() rewrites only the
+# v-prefixed tag token, but README install snippets can also carry the
+# BARE X.Y.Z in Maven <version> literals and Gradle coordinate tails
+# (":X.Y.Z") — corvid-jvm's release gate checks tag == README
+# <version>, so the bump PR must move them too. Scoped to README.md
+# files among the pin globs, exact-string forms only; a no-op in repos
+# whose READMEs carry none (the v-prefixed pins and version files
+# cover everyone else today).
+substitute_bare_coordinates() { # REPO_DIR OLD_BARE NEW_BARE FILE...
+    local repo_dir="$1" oldb="$2" newb="$3"; shift 3
+    local f c total=0
+    for f in "$@"; do
+        [ "$(basename "$f")" = "README.md" ] || continue
+        c="$({ grep -oE "<version>${oldb//./\\.}</version>|:${oldb//./\\.}\"" "$repo_dir/$f" || true; } | wc -l | tr -d ' ')"
+        [ "$c" -eq 0 ] && continue
+        perl -pi -e "s/<version>\Q$oldb\E<\/version>/<version>$newb<\/version>/g; s/:\Q$oldb\E\"/:$newb\"/g" "$repo_dir/$f"
+        printf '%s\t%s bare coordinate(s)\n' "$f" "$c"
+        total=$((total + c))
+    done
+    return 0
+}
+
 # read_package_version FILE -> the binding's OWN package version on stdout
 # (bare X.Y.Z, no v), format-detected from the file: package.json /
 # composer.json ("version": "x"), pubspec.yaml (version: x), anything TOMLish
@@ -623,6 +645,11 @@ for i in "${!REPOS[@]}"; do
     fi
 
     subs="$(substitute "$WORK/$name" "$old" "$NEW_TAG" ${files[@]+"${files[@]}"})"
+    # Bare Maven/Gradle install coordinates in READMEs ride the same PR
+    # (no-op where none exist); logged separately so the PR diff and the
+    # summary both show it.
+    bare_subs="$(substitute_bare_coordinates "$WORK/$name" "${old#v}" "${NEW_TAG#v}" ${files[@]+"${files[@]}"})"
+    [ -n "$bare_subs" ] && log "$repo: bare install coordinates bumped (${bare_subs//$'\n'/; })"
     total="$(printf '%s\n' "$subs" | cut -f2 | awk '{s+=$1} END {print s+0}')"
 
     # Release parity: repos with a registered version-file ALSO get their own
