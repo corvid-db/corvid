@@ -5,7 +5,11 @@ name: Release
 # PLUS the C ABI artifact set per platform (the corvid-ffi cdylib —
 # libcorvid.so / libcorvid.dylib / corvid.dll (+ corvid.dll.lib, the MSVC
 # import library) — with the committed corvid.h and the golden/ fixture
-# directory binding authors can smoke their bindings against).
+# directory binding authors can smoke their bindings against), PLUS the
+# mobile sets: the Android cdylib artifact sets for aarch64-linux-android
+# and x86_64-linux-android (NDK; consumed by the corvid-android AAR) and
+# the CorvidEngine.xcframework zip for corvid-swift (iOS device/simulator
+# + macOS staticlib slices).
 # The GitHub release is created only AFTER every matrix build has succeeded
 # and the tag has been verified against the workspace version; the release
 # job then attaches the platform archives plus a checksums.txt of their
@@ -174,8 +178,66 @@ jobs:
             corvid-ffi-*.zip
           if-no-files-found: error
 
+  # ---- Mobile platform artifact sets (Android + Apple) ----------------------
+  # The same cdylib/staticlib discipline as the desktop legs, for the
+  # platform consumers: corvid-android's AAR jniLibs (the corvid-jvm
+  # repo's release workflow compiles the JNI shim against these .so
+  # files with the same NDK) and corvid-swift's CorvidEngine.xcframework
+  # (SPM binary target; scripts/release/build-apple.sh builds it).
+
+  build-android:
+    name: build android (NDK r28b)
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      # NDK r28b = 28.2.13676358 — the version build-android.sh was proven
+      # with locally. Not cached: the extracted NDK (~2.5 GB) would crowd
+      # the 10 GB repo cache budget the rust caches live in; a release
+      # runs a handful of times per cycle.
+      - name: Install the NDK
+        run: |
+          curl -fsSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r28b-linux.zip
+          unzip -q /tmp/ndk.zip -d "$RUNNER_TEMP"
+          echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r28b" >> "$GITHUB_ENV"
+      - name: Build + stage the android artifact sets
+        run: scripts/release/build-android.sh
+      - name: Upload archives as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: corvid-ffi-android
+          path: corvid-ffi-*.tar.gz
+          if-no-files-found: error
+
+  build-apple:
+    name: build apple (CorvidEngine.xcframework)
+    permissions:
+      contents: read
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the xcframework + zip (sha256 printed)
+        run: scripts/release/build-apple.sh
+      - name: Upload the zip as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: corvid-swift-xcframework
+          path: corvid-swift-*.zip
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, build-android, build-apple]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -212,7 +274,7 @@ jobs:
         run: |
           cd dist
           ls -l
-          sha256sum corvid-mcp-* corvid-ffi-* > checksums.txt
+          sha256sum corvid-mcp-* corvid-ffi-* corvid-swift-* > checksums.txt
           cat checksums.txt
       - name: "dry-run: publish skipped"
         if: inputs.dry_run == true
@@ -228,7 +290,7 @@ jobs:
           gh release view "$GITHUB_REF_NAME" \
             || gh release create "$GITHUB_REF_NAME" \
                  --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
-          gh release upload "$GITHUB_REF_NAME" dist/corvid-mcp-* dist/corvid-ffi-* dist/checksums.txt --clobber
+          gh release upload "$GITHUB_REF_NAME" dist/corvid-mcp-* dist/corvid-ffi-* dist/corvid-swift-* dist/checksums.txt --clobber
 
   crates-io:
     name: crates.io (corvid-db)

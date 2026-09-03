@@ -16,14 +16,18 @@ publish = false
 # `corvid.dll` (FFI.md §8), and cargo names artifacts after the LIB TARGET
 # name — hence `corvid` here even though the package is `corvid-ffi`.
 #
-# crate-type is cdylib only (no rlib): an rlib named `corvid` would collide
-# with the engine's `libcorvid.rlib` in the shared target dir (cargo warns
-# about the filename today and reserves the right to error), and it would
-# make `corvid` ambiguous in any integration test's extern prelude — the
-# engine dependency and this crate's own lib share that name. All tests are
-# therefore unit tests inside src/.
+# crate-type is cdylib + staticlib (no rlib): an rlib named `corvid` would
+# collide with the engine's `libcorvid.rlib` in the shared target dir (cargo
+# warns about the filename today and reserves the right to error), and it
+# would make `corvid` ambiguous in any integration test's extern prelude —
+# the engine dependency and this crate's own lib share that name. All tests
+# are therefore unit tests inside src/. The staticlib (`libcorvid.a`, no
+# rlib-style collision) is the Apple distribution shape: corvid-swift's
+# CorvidEngine.xcframework slices (iOS device/simulator + macOS, release
+# workflow's apple job + scripts/release/build-apple.sh) link the static
+# archive — bare dylibs outside frameworks are not supported on iOS.
 name = "corvid"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "staticlib"]
 # Two workspace libs cannot both rustdoc into target/doc/corvid; the engine
 # keeps the workspace doc slot. `cargo doc -p corvid-ffi` is VACUOUS under
 # doc = false (it emits nothing), so this crate's doc gate invokes rustdoc

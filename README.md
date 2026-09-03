@@ -78,6 +78,13 @@ binding in the [org](https://github.com/corvid-db) is built on it.
 **corvid-mcp** is a sidecar exposing a corvid store to agentic coding tools
 over MCP on stdio (`corvid-mcp [PATH]`).
 
+Each engine release ships the ABI artifact set per platform: the desktop
+cdylib sets (`libcorvid.so` / `libcorvid.dylib` / `corvid.dll` + `corvid.h`
++ the golden fixtures), the Android cdylib sets for `aarch64-linux-android`
+and `x86_64-linux-android` (NDK, API 24 — consumed by the corvid-android
+AAR), and the `CorvidEngine.xcframework` zip (iOS device/simulator + macOS
+staticlib slices — the binary target of the corvid-swift SPM package).
+
 The canonical documentation lives at
 **[corvid-db.github.io/docs](https://corvid-db.github.io/docs/)** — a
 task-oriented tutorial, the corvid-language reference, index/full-text/geo/
