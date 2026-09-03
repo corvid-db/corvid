@@ -648,6 +648,31 @@ for i in "${!REPOS[@]}"; do
         fi
     fi
 
+    # Cargo.lock #rev refresh: the substitution above rewrites the tag
+    # TEXT in the lock (tag=vX.Y.Z) but leaves the locked #rev pointing
+    # at the OLD tag's commit — the lock then names the new tag over the
+    # old code (v0.4.0's lesson: three bindings shipped that way; no
+    # code delta that cycle, but the lock lied). Cargo resolves the
+    # mismatch itself with the tag, so one `cargo update -p corvid-db`
+    # in the clone lands the true rev in the same bump PR.
+    if [ -f "$WORK/$name/Cargo.lock" ] && grep -q 'name = "corvid-db"' "$WORK/$name/Cargo.lock" 2>/dev/null; then
+        if command -v cargo >/dev/null 2>&1; then
+            if (cd "$WORK/$name" && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo update -p corvid-db >/dev/null 2>&1); then
+                if git -C "$WORK/$name" diff --quiet -- Cargo.lock; then
+                    log "$repo: Cargo.lock rev already at $NEW_TAG"
+                else
+                    log "$repo: Cargo.lock engine #rev refreshed to $NEW_TAG"
+                fi
+            else
+                # Never block the bump on this — but say it loudly: the
+                # PR merges with a stale rev and needs the manual step.
+                log "$repo: WARNING — cargo update -p corvid-db failed; Cargo.lock keeps a stale #rev (refresh manually before the next build)"
+            fi
+        else
+            log "$repo: WARNING — cargo not found; Cargo.lock keeps a stale #rev (refresh manually before the next build)"
+        fi
+    fi
+
     if git -C "$WORK/$name" diff --quiet; then
         out_repo+=("$repo"); out_old+=("$old"); out_new+=("$NEW_TAG"); out_url+=("-")
         out_status+=("NO-OP — substitution produced no diff"); fail=1; continue
