@@ -630,6 +630,49 @@ if [ "$MODE_RELEASE" -eq 1 ]; then
         log "$repo: $action — $detail $url"
     done
 
+    # 6. VERIFY the fired release runs — "fired" is not "published" (the
+    #    corvid-node lesson: FOUR cascade cycles of silently-failing npm
+    #    publishes hid behind green tag pushes because nothing watched
+    #    the runs). Poll each fired run to completion under the same
+    #    --timeout/--interval budget as --merge-when-green; a red run
+    #    fails this mode. A run still queued at the deadline is
+    #    WATCH-MANUALLY, not a failure (a slow queue is not a publish
+    #    verdict).
+    declare -a ver_repo=() ver_verdict=() ver_url=()
+    if [ "$MODE_DRY" -eq 0 ]; then
+        deadline=$(( $(date +%s) + POLL_TIMEOUT_MIN * 60 ))
+        for i in "${!rel_repo[@]}"; do
+            url="${rel_url[$i]}"
+            case "$url" in http*) ;; *) continue ;; esac
+            repo="${rel_repo[$i]}"
+            rid="${url##*/}"
+            verdict="?"
+            while :; do
+                line="$(gh run view "$rid" --repo "$repo" --json status,conclusion \
+                            --jq '.status + " " + (.conclusion // "-")' 2>/dev/null || true)"
+                if [ -z "$line" ]; then
+                    verdict="UNREADABLE (run $rid)"; break
+                fi
+                st="${line%% *}"; conc="${line#* }"
+                if [ "$st" = "completed" ]; then
+                    verdict="$conc"
+                    break
+                fi
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                    verdict="TIMEOUT ($st — watch manually)"
+                    break
+                fi
+                sleep "$POLL_INTERVAL"
+            done
+            ver_repo+=("$repo"); ver_verdict+=("$verdict"); ver_url+=("$url")
+            log "$repo: release run $verdict"
+            case "$verdict" in
+                success|TIMEOUT*) ;;
+                *) rel_fail=1 ;;
+            esac
+        done
+    fi
+
     echo
     dry_suffix=""
     [ "$MODE_DRY" -eq 1 ] && dry_suffix=" (dry-run — nothing tagged, nothing pushed)"
@@ -638,6 +681,14 @@ if [ "$MODE_RELEASE" -eq 1 ]; then
     for i in "${!rel_repo[@]}"; do
         printf '%-24s %-14s %-44s %s\n' "${rel_repo[$i]}" "${rel_action[$i]}" "${rel_detail[$i]}" "${rel_url[$i]}"
     done
+    if [ "${#ver_repo[@]}" -gt 0 ]; then
+        echo
+        echo "=== release-run verdicts ==="
+        printf '%-24s %-40s %s\n' REPO VERDICT URL
+        for i in "${!ver_repo[@]}"; do
+            printf '%-24s %-40s %s\n' "${ver_repo[$i]}" "${ver_verdict[$i]}" "${ver_url[$i]}"
+        done
+    fi
     [ "$rel_fail" -eq 0 ] || exit 1
     exit 0
 fi
