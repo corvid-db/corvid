@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/). Until 1.0 the
 on-disk format and API may change without backward-compatibility guarantees.
 
+## [0.4.1] - 2026-09-03
+### Added
+
+- Mobile platform artifact sets join every engine release (decision log,
+  2026-09-03; additive — no code change to the engine or the ABI, which
+  stays `FFI_VERSION = 1` with all 124 symbols unchanged):
+  - **Android cdylib sets** for `aarch64-linux-android` and
+    `x86_64-linux-android` (NDK r28b, API 24, SONAME-stamped), shipped
+    as the same `corvid-ffi-<tag>-<target>.tar.gz` shape as the desktop
+    sets (cdylib + `corvid.h` + `golden/`). Consumed by the
+    **corvid-android** AAR (`io.github.corvid-db:corvid-android` on
+    Maven Central, assembled in the corvid-jvm repo — its JNI shim
+    compiles against these with the same NDK).
+  - **`CorvidEngine.xcframework` zip** (`corvid-swift-<tag>.zip`,
+    sha256 in `checksums.txt`): iOS device + fat iOS-simulator + fat
+    macOS staticlib slices of `corvid-ffi` (which gains `staticlib` in
+    its crate-type; every desktop cdylib output is unchanged), with
+    `corvid.h` + an umbrella + a module map so SwiftPM forms the
+    `CorvidEngine` clang module. This is the binary target of the
+    **corvid-swift** SPM package.
+  - CI's mobile cross-compile jobs now `cargo check` the FFI crate for
+    all seven mobile targets on every PR (the full artifact builds live
+    in the release workflow, whose dry-run validated both new jobs).
+- ABI scope rulings (recorded in DESIGN.md): 32-bit Android ABIs and
+  watchOS/visionOS/tvOS slices are deliberately out — both are additive
+  artifact additions the day a consumer asks.
+
 ## [0.4.0] - 2026-09-02
 ### Design ledger
 
