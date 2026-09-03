@@ -89,9 +89,9 @@ The canonical documentation lives at
 **[corvid-db.github.io/docs](https://corvid-db.github.io/docs/)** — a
 task-oriented tutorial, the corvid-language reference, index/full-text/geo/
 vector guides, administration, performance, the C ABI, and the bindings
-ecosystem, with versioned release snapshots. The
-**[website](https://corvid-db.github.io/corvid/)** hosts an overview and the
-full **[API reference](https://corvid-db.github.io/corvid/api/corvid/)**.
+ecosystem, with versioned release snapshots. The full rustdoc
+**[API reference](https://corvid-db.github.io/corvid/api/corvid/)** is
+rebuilt and published on every push to this repo.
 
 ## Capabilities
 

@@ -3,238 +3,29 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>corvid — embedded multi-modal data store for AI apps</title>
-<meta name="description" content="An embedded, in-process Rust data store that composes vector search, full-text search, filtering, graph traversal, and rank fusion into one transactionally consistent builder call.">
+<title>corvid — documentation moved</title>
+<meta name="robots" content="noindex">
+<link rel="canonical" href="https://corvid-db.github.io/docs/">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%90%A6%E2%80%8D%E2%AC%9B%3C/text%3E%3C/svg%3E">
+<meta http-equiv="refresh" content="0; url=https://corvid-db.github.io/docs/">
 <style>
-  :root {
-    --bg: #0b0d12;
-    --surface: #13161e;
-    --surface-2: #181c26;
-    --border: #232839;
-    --text: #e7e9f0;
-    --muted: #9aa3b6;
-    --faint: #6b7384;
-    --accent: #8b8cf6;
-    --accent-2: #c178f0;
-    --code-bg: #0e1117;
-    --green: #6ee7a8;
-    --radius: 14px;
-    --maxw: 1080px;
-  }
-  * { box-sizing: border-box; }
-  html { scroll-behavior: smooth; }
   body {
-    margin: 0;
-    background: radial-gradient(1200px 600px at 70% -10%, rgba(139,140,246,0.10), transparent 60%), var(--bg);
-    color: var(--text);
-    font: 16px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    -webkit-font-smoothing: antialiased;
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: #0b0d12; color: #e7e9f0; text-align: center;
+    font: 16px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
-  a { color: inherit; text-decoration: none; }
-  code, pre { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
-  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
-
-  /* nav */
-  header.nav {
-    position: sticky; top: 0; z-index: 10;
-    backdrop-filter: blur(10px);
-    background: rgba(11,13,18,0.72);
-    border-bottom: 1px solid var(--border);
-  }
-  .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 62px; }
-  .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; letter-spacing: -0.01em; }
-  .brand .glyph { font-size: 20px; }
-  .nav-links { display: flex; gap: 22px; align-items: center; }
-  .nav-links a { color: var(--muted); font-size: 14.5px; transition: color .15s; }
-  .nav-links a:hover { color: var(--text); }
-  .nav-links a.gh { color: var(--text); }
-
-  /* hero */
-  .hero { padding: 84px 0 36px; }
-  .tag {
-    display: inline-flex; align-items: center; gap: 8px;
-    font-size: 13px; color: var(--muted);
-    border: 1px solid var(--border); border-radius: 999px;
-    padding: 5px 13px; margin-bottom: 26px; background: var(--surface);
-  }
-  .tag .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); }
-  h1 {
-    font-size: clamp(38px, 6.4vw, 66px); line-height: 1.04; margin: 0 0 18px;
-    letter-spacing: -0.03em; font-weight: 720;
-    background: linear-gradient(180deg, #fff 30%, #b9bdd0);
-    -webkit-background-clip: text; background-clip: text; color: transparent;
-  }
-  h1 .accent {
-    background: linear-gradient(110deg, var(--accent), var(--accent-2));
-    -webkit-background-clip: text; background-clip: text; color: transparent;
-  }
-  .lede { font-size: clamp(17px, 2.2vw, 20px); color: var(--muted); max-width: 64ch; margin: 0 0 30px; }
-  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 14px; }
-  .btn {
-    display: inline-flex; align-items: center; gap: 8px;
-    padding: 11px 18px; border-radius: 10px; font-size: 15px; font-weight: 560;
-    border: 1px solid var(--border); transition: transform .12s, border-color .15s, background .15s;
-  }
-  .btn:hover { transform: translateY(-1px); }
-  .btn.primary { background: linear-gradient(110deg, var(--accent), var(--accent-2)); border-color: transparent; color: #0b0d12; font-weight: 640; }
-  .btn.ghost { background: var(--surface); color: var(--text); }
-  .btn.ghost:hover { border-color: var(--accent); }
-
-  /* code card */
-  .panel {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); overflow: hidden;
-    box-shadow: 0 30px 80px -40px rgba(0,0,0,0.8);
-  }
-  .panel-bar { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface-2); }
-  .panel-bar .dots { display: flex; gap: 6px; }
-  .panel-bar .dots i { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
-  .panel-bar .dots i:nth-child(1){ background:#ff5f57; } .panel-bar .dots i:nth-child(2){ background:#febc2e; } .panel-bar .dots i:nth-child(3){ background:#28c840; }
-  .panel-bar .file { color: var(--faint); font-size: 13px; margin-left: 6px; }
-  pre.code { margin: 0; padding: 22px 22px; background: var(--code-bg); overflow-x: auto; font-size: 13.5px; line-height: 1.7; }
-  pre.code .c { color: #6b7384; font-style: italic; }
-  pre.code .k { color: #c178f0; }
-  pre.code .t { color: #8b8cf6; }
-  pre.code .s { color: #6ee7a8; }
-  pre.code .f { color: #e7e9f0; }
-  pre.code .n { color: #f0a868; }
-
-  section { padding: 58px 0; }
-  .section-head { margin: 0 0 8px; }
-  h2 { font-size: clamp(24px, 3.4vw, 34px); letter-spacing: -0.02em; margin: 0 0 10px; font-weight: 680; }
-  .sub { color: var(--muted); max-width: 70ch; margin: 0 0 34px; }
-
-  /* honest note */
-  .note {
-    border: 1px solid var(--border); border-left: 3px solid var(--accent);
-    background: var(--surface); border-radius: 12px; padding: 22px 24px;
-  }
-  .note p { margin: 0 0 12px; color: var(--muted); }
-  .note p:last-child { margin: 0; }
-  .note strong { color: var(--text); font-weight: 620; }
-
-  /* features */
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(258px, 1fr)); gap: 16px; }
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px 20px; transition: border-color .15s, transform .12s; }
-  .card:hover { border-color: #34406a; transform: translateY(-2px); }
-  .card h3 { margin: 0 0 7px; font-size: 16px; font-weight: 620; letter-spacing: -0.01em; }
-  .card p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.6; }
-  .card .ic { font-size: 17px; margin-bottom: 12px; display: block; opacity: .9; }
-
-  /* install */
-  .install pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; overflow-x: auto; font-size: 14px; color: var(--text); }
-  .install .muted-line { color: var(--faint); }
-
-  /* footer */
-  footer { border-top: 1px solid var(--border); padding: 34px 0 60px; color: var(--faint); font-size: 14px; }
-  .foot-inner { display: flex; flex-wrap: wrap; gap: 18px; justify-content: space-between; align-items: center; }
-  .foot-links { display: flex; gap: 20px; flex-wrap: wrap; }
-  .foot-links a { color: var(--muted); }
-  .foot-links a:hover { color: var(--text); }
-
-  .two { display: grid; grid-template-columns: 1.05fr 1fr; gap: 30px; align-items: start; }
-  @media (max-width: 820px) { .two { grid-template-columns: 1fr; } }
+  a { color: #8b8cf6; }
+  p { color: #9aa3b6; }
 </style>
 </head>
 <body>
-
-<header class="nav">
-  <div class="wrap nav-inner">
-    <a class="brand" href="#top"><span class="glyph">🐦‍⬛</span> corvid</a>
-    <nav class="nav-links">
-      <a href="https://github.com/i-rocky/corvid/blob/master/docs/GUIDE.md">Guide</a>
-      <a href="api/corvid/index.html">API</a>
-      <a href="https://github.com/i-rocky/corvid/blob/master/DESIGN.md">Design</a>
-      <a class="gh" href="https://github.com/i-rocky/corvid">GitHub ↗</a>
-    </nav>
-  </div>
-</header>
-
-<main id="top">
-  <div class="wrap">
-    <section class="hero">
-      <div class="two">
-        <div>
-          <span class="tag"><span class="dot"></span> v0.1.1 · pre-1.0 · MIT</span>
-          <h1>One engine for <span class="accent">vector, text, filter &amp; graph</span>.</h1>
-          <p class="lede">corvid is an embedded, in-process Rust data store for AI applications. Vector search, full-text search, metadata filtering, graph traversal, and rank fusion compose into a single transactionally consistent builder call — no glue, no reconciliation, no separate services.</p>
-          <div class="cta">
-            <a class="btn primary" href="https://github.com/i-rocky/corvid/blob/master/docs/GUIDE.md">Read the guide</a>
-            <a class="btn ghost" href="api/corvid/index.html">API reference</a>
-            <a class="btn ghost" href="https://github.com/i-rocky/corvid">View source ↗</a>
-          </div>
-        </div>
-        <div class="panel" aria-hidden="true">
-          <div class="panel-bar"><span class="dots"><i></i><i></i><i></i></span><span class="file">hybrid_query.rs</span></div>
-<pre class="code"><span class="k">use</span> corvid::{Db, Metric, Value, field};
-
-<span class="k">let</span> db = Db::<span class="f">open</span>(<span class="s">"memory.corvid"</span>)?;
-<span class="k">let</span> docs = db.<span class="f">collection</span>(<span class="s">"docs"</span>);
-
-<span class="c">// filter + vector + text, fused and reranked,</span>
-<span class="c">// in one transactionally consistent call.</span>
-<span class="k">let</span> rows = docs
-    .<span class="f">query</span>()
-    .<span class="f">filter</span>(<span class="f">field</span>(<span class="s">"category"</span>).<span class="f">eq</span>(Value::<span class="t">Text</span>(<span class="s">"blog"</span>.into())))
-    .<span class="f">vector</span>(<span class="s">"embedding"</span>, q, <span class="n">100</span>, Metric::<span class="t">Cosine</span>)
-    .<span class="f">text</span>(<span class="s">"body"</span>, <span class="s">"rust embedded database"</span>, <span class="n">100</span>)
-    .<span class="f">rerank_mmr</span>(<span class="n">0.7</span>)
-    .<span class="f">limit</span>(<span class="n">10</span>)
-    .<span class="f">run</span>()?;</pre>
-        </div>
-      </div>
-    </section>
-
-    <section>
-      <div class="note">
-        <p><strong>An honest note.</strong> corvid is a personal experiment, and it was <strong>entirely vibe coded</strong> — built by directing an AI coding agent, not hand-written line by line. It is not a product, has no roadmap, and comes with no support promises.</p>
-        <p>It is also <strong>not a toy.</strong> The code is solid and genuinely usable: ~390 tests, &gt;90% line coverage, zero-warning clippy, criterion benchmarks on the hot paths, and a correctness-first design — filters are true predicates, indexes are never stale, writes are transactional. If a corner is rough, it's a missing feature, not a broken one.</p>
-      </div>
-    </section>
-
-    <section>
-      <h2 class="section-head">Why it exists</h2>
-      <p class="sub">AI apps usually bolt together a vector database, a full-text engine, and a metadata store, then reconcile them in application code. corvid puts them behind one embedded engine and one query builder. The filter runs <em>before</em> ranking, so the top-k is computed among matching documents — a true predicate, never a post-hoc trim.</p>
-      <div class="grid">
-        <div class="card"><span class="ic">🧭</span><h3>Vector search</h3><p>Cosine / dot / L2. Exact brute-force baseline, or HNSW — in-memory and on-disk — used transparently once indexed.</p></div>
-        <div class="card"><span class="ic">🔤</span><h3>Full-text (BM25)</h3><p>Inverted index with positions for phrase search. Stop-word removal and a conservative stemmer, shared by index and query.</p></div>
-        <div class="card"><span class="ic">🔎</span><h3>Filters as predicates</h3><p>eq / range / in / between / starts_with / contains, and/or/not, dotted paths. Pushed down before ranking.</p></div>
-        <div class="card"><span class="ic">🔀</span><h3>Fusion &amp; rerank</h3><p>Reciprocal Rank Fusion across sources, MMR diversification — first-class operators in the builder.</p></div>
-        <div class="card"><span class="ic">🕸️</span><h3>Property graph</h3><p>Directed edges over document keys: link / neighbors / in-neighbors / multi-hop traverse, atomic with the write.</p></div>
-        <div class="card"><span class="ic">📍</span><h3>Geospatial</h3><p>Haversine radius, bounding box, and k-nearest — with an on-disk grid index for sub-linear queries.</p></div>
-        <div class="card"><span class="ic">💽</span><h3>On-disk indexes</h3><p>HNSW, inverted text, scalar/compound, and geo state stored as ordinary records: bounded memory, no rebuild on open.</p></div>
-        <div class="card"><span class="ic">🗜️</span><h3>Quantization</h3><p>Binary (~32×) and scalar (~4×) vector compression, plus product quantization on the on-disk index.</p></div>
-        <div class="card"><span class="ic">🧱</span><h3>Transactional</h3><p>redb-backed, single-writer MVCC. Every secondary index reflects the same committed state — the core invariant.</p></div>
-        <div class="card"><span class="ic">⏳</span><h3>Schema, TTL, reactive</h3><p>Optional declared schema, per-record expiry, in-process change feeds, and a vector-keyed semantic cache.</p></div>
-        <div class="card"><span class="ic">🔌</span><h3>MCP sidecar</h3><p><code>corvid-mcp</code> exposes the engine to agentic tools over MCP (JSON-RPC on stdio) as 27 tools.</p></div>
-        <div class="card"><span class="ic">🦀</span><h3>Pure, portable Rust</h3><p><code>#![forbid(unsafe_code)]</code>. Builds for desktop, server, mobile (aarch64), and WASM (≈0.2&nbsp;MB gzipped).</p></div>
-      </div>
-    </section>
-
-    <section class="install">
-      <h2 class="section-head">Get started</h2>
-      <p class="sub">Add it as a git dependency (corvid targets stable Rust, 2024 edition). Then open a database and start a collection.</p>
-      <pre><span class="muted-line"># Cargo.toml</span>
-corvid = { git = "https://github.com/i-rocky/corvid" }</pre>
-      <p class="sub" style="margin-top:24px">Or run the MCP sidecar and point an agentic client at it:</p>
-      <pre>cargo run -p corvid-mcp -- app.corvid   <span class="muted-line"># omit the path for in-memory</span></pre>
-    </section>
-  </div>
+<main>
+  <h1>🐦‍⬛ corvid</h1>
+  <p>The corvid documentation now lives at
+  <a href="https://corvid-db.github.io/docs/">corvid-db.github.io/docs</a>.</p>
+  <p>Redirecting… <a href="https://corvid-db.github.io/docs/">continue</a> if
+  your browser does not.</p>
 </main>
-
-<footer>
-  <div class="wrap foot-inner">
-    <div>corvid · embedded multi-modal data store · MIT</div>
-    <div class="foot-links">
-      <a href="https://github.com/i-rocky/corvid">GitHub</a>
-      <a href="https://github.com/i-rocky/corvid/blob/master/docs/GUIDE.md">Guide</a>
-      <a href="api/corvid/index.html">API docs</a>
-      <a href="https://github.com/i-rocky/corvid/blob/master/DESIGN.md">Design</a>
-      <a href="https://github.com/i-rocky/corvid/releases">Releases</a>
-    </div>
-  </div>
-</footer>
-
+<script>location.replace("https://corvid-db.github.io/docs/");</script>
 </body>
 </html>
