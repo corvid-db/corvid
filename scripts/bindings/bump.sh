@@ -175,6 +175,39 @@ substitute_bare_coordinates() { # REPO_DIR OLD_BARE NEW_BARE FILE...
     return 0
 }
 
+# SPM binary-target checksum refresh (corvid-swift): the substitution
+# rewrites the URL's tag, but the sha256 `checksum:` literal must match
+# the NEW tag's actual zip bytes — SwiftPM refuses to resolve a drifted
+# checksum, so a stale one would break the binding's build the moment
+# the bump PR lands. Download the zip at the substituted URL (release
+# assets are up — the wait guard ran; dry-run relies on them being up
+# too, else a loud warning and a manual refresh), hash it, and rewrite
+# the literal in the same PR. No-op in repos without an SPM binary
+# target pointing at an engine-release zip of the new tag.
+refresh_swift_checksum() { # REPO_DIR NEW_TAG
+    local repo_dir="$1" new_tag="$2"
+    local manifest="$repo_dir/Package.swift"
+    [ -f "$manifest" ] || return 0
+    grep -q 'binaryTarget' "$manifest" 2>/dev/null || return 0
+    local url sum tmp
+    url="$(grep -oE "https://github\.com/[^\"']+releases/download/${new_tag//./\\.}/[^\"']+\.zip" "$manifest" | head -1 || true)"
+    [ -n "$url" ] || return 0
+    tmp="$(mktemp)"
+    if ! curl -fsSL -o "$tmp" "$url"; then
+        log "  WARNING — cannot fetch $url; checksum left stale (refresh manually before the PR merges)"
+        rm -f "$tmp"
+        return 0
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        sum="$(shasum -a 256 "$tmp" | awk '{print $1}')"
+    else
+        sum="$(sha256sum "$tmp" | awk '{print $1}')"
+    fi
+    rm -f "$tmp"
+    perl -pi -e 's/checksum: "[0-9a-f]{64}"/checksum: "'"$sum"'"/g' "$manifest"
+    log "  Package.swift binary-target checksum refreshed (${url##*/} -> $sum)"
+}
+
 # read_package_version FILE -> the binding's OWN package version on stdout
 # (bare X.Y.Z, no v), format-detected from the file: package.json /
 # composer.json ("version": "x"), pubspec.yaml (version: x), anything TOMLish
@@ -650,6 +683,9 @@ for i in "${!REPOS[@]}"; do
     # summary both show it.
     bare_subs="$(substitute_bare_coordinates "$WORK/$name" "${old#v}" "${NEW_TAG#v}" ${files[@]+"${files[@]}"})"
     [ -n "$bare_subs" ] && log "$repo: bare install coordinates bumped (${bare_subs//$'\n'/; })"
+    # SPM binary-target checksums ride the same PR (no-op everywhere
+    # but corvid-swift).
+    refresh_swift_checksum "$WORK/$name" "$NEW_TAG"
     total="$(printf '%s\n' "$subs" | cut -f2 | awk '{s+=$1} END {print s+0}')"
 
     # Release parity: repos with a registered version-file ALSO get their own

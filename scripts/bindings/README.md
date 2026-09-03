@@ -281,6 +281,14 @@ being pushable by whoever runs the tool. Nothing else to wire up.
 - **Pin globs that match nothing are reported, not fatal** (an optional
   `.engine-pin` may legitimately be absent); a typo'd glob is visible in every
   mode's output.
+- **SPM binary-target checksums (corvid-swift):** the `Package.swift`
+  binary-target URL's tag is substituted like any pin, and the sha256
+  `checksum:` literal is REFRESHED from the new tag's actual zip
+  (`refresh_swift_checksum` downloads the asset the wait guard already
+  proved live and hashes it) — SwiftPM refuses a drifted checksum, so
+  a stale one would break the binding the moment the PR lands. A fetch
+  failure downgrades to a loud warning + a manual refresh, never a
+  silent lie.
 
 ## Example: the live drift audit (2026-09-01)
 
